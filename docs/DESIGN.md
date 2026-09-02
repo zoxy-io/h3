@@ -36,9 +36,9 @@ Both are in `src/quic/`, because they are one protocol with three documents. See
 |---|---|---|
 | 9000 | varints, packet headers, packet numbers, 20 frame types, transport parameters, stream identifiers, error codes | `src/varint.zig`, `src/quic/` |
 | 9001 | Initial secrets, packet protection, header protection, Retry integrity, key update | `src/quic/crypto/` |
-| 9002 | RTT estimation, loss detection, PTO, congestion control | `src/quic/recovery/` *(not yet written — §6)* |
+| 9002 | RTT estimation, loss detection, PTO, congestion control | `src/quic/Recovery.zig` |
 | 9204 | prefixed integers, static table, field line representations, encoder/decoder streams | `src/qpack/` |
-| 9114 | frame layer, unidirectional stream types, settings, message validation | `src/frame.zig`, `src/stream.zig`, `src/fields.zig` *(the last not yet written)* |
+| 9114 | frame layer, unidirectional stream types, settings, message validation | `src/frame.zig`, `src/stream.zig`, `src/fields.zig` |
 
 ## 2. The boundary moves, compared with h2
 
@@ -202,10 +202,16 @@ all three build legs):
   changes" and section 4.5's final size.
 - `quic/AckRanges.zig` — the received-packet set for one number space, and the
   ACK frames rendered from it (sections 13.2 and 19.3).
-- `quic/Recovery.zig` — RFC 9002 entire: RTT estimation, packet- and
-  time-threshold loss detection, the PTO, and NewReno congestion control. It
-  never learns what a packet contained; `Config.Context` is an opaque token the
-  connection attaches on send and gets back on loss.
+- `quic/Recovery.zig` — RFC 9002: RTT estimation, packet- and time-threshold
+  loss detection, the PTO with its backoff, and NewReno — slow start, recovery,
+  per-packet window growth (appendix B.5) and persistent congestion (section
+  7.6). Not "RFC 9002 entire", which this line claimed before anyone counted:
+  **ECN is parsed but not acted on** (an `ACK_ECN` frame's counts reach
+  `frame.Ack.ecn` and go no further, so section 7.3.2's congestion signal is
+  ignored) and **there is no pacer** (section 7.7, a SHOULD). Both are listed in
+  §6's ledger rather than hidden here. It never learns what a packet contained;
+  `Config.Context` is an opaque token the connection attaches on send and gets
+  back on loss.
 - `qpack/field_line.zig` — RFC 9204 section 4.5's representations, both
   directions, against the static table with the dynamic table disabled.
 - `fields.zig` — RFC 9114 sections 4.2 and 4.3: the octet rules and the
@@ -239,6 +245,16 @@ all three build legs):
    tested by moving a number rather than by waiting a second. A handshake now
    survives a dropped datagram, which is the property the whole document exists
    for.
+
+   "Wired into the connection" was a claim before it was a fact. The window was
+   computed, halved, floored and unit-tested for weeks while `canSend` had no
+   callers at all, so the sender obeyed nothing: `Connection.sendPacket` now
+   consults it and rolls the packet back when it does not fit, exempting
+   ACK-only packets and PTO probes. A congestion controller nothing calls is a
+   comment. Still open, and deliberately: **ECN** (section 7.3.2 — the counts
+   are parsed into `frame.Ack.ecn` and dropped) and **pacing** (section 7.7, a
+   SHOULD). Both matter more to zoxy than to zrk, and neither blocks a
+   handshake.
 4. **The connection.** The largest item, and the one everything else serves. It
    decomposes into three pieces that are worth building and reviewing apart,
    because two of them are pure data structures with no policy in them:

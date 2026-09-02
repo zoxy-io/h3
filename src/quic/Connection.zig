@@ -1051,6 +1051,30 @@ pub fn Connection(comptime config: Config) type {
                 varint.encodeIn(buffer[at..][0..length_field_octets], length, length_field_octets) catch unreachable; // The width was chosen at comptime to hold any length this datagram can carry.
             }
 
+            // RFC 9002 section 7: "An endpoint MUST NOT send a packet if it
+            // would cause bytes_in_flight to exceed the congestion window,
+            // unless the packet is sent on a probe timeout."
+            //
+            // This is the line that makes the congestion controller a
+            // controller. Without it the window was computed, halved, floored
+            // and tested, and then nothing consulted it before sending — a
+            // sender with a congestion window it does not obey is a sender with
+            // no congestion control, however carefully the number is
+            // maintained.
+            //
+            // Only ack-eliciting packets are held back. A packet carrying
+            // nothing but an ACK is not in flight (section 2), and throttling
+            // acknowledgements would throttle the feedback the window itself
+            // depends on. A probe is exempt because a connection that cannot
+            // probe cannot discover that the path recovered.
+            const in_flight_estimate = header.header_octets + payload_octets + crypto.tag_octets;
+            if (written.ack_eliciting and space.probes_pending == 0 and
+                !self.recovery.canSend(in_flight_estimate))
+            {
+                self.rollback(level, undo, written);
+                return error.Empty;
+            }
+
             const total = keys.seal(buffer, header.packet_number_offset, header.header_octets, payload_octets, number) catch {
                 self.rollback(level, undo, written);
                 return error.Empty;
@@ -2293,4 +2317,48 @@ test "section 14.1: an undersized Initial is discarded and buys no allowance" {
     try server.receive(datagram[0..full], 0);
     try testing.expectEqual(@as(u64, initial_datagram_min), server.received_octets);
     try testing.expect(server.sendRoom() > 0);
+}
+
+test "RFC 9002 section 7: a full congestion window stops the sender" {
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+
+    // Fill the window. Before this was wired, the window was computed, halved,
+    // floored and tested, and then nothing consulted it: a sender with a
+    // congestion window it does not obey has no congestion control.
+    client.recovery.bytes_in_flight = client.recovery.congestion_window;
+    try testing.expect(!client.recovery.canSend(1));
+
+    _ = try client.write(0, "held back", false);
+    var datagram: [TestConnection.datagram_octets]u8 = @splat(0);
+    const octets = try client.send(&datagram, 1000);
+    // Nothing ack-eliciting goes out, and the stream data is still queued
+    // rather than lost — `rollback` put the send cursor back.
+    try testing.expectEqual(@as(usize, 0), octets);
+    try testing.expect(client.streams.wantsSend());
+
+    // Room again, and it flows.
+    client.recovery.bytes_in_flight = 0;
+    _ = try deliver(&client, &server, 2000);
+    try testing.expectEqualStrings("held back", server.readable(0));
+}
+
+test "a full window does not throttle acknowledgements" {
+    // Section 2 of RFC 9002: a packet carrying only an ACK is not in flight, so
+    // holding it back would throttle the feedback the window depends on — the
+    // connection would wedge itself shut.
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+
+    _ = try client.write(0, "data", false);
+    _ = try deliver(&client, &server, 1000);
+    try testing.expect(server.spaces[@intFromEnum(Space.application)].received.ack_eliciting_pending);
+
+    server.recovery.bytes_in_flight = server.recovery.congestion_window;
+    var datagram: [TestConnection.datagram_octets]u8 = @splat(0);
+    const octets = try server.send(&datagram, 2000);
+    try testing.expect(octets > 0);
+    try testing.expect(!server.spaces[@intFromEnum(Space.application)].received.ack_eliciting_pending);
 }

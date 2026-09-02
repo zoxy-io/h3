@@ -56,10 +56,26 @@ pub const initial_rtt_ns: u64 = 333 * std.time.ns_per_ms;
 /// is gone rather than lossy.
 pub const persistent_congestion_threshold: u64 = 3;
 
+/// The most the PTO backoff is shifted by.
+///
+/// Section 6.2.1's backoff is exponential and unbounded in the text, but a
+/// `u64` of nanoseconds is not: at 2^20 the smallest possible PTO is already
+/// longer than any connection, and the shift itself must stay inside a `u6`.
+/// Named rather than written twice at the two shift sites, with the overflow
+/// argument checked below rather than assumed.
+pub const pto_backoff_shift_max: u6 = 20;
+
 /// Section 7.3.2: what the window is multiplied by on a congestion event.
 pub const loss_reduction_divisor: u64 = 2;
 
 comptime {
+    // The shift cannot overflow the accumulator it is applied to: the largest
+    // base a PTO can have is the initial RTT plus four times its variance, and
+    // shifting that by the cap stays inside `u64`.
+    const pto_base_max: u64 = initial_rtt_ns + 4 * initial_rtt_ns;
+    assert(pto_base_max < std.math.maxInt(u64) >> pto_backoff_shift_max);
+    assert(pto_backoff_shift_max <= std.math.maxInt(u6));
+
     assert(packet_threshold == 3);
     assert(time_threshold_numerator * 8 == time_threshold_denominator * 9);
     assert(granularity_ns == 1_000_000);
@@ -103,6 +119,19 @@ pub fn Recovery(comptime config: Config) type {
             ack_eliciting: bool,
             in_flight: bool,
             context: Context,
+        };
+
+        /// What section B.5 needs about a packet the peer acknowledged.
+        ///
+        /// Collected rather than acted on immediately, because appendix A.7
+        /// runs loss detection *between* removing the acknowledged packets and
+        /// growing the window — and loss detection is what starts a recovery
+        /// period, which is exactly what `onPacketAcked` then declines to grow
+        /// through.
+        const AckedPacket = struct {
+            time_sent: u64,
+            octets: u32,
+            in_flight: bool,
         };
 
         const SpaceState = struct {
@@ -204,7 +233,8 @@ pub fn Recovery(comptime config: Config) type {
             }
 
             var result: AckResult = .{};
-            const newly = try self.removeAcked(space, ack, &result);
+            var acked: [config.sent_max]AckedPacket = undefined;
+            const newly = try self.removeAcked(space, ack, &result, &acked);
             if (newly == null) return result;
             const largest = newly.?;
 
@@ -225,7 +255,10 @@ pub fn Recovery(comptime config: Config) type {
             // sender that is quietly unfair to everything else on the path, and
             // which no crash would ever reveal.
             result.lost = self.detectAndRemoveLostPackets(space, now, lost);
-            self.onPacketsAcked(largest.time_sent);
+            // Section B.5, one call per acknowledged packet, and after loss
+            // detection so a packet sent before a recovery period does not grow
+            // the window that loss just halved.
+            for (acked[0..@min(result.acked, acked.len)]) |one| self.onPacketAcked(one);
             // Section A.7: a delivery means the path is working, so the PTO
             // backoff resets.
             self.pto_count = 0;
@@ -234,7 +267,13 @@ pub fn Recovery(comptime config: Config) type {
 
         /// Remove every tracked packet the frame acknowledges, returning the
         /// largest of them.
-        fn removeAcked(self: *Self, space: Space, ack: frame.Ack, result: *AckResult) AckError!?Sent {
+        fn removeAcked(
+            self: *Self,
+            space: Space,
+            ack: frame.Ack,
+            result: *AckResult,
+            acked: *[config.sent_max]AckedPacket,
+        ) AckError!?Sent {
             const state = &self.spaces[@intFromEnum(space)];
             var ranges = ack.iterate();
             var largest: ?Sent = null;
@@ -255,6 +294,11 @@ pub fn Recovery(comptime config: Config) type {
                         self.bytes_in_flight -= packet.octets;
                     }
                     if (largest == null or packet.number > largest.?.number) largest = packet;
+                    if (result.acked < acked.len) acked[result.acked] = .{
+                        .time_sent = packet.time_sent,
+                        .octets = packet.octets,
+                        .in_flight = packet.in_flight,
+                    };
                     result.acked += 1;
                     self.remove(state, index);
                 }
@@ -325,6 +369,12 @@ pub fn Recovery(comptime config: Config) type {
 
             var count: u32 = 0;
             var largest_lost: ?Sent = null;
+            // Section B.8's window: the first and last ack-eliciting packets
+            // lost in this pass. Only ack-eliciting ones count, because a
+            // PADDING-only packet the peer was never obliged to acknowledge is
+            // no evidence the path is gone.
+            var earliest_eliciting: ?u64 = null;
+            var latest_eliciting: ?u64 = null;
             var index: u32 = 0;
             while (index < state.count) {
                 const packet = state.sent[index];
@@ -357,28 +407,73 @@ pub fn Recovery(comptime config: Config) type {
                     self.bytes_in_flight -= packet.octets;
                     if (largest_lost == null or packet.number > largest_lost.?.number) largest_lost = packet;
                 }
+                if (packet.ack_eliciting) {
+                    if (earliest_eliciting == null or packet.time_sent < earliest_eliciting.?) {
+                        earliest_eliciting = packet.time_sent;
+                    }
+                    if (latest_eliciting == null or packet.time_sent > latest_eliciting.?) {
+                        latest_eliciting = packet.time_sent;
+                    }
+                }
                 if (count < lost.len) lost[count] = packet.context;
                 count += 1;
                 self.remove(state, index);
             }
 
-            if (largest_lost) |packet| self.onCongestionEvent(packet.time_sent, now);
+            if (largest_lost) |packet| {
+                self.onCongestionEvent(packet.time_sent, now);
+                // Section 7.6: losing everything across more than a few PTOs is
+                // not congestion, it is a path that has gone away — so the
+                // window collapses to the floor rather than halving, and the
+                // recovery period is cleared so the next delivery can grow it
+                // again from there.
+                if (self.inPersistentCongestion(earliest_eliciting, latest_eliciting)) {
+                    self.congestion_window = minimum_window;
+                    self.congestion_recovery_start_time = null;
+                }
+            }
             return count;
         }
 
         // ------------------------------------------------------- section B.4-7
 
-        /// Section B.5: a delivery grows the window, unless we are recovering
-        /// from a loss the acknowledged packet predates.
-        fn onPacketsAcked(self: *Self, time_sent: u64) void {
-            if (self.inCongestionRecovery(time_sent)) return;
+        /// Section B.5: one delivery, one window increase.
+        ///
+        /// Per *packet*, not per ACK frame. Growing once per frame — which this
+        /// did — halves slow start against any peer acknowledging every second
+        /// packet, which is section 13.2.2's default behaviour, and leaves
+        /// congestion avoidance adding roughly half what it should. Neither
+        /// shows up as a failure; it shows up as a connection that is slower
+        /// than it should be and a sender whose algorithm is quietly its own.
+        fn onPacketAcked(self: *Self, packet: AckedPacket) void {
+            if (!packet.in_flight) return; // Section B.5: an ACK-only packet grows nothing.
+            if (self.inCongestionRecovery(packet.time_sent)) return;
             if (self.congestion_window < self.ssthresh) {
-                // Slow start: one for one.
-                self.congestion_window += config.max_datagram_size;
+                // Slow start: one for one, by the acknowledged packet's size.
+                self.congestion_window += packet.octets;
                 return;
             }
             // Congestion avoidance: roughly one datagram per round trip.
-            self.congestion_window += (@as(u64, config.max_datagram_size) * config.max_datagram_size) / self.congestion_window;
+            self.congestion_window += (@as(u64, config.max_datagram_size) * packet.octets) / self.congestion_window;
+        }
+
+        /// Section 7.6 and appendix B.8.
+        ///
+        /// Gated on an RTT sample existing, which the RFC requires and which
+        /// matters: without one `smoothed_rtt` is the 333 ms default, and a
+        /// connection that lost its whole first flight would declare the path
+        /// dead on the strength of a number nobody measured.
+        fn inPersistentCongestion(self: *const Self, earliest: ?u64, latest: ?u64) bool {
+            if (!self.has_rtt_sample) return false;
+            const from = earliest orelse return false;
+            const to = latest orelse return false;
+            // Two distinct ack-eliciting packets are needed: one lost packet
+            // says nothing about duration.
+            if (to <= from) return false;
+
+            const pto = self.smoothed_rtt + @max(4 * self.rttvar, granularity_ns) + self.max_ack_delay_ns;
+            const period = pto * persistent_congestion_threshold;
+            return (to - from) > period;
         }
 
         fn inCongestionRecovery(self: *const Self, time_sent: u64) bool {
@@ -413,7 +508,7 @@ pub fn Recovery(comptime config: Config) type {
         /// Section A.6: the PTO, and the space it belongs to.
         fn ptoTimeAndSpace(self: *const Self) ?PtoTime {
             var duration = self.smoothed_rtt + @max(4 * self.rttvar, granularity_ns);
-            duration <<= @intCast(@min(self.pto_count, 20));
+            duration <<= @intCast(@min(self.pto_count, @as(u32, pto_backoff_shift_max)));
 
             var earliest: ?PtoTime = null;
             for (0..Space.count) |index| {
@@ -425,7 +520,7 @@ pub fn Recovery(comptime config: Config) type {
                 var at = state.time_of_last_ack_eliciting orelse continue;
                 if (space == .application) {
                     if (!self.handshake_confirmed) continue;
-                    at += (self.max_ack_delay_ns << @intCast(@min(self.pto_count, 20)));
+                    at += (self.max_ack_delay_ns << @intCast(@min(self.pto_count, @as(u32, pto_backoff_shift_max))));
                 }
                 at += duration;
                 if (earliest == null or at < earliest.?.at) earliest = .{ .at = at, .space = space };
@@ -812,4 +907,78 @@ test "a caller's lost slice may be shorter than the truth" {
     try testing.expectEqual(@as(u32, 5), result.lost);
     try testing.expectEqual(@as(u64, 0), lost[0]);
     try testing.expectEqual(@as(u64, 1), lost[1]);
+}
+
+test "appendix B.5: the window grows once per acknowledged packet" {
+    var recovery: TestRecovery = .{};
+    var lost: [8]u64 = undefined;
+    const before = recovery.congestion_window;
+
+    // Four packets, all acknowledged by one frame. Growing once per *frame* —
+    // which this did — halves slow start against any peer acknowledging every
+    // second packet, which is RFC 9000 section 13.2.2's default.
+    for (0..4) |number| try recovery.onPacketSent(.initial, sentPacket(number, 0));
+    const result = try recovery.onAckReceived(.initial, ackOf(3, 3), 0, 1 * ms, &lost);
+    try testing.expectEqual(@as(u32, 4), result.acked);
+    try testing.expectEqual(@as(u32, 0), result.lost);
+    try testing.expectEqual(before + 4 * 1200, recovery.congestion_window);
+}
+
+test "appendix B.5: an ACK-only packet grows nothing" {
+    var recovery: TestRecovery = .{};
+    var lost: [8]u64 = undefined;
+    const before = recovery.congestion_window;
+    // Not in flight, so section B.5 returns before touching the window —
+    // otherwise acknowledgement traffic would inflate it for free.
+    var ack_only = sentPacket(0, 0);
+    ack_only.in_flight = false;
+    ack_only.ack_eliciting = false;
+    try recovery.onPacketSent(.initial, ack_only);
+    _ = try recovery.onAckReceived(.initial, ackOf(0, 0), 0, 1 * ms, &lost);
+    try testing.expectEqual(before, recovery.congestion_window);
+}
+
+test "section 7.6: losing everything across several PTOs collapses the window" {
+    var recovery: TestRecovery = .{};
+    var lost: [16]u64 = undefined;
+
+    // An RTT sample first: without one the estimate is the 333 ms default, and
+    // section 7.6 declines to declare a path dead on a number nobody measured.
+    try recovery.onPacketSent(.initial, sentPacket(0, 0));
+    _ = try recovery.onAckReceived(.initial, ackOf(0, 0), 0, 100 * ms, &lost);
+    try testing.expect(recovery.has_rtt_sample);
+
+    // pto = 100 + max(4*50, 1) + 25 = 325ms; the period is three of those.
+    // Two ack-eliciting packets that far apart, with everything between them
+    // lost, is a path that has gone away rather than a congested one.
+    try recovery.onPacketSent(.initial, sentPacket(1, 200 * ms));
+    try recovery.onPacketSent(.initial, sentPacket(2, 2000 * ms));
+    try recovery.onPacketSent(.initial, sentPacket(3, 2100 * ms));
+    const result = try recovery.onAckReceived(.initial, ackOf(3, 0), 0, 2200 * ms, &lost);
+    try testing.expect(result.lost >= 2);
+
+    // Section 7.6: the floor, not a halving — and then exactly one packet's
+    // growth on top, because appendix B.8 clears the recovery period and
+    // appendix A.7 runs the acknowledgement *after* the loss. The packet
+    // acknowledged in this same frame therefore grows the collapsed window by
+    // its own size. That is the RFC's behaviour rather than an accident, and
+    // asserting the bare floor here was this test being wrong about it.
+    try testing.expectEqual(@as(u64, 2 * 1200 + 1200), recovery.congestion_window);
+    try testing.expectEqual(@as(?u64, null), recovery.congestion_recovery_start_time);
+    // What matters is that it collapsed rather than halved: a halving from
+    // 13200 would have left 6600.
+    try testing.expect(recovery.congestion_window < 6600);
+}
+
+test "a single loss is congestion, not a dead path" {
+    var recovery: TestRecovery = .{};
+    var lost: [8]u64 = undefined;
+    try recovery.onPacketSent(.initial, sentPacket(0, 0));
+    _ = try recovery.onAckReceived(.initial, ackOf(0, 0), 0, 100 * ms, &lost);
+
+    for (1..6) |number| try recovery.onPacketSent(.initial, sentPacket(number, 200 * ms));
+    _ = try recovery.onAckReceived(.initial, ackOf(5, 0), 0, 250 * ms, &lost);
+    // Halved, not collapsed: the lost packets were sent together, so no
+    // duration passed between the first and last of them.
+    try testing.expect(recovery.congestion_window > 2 * 1200);
 }

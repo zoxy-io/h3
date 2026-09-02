@@ -30,7 +30,9 @@ ledger — read it before depending on this.
 * **RFC 9001 — packet protection.** Initial secrets, AEAD packet protection,
   header protection, the Retry integrity tag, key update.
 * **RFC 9002 — loss detection and congestion control.** RTT estimation, both
-  loss thresholds, the PTO, and NewReno.
+  loss thresholds, the PTO, and NewReno, including per-packet window growth and
+  persistent congestion. ECN is parsed and not yet acted on, and there is no
+  pacer; both are tracked in docs/DESIGN.md §6 rather than implied away here.
 * **RFC 9204 — QPACK.** The static table and section 4.5's field line
   representations, both directions. The prefixed integer and the Huffman code
   come from [hpack](https://github.com/zoxy-io/hpack), which holds the RFC 7541
