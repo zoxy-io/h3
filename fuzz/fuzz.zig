@@ -464,6 +464,12 @@ test "ack ranges: never acknowledge a packet that did not arrive" {
 /// Octets drawn for one connection-level datagram.
 const connection_input_max = 1500;
 
+/// Section 14.1: a server MUST discard an Initial packet carried in a datagram
+/// smaller than this, so a target that does not pad to it exercises that one
+/// rule and nothing behind it. Taken from the package rather than restated,
+/// because a target testing its own copy of a bound tests nothing.
+const initial_datagram_min = quic.connection.initial_datagram_min;
+
 /// Small on purpose: a connection at the default configuration is megabytes,
 /// and a fuzz target builds one per input.
 const FuzzConnection = quic.Connection(.{
@@ -503,7 +509,8 @@ fn fuzzConnection(_: void, smith: *std.testing.Smith) !void {
     while (datagrams < connection_datagrams_max and !smith.eosWeightedSimple(6, 1)) : (datagrams += 1) {
         var buffer: [connection_input_max]u8 = @splat(0);
 
-        const octets = switch (smith.value(enum { raw, sealed })) {
+        const shape = smith.value(enum { raw, sealed, framed });
+        const octets = switch (shape) {
             // Straight garbage: has to be discarded rather than crash.
             .raw => blk: {
                 var drawn: [connection_input_max]u8 = undefined;
@@ -511,35 +518,44 @@ fn fuzzConnection(_: void, smith: *std.testing.Smith) !void {
                 @memcpy(buffer[0..length], drawn[0..length]);
                 break :blk length;
             },
-            // A well-formed Initial packet whose payload is whatever was drawn.
+            // An Initial packet that really does authenticate, whose payload is
+            // whatever was drawn. The number is drawn *once* and used for both
+            // the header and the nonce: it used to be drawn separately for
+            // each, and since the nonce is derived from the packet number, the
+            // two agreed about one time in nine. The other eight were forgeries
+            // that this target then reported as coverage of the accept path it
+            // had never once reached.
             .sealed => blk: {
                 var payload: [512]u8 = undefined;
                 const payload_len = @min(smith.slice(&payload), payload.len);
-                const written = quic.packet.writeLong(&buffer, .{
-                    .long_type = .initial,
-                    .destination = source,
-                    .source = original,
-                    .payload_octets = payload_len,
-                    .number = smith.valueRangeAtMost(u8, 0, 8),
-                    .number_octets = 4,
-                }) catch break :blk 0;
-                @memcpy(buffer[written.header_octets..][0..payload_len], payload[0..payload_len]);
-                break :blk keys.seal(
-                    &buffer,
-                    written.packet_number_offset,
-                    written.header_octets,
-                    payload_len,
-                    smith.valueRangeAtMost(u8, 0, 8),
-                ) catch 0;
+                break :blk sealInitial(&buffer, keys, source, original, payload[0..payload_len], smith.valueRangeAtMost(u8, 0, 8));
+            },
+            // The same, but carrying frames a conforming peer would send, so
+            // that the packet is expected to be *accepted* rather than merely
+            // parsed. Drawn payloads are almost never a valid frame sequence,
+            // so without this arm the authenticated path is exercised only as
+            // far as the frame parser's first rejection.
+            .framed => blk: {
+                var payload: [512]u8 = undefined;
+                const payload_len = drawFrames(smith, &payload);
+                break :blk sealInitial(&buffer, keys, source, original, payload[0..payload_len], smith.valueRangeAtMost(u8, 0, 8));
             },
         };
         if (octets == 0) continue;
+        // Section 14.1 again, this time in the target: an Initial that is not
+        // padded to 1200 is discarded on arrival, so both sealed shapes above
+        // would reach nothing behind that rule. `buffer` is zeroed each round
+        // and a zero octet is a PADDING frame, so the padding is inside the
+        // datagram rather than inside the packet — which is what a real client
+        // does with its first flight.
+        const datagram_octets = if (shape == .raw) octets else @max(octets, initial_datagram_min);
+        assert(datagram_octets <= buffer.len);
 
         // Reject or accept, never a third outcome.
         // Every error is named rather than swallowed, so a new one added to the
         // connection surfaces here as a compile error and gets a decision
         // rather than a shrug.
-        connection.receive(buffer[0..octets], @as(u64, datagrams) * 1000) catch |err| switch (err) {
+        connection.receive(buffer[0..datagram_octets], @as(u64, datagrams) * 1000) catch |err| switch (err) {
             error.Protocol,
             error.CryptoBufferExceeded,
             error.FlowControl,
@@ -569,11 +585,115 @@ fn fuzzConnection(_: void, smith: *std.testing.Smith) !void {
     }
 }
 
+/// Build an Initial packet that authenticates, and return its length.
+///
+/// One `number` for the header and the nonce both, because RFC 9001 section
+/// 5.3 derives the nonce from the packet number: two draws mean two numbers
+/// mean a tag that does not verify.
+fn sealInitial(
+    buffer: []u8,
+    keys: quic.crypto.Keys,
+    destination: quic.ConnectionId,
+    source: quic.ConnectionId,
+    payload: []const u8,
+    number: u64,
+) usize {
+    const written = quic.packet.writeLong(buffer, .{
+        .long_type = .initial,
+        .destination = destination,
+        .source = source,
+        .payload_octets = payload.len,
+        .number = number,
+        .number_octets = 4,
+    }) catch return 0;
+    @memcpy(buffer[written.header_octets..][0..payload.len], payload);
+    return keys.seal(
+        buffer,
+        written.packet_number_offset,
+        written.header_octets,
+        payload.len,
+        number,
+    ) catch 0;
+}
+
+/// Draw a run of frames an Initial packet may legally carry (section 12.4,
+/// Table 3), so that the payload reaches the connection's state machine rather
+/// than stopping at the frame parser.
+fn drawFrames(smith: *std.testing.Smith, target: []u8) usize {
+    var offset: usize = 0;
+    const count = smith.valueRangeAtMost(u8, 1, 6);
+    for (0..count) |_| {
+        var data: [64]u8 = undefined;
+        const drawn = @min(smith.slice(&data), data.len);
+        const one: quic.frame.Frame = switch (smith.value(enum { ping, padding, crypto, close })) {
+            .ping => .ping,
+            .padding => .{ .padding = .{ .octets = smith.valueRangeAtMost(u16, 1, 64) } },
+            .crypto => .{ .crypto = .{
+                .offset = smith.valueRangeAtMost(u16, 0, 512),
+                .data = data[0..drawn],
+            } },
+            .close => .{ .connection_close = .{
+                .code = smith.valueRangeAtMost(u16, 0, 0x11),
+                .application = false,
+                .triggered_by = null,
+                .reason = &.{},
+            } },
+        };
+        const written = quic.frame.encode(target[offset..], one) catch break;
+        offset += written;
+    }
+    return offset;
+}
+
 test "connection: authenticated does not mean trusted" {
     try std.testing.fuzz({}, fuzzConnection, .{});
 }
 
 const FuzzRecovery = quic.Recovery(.{ .sent_max = 32, .max_datagram_size = 1200, .Context = u64 });
+
+/// Additional ACK ranges beyond the first, drawn and encoded as section 19.3.1
+/// writes them: `[Gap, ACK Range Length]` varint pairs, descending.
+///
+/// `covered` is marked as each range is *constructed*, so the model knows what
+/// the frame acknowledges without parsing it back through the code being
+/// tested.
+fn drawAckRanges(
+    smith: *std.testing.Smith,
+    target: []u8,
+    largest: u64,
+    first_range: u64,
+    covered: []bool,
+) struct { count: u64, octets: usize } {
+    assert(first_range <= largest);
+    var number = largest - first_range;
+    while (number <= largest) : (number += 1) covered[@intCast(number)] = true;
+
+    var smallest = largest - first_range;
+    var count: u64 = 0;
+    var octets: usize = 0;
+    const ranges_max = 6;
+    while (count < ranges_max) {
+        // Section 19.3.1: the next range's largest is
+        // `previous_smallest - gap - 2`, so there has to be room below for the
+        // subtraction to mean anything. This is the walk that must not go below
+        // zero, and building it correctly here is what lets the malformed cases
+        // below be recognisable as malformed.
+        if (smallest < 2) break;
+        const gap = smith.valueRangeAtMost(u64, 0, @min(smallest - 2, 8));
+        const next_largest = smallest - gap - 2;
+        const length = smith.valueRangeAtMost(u64, 0, @min(next_largest, 8));
+
+        const gap_octets = h3.varint.encode(target[octets..], gap) catch break;
+        const length_octets = h3.varint.encode(target[octets + gap_octets ..], length) catch break;
+        octets += gap_octets + length_octets;
+
+        var at = next_largest - length;
+        while (at <= next_largest) : (at += 1) covered[@intCast(at)] = true;
+        smallest = next_largest - length;
+        count += 1;
+    }
+    return .{ .count = count, .octets = octets };
+}
 
 /// Loss recovery against a model of what is outstanding.
 ///
@@ -620,19 +740,45 @@ fn fuzzRecovery(_: void, smith: *std.testing.Smith) !void {
             .ack => {
                 const largest = smith.valueRangeAtMost(u8, 0, @intCast(outstanding.len - 1));
                 const first_range = smith.valueRangeAtMost(u8, 0, largest);
+
+                // `range_count` was pinned at zero and `ranges` at empty, so
+                // every ACK this target built covered one contiguous run. The
+                // range walk — the loop the reviewer's checklist singles out as
+                // the one that must not underflow, and the only place a peer
+                // gets to choose a *sequence* of offsets — was unreachable, in
+                // a target whose own comment claimed to cover it.
+                var range_bytes: [128]u8 = undefined;
+                var covered: [outstanding.len]bool = @splat(false);
+                const drawn = drawAckRanges(smith, &range_bytes, largest, first_range, &covered);
+
                 const ack: h3.quic.frame.Ack = .{
                     .largest = largest,
                     .delay = smith.value(u16),
                     .first_range = first_range,
-                    .range_count = 0,
-                    .ranges = &.{},
+                    .range_count = drawn.count,
+                    .ranges = range_bytes[0..drawn.octets],
                     .ecn = null,
                 };
-                const result = recovery.onAckReceived(.initial, ack, smith.value(u16), now, &lost) catch continue;
+                const result = recovery.onAckReceived(.initial, ack, smith.value(u16), now, &lost) catch |err| switch (err) {
+                    // A malformed ACK is a FRAME_ENCODING_ERROR and the
+                    // connection is torn down, so there is no "carry on" to
+                    // model. Note that `removeAcked` has already applied every
+                    // range before the bad one — harmless because the caller
+                    // closes, but it means the model cannot resynchronise, so
+                    // this run ends here rather than drifting.
+                    // The only way this fails, which the exhaustive switch
+                    // keeps true rather than assumes.
+                    error.Malformed => return,
+                };
+
                 // Everything the frame covered leaves the model, and so does
-                // everything reported lost.
-                var number = largest - first_range;
-                while (number <= largest) : (number += 1) outstanding[number] = null;
+                // everything reported lost. `covered` was filled while the
+                // ranges were *built*, not by parsing them back — an oracle
+                // that reuses the code under test to decide what it expects is
+                // not an oracle.
+                for (covered, 0..) |hit, number| {
+                    if (hit) outstanding[number] = null;
+                }
                 for (lost[0..@min(result.lost, lost.len)]) |context| outstanding[context] = null;
             },
             .timeout => {
@@ -887,4 +1033,158 @@ fn accepts(options: h3.fields.Options, section: []const h3.qpack.Field) bool {
 
 test "fields: a field section is a message or it is refused" {
     try std.testing.fuzz({}, fuzzFields, .{});
+}
+
+test "connection: the target's own packets actually authenticate" {
+    // The regression this guards is not a bug in the connection — it is a bug
+    // in the *target*. `fuzzConnection` drew the packet number twice, once for
+    // the header and once for the nonce, and RFC 9001 section 5.3 derives the
+    // nonce from the number: the two agreed about one time in nine, so eight
+    // sealed packets in nine were forgeries. The target passed either way,
+    // because "discarded" is a legal outcome — it simply never once reached the
+    // accept path it existed to cover.
+    const original = quic.ConnectionId.init(&.{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 }) catch unreachable;
+    const source = quic.ConnectionId.init(&.{ 0xaa, 0xbb }) catch unreachable;
+    const keys: quic.crypto.Keys = .initial(original.bytes(), .client);
+
+    for (0..8) |number| {
+        var connection: FuzzConnection = .init(.{
+            .side = .server,
+            .original_destination = original,
+            .source = source,
+        });
+        var payload: [64]u8 = undefined;
+        const framed = try quic.frame.encode(&payload, .ping);
+
+        var buffer: [connection_input_max]u8 = @splat(0);
+        const octets = sealInitial(&buffer, keys, source, original, payload[0..framed], number);
+        try std.testing.expect(octets > 0);
+        // Section 14.1: a server discards an Initial in a datagram under 1200
+        // octets. The old target never padded, so *every* sealed packet it
+        // built was dropped on this rule before the nonce it got wrong was even
+        // consulted — two reasons the accept path was unreachable, and the
+        // outer one hid the inner one.
+        try std.testing.expect(octets < initial_datagram_min);
+        try connection.receive(buffer[0..initial_datagram_min], 0);
+
+        // A PING is ack-eliciting, so a connection that opened this packet owes
+        // an acknowledgement. A connection that discarded it as a forgery owes
+        // nothing, which is exactly how the old target's failure looked.
+        try std.testing.expect(connection.spaces[0].received.ack_eliciting_pending);
+        try std.testing.expectEqual(@as(u64, 0), connection.forgeries);
+    }
+}
+
+test "connection: a packet sealed under the wrong number is refused" {
+    // The other half, and the reason the property above is worth asserting: the
+    // connection is right to discard these, so the old target was passing on
+    // genuinely correct behaviour while covering nothing.
+    const original = quic.ConnectionId.init(&.{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 }) catch unreachable;
+    const source = quic.ConnectionId.init(&.{ 0xaa, 0xbb }) catch unreachable;
+    const keys: quic.crypto.Keys = .initial(original.bytes(), .client);
+
+    var connection: FuzzConnection = .init(.{
+        .side = .server,
+        .original_destination = original,
+        .source = source,
+    });
+    var payload: [64]u8 = undefined;
+    const framed = try quic.frame.encode(&payload, .ping);
+
+    // Header says 3, nonce says 4 — the shape the old target produced eight
+    // times in nine.
+    var buffer: [connection_input_max]u8 = @splat(0);
+    const written = try quic.packet.writeLong(&buffer, .{
+        .long_type = .initial,
+        .destination = source,
+        .source = original,
+        .payload_octets = framed,
+        .number = 3,
+        .number_octets = 4,
+    });
+    @memcpy(buffer[written.header_octets..][0..framed], payload[0..framed]);
+    const octets = try keys.seal(&buffer, written.packet_number_offset, written.header_octets, framed, 4);
+    try std.testing.expect(octets < initial_datagram_min);
+
+    try connection.receive(buffer[0..initial_datagram_min], 0);
+    try std.testing.expect(!connection.spaces[0].received.ack_eliciting_pending);
+}
+
+test "recovery: the target's ACKs really do carry several ranges" {
+    // The regression this guards is again in the target, not the code: it
+    // pinned `range_count = 0` and `ranges = &.{}`, so every ACK it built
+    // covered one contiguous run and the range walk was never entered.
+    var recovery: FuzzRecovery = .{};
+    var lost: [32]u64 = undefined;
+
+    // Six packets; acknowledge 4-5 and 0-1, leaving 2-3 outstanding. That is
+    // two ranges with a gap, which is the shape a single range cannot express.
+    for (0..6) |number| {
+        try recovery.onPacketSent(.initial, .{
+            .number = number,
+            .time_sent = 0,
+            .octets = 100,
+            .ack_eliciting = true,
+            .in_flight = true,
+            .context = number,
+        });
+    }
+    try std.testing.expectEqual(@as(u64, 600), recovery.bytes_in_flight);
+
+    // Section 19.3.1: after the first range's smallest (4), the next range's
+    // largest is `smallest - gap - 2`, so a gap of 1 puts it at 1, and a length
+    // of 1 makes that range cover 0 and 1.
+    var ranges: [16]u8 = undefined;
+    var octets: usize = 0;
+    octets += try h3.varint.encode(ranges[octets..], 1);
+    octets += try h3.varint.encode(ranges[octets..], 1);
+
+    const result = try recovery.onAckReceived(.initial, .{
+        .largest = 5,
+        .delay = 0,
+        .first_range = 1,
+        .range_count = 1,
+        .ranges = ranges[0..octets],
+        .ecn = null,
+    }, 0, 1_000_000, &lost);
+
+    // Four packets acknowledged across two ranges — which is the point: a
+    // single range could cover at most 0-5 or 4-5, never both ends with a hole.
+    try std.testing.expectEqual(@as(u32, 4), result.acked);
+    // Packet 2 then goes to the packet threshold (section 6.1.1: three below
+    // the largest acknowledged), leaving only packet 3 in flight. That is the
+    // loss half of the walk, and reaching it at all needed the gap.
+    try std.testing.expectEqual(@as(u32, 1), result.lost);
+    try std.testing.expectEqual(@as(u64, 100), recovery.bytes_in_flight);
+}
+
+test "recovery: a range walking below zero is refused rather than wrapped" {
+    // The property the walk exists to have, and the one an ACK carrying no
+    // ranges at all could never test.
+    var recovery: FuzzRecovery = .{};
+    var lost: [32]u64 = undefined;
+    try recovery.onPacketSent(.initial, .{
+        .number = 0,
+        .time_sent = 0,
+        .octets = 100,
+        .ack_eliciting = true,
+        .in_flight = true,
+        .context = 0,
+    });
+
+    // Largest 1, first range 1 — so the first range reaches 0, and any further
+    // range must start below zero.
+    var ranges: [16]u8 = undefined;
+    var octets: usize = 0;
+    octets += try h3.varint.encode(ranges[octets..], 0);
+    octets += try h3.varint.encode(ranges[octets..], 0);
+
+    try std.testing.expectError(error.Malformed, recovery.onAckReceived(.initial, .{
+        .largest = 1,
+        .delay = 0,
+        .first_range = 1,
+        .range_count = 1,
+        .ranges = ranges[0..octets],
+        .ecn = null,
+    }, 0, 1_000_000, &lost));
 }
