@@ -33,9 +33,6 @@
 //!
 //! Not carried, and each is somebody else's slice rather than an oversight:
 //!
-//! * **Streams and flow control** are roadmap slice 5. STREAM frames are
-//!   refused rather than ignored, so a peer that sends one before this package
-//!   can honour it gets an error instead of silence.
 //! * **Migration, stateless reset and 0-RTT.** A connection here has one path.
 
 const std = @import("std");
@@ -52,6 +49,7 @@ const varint = @import("../varint.zig");
 const AckRanges = @import("AckRanges.zig").AckRanges;
 const ConnectionId = @import("ConnectionId.zig");
 const Reassembler = @import("Reassembler.zig").Reassembler;
+const StreamsOf = @import("Streams.zig").Streams;
 const RecoveryOf = @import("Recovery.zig").Recovery;
 
 const Level = crypto.Level;
@@ -96,6 +94,11 @@ pub const Config = struct {
     transport_parameters_octets: u32 = 1024,
     /// Unacknowledged packets tracked per space, for RFC 9002.
     sent_max: u32 = 128,
+    /// Concurrent streams, and the two flow control windows of section 4.1.
+    streams_max: u32 = 64,
+    stream_receive_octets: u32 = 64 * 1024,
+    stream_send_octets: u32 = 16 * 1024,
+    connection_receive_octets: u64 = 1 << 20,
 };
 
 /// Where the connection is, in the terms section 10 uses.
@@ -161,9 +164,21 @@ pub fn Connection(comptime config: Config) type {
     // the lost packet started.
     const PacketContext = struct {
         level: Level,
-        crypto_start: u32,
-        crypto_end: u32,
+        crypto_start: u32 = 0,
+        crypto_end: u32 = 0,
+        /// The stream range this packet carried, if any. Same arrangement as
+        /// the CRYPTO one: losing it rewinds the stream's send cursor.
+        stream: u64 = 0,
+        stream_start: u32 = 0,
+        stream_end: u32 = 0,
     };
+
+    const ConnectionStreams = StreamsOf(.{
+        .streams_max = config.streams_max,
+        .receive_octets = config.stream_receive_octets,
+        .send_octets = config.stream_send_octets,
+        .connection_receive_octets = config.connection_receive_octets,
+    });
 
     const Recovery = RecoveryOf(.{
         .sent_max = config.sent_max,
@@ -208,6 +223,13 @@ pub fn Connection(comptime config: Config) type {
 
         /// RFC 9002: what decides that a packet was lost, and when to probe.
         recovery: Recovery = .{},
+
+        /// Sections 2, 3 and 4: the streams and their flow control.
+        streams: ConnectionStreams = .{},
+        /// The limits last advertised, so a new one goes out only when it has
+        /// moved enough to be worth a frame.
+        max_data_sent: u64 = 0,
+        max_streams_sent: u64 = 0,
 
         /// Set by a CONNECTION_CLOSE in either direction.
         close_code: u64 = 0,
@@ -269,6 +291,18 @@ pub fn Connection(comptime config: Config) type {
             // packet can be sent. Holding them longer is holding keys anyone who
             // saw the first packet can compute.
             if (level == .handshake) self.discard(.initial);
+
+            // RFC 9001 section 4.1.2: the handshake is confirmed at the *server*
+            // when the handshake completes, which is when it can send 1-RTT — a
+            // client waits for HANDSHAKE_DONE instead. This matters to RFC 9002
+            // rather than to anything here: section 6.2.1 declines to arm an
+            // application-data PTO before it, because 1-RTT keys may not exist
+            // on both sides yet, and a connection that never confirms is a
+            // connection whose 1-RTT packets are never retransmitted.
+            if (level == .one_rtt and direction == .send and self.side == .server) {
+                self.state = .established;
+                self.recovery.handshake_confirmed = true;
+            }
         }
 
         /// Queue handshake bytes for sending at `level`.
@@ -315,10 +349,15 @@ pub fn Connection(comptime config: Config) type {
             /// More handshake data than `crypto_octets`. RFC 9001 section 4.4's
             /// `CRYPTO_BUFFER_EXCEEDED`.
             CryptoBufferExceeded,
-            /// A frame this slice does not implement — a STREAM frame, before
-            /// slice 5 lands. Refused rather than ignored, so a peer gets an
-            /// error instead of silence.
-            Unsupported,
+            /// Section 4.1: the peer sent past a flow control limit.
+            /// `FLOW_CONTROL_ERROR`.
+            FlowControl,
+            /// Section 4.5: data past a final size, or a contradictory one.
+            /// `FINAL_SIZE_ERROR`.
+            FinalSize,
+            /// Section 4.6: more streams than this endpoint tracks.
+            /// `STREAM_LIMIT_ERROR`.
+            StreamLimit,
         };
 
         /// Take one UDP datagram.
@@ -432,6 +471,7 @@ pub fn Connection(comptime config: Config) type {
                     // is what confirms the handshake for a client.
                     if (self.side == .server) return error.Protocol;
                     self.state = .established;
+                    self.recovery.handshake_confirmed = true;
                     self.discard(.handshake);
                 },
                 .connection_close => |value| {
@@ -446,12 +486,84 @@ pub fn Connection(comptime config: Config) type {
                     // ignored rather than refused, because they are legal and a
                     // conforming peer may send them.
                 },
-                .new_token, .max_data, .max_stream_data, .max_streams => {},
+                .new_token => {},
+                .max_data => |value| self.streams.setConnectionSendLimit(value.maximum),
+                .max_stream_data => |value| self.streams.setSendLimit(value.stream, value.maximum) catch |err| {
+                    return streamError(err);
+                },
+                // Section 4.6's stream limits are the peer telling us how many
+                // we may open. This package opens what its comptime bound
+                // allows and no more, so a larger limit changes nothing and a
+                // smaller one is already respected.
+                .max_streams => {},
+                // Section 4.1 and 4.6: the peer says it is blocked. Purely
+                // informational — it is a signal that our advertised limit is
+                // too low, and raising it is what `writePayload` already does
+                // as the application reads.
                 .data_blocked, .stream_data_blocked, .streams_blocked => {},
-                // Slice 5. Refused rather than dropped: a peer that opened a
-                // stream is waiting for an answer this package cannot give.
-                .stream, .reset_stream, .stop_sending => return error.Unsupported,
+                .stream => |value| {
+                    if (level != .one_rtt and level != .zero_rtt) return error.Protocol;
+                    self.streams.receive(value.stream, value.offset, value.data, value.fin) catch |err| {
+                        return streamError(err);
+                    };
+                },
+                .reset_stream => |value| {
+                    self.streams.reset(value.stream, @intFromEnum(value.code), value.final_size) catch |err| {
+                        return streamError(err);
+                    };
+                },
+                // Section 3.5: the peer wants us to stop sending. Recorded as a
+                // reset of our send half; what to tell the application is the
+                // consumer's decision.
+                .stop_sending => |value| {
+                    const stream = self.streams.open(value.stream) catch |err| return streamError(err);
+                    stream.send_state = .reset;
+                    stream.reset_code = @intFromEnum(value.code);
+                },
             }
+        }
+
+        /// Map a stream-layer error onto what the connection reports, so that
+        /// each one keeps the RFC's own name for it: a flow control violation
+        /// and a final size violation are different connection errors, and
+        /// collapsing them would tell a peer the wrong thing about its bug.
+        fn streamError(err: ConnectionStreams.Error) ReceiveError {
+            return switch (err) {
+                error.FlowControl => error.FlowControl,
+                error.FinalSize => error.FinalSize,
+                error.TooManyStreams => error.StreamLimit,
+                error.Protocol, error.NotFound => error.Protocol,
+            };
+        }
+
+        // ------------------------------------------------------------ streams
+
+        /// Queue bytes on a stream, returning how many were taken. A short
+        /// write means the peer's flow control limit or this endpoint's buffer
+        /// is full; the caller retries when `MAX_STREAM_DATA` raises it.
+        pub fn write(self: *Self, id: u64, data: []const u8, fin: bool) ConnectionStreams.Error!usize {
+            return self.streams.write(id, data, fin);
+        }
+
+        /// Bytes readable in order on a stream, or an empty slice.
+        pub fn readable(self: *Self, id: u64) []const u8 {
+            const stream = self.streams.find(id) orelse return &.{};
+            return stream.readable();
+        }
+
+        /// Release bytes the application has read, which is what moves the flow
+        /// control window forward.
+        pub fn consume(self: *Self, id: u64, octets: usize) ConnectionStreams.Error!void {
+            return self.streams.consume(id, octets);
+        }
+
+        /// The stream's own state — its receive and send states, its final
+        /// size, the code a RESET_STREAM carried. Named `findStream` rather
+        /// than `stream` because `stream` is what every local that holds one is
+        /// called, and a method that shadows them all is a method nobody can
+        /// use next to them.
+        pub fn findStream(self: *Self, id: u64) ?*ConnectionStreams.Stream {
+            return self.streams.find(id);
         }
 
         /// Section 4.9: drop a level's keys and its packet number space.
@@ -477,9 +589,13 @@ pub fn Connection(comptime config: Config) type {
         /// a few kilobytes.
         fn onPacketsLost(self: *Self, contexts: []const PacketContext) void {
             for (contexts) |context| {
-                if (context.crypto_end <= context.crypto_start) continue;
-                const stream = &self.levels[@intFromEnum(context.level)];
-                stream.framed = @min(stream.framed, context.crypto_start);
+                if (context.crypto_end > context.crypto_start) {
+                    const level = &self.levels[@intFromEnum(context.level)];
+                    level.framed = @min(level.framed, context.crypto_start);
+                }
+                if (context.stream_end > context.stream_start) {
+                    self.streams.rewind(context.stream, context.stream_start);
+                }
             }
         }
 
@@ -618,6 +734,9 @@ pub fn Connection(comptime config: Config) type {
                     .level = level,
                     .crypto_start = written.crypto_start,
                     .crypto_end = written.crypto_end,
+                    .stream = written.stream,
+                    .stream_start = written.stream_start,
+                    .stream_end = written.stream_end,
                 },
             }) catch {};
             return total;
@@ -654,6 +773,10 @@ pub fn Connection(comptime config: Config) type {
             /// The CRYPTO range this packet carried, so losing it can rewind.
             crypto_start: u32 = 0,
             crypto_end: u32 = 0,
+            /// And the stream range, likewise.
+            stream: u64 = 0,
+            stream_start: u32 = 0,
+            stream_end: u32 = 0,
         };
 
         /// Fill a payload: an ACK if one is owed, then whatever handshake bytes
@@ -692,6 +815,15 @@ pub fn Connection(comptime config: Config) type {
                 if (result.crypto_end > result.crypto_start) result.ack_eliciting = true;
             }
 
+            // Application data only: sections 4.1 and 2 put streams and their
+            // limits in the 1-RTT space alone.
+            if (level == .one_rtt) {
+                offset += self.writeFlowControl(payload[offset..]);
+                const framed = self.writeStream(payload[offset..], &result);
+                offset += framed;
+                if (framed > 0) result.ack_eliciting = true;
+            }
+
             if (self.close_pending and offset < payload.len) {
                 offset += frame.encode(payload[offset..], .{ .connection_close = .{
                     .application = self.close_is_application,
@@ -703,6 +835,67 @@ pub fn Connection(comptime config: Config) type {
             }
             result.octets = offset;
             return result;
+        }
+
+        /// Section 4.1: raise the peer's limits as the application reads.
+        ///
+        /// Sent when the window has moved by half, rather than on every read: a
+        /// MAX_DATA per octet consumed would spend more of the connection on
+        /// flow control than on data, and a peer only needs the limit before it
+        /// runs out.
+        fn writeFlowControl(self: *Self, target: []u8) usize {
+            var offset: usize = 0;
+            const limit = self.streams.receiveLimit();
+            if (limit >= self.max_data_sent + config.connection_receive_octets / 2) {
+                offset += frame.encode(target[offset..], .{ .max_data = .{ .maximum = limit } }) catch 0;
+                if (offset > 0) self.max_data_sent = limit;
+            }
+
+            for (self.streams.streams[0..self.streams.count]) |*stream| {
+                if (offset >= target.len) break;
+                const stream_limit = stream.receiveLimit();
+                if (stream_limit < stream.max_data_sent + config.stream_receive_octets / 2) continue;
+                const written = frame.encode(target[offset..], .{ .max_stream_data = .{
+                    .stream = stream.id,
+                    .maximum = stream_limit,
+                } }) catch 0;
+                if (written == 0) break;
+                offset += written;
+                stream.max_data_sent = stream_limit;
+            }
+            return offset;
+        }
+
+        /// Frame whatever one stream has waiting.
+        ///
+        /// One stream per packet rather than as many as fit: a packet carrying
+        /// two streams' data has to record two ranges to undo on loss, and the
+        /// gain is a few octets of header on a path that is already
+        /// AEAD-bound.
+        fn writeStream(self: *Self, target: []u8, result: *Payload) usize {
+            for (self.streams.streams[0..self.streams.count]) |*stream| {
+                const waiting = stream.send_len - stream.framed;
+                const fin_owed = stream.send_fin and stream.framed == stream.send_len;
+                if (waiting == 0 and !fin_owed) continue;
+
+                // Type, stream id, offset and length, each at its widest.
+                const overhead = 1 + varint.octets_max * 3;
+                if (target.len <= overhead) return 0;
+                const take = @min(waiting, target.len - overhead);
+                const written = frame.encode(target, .{ .stream = .{
+                    .stream = stream.id,
+                    .offset = stream.send_offset + stream.framed,
+                    .data = stream.send[stream.framed..][0..take],
+                    .fin = stream.send_fin and stream.framed + take == stream.send_len,
+                } }) catch return 0;
+
+                result.stream = stream.id;
+                result.stream_start = stream.framed;
+                stream.framed += @intCast(take);
+                result.stream_end = stream.framed;
+                return written;
+            }
+            return 0;
         }
 
         fn writeCrypto(self: *Self, target: []u8, stream: *CryptoLevel) usize {
@@ -739,6 +932,7 @@ pub fn Connection(comptime config: Config) type {
             for (self.spaces) |space| {
                 if (space.probes_pending > 0 and !space.discarded) return true;
             }
+            if (self.streams.wantsSend()) return true;
             for (0..Level.count) |index| {
                 const level: Level = @enumFromInt(index);
                 if (self.send_keys[index] == null) continue;
@@ -1135,4 +1329,200 @@ test "the timer is only about what is outstanding" {
     var datagram: [TestConnection.datagram_octets]u8 = @splat(0);
     _ = try client.send(&datagram, 0);
     try testing.expect(client.timeout() != null);
+}
+
+/// Bring two connections to the point where 1-RTT keys are installed both ways,
+/// which is where streams become legal.
+fn established(client: *TestConnection, server: *TestConnection) !void {
+    try client.cryptoIn(.initial, "ClientHello");
+    _ = try deliver(client, server, 0);
+    try installBoth(server, client, .handshake, 0x11);
+    try installBoth(client, server, .handshake, 0x22);
+    try installBoth(server, client, .one_rtt, 0x33);
+    try installBoth(client, server, .one_rtt, 0x44);
+
+    // RFC 9001 section 4.1.2: the server confirms on completing the handshake
+    // and tells the client with HANDSHAKE_DONE. Both matter to RFC 9002, which
+    // will not arm an application-data probe timeout before confirmation.
+    var payload: [16]u8 = @splat(0);
+    const written = try frame.encode(&payload, .handshake_done);
+    _ = try client.receiveFrames(.one_rtt, payload[0..written], 0);
+
+    client.streams.setConnectionSendLimit(1 << 20);
+    server.streams.setConnectionSendLimit(1 << 20);
+    try client.streams.setSendLimit(0, 1 << 16);
+    try server.streams.setSendLimit(0, 1 << 16);
+    client.address_validated = true;
+    server.address_validated = true;
+}
+
+test "a stream carries bytes from one connection to the other" {
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+
+    // Stream 0 is the first client-initiated bidirectional stream, which is
+    // where RFC 9114 section 6.1 puts the first request.
+    const taken = try client.write(0, "GET / HTTP/3-ish", true);
+    try testing.expectEqual(@as(usize, 16), taken);
+    try testing.expect(client.wantsSend());
+
+    _ = try deliver(&client, &server, 1000);
+    try testing.expectEqualStrings("GET / HTTP/3-ish", server.readable(0));
+    // The FIN travelled with it, so the server knows the request is whole.
+    try testing.expect(server.findStream(0).?.receive_state != .receiving);
+
+    try server.consume(0, server.readable(0).len);
+    try testing.expect(server.findStream(0).?.isComplete());
+}
+
+test "a response larger than one packet arrives in order" {
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+
+    var body: [4096]u8 = undefined;
+    for (&body, 0..) |*octet, index| octet.* = @truncate(index);
+    var queued: usize = 0;
+    var attempts: u32 = 0;
+    while (attempts < 32 and queued < body.len) : (attempts += 1) {
+        queued += try server.write(0, body[queued..], queued + 1 >= body.len);
+    }
+    try testing.expectEqual(body.len, queued);
+
+    var rounds: u32 = 0;
+    var received: [4096]u8 = undefined;
+    var received_len: usize = 0;
+    // `now` only ever moves forward. A connection whose clock goes backwards is
+    // one whose ACK delay is negative, and `AckRanges.write` asserts against it
+    // — which is how the first version of this test failed.
+    var now: u64 = 1000;
+    while (rounds < 16 and received_len < body.len) : (rounds += 1) {
+        now += 1000;
+        _ = try deliver(&server, &client, now);
+        const ready = client.readable(0);
+        @memcpy(received[received_len..][0..ready.len], ready);
+        received_len += ready.len;
+        try client.consume(0, ready.len);
+        // The client's acknowledgements are what free the server's window.
+        now += 1000;
+        _ = try deliver(&client, &server, now);
+    }
+    try testing.expectEqual(body.len, received_len);
+    try testing.expectEqualSlices(u8, &body, received[0..body.len]);
+}
+
+test "section 4.1: a peer that sends past its limit is refused" {
+    var server = testServer();
+    var payload: [256]u8 = @splat(0);
+    // Far past the stream window this connection advertised.
+    const written = try frame.encode(&payload, .{ .stream = .{
+        .stream = 0,
+        .offset = 1 << 30,
+        .data = "x",
+        .fin = false,
+    } });
+    try testing.expectError(error.FlowControl, server.receiveFrames(.one_rtt, payload[0..written], 0));
+}
+
+test "the window is raised as the application reads" {
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+
+    const before = server.max_data_sent;
+
+    // Enough for the half-window heuristic to fire. `write` takes what fits and
+    // answers how much — a zero is ordinary, not an error, and a loop that does
+    // not expect one spins forever. This one did, the first time it was
+    // written.
+    var body: [40 * 1024]u8 = @splat('x');
+    var queued: usize = 0;
+    var rounds: u32 = 0;
+    var now: u64 = 1000;
+    while (rounds < 64 and queued < body.len) : (rounds += 1) {
+        queued += try client.write(0, body[queued..], false);
+        now += 1000;
+        _ = try deliver(&client, &server, now);
+        const ready = server.readable(0);
+        if (ready.len > 0) try server.consume(0, ready.len);
+        now += 1000;
+        _ = try deliver(&server, &client, now);
+    }
+    try testing.expect(queued > 0);
+    // Section 4.1: reading is what moves the limit, and the peer learns about
+    // it — otherwise a stream stalls forever at its initial window.
+    try testing.expect(server.max_data_sent > before);
+    try testing.expect(client.streams.send_limit > 0);
+}
+
+test "a lost stream packet is sent again" {
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+    _ = try client.write(0, "the body", true);
+
+    // Dropped on the floor.
+    var datagram: [TestConnection.datagram_octets]u8 = @splat(0);
+    _ = try client.send(&datagram, 1000);
+    try testing.expectEqualStrings("", server.readable(0));
+
+    // The probe timeout rewinds the stream's send cursor, the same way it does
+    // the CRYPTO stream's.
+    const at = client.timeout().?;
+    client.onTimeout(at);
+    _ = try deliver(&client, &server, at);
+    try testing.expectEqualStrings("the body", server.readable(0));
+}
+
+test "a RESET_STREAM ends the receive half and keeps its accounting" {
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+
+    _ = try client.write(0, "partial", false);
+    _ = try deliver(&client, &server, 1000);
+    try testing.expectEqual(@as(u64, 7), server.streams.received_total);
+
+    var payload: [64]u8 = @splat(0);
+    const written = try frame.encode(&payload, .{ .reset_stream = .{
+        .stream = 0,
+        .code = .request_cancelled,
+        .final_size = 7,
+    } });
+    _ = try server.receiveFrames(.one_rtt, payload[0..written], 2000);
+    try testing.expectEqual(@import("Streams.zig").ReceiveState.reset, server.findStream(0).?.receive_state);
+    // Section 4.1: the credit stays consumed, so resetting is not a way to
+    // reuse the connection's window.
+    try testing.expectEqual(@as(u64, 7), server.streams.received_total);
+}
+
+test "STOP_SENDING closes this endpoint's send half" {
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+    _ = try client.write(0, "data", false);
+
+    var payload: [64]u8 = @splat(0);
+    const written = try frame.encode(&payload, .{ .stop_sending = .{
+        .stream = 0,
+        .code = .request_rejected,
+    } });
+    _ = try client.receiveFrames(.one_rtt, payload[0..written], 1000);
+    try testing.expectError(error.Protocol, client.write(0, "more", false));
+}
+
+test "a STREAM frame before 1-RTT is a protocol violation" {
+    var server = testServer();
+    var payload: [64]u8 = @splat(0);
+    const written = try frame.encode(&payload, .{ .stream = .{
+        .stream = 0,
+        .offset = 0,
+        .data = "x",
+        .fin = false,
+    } });
+    // Section 12.4's Table 3 already refuses this at the Initial and Handshake
+    // levels; the check inside the frame handler is the second lock, for a
+    // level that is permitted by the table but not by this package.
+    try testing.expectError(error.Protocol, server.receiveFrames(.initial, payload[0..written], 0));
 }

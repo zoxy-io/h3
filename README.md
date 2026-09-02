@@ -13,9 +13,10 @@ threads through `std.Io`), which is why it owns no socket, no clock and no TLS
 engine.
 
 **Status: in progress.** The transport is built: wire format, packet
-protection, the connection state machine, and loss recovery. A handshake
-completes and survives a dropped datagram. Streams, flow control and QPACK's
-field lines are not written yet, so no request has been sent over it.
+protection, the connection state machine, loss recovery, streams and flow
+control. A handshake completes, survives a dropped datagram, and carries bytes
+on a stream in both directions. QPACK's field line representations are the
+remaining piece before an HTTP/3 request can go over it.
 [docs/DESIGN.md §6](docs/DESIGN.md#6-what-is-built-and-what-is-next) is the
 ledger — read it before depending on this.
 
@@ -23,7 +24,8 @@ ledger — read it before depending on this.
 
 * **RFC 9000 — QUIC transport.** Variable-length integers, packet headers,
   packet numbers, the twenty frame types, transport parameters, stream
-  identifiers, error codes.
+  identifiers, error codes, the connection state machine, streams, and both
+  levels of flow control.
 * **RFC 9001 — packet protection.** Initial secrets, AEAD packet protection,
   header protection, the Retry integrity tag, key update.
 * **RFC 9002 — loss detection and congestion control.** RTT estimation, both

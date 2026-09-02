@@ -301,7 +301,16 @@ pub fn Recovery(comptime config: Config) type {
 
         /// Section 6.1.2's loss delay: 9/8 of the larger RTT, floored at the
         /// timer granularity.
-        fn lossDelay(self: *const Self) u64 {
+        ///
+        /// The floor is what makes a zero RTT harmless. A sample of zero is
+        /// physically impossible on a network and entirely possible with a
+        /// coarse clock — a packet sent and acknowledged inside one tick — and
+        /// section 5.3 has nothing to say about it, so `smoothed_rtt` becomes
+        /// zero and stays a valid estimate. Every timer derived from it is
+        /// floored here and in `ptoTimeAndSpace`, which is why nothing needs to
+        /// special-case it. A fuzz oracle that asserted `smoothed_rtt > 0`
+        /// found this and was wrong; the tests below pin the behaviour instead.
+        pub fn lossDelay(self: *const Self) u64 {
             const rtt = @max(self.latest_rtt, self.smoothed_rtt);
             return @max((rtt * time_threshold_numerator) / time_threshold_denominator, granularity_ns);
         }
@@ -740,6 +749,25 @@ test "a silent peer produces a probe, and the backoff is exponential" {
     try recovery.onPacketSent(.initial, sentPacket(1, 0));
     _ = try recovery.onAckReceived(.initial, ackOf(1, 0), 0, 10 * ms, &lost);
     try testing.expectEqual(@as(u32, 0), recovery.pto_count);
+}
+
+test "a zero RTT sample is degenerate, not dangerous" {
+    var recovery: TestRecovery = .{};
+    var lost: [8]u64 = undefined;
+    // A packet sent and acknowledged inside one clock tick. Impossible on a
+    // network, ordinary with a coarse clock, and not something RFC 9002
+    // forbids — so the estimate really does become zero.
+    try recovery.onPacketSent(.initial, sentPacket(0, 0));
+    _ = try recovery.onAckReceived(.initial, ackOf(0, 0), 0, 0, &lost);
+    try testing.expectEqual(@as(u64, 0), recovery.smoothed_rtt);
+
+    // What matters is that every timer derived from it still obeys its floor,
+    // which is what sections 6.1.2 and 6.2.1 require and what keeps a zero
+    // estimate from turning into a busy loop.
+    try testing.expectEqual(granularity_ns, recovery.lossDelay());
+    try recovery.onPacketSent(.initial, sentPacket(1, 0));
+    const at = recovery.timeoutAt().?;
+    try testing.expect(at >= granularity_ns);
 }
 
 test "an application-data PTO waits for the handshake" {

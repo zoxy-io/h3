@@ -26,6 +26,8 @@ pub const Recovery = recovery.Recovery;
 pub const packet = @import("quic/packet.zig");
 pub const packet_number = @import("quic/packet_number.zig");
 pub const stream_id = @import("quic/stream_id.zig");
+pub const streams = @import("quic/Streams.zig");
+pub const Streams = streams.Streams;
 pub const transport_parameters = @import("quic/transport_parameters.zig");
 
 test {
@@ -40,5 +42,6 @@ test {
     _ = packet;
     _ = packet_number;
     _ = stream_id;
+    _ = streams;
     _ = transport_parameters;
 }

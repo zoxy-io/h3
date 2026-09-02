@@ -57,6 +57,7 @@ const reassembler_operations_max = 64;
 const ack_operations_max = 128;
 const connection_datagrams_max = 24;
 const recovery_operations_max = 96;
+const streams_operations_max = 96;
 
 /// Frames drawn into one payload, and settings into one SETTINGS frame.
 const settings_max = 16;
@@ -525,8 +526,16 @@ fn fuzzConnection(_: void, smith: *std.testing.Smith) !void {
         if (octets == 0) continue;
 
         // Reject or accept, never a third outcome.
+        // Every error is named rather than swallowed, so a new one added to the
+        // connection surfaces here as a compile error and gets a decision
+        // rather than a shrug.
         connection.receive(buffer[0..octets], @as(u64, datagrams) * 1000) catch |err| switch (err) {
-            error.Protocol, error.CryptoBufferExceeded, error.Unsupported => {},
+            error.Protocol,
+            error.CryptoBufferExceeded,
+            error.FlowControl,
+            error.FinalSize,
+            error.StreamLimit,
+            => {},
         };
 
         // A connection that took a protocol error is finished with, but it must
@@ -629,14 +638,94 @@ fn fuzzRecovery(_: void, smith: *std.testing.Smith) !void {
         for (outstanding) |octets| expected += octets orelse 0;
         assert(recovery.bytes_in_flight == expected);
 
-        // Section B.6's floor, and the estimates staying sane whatever the peer
-        // claimed about its own delay.
+        // Section B.6's floor.
         assert(recovery.congestion_window >= 2 * 1200);
-        assert(recovery.smoothed_rtt > 0);
-        if (recovery.has_rtt_sample) assert(recovery.min_rtt <= recovery.smoothed_rtt + recovery.rttvar * 4);
+        // Sections 6.1.2 and 6.2.1: every timer has a floor at the granularity,
+        // whatever the RTT estimate is. This is what an earlier version of this
+        // target got wrong — it asserted `smoothed_rtt > 0`, which RFC 9002
+        // does not guarantee: a packet sent and acknowledged inside one clock
+        // tick is a zero sample, and a zero estimate is valid because
+        // everything derived from it is floored. The floors are the property
+        // worth asserting.
+        assert(recovery.lossDelay() >= quic.recovery.granularity_ns);
+        if (recovery.timeoutAt()) |at| assert(at >= quic.recovery.granularity_ns);
+        // Section 5.2: the minimum is a minimum of samples, so it never exceeds
+        // the newest one.
+        if (recovery.has_rtt_sample) assert(recovery.min_rtt <= recovery.latest_rtt);
     }
 }
 
 test "recovery: bytes in flight are exactly what is outstanding" {
     try std.testing.fuzz({}, fuzzRecovery, .{});
+}
+
+const FuzzStreams = quic.Streams(.{
+    .streams_max = 4,
+    .receive_octets = 64,
+    .send_octets = 32,
+    .connection_receive_octets = 128,
+});
+
+/// Streams and flow control, against the invariant that actually bounds memory.
+///
+/// A peer chooses the stream identifiers, the offsets, the lengths and when a
+/// FIN or a RESET_STREAM lands. The oracle is section 4.1's connection-level
+/// accounting: `received_total` may never exceed the advertised limit, and it
+/// may never *fall* — a peer that could make it fall could open a stream, fill
+/// the connection's window, reset it, and repeat, holding nothing and consuming
+/// everything.
+fn fuzzStreams(_: void, smith: *std.testing.Smith) !void {
+    var set: FuzzStreams = .{};
+    var previous_total: u64 = 0;
+
+    var operations: u32 = 0;
+    while (operations < streams_operations_max and !smith.eosWeightedSimple(8, 1)) : (operations += 1) {
+        const id: u64 = @as(u64, smith.valueRangeAtMost(u8, 0, 5)) * 4;
+
+        switch (smith.value(enum { receive, consume, reset, write, limits })) {
+            .receive => {
+                var chunk: [96]u8 = undefined;
+                const length = @min(smith.slice(&chunk), chunk.len);
+                const offset = smith.valueRangeAtMost(u8, 0, 96);
+                set.receive(id, offset, chunk[0..length], smith.value(bool)) catch {};
+            },
+            .consume => {
+                const stream = set.find(id) orelse continue;
+                const ready = stream.readable().len;
+                if (ready == 0) continue;
+                const take = smith.valueRangeAtMost(u8, 1, @intCast(@min(ready, 255)));
+                set.consume(id, take) catch {};
+            },
+            .reset => set.reset(id, smith.value(u16), smith.valueRangeAtMost(u8, 0, 96)) catch {},
+            .write => {
+                var chunk: [64]u8 = undefined;
+                const length = @min(smith.slice(&chunk), chunk.len);
+                _ = set.write(id, chunk[0..length], smith.value(bool)) catch {};
+            },
+            .limits => {
+                set.setConnectionSendLimit(smith.value(u16));
+                set.setSendLimit(id, smith.value(u16)) catch {};
+            },
+        }
+
+        // Section 4.1's connection limit, which is what bounds memory: without
+        // it a peer's budget is the per-stream window times the stream count.
+        assert(set.received_total <= set.receiveLimit());
+        // And credit consumed never comes back.
+        assert(set.received_total >= previous_total);
+        previous_total = set.received_total;
+
+        // Each stream stays inside its own limit, and what is readable is never
+        // more than the window that admitted it.
+        for (set.streams[0..set.count]) |*stream| {
+            assert(stream.received_highest <= stream.receiveLimit());
+            assert(stream.readable().len <= FuzzStreams.receive_octets);
+            assert(stream.consumed <= stream.received_highest);
+        }
+        assert(set.count <= FuzzStreams.streams_max);
+    }
+}
+
+test "streams: the connection window is never exceeded and never returned" {
+    try std.testing.fuzz({}, fuzzStreams, .{});
 }

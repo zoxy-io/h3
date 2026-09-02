@@ -206,6 +206,8 @@ all three build legs):
   time-threshold loss detection, the PTO, and NewReno congestion control. It
   never learns what a packet contained; `Config.Context` is an opaque token the
   connection attaches on send and gets back on loss.
+- `quic/Streams.zig` — streams, their states, and both levels of flow control.
+  The connection-level window is the one that bounds memory; see the file.
 - `quic/Connection.zig` — the state machine: three packet number spaces, four
   encryption levels and their keys, CRYPTO reassembly per level, ACK
   generation, section 12.4's frame permissions, section 8.1's amplification
@@ -241,12 +243,15 @@ all three build legs):
       belong to other slices and are named at the top of `Connection.zig` so a
       reader meets them before the code:
 
-      * **Flow control and streams.** STREAM, RESET_STREAM and STOP_SENDING are
-        refused rather than ignored, so a peer that opens a stream gets an error
-        instead of silence. Slice 5.
-5. **Streams and the HTTP/3 request layer.** Reassembly, `MAX_STREAM_DATA`
-   accounting, and the request/response mapping.
-6. **QPACK dynamic table**, encoder and decoder streams, blocked streams.
+      * Nothing. Slice 5 landed on top of it.
+5. ~~**Streams and flow control.**~~ — done. `quic/Streams.zig` carries the
+   stream states of sections 3.1 and 3.2, the final size rules of 4.5, and both
+   levels of flow control from 4.1. What is left of this item is the HTTP/3
+   request layer on top, which needs QPACK first and so has swapped places with
+   item 6.
+6. **QPACK field line representations** (RFC 9204 section 4.5), then the HTTP/3
+   request layer, then QPACK's dynamic table and its encoder and decoder
+   streams. This is now the only thing between the transport and a request.
 
 **Corpus — done.** RFC 9001 appendix A's four worked packets are in `corpus/`,
 machine-lifted from the RFC text and checked octet for octet. The strongest case
