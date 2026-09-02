@@ -464,7 +464,17 @@ test "ack ranges: never acknowledge a packet that did not arrive" {
 /// Octets drawn for one connection-level datagram.
 const connection_input_max = 1500;
 
-const FuzzConnection = quic.Connection(.{ .crypto_octets = 4096, .ack_ranges_max = 8 });
+/// Small on purpose: a connection at the default configuration is megabytes,
+/// and a fuzz target builds one per input.
+const FuzzConnection = quic.Connection(.{
+    .crypto_octets = 4096,
+    .ack_ranges_max = 8,
+    .sent_max = 32,
+    .streams_max = 4,
+    .stream_receive_octets = 4 * 1024,
+    .stream_send_octets = 4 * 1024,
+    .connection_receive_octets = 16 * 1024,
+});
 
 /// Arbitrary datagrams into a connection, most of them properly sealed.
 ///

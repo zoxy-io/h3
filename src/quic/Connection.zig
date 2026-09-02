@@ -16,13 +16,22 @@
 //! zoxy wires those to ztls and zrk to zssl, and neither has to know the other
 //! exists.
 //!
-//! ## Sized at compile time
+//! ## Sized at compile time, and bigger than it looks
 //!
 //! `Connection(config)` produces a type whose every buffer is a fixed array, so
 //! a connection's footprint is a closed-form function of constants the consumer
-//! picked and can print at startup. A peer's transport parameter is checked
-//! *against* these limits and never used as one — see docs/TIGER_STYLE.md, "a
-//! limit that is not comptime is a bug".
+//! picked. A peer's transport parameter is checked *against* these limits and
+//! never used as one — see docs/TIGER_STYLE.md, "a limit that is not comptime
+//! is a bug".
+//!
+//! **A connection is not a stack value.** `footprint_octets` is what one costs,
+//! and at the defaults it is megabytes: the stream buffers dominate, and there
+//! are `streams_max` of them. Put connections in an arena sized at startup —
+//! which is what zoxy does anyway, and what the closed-form size is *for* — and
+//! not in a local. This is stated because it was learned: the first version of
+//! this file had tests that built two connections as locals at the default
+//! configuration, which is 5 MB apiece. Linux's 8 MB stack absorbed it and
+//! every other platform in CI crashed.
 //!
 //! ## What this slice does and does not carry
 //!
@@ -95,6 +104,13 @@ pub const Config = struct {
     /// Unacknowledged packets tracked per space, for RFC 9002.
     sent_max: u32 = 128,
     /// Concurrent streams, and the two flow control windows of section 4.1.
+    ///
+    /// These four dominate `footprint_octets`, and the defaults are not small:
+    /// 64 streams at a 64 KiB receive window and a 16 KiB send buffer is
+    /// **5.1 MiB per connection**. That is not overhead, it is what a QUIC
+    /// endpoint offering those windows costs — but it is worth knowing before
+    /// multiplying it by a connection count, and it is why a connection belongs
+    /// in an arena rather than on a stack.
     streams_max: u32 = 64,
     stream_receive_octets: u32 = 64 * 1024,
     stream_send_octets: u32 = 16 * 1024,
@@ -190,6 +206,13 @@ pub fn Connection(comptime config: Config) type {
         const Self = @This();
 
         pub const datagram_octets: u32 = config.datagram_octets;
+
+        /// What one connection costs, in octets.
+        ///
+        /// Exported so a consumer can price its arena at startup — and so that
+        /// a change which quietly doubles it shows up in a diff rather than in
+        /// a crash on the one platform with the smallest stack.
+        pub const footprint_octets: usize = @sizeOf(Self);
 
         side: Side,
         state: State = .handshaking,
@@ -948,7 +971,26 @@ pub fn Connection(comptime config: Config) type {
 
 const testing = std.testing;
 
-const TestConnection = Connection(.{ .crypto_octets = 4096, .ack_ranges_max = 8 });
+/// Deliberately small. These tests exercise behaviour, not capacity, and a
+/// connection at the default configuration is megabytes — see the note on
+/// `footprint_octets`.
+const TestConnection = Connection(.{
+    .crypto_octets = 4096,
+    .ack_ranges_max = 8,
+    .sent_max = 32,
+    .streams_max = 4,
+    .stream_receive_octets = 8 * 1024,
+    .stream_send_octets = 8 * 1024,
+    .connection_receive_octets = 32 * 1024,
+});
+
+test "a connection's footprint is a number a consumer can price" {
+    // Not a limit, a tripwire. The point of sizing everything at compile time
+    // is that this number exists; a change that moves it by an order of
+    // magnitude should be a decision rather than a surprise.
+    try testing.expect(TestConnection.footprint_octets > 0);
+    try testing.expect(TestConnection.footprint_octets < 256 * 1024);
+}
 
 const client_cid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
 const client_source = [_]u8{ 0x01, 0x02, 0x03, 0x04 };
