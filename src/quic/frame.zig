@@ -174,6 +174,13 @@ pub const Ecn = struct {
 };
 
 /// Section 19.3. The ranges are left as wire octets; `iterate` walks them.
+/// Section 19.6. Named rather than anonymous so that a receiver can take one
+/// as an argument; `Ack` beside it always could.
+pub const Crypto = struct {
+    offset: u64,
+    data: []const u8,
+};
+
 pub const Ack = struct {
     largest: u64,
     /// The raw delay field. Scaling it by the peer's `ack_delay_exponent`
@@ -254,7 +261,7 @@ pub const Frame = union(enum) {
     ack: Ack,
     reset_stream: struct { stream: u64, code: error_code.Application, final_size: u64 },
     stop_sending: struct { stream: u64, code: error_code.Application },
-    crypto: struct { offset: u64, data: []const u8 },
+    crypto: Crypto,
     new_token: struct { token: []const u8 },
     stream: struct { stream: u64, offset: u64, data: []const u8, fin: bool },
     max_data: struct { maximum: u64 },

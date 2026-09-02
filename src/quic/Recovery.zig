@@ -318,6 +318,10 @@ pub fn Recovery(comptime config: Config) type {
 
         /// Section 5.3.
         fn updateRtt(self: *Self, sample: u64, ack_delay_ns: u64) void {
+            // A sample is an elapsed time computed by the caller from two of
+            // its own timestamps, so a zero is a clock that did not move rather
+            // than a packet that arrived before it left.
+            assert(sample < std.math.maxInt(u64) / 8);
             self.latest_rtt = sample;
             if (!self.has_rtt_sample) {
                 self.min_rtt = sample;
@@ -332,8 +336,15 @@ pub fn Recovery(comptime config: Config) type {
             // it said it would ever be, and only where subtracting it still
             // leaves a plausible RTT. A peer that inflates it would otherwise
             // shrink our RTT estimate and make us declare loss early.
+            assert(self.min_rtt <= sample);
             const delay = @min(ack_delay_ns, self.max_ack_delay_ns);
+            assert(delay <= self.max_ack_delay_ns);
+            // The comparison is the guard on the subtraction, not the assertion
+            // beside it: both terms come from the peer, and section 5.3 is
+            // explicit that a peer inflating its reported delay must not be
+            // able to shrink our estimate below what we measured.
             const adjusted = if (sample >= self.min_rtt + delay) sample - delay else sample;
+            assert(adjusted <= sample);
 
             const difference = if (self.smoothed_rtt > adjusted)
                 self.smoothed_rtt - adjusted
@@ -356,7 +367,12 @@ pub fn Recovery(comptime config: Config) type {
         /// found this and was wrong; the tests below pin the behaviour instead.
         pub fn lossDelay(self: *const Self) u64 {
             const rtt = @max(self.latest_rtt, self.smoothed_rtt);
-            return @max((rtt * time_threshold_numerator) / time_threshold_denominator, granularity_ns);
+            assert(rtt >= self.latest_rtt);
+            const delay = @max((rtt * time_threshold_numerator) / time_threshold_denominator, granularity_ns);
+            // Section 6.1.2: the threshold is never below the timer granularity,
+            // or a packet would be declared lost inside the noise of the clock.
+            assert(delay >= granularity_ns);
+            return delay;
         }
 
         /// Section A.10.
@@ -478,6 +494,10 @@ pub fn Recovery(comptime config: Config) type {
 
         fn inCongestionRecovery(self: *const Self, time_sent: u64) bool {
             const start = self.congestion_recovery_start_time orelse return false;
+            // A packet sent after the period began is feedback about the
+            // reduced window rather than about what caused the reduction, which
+            // is the whole reason this predicate exists.
+            assert(self.congestion_window >= minimum_window);
             return time_sent <= start;
         }
 
@@ -486,15 +506,26 @@ pub fn Recovery(comptime config: Config) type {
             // Everything lost in one round trip is one event: reacting to each
             // packet would collapse the window by a factor of two per packet.
             if (self.inCongestionRecovery(time_sent)) return;
+            assert(self.congestion_window >= minimum_window);
             self.congestion_recovery_start_time = now;
             self.ssthresh = @max(self.congestion_window / loss_reduction_divisor, minimum_window);
+            // Section 7.3.2: the window never goes below two datagrams, or a
+            // sender in recovery could not put a packet on the wire to find out
+            // that the path came back.
+            assert(self.ssthresh >= minimum_window);
             self.congestion_window = self.ssthresh;
+            assert(self.congestion_window >= minimum_window);
         }
 
         /// Whether `octets` may go out now. Section 7: a sender is limited by
         /// the congestion window, and probes are exempt because a connection
         /// that cannot probe cannot recover.
         pub fn canSend(self: *const Self, octets: u64) bool {
+            // Both terms are ours rather than the peer's: `bytes_in_flight` is
+            // the sum of what this endpoint sent and has not had acknowledged,
+            // bounded by `sent_max` packets of `max_datagram_size`.
+            assert(self.bytes_in_flight <= @as(u64, config.sent_max) * config.max_datagram_size);
+            assert(octets <= config.max_datagram_size);
             return self.bytes_in_flight + octets <= self.congestion_window;
         }
 

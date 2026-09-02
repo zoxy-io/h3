@@ -425,22 +425,37 @@ pub fn Connection(comptime config: Config) type {
 
         /// Queue handshake bytes for sending at `level`.
         pub fn cryptoIn(self: *Self, level: Level, data: []const u8) error{CryptoBufferExceeded}!void {
+            assert(@intFromEnum(level) < self.levels.len);
             const stream = &self.levels[@intFromEnum(level)];
+            assert(stream.pending_len <= config.crypto_octets);
             if (stream.pending_len + data.len > config.crypto_octets) {
                 return error.CryptoBufferExceeded;
             }
+            // That comparison is the guard on both the copy and the cast below:
+            // it bounds `data.len` by a comptime constant, so neither can be
+            // reached with a length the buffer cannot hold.
+            assert(data.len <= config.crypto_octets);
             @memcpy(stream.pending[stream.pending_len..][0..data.len], data);
             stream.pending_len += @intCast(data.len);
+            assert(stream.pending_len <= config.crypto_octets);
         }
 
         /// Handshake bytes received at `level`, in order. Borrows until the next
         /// `receive`.
         pub fn cryptoOut(self: *const Self, level: Level) []const u8 {
-            return self.levels[@intFromEnum(level)].received.readable();
+            assert(@intFromEnum(level) < self.levels.len);
+            const out = self.levels[@intFromEnum(level)].received.readable();
+            assert(out.len <= config.crypto_octets);
+            return out;
         }
 
         /// Release handshake bytes a TLS engine has taken.
         pub fn cryptoConsumed(self: *Self, level: Level, octets: usize) void {
+            assert(@intFromEnum(level) < self.levels.len);
+            // A consumer cannot give back more than it was handed, and
+            // `Reassembler.consume` would otherwise move the read cursor past
+            // data that was never delivered.
+            assert(octets <= self.levels[@intFromEnum(level)].received.readable().len);
             self.levels[@intFromEnum(level)].received.consume(octets);
         }
 
@@ -637,13 +652,23 @@ pub fn Connection(comptime config: Config) type {
             // Header protection first and on its own: RFC 9001 section 6.1
             // keeps the header protection key across an update, so this works
             // whichever generation protected the payload.
+            assert(offset < bytes.len);
             const header = keys.unprotectHeader(bytes, offset, largest) catch return error.Discard;
+            // The packet number is the AEAD nonce, so a header that unprotected
+            // has to name a width the wire actually carried.
+            assert(header.number_octets >= 1);
+            assert(header.number_octets <= 4);
+            assert(header.header_octets <= bytes.len);
 
             if (level != .one_rtt) {
                 return keys.decrypt(bytes, header) catch return self.countForgery();
             }
 
             const one = &self.one_rtt;
+            // Section 6.1: the header protection key is not updated, so the
+            // phase bit read above is meaningful whichever generation sealed
+            // the payload. Getting this wrong once produced `ReservedBitsSet`.
+            assert(level == .one_rtt);
             if (header.key_phase == one.phase) {
                 return keys.decrypt(bytes, header) catch return self.countForgery();
             }
@@ -669,7 +694,12 @@ pub fn Connection(comptime config: Config) type {
         /// Section 6.6: count a packet that failed authentication, and close
         /// the connection once the integrity limit for the suite is passed.
         fn countForgery(self: *Self) error{ Discard, AeadLimitReached } {
+            // RFC 9001 section 6.6 counts every failure, not every packet: an
+            // off-path attacker injects at will, so this is the only number
+            // that bounds how long a key stays in use under attack.
+            assert(self.forgeries < std.math.maxInt(u64));
             self.forgeries += 1;
+            assert(self.forgeries >= 1);
             if (self.forgeries > crypto.integrityLimit(self.one_rtt.suite)) {
                 self.close(.aead_limit_reached);
                 return error.AeadLimitReached;
@@ -698,56 +728,9 @@ pub fn Connection(comptime config: Config) type {
         fn receiveFrame(self: *Self, level: Level, one: frame.Frame, now: u64) ReceiveError!void {
             switch (one) {
                 .padding, .ping => {},
-                .ack => |value| {
-                    const space = &self.spaces[@intFromEnum(level.space())];
-                    // A peer cannot acknowledge a number we never sent; doing so
-                    // would move our packet number encoding window somewhere we
-                    // never were.
-                    if (value.largest >= space.next) return error.Protocol;
-                    space.largest_acked = @max(space.largest_acked orelse 0, value.largest);
-                    // Section 6.1: a second update waits for an acknowledgement
-                    // of something sent in the current phase, which is what
-                    // proves the peer has these keys.
-                    if (level == .one_rtt) self.one_rtt.phase_acknowledged = true;
-
-                    // Section 13.2.5: the delay is in microseconds, scaled by
-                    // the exponent the peer advertised. Until the transport
-                    // parameters are decoded this uses section 18.2's default,
-                    // which is what an absent one means. Clamped before the
-                    // shift — see `ack_delay_units_max`.
-                    // The `u64` annotation is load-bearing. `@min` narrows its
-                    // result type to fit the comptime-known bound, so
-                    // `@min(x, 2_048_000)` is a `u21` — and `u21 << 3` needs
-                    // twenty-four bits and overflows. The clamp written without
-                    // it *created* the overflow it was added to prevent.
-                    const delay_units: u64 = @min(value.delay, ack_delay_units_max);
-                    const delay_ns: u64 = (delay_units << ack_delay_exponent_default) * std.time.ns_per_us;
-                    assert(delay_ns <= ack_delay_ns_max);
-                    var lost: [lost_report_max]PacketContext = undefined;
-                    const result = self.recovery.onAckReceived(
-                        level.space(),
-                        value,
-                        delay_ns,
-                        now,
-                        &lost,
-                    ) catch return error.Protocol;
-                    self.onPacketsLost(lost[0..@min(result.lost, lost.len)]);
-                },
-                .crypto => |value| {
-                    const stream = &self.levels[@intFromEnum(level)];
-                    stream.received.push(value.offset, value.data) catch |err| return switch (err) {
-                        error.BeyondWindow, error.TooFragmented => error.CryptoBufferExceeded,
-                        error.Inconsistent, error.FinalSizeViolated => error.Protocol,
-                    };
-                },
-                .handshake_done => {
-                    // Section 4.1.2 of RFC 9001: only a server sends it, and it
-                    // is what confirms the handshake for a client.
-                    if (self.side == .server) return error.Protocol;
-                    self.state = .established;
-                    self.recovery.handshake_confirmed = true;
-                    self.discard(.handshake);
-                },
+                .ack => |value| try self.receiveAck(level, value, now),
+                .crypto => |value| try self.receiveCrypto(level, value),
+                .handshake_done => try self.receiveHandshakeDone(),
                 .connection_close => |value| {
                     self.close_code = value.code;
                     self.close_is_application = value.application;
@@ -797,6 +780,80 @@ pub fn Connection(comptime config: Config) type {
             }
         }
 
+        /// Section 13.2 and RFC 9002 section 5: what an acknowledgement moves.
+        fn receiveAck(self: *Self, level: Level, value: frame.Ack, now: u64) ReceiveError!void {
+            // The caller applied section 12.4's Table 3 before dispatching, so
+            // an ACK cannot arrive at a level that forbids one.
+            assert(frame.Type.ack.allowedIn(level));
+            const space = &self.spaces[@intFromEnum(level.space())];
+
+            // A peer cannot acknowledge a number we never sent; doing so would
+            // move our packet number encoding window somewhere we never were.
+            if (value.largest >= space.next) return error.Protocol;
+            assert(space.next > 0);
+            space.largest_acked = @max(space.largest_acked orelse 0, value.largest);
+            assert(space.largest_acked.? >= value.largest);
+            assert(space.largest_acked.? < space.next);
+            // Section 6.1: a second update waits for an acknowledgement of
+            // something sent in the current phase, which is what proves the
+            // peer has these keys.
+            if (level == .one_rtt) self.one_rtt.phase_acknowledged = true;
+
+            // Section 13.2.5: the delay is in microseconds, scaled by the
+            // exponent the peer advertised. Until the transport parameters are
+            // decoded this uses section 18.2's default, which is what an absent
+            // one means. Clamped before the shift — see `ack_delay_units_max`.
+            // The `u64` annotation is load-bearing. `@min` narrows its result
+            // type to fit the comptime-known bound, so `@min(x, 2_048_000)` is
+            // a `u21` — and `u21 << 3` needs twenty-four bits and overflows.
+            // The clamp written without it *created* the overflow it was added
+            // to prevent.
+            const delay_units: u64 = @min(value.delay, ack_delay_units_max);
+            assert(delay_units <= ack_delay_units_max);
+            const delay_ns: u64 = (delay_units << ack_delay_exponent_default) * std.time.ns_per_us;
+            assert(delay_ns <= ack_delay_ns_max);
+
+            var lost: [lost_report_max]PacketContext = undefined;
+            const result = self.recovery.onAckReceived(
+                level.space(),
+                value,
+                delay_ns,
+                now,
+                &lost,
+            ) catch return error.Protocol;
+            // `onPacketsLost` indexes `lost`, so the count has to be clamped to
+            // it rather than trusted — the clamp is the guard, and `result.lost`
+            // counts what was detected rather than what was reported.
+            assert(result.lost >= @min(result.lost, lost.len));
+            self.onPacketsLost(lost[0..@min(result.lost, lost.len)]);
+        }
+
+        /// Section 19.6: CRYPTO carries the handshake, at its own offsets, in a
+        /// stream that is separate per encryption level.
+        fn receiveCrypto(self: *Self, level: Level, value: frame.Crypto) ReceiveError!void {
+            assert(frame.Type.crypto.allowedIn(level));
+            assert(@intFromEnum(level) < self.levels.len);
+            const stream = &self.levels[@intFromEnum(level)];
+            stream.received.push(value.offset, value.data) catch |err| return switch (err) {
+                // A CRYPTO stream that outruns its buffer is a resource limit
+                // rather than a peer breaking a rule, and section 7.5 gives it
+                // its own code.
+                error.BeyondWindow, error.TooFragmented => error.CryptoBufferExceeded,
+                error.Inconsistent, error.FinalSizeViolated => error.Protocol,
+            };
+        }
+
+        /// RFC 9001 section 4.1.2: only a server sends HANDSHAKE_DONE, and it
+        /// is what confirms the handshake for a client.
+        fn receiveHandshakeDone(self: *Self) ReceiveError!void {
+            if (self.side == .server) return error.Protocol;
+            assert(self.side == .client);
+            self.state = .established;
+            self.recovery.handshake_confirmed = true;
+            self.discard(.handshake);
+            assert(self.recovery.handshake_confirmed);
+        }
+
         /// Map a stream-layer error onto what the connection reports, so that
         /// each one keeps the RFC's own name for it: a flow control violation
         /// and a final size violation are different connection errors, and
@@ -823,7 +880,11 @@ pub fn Connection(comptime config: Config) type {
         /// Bytes readable in order on a stream, or an empty slice.
         pub fn readable(self: *Self, id: u64) []const u8 {
             const stream = self.streams.find(id) orelse return &.{};
-            return stream.readable();
+            const out = stream.readable();
+            // What a stream offers is bounded by the buffer it was given, which
+            // is the comptime limit rather than anything the peer sent.
+            assert(out.len <= config.stream_receive_octets);
+            return out;
         }
 
         /// Release bytes the application has read, which is what moves the flow
@@ -843,6 +904,12 @@ pub fn Connection(comptime config: Config) type {
 
         /// Section 4.9: drop a level's keys and its packet number space.
         fn discard(self: *Self, level: Level) void {
+            assert(@intFromEnum(level) < self.send_keys.len);
+            assert(@intFromEnum(level) < self.receive_keys.len);
+            // Section 4.9 of RFC 9001: discarding is one-way. A level whose
+            // keys came back would be one where a packet number could repeat,
+            // and a repeated number in a space is a repeated AEAD nonce.
+            assert(level != .one_rtt);
             self.send_keys[@intFromEnum(level)] = null;
             self.receive_keys[@intFromEnum(level)] = null;
             self.spaces[@intFromEnum(level.space())].discarded = true;
@@ -863,9 +930,18 @@ pub fn Connection(comptime config: Config) type {
         /// it would be a second reassembler on the send side, and a handshake is
         /// a few kilobytes.
         fn onPacketsLost(self: *Self, contexts: []const PacketContext) void {
+            // Bounded by the caller's array rather than by anything the peer
+            // chose; `receiveAck` clamps the count to it before calling here.
+            assert(contexts.len <= lost_report_max);
             for (contexts) |context| {
+                assert(context.crypto_end >= context.crypto_start);
+                assert(context.stream_end >= context.stream_start);
                 if (context.crypto_end > context.crypto_start) {
+                    assert(@intFromEnum(context.level) < self.levels.len);
                     const level = &self.levels[@intFromEnum(context.level)];
+                    // Rewinding is what makes a lost packet retransmittable, so
+                    // it may only ever move the cursor back.
+                    assert(@min(level.framed, context.crypto_start) <= level.framed);
                     level.framed = @min(level.framed, context.crypto_start);
                 }
                 if (context.stream_end > context.stream_start or context.stream_fin) {
@@ -967,14 +1043,20 @@ pub fn Connection(comptime config: Config) type {
         /// handshake, are discarded early, and cannot approach the limit — so
         /// reaching it there is a close.
         fn countSealed(self: *Self, level: Level) void {
+            // RFC 9001 section 6.6: a count per key, kept because exceeding the
+            // confidentiality limit is a break rather than a degradation.
+            assert(@intFromEnum(level) < self.sealed.len);
             if (level != .one_rtt) {
+                assert(self.sealed[@intFromEnum(level)] < std.math.maxInt(u64));
                 self.sealed[@intFromEnum(level)] += 1;
                 if (self.sealed[@intFromEnum(level)] >= crypto.confidentialityLimit(secrets_suite_initial)) {
                     self.close(.aead_limit_reached);
                 }
                 return;
             }
+            assert(self.one_rtt.sealed < std.math.maxInt(u64));
             self.one_rtt.sealed += 1;
+            assert(self.one_rtt.sealed >= 1);
             if (self.one_rtt.sealed < crypto.confidentialityLimit(self.one_rtt.suite)) return;
             if (self.canUpdateKeys()) {
                 self.updateKeys();
@@ -989,8 +1071,15 @@ pub fn Connection(comptime config: Config) type {
         fn sendRoom(self: *const Self) u64 {
             if (self.address_validated) return config.datagram_octets;
             const allowance = self.received_octets * amplification_factor;
+            // The comparison is what makes the subtraction below safe, and it
+            // is a returned value rather than an assertion because both terms
+            // are driven by the peer: this underflowed once, and the panic it
+            // produced was reachable from the network.
             if (allowance <= self.sent_octets) return 0;
-            return @min(allowance - self.sent_octets, config.datagram_octets);
+            assert(allowance > self.sent_octets);
+            const room = @min(allowance - self.sent_octets, config.datagram_octets);
+            assert(room <= config.datagram_octets);
+            return room;
         }
 
         /// One packet at one level, or `error.Empty` when the level has nothing
@@ -1107,6 +1196,12 @@ pub fn Connection(comptime config: Config) type {
         }
 
         fn writeHeader(self: *const Self, buffer: []u8, level: Level, number: u64, number_octets: u8) !packet.Written {
+            // A number wider than four octets has no encoding, and one at the
+            // varint ceiling has no successor — either would make the next
+            // packet in this space reuse a nonce.
+            assert(number_octets >= 1);
+            assert(number_octets <= 4);
+            assert(number <= varint.max);
             return switch (level) {
                 .one_rtt => packet.writeShort(buffer, .{
                     .destination = self.destination,
@@ -1267,7 +1362,12 @@ pub fn Connection(comptime config: Config) type {
         /// gain is a few octets of header on a path that is already
         /// AEAD-bound.
         fn writeStream(self: *Self, target: []u8, result: *Payload) usize {
+            assert(self.streams.count <= self.streams.streams.len);
             for (self.streams.streams[0..self.streams.count]) |*stream| {
+                // `framed` is how much of the send buffer has been put into a
+                // packet, so it never passes what the application wrote —
+                // `onPacketsLost` only ever moves it back.
+                assert(stream.framed <= stream.send_len);
                 const waiting = stream.send_len - stream.framed;
                 // Owed once. Without `fin_framed` this was permanently true,
                 // so every packet carried another empty FIN and `wantsSend`
@@ -1278,7 +1378,12 @@ pub fn Connection(comptime config: Config) type {
                 // Type, stream id, offset and length, each at its widest.
                 const overhead = 1 + varint.octets_max * 3;
                 if (target.len <= overhead) return 0;
+                // The comparison above is the guard on this subtraction:
+                // `target` is what is left of the datagram after the header,
+                // and a frame that does not fit its own overhead writes nothing.
+                assert(target.len > overhead);
                 const take = @min(waiting, target.len - overhead);
+                assert(take <= waiting);
                 const written = frame.encode(target, .{ .stream = .{
                     .stream = stream.id,
                     .offset = stream.send_offset + stream.framed,

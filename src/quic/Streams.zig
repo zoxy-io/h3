@@ -150,7 +150,12 @@ pub fn Streams(comptime config: Config) type {
             /// Advertising from arrival would let a peer that sends faster than
             /// we read push the window ahead of the buffer.
             pub fn receiveLimit(self: *const Stream) u64 {
-                return self.consumed + config.receive_octets;
+                // Section 4.1: the limit moves forward as the application
+                // reads, so a stream that is never read never grows one.
+                assert(self.consumed <= self.received_highest);
+                const limit = self.consumed + config.receive_octets;
+                assert(limit >= config.receive_octets);
+                return limit;
             }
 
             /// Whether this endpoint may still write to it.
@@ -209,6 +214,9 @@ pub fn Streams(comptime config: Config) type {
         /// a `STREAM_STATE_ERROR` rather than something to ignore.
         fn peerMaySend(self: *const Self, id: u64) bool {
             const kind = stream_id.kindOf(id);
+            // The low two bits are the type tag, so every identifier has a
+            // kind; there is no such thing as an unrecognised one to reject.
+            assert(@intFromEnum(kind) == id & 0b11);
             return kind.bidirectional() or kind.initiator() != self.side;
         }
 
@@ -271,16 +279,27 @@ pub fn Streams(comptime config: Config) type {
             if (end <= stream.received_highest) return;
             if (end > stream.receiveLimit()) return error.FlowControl;
 
+            // Both comparisons above are returned errors rather than
+            // assertions, because `end` is an offset the peer chose: the first
+            // is what makes this subtraction safe, and the second is section
+            // 4.1's connection-level window, which is the one that bounds
+            // memory across every stream at once.
+            assert(end > stream.received_highest);
             const charge = end - stream.received_highest;
+            assert(charge <= config.receive_octets);
             if (self.received_total + charge > self.receiveLimit()) return error.FlowControl;
             self.received_total += charge;
             stream.received_highest = end;
+            assert(stream.received_highest <= stream.receiveLimit());
         }
 
         /// Section 4.1: the connection's limit, measured forward from what the
         /// application has taken across all streams.
         pub fn receiveLimit(self: *const Self) u64 {
-            return self.consumed_total + config.connection_receive_octets;
+            assert(self.consumed_total <= self.received_total);
+            const limit = self.consumed_total + config.connection_receive_octets;
+            assert(limit >= config.connection_receive_octets);
+            return limit;
         }
 
         /// Release bytes the application has read.
@@ -293,6 +312,10 @@ pub fn Streams(comptime config: Config) type {
             stream.received.consume(octets);
             stream.consumed += octets;
             self.consumed_total += octets;
+            // Credit is released, never invented: what the application took
+            // cannot exceed what the peer was admitted to send.
+            assert(stream.consumed <= stream.received_highest);
+            assert(self.consumed_total <= self.received_total);
             self.settle(stream);
         }
 
@@ -372,7 +395,14 @@ pub fn Streams(comptime config: Config) type {
         }
 
         fn sendRoom(limit: u64, at: u64) u64 {
-            return if (limit > at) limit - at else 0;
+            // The comparison is the guard on the subtraction. `limit` is the
+            // peer's advertised window and `at` is how far we have written, and
+            // a peer may lower neither — but it may send a MAX_STREAM_DATA that
+            // arrives after we have already written past it.
+            const room = if (limit > at) limit - at else 0;
+            assert(room == 0 or limit > at);
+            assert(room <= limit);
+            return room;
         }
 
         /// Section 19.10 and 19.9: raise a peer's limits.
