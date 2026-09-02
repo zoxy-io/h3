@@ -21,6 +21,8 @@ pub const frame = @import("quic/frame.zig");
 pub const connection = @import("quic/Connection.zig");
 pub const Connection = connection.Connection;
 pub const Reassembler = @import("quic/Reassembler.zig").Reassembler;
+pub const recovery = @import("quic/Recovery.zig");
+pub const Recovery = recovery.Recovery;
 pub const packet = @import("quic/packet.zig");
 pub const packet_number = @import("quic/packet_number.zig");
 pub const stream_id = @import("quic/stream_id.zig");
@@ -34,6 +36,7 @@ test {
     _ = frame;
     _ = connection;
     _ = @import("quic/Reassembler.zig");
+    _ = recovery;
     _ = packet;
     _ = packet_number;
     _ = stream_id;

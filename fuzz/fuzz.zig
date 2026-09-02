@@ -56,6 +56,7 @@ const local_connection_id_octets_max = 20;
 const reassembler_operations_max = 64;
 const ack_operations_max = 128;
 const connection_datagrams_max = 24;
+const recovery_operations_max = 96;
 
 /// Frames drawn into one payload, and settings into one SETTINGS frame.
 const settings_max = 16;
@@ -546,4 +547,96 @@ fn fuzzConnection(_: void, smith: *std.testing.Smith) !void {
 
 test "connection: authenticated does not mean trusted" {
     try std.testing.fuzz({}, fuzzConnection, .{});
+}
+
+const FuzzRecovery = quic.Recovery(.{ .sent_max = 32, .max_datagram_size = 1200, .Context = u64 });
+
+/// Loss recovery against a model of what is outstanding.
+///
+/// The oracle is `bytes_in_flight`, because it is the number that gates
+/// sending and because both directions of drift are silent failures rather
+/// than crashes: too high and the connection deadlocks against a window it
+/// cannot get under, too low and congestion control has been defeated and this
+/// endpoint is unfair to everything else on the path. Neither shows up as
+/// anything but a bad day on someone's network.
+///
+/// The ACK frames are drawn rather than well-formed, because a peer chooses
+/// them: an ACK claiming numbers never sent, ranges that walk below zero, or a
+/// delay far past what was advertised are all things a hostile peer sends and a
+/// conforming one occasionally does under reordering.
+fn fuzzRecovery(_: void, smith: *std.testing.Smith) !void {
+    var recovery: FuzzRecovery = .{};
+    var lost: [32]u64 = undefined;
+
+    // The model: what this target believes is outstanding and in flight.
+    var outstanding: [64]?u32 = @splat(null);
+    var next_number: u64 = 0;
+    var now: u64 = 0;
+
+    var operations: u32 = 0;
+    while (operations < recovery_operations_max and !smith.eosWeightedSimple(6, 1)) : (operations += 1) {
+        now += @as(u64, smith.valueRangeAtMost(u8, 0, 200)) * std.time.ns_per_ms;
+
+        switch (smith.value(enum { send, ack, timeout })) {
+            .send => {
+                if (next_number >= outstanding.len) continue;
+                const octets = smith.valueRangeAtMost(u16, 1, 1200);
+                const in_flight = smith.value(bool);
+                recovery.onPacketSent(.initial, .{
+                    .number = next_number,
+                    .time_sent = now,
+                    .octets = octets,
+                    .ack_eliciting = smith.value(bool),
+                    .in_flight = in_flight,
+                    .context = next_number,
+                }) catch continue;
+                if (in_flight) outstanding[next_number] = octets;
+                next_number += 1;
+            },
+            .ack => {
+                const largest = smith.valueRangeAtMost(u8, 0, @intCast(outstanding.len - 1));
+                const first_range = smith.valueRangeAtMost(u8, 0, largest);
+                const ack: h3.quic.frame.Ack = .{
+                    .largest = largest,
+                    .delay = smith.value(u16),
+                    .first_range = first_range,
+                    .range_count = 0,
+                    .ranges = &.{},
+                    .ecn = null,
+                };
+                const result = recovery.onAckReceived(.initial, ack, smith.value(u16), now, &lost) catch continue;
+                // Everything the frame covered leaves the model, and so does
+                // everything reported lost.
+                var number = largest - first_range;
+                while (number <= largest) : (number += 1) outstanding[number] = null;
+                for (lost[0..@min(result.lost, lost.len)]) |context| outstanding[context] = null;
+            },
+            .timeout => {
+                const at = recovery.timeoutAt() orelse continue;
+                const outcome = recovery.onLossDetectionTimeout(@max(now, at), &lost);
+                switch (outcome) {
+                    .lost => |count| for (lost[0..@min(count, lost.len)]) |context| {
+                        outstanding[context] = null;
+                    },
+                    .probe, .idle => {},
+                }
+            },
+        }
+
+        // The oracle. A short `lost` slice would make the model drift, so it is
+        // sized above what the recovery can hold and the assertion is exact.
+        var expected: u64 = 0;
+        for (outstanding) |octets| expected += octets orelse 0;
+        assert(recovery.bytes_in_flight == expected);
+
+        // Section B.6's floor, and the estimates staying sane whatever the peer
+        // claimed about its own delay.
+        assert(recovery.congestion_window >= 2 * 1200);
+        assert(recovery.smoothed_rtt > 0);
+        if (recovery.has_rtt_sample) assert(recovery.min_rtt <= recovery.smoothed_rtt + recovery.rttvar * 4);
+    }
+}
+
+test "recovery: bytes in flight are exactly what is outstanding" {
+    try std.testing.fuzz({}, fuzzRecovery, .{});
 }

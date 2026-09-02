@@ -33,11 +33,6 @@
 //!
 //! Not carried, and each is somebody else's slice rather than an oversight:
 //!
-//! * **Retransmission and congestion control** are RFC 9002 (roadmap slice 3).
-//!   The consequence is stated where it bites: CRYPTO bytes stay in their send
-//!   buffer after being framed, so the data needed to retransmit is *held* —
-//!   what is missing is the loss detection that decides to. A handshake over a
-//!   lossy path stalls until that lands.
 //! * **Streams and flow control** are roadmap slice 5. STREAM frames are
 //!   refused rather than ignored, so a peer that sends one before this package
 //!   can honour it gets an error instead of silence.
@@ -57,6 +52,7 @@ const varint = @import("../varint.zig");
 const AckRanges = @import("AckRanges.zig").AckRanges;
 const ConnectionId = @import("ConnectionId.zig");
 const Reassembler = @import("Reassembler.zig").Reassembler;
+const RecoveryOf = @import("Recovery.zig").Recovery;
 
 const Level = crypto.Level;
 const Side = crypto.Side;
@@ -66,6 +62,17 @@ const Space = packet_number.Space;
 /// least this, so a server knows the path carries enough for a handshake before
 /// it commits state to it.
 pub const initial_datagram_min: u32 = 1200;
+
+/// Lost packets reported out of one acknowledgement or timeout. A bound rather
+/// than a promise: `Recovery` answers the true count, so a caller can tell it
+/// did not see everything — and this package's response to a loss is to rewind
+/// a cursor, which the *earliest* lost packet decides. Seeing the rest changes
+/// nothing.
+const lost_report_max: usize = 32;
+
+/// RFC 9000 section 18.2's default `ack_delay_exponent`, used until the peer's
+/// transport parameters are decoded.
+const ack_delay_exponent_default: u6 = 3;
 
 /// RFC 9000 section 8.1: before a peer's address is validated, a server may
 /// send no more than this multiple of what it has received. Without it a server
@@ -87,6 +94,8 @@ pub const Config = struct {
     /// Transport parameter octets held from the peer, as the extension's own
     /// encoding.
     transport_parameters_octets: u32 = 1024,
+    /// Unacknowledged packets tracked per space, for RFC 9002.
+    sent_max: u32 = 128,
 };
 
 /// Where the connection is, in the terms section 10 uses.
@@ -132,6 +141,9 @@ pub fn Connection(comptime config: Config) type {
         largest_acked: ?u64 = null,
         /// Discarded per section 4.9 once a later level's keys are in use.
         discarded: bool = false,
+        /// Probe packets RFC 9002 section 6.2.4 asked for and that have not
+        /// gone out yet.
+        probes_pending: u8 = 0,
     };
 
     // The width a long header's Length field is reserved at: wide enough for
@@ -140,6 +152,24 @@ pub fn Connection(comptime config: Config) type {
     // Derived rather than chosen — a bigger datagram needs a wider field, and
     // nothing here has to be touched for it.
     const length_field_octets: u8 = varint.encodedLength(config.datagram_octets);
+
+    // What a sent packet carried, so that losing it can be undone. RFC 9002
+    // tracks a packet's number, size and send time and deliberately never
+    // learns what was *in* it; this is the token `Recovery.Context` hands back
+    // on loss, and it is the whole of what this slice needs to rebuild one —
+    // the CRYPTO range, re-framed by rewinding the level's send cursor to where
+    // the lost packet started.
+    const PacketContext = struct {
+        level: Level,
+        crypto_start: u32,
+        crypto_end: u32,
+    };
+
+    const Recovery = RecoveryOf(.{
+        .sent_max = config.sent_max,
+        .max_datagram_size = config.datagram_octets,
+        .Context = PacketContext,
+    });
 
     return struct {
         const Self = @This();
@@ -175,6 +205,9 @@ pub fn Connection(comptime config: Config) type {
         /// over without this package caring when they arrive.
         peer_parameters: [config.transport_parameters_octets]u8 = @splat(0),
         peer_parameters_len: u32 = 0,
+
+        /// RFC 9002: what decides that a packet was lost, and when to probe.
+        recovery: Recovery = .{},
 
         /// Set by a CONNECTION_CLOSE in either direction.
         close_code: u64 = 0,
@@ -362,7 +395,6 @@ pub fn Connection(comptime config: Config) type {
         }
 
         fn receiveFrame(self: *Self, level: Level, one: frame.Frame, now: u64) ReceiveError!void {
-            _ = now;
             switch (one) {
                 .padding, .ping => {},
                 .ack => |value| {
@@ -372,6 +404,21 @@ pub fn Connection(comptime config: Config) type {
                     // never were.
                     if (value.largest >= space.next) return error.Protocol;
                     space.largest_acked = @max(space.largest_acked orelse 0, value.largest);
+
+                    // Section 13.2.5: the delay is in microseconds, scaled by
+                    // the exponent the peer advertised. Until the transport
+                    // parameters are decoded this uses section 18.2's default,
+                    // which is what an absent one means.
+                    const delay_ns = (value.delay << ack_delay_exponent_default) * std.time.ns_per_us;
+                    var lost: [lost_report_max]PacketContext = undefined;
+                    const result = self.recovery.onAckReceived(
+                        level.space(),
+                        value,
+                        delay_ns,
+                        now,
+                        &lost,
+                    ) catch return error.Protocol;
+                    self.onPacketsLost(lost[0..@min(result.lost, lost.len)]);
                 },
                 .crypto => |value| {
                     const stream = &self.levels[@intFromEnum(level)];
@@ -412,6 +459,61 @@ pub fn Connection(comptime config: Config) type {
             self.send_keys[@intFromEnum(level)] = null;
             self.receive_keys[@intFromEnum(level)] = null;
             self.spaces[@intFromEnum(level.space())].discarded = true;
+            // Section 6.2.3 of RFC 9002: what was outstanding there is neither
+            // lost nor acknowledged, and leaving its octets in flight would
+            // hold the congestion window down for the rest of the connection.
+            self.recovery.discardSpace(level.space());
+        }
+
+        /// Undo the sending of packets RFC 9002 declared lost.
+        ///
+        /// Rewinding the level's send cursor to where the lost packet began is
+        /// the whole of it: everything from there is framed again on the next
+        /// send. That re-sends octets a *later* packet also carried and that may
+        /// have arrived, which is wasteful and not wrong — the peer's
+        /// reassembler treats a duplicate as free, and section 2.2 guarantees
+        /// the bytes are identical. Tracking per-range acknowledgement to avoid
+        /// it would be a second reassembler on the send side, and a handshake is
+        /// a few kilobytes.
+        fn onPacketsLost(self: *Self, contexts: []const PacketContext) void {
+            for (contexts) |context| {
+                if (context.crypto_end <= context.crypto_start) continue;
+                const stream = &self.levels[@intFromEnum(context.level)];
+                stream.framed = @min(stream.framed, context.crypto_start);
+            }
+        }
+
+        /// When the caller must wake this connection, in its own clock's
+        /// nanoseconds, or null when nothing is outstanding.
+        ///
+        /// Returned rather than armed: the caller owns the timer, because the
+        /// two consumers arm one very differently and neither wants this
+        /// package's idea of a timer wheel.
+        pub fn timeout(self: *const Self) ?u64 {
+            if (self.state == .draining) return null;
+            return self.recovery.timeoutAt();
+        }
+
+        /// Section A.9 of RFC 9002: the timer fired.
+        pub fn onTimeout(self: *Self, now: u64) void {
+            var lost: [lost_report_max]PacketContext = undefined;
+            switch (self.recovery.onLossDetectionTimeout(now, &lost)) {
+                .lost => |count| self.onPacketsLost(lost[0..@min(count, lost.len)]),
+                // Section 6.2.4: nothing is known to be lost and the peer has
+                // gone quiet, so send something it must answer — and where
+                // there is unacknowledged data, that rather than a bare PING,
+                // because a probe that carries the handshake makes progress and
+                // a probe that carries nothing only asks whether the path is
+                // alive. The PING in `writePayload` is the fallback for when
+                // there is no data to resend.
+                .probe => |probe| {
+                    self.spaces[@intFromEnum(probe.space)].probes_pending = probe.packets;
+                    if (self.recovery.earliestContext(probe.space)) |context| {
+                        self.onPacketsLost(&.{context});
+                    }
+                },
+                .idle => {},
+            }
         }
 
         // --------------------------------------------------------------- send
@@ -482,7 +584,8 @@ pub fn Connection(comptime config: Config) type {
 
             // The payload goes after the header, leaving room for the tag.
             const payload_room = buffer.len - header.header_octets - crypto.tag_octets;
-            const payload_octets = self.writePayload(buffer[header.header_octets..][0..payload_room], level, now);
+            const written = self.writePayload(buffer[header.header_octets..][0..payload_room], level, now);
+            const payload_octets = written.octets;
             if (payload_octets == 0) return error.Empty;
 
             // A long header's Length field was reserved at a fixed width above
@@ -499,6 +602,24 @@ pub fn Connection(comptime config: Config) type {
 
             const total = keys.seal(buffer, header.packet_number_offset, header.header_octets, payload_octets, number) catch return error.Empty;
             space.next += 1;
+
+            // Section 2 of RFC 9002: a packet is in flight when it is
+            // ack-eliciting or padded, and only ack-eliciting packets oblige
+            // the peer to answer. A packet carrying nothing but an ACK is
+            // neither, so that congestion control cannot throttle the feedback
+            // it depends on.
+            self.recovery.onPacketSent(level.space(), .{
+                .number = number,
+                .time_sent = now,
+                .octets = @intCast(total),
+                .ack_eliciting = written.ack_eliciting,
+                .in_flight = written.ack_eliciting,
+                .context = .{
+                    .level = level,
+                    .crypto_start = written.crypto_start,
+                    .crypto_end = written.crypto_end,
+                },
+            }) catch {};
             return total;
         }
 
@@ -524,9 +645,21 @@ pub fn Connection(comptime config: Config) type {
             };
         }
 
+        const Payload = struct {
+            octets: usize = 0,
+            /// Section 2 of RFC 9002: whether anything here obliges the peer to
+            /// acknowledge. An ACK-only packet does not, and must not count
+            /// against the congestion window.
+            ack_eliciting: bool = false,
+            /// The CRYPTO range this packet carried, so losing it can rewind.
+            crypto_start: u32 = 0,
+            crypto_end: u32 = 0,
+        };
+
         /// Fill a payload: an ACK if one is owed, then whatever handshake bytes
         /// are waiting.
-        fn writePayload(self: *Self, payload: []u8, level: Level, now: u64) usize {
+        fn writePayload(self: *Self, payload: []u8, level: Level, now: u64) Payload {
+            var result: Payload = .{};
             var offset: usize = 0;
             const space = &self.spaces[@intFromEnum(level.space())];
 
@@ -538,9 +671,25 @@ pub fn Connection(comptime config: Config) type {
                 if (written) |value| offset += value.octets;
             }
 
+            // Section 6.2.4: a probe must be ack-eliciting, and a PING is the
+            // cheapest frame that is. Real handshake data takes its place when
+            // there is any, which is why this runs before the CRYPTO below and
+            // only claims the space when it has nothing to say.
+            if (space.probes_pending > 0 and stream_has_nothing: {
+                const stream = &self.levels[@intFromEnum(level)];
+                break :stream_has_nothing stream.framed >= stream.pending_len;
+            }) {
+                offset += frame.encode(payload[offset..], .ping) catch 0;
+                space.probes_pending -= 1;
+                result.ack_eliciting = true;
+            }
+
             const stream = &self.levels[@intFromEnum(level)];
             if (stream.framed < stream.pending_len) {
+                result.crypto_start = stream.framed;
                 offset += self.writeCrypto(payload[offset..], stream);
+                result.crypto_end = stream.framed;
+                if (result.crypto_end > result.crypto_start) result.ack_eliciting = true;
             }
 
             if (self.close_pending and offset < payload.len) {
@@ -552,7 +701,8 @@ pub fn Connection(comptime config: Config) type {
                 } }) catch 0;
                 self.close_pending = false;
             }
-            return offset;
+            result.octets = offset;
+            return result;
         }
 
         fn writeCrypto(self: *Self, target: []u8, stream: *CryptoLevel) usize {
@@ -586,6 +736,9 @@ pub fn Connection(comptime config: Config) type {
         pub fn wantsSend(self: *const Self) bool {
             if (self.state == .draining) return false;
             if (self.close_pending) return true;
+            for (self.spaces) |space| {
+                if (space.probes_pending > 0 and !space.discarded) return true;
+            }
             for (0..Level.count) |index| {
                 const level: Level = @enumFromInt(index);
                 if (self.send_keys[index] == null) continue;
@@ -902,4 +1055,84 @@ test "transport parameters cross as opaque octets" {
     // and what they mean is the consumer's.
     const parameters = try transport_parameters.parse(client.transportParametersOut());
     try testing.expectEqual(@as(u64, 1 << 20), parameters.initial_max_data);
+}
+
+test "a handshake survives a dropped datagram" {
+    // The point of RFC 9002, end to end: without it this test hangs forever,
+    // because QUIC has no retransmission of its own and a lost Initial is a
+    // handshake that never starts.
+    var client = testClient();
+    var server = testServer();
+    var now: u64 = 0;
+
+    try client.cryptoIn(.initial, "ClientHello");
+
+    // The first flight goes out and is dropped on the floor.
+    var datagram: [TestConnection.datagram_octets]u8 = @splat(0);
+    const dropped = try client.send(&datagram, now);
+    try testing.expect(dropped > 0);
+    try testing.expectEqualStrings("", server.cryptoOut(.initial));
+
+    // Nothing is owed until the probe timeout, and the client knows when.
+    const at = client.timeout().?;
+    try testing.expect(at > now);
+    try testing.expect(!client.wantsSend());
+
+    // The timer fires. Section 6.2.4: the probe carries the unacknowledged
+    // handshake data rather than a bare PING, so the retransmission is the
+    // thing that makes progress.
+    now = at;
+    client.onTimeout(now);
+    try testing.expect(client.wantsSend());
+
+    const octets = try deliver(&client, &server, now);
+    try testing.expect(octets > 0);
+    try testing.expectEqualStrings("ClientHello", server.cryptoOut(.initial));
+}
+
+test "an acknowledgement stops the retransmission and resets the backoff" {
+    var client = testClient();
+    var server = testServer();
+
+    try client.cryptoIn(.initial, "ClientHello");
+    _ = try deliver(&client, &server, 0);
+    // The server's answer carries an ACK.
+    try server.cryptoIn(.initial, "ServerHello");
+    _ = try deliver(&server, &client, 1000);
+
+    try testing.expectEqual(@as(u32, 0), client.recovery.pto_count);
+    // Section 5.3: the round trip was measured, so the 333ms default is gone.
+    try testing.expect(client.recovery.has_rtt_sample);
+    try testing.expect(client.recovery.smoothed_rtt < initial_rtt_reference);
+    // And nothing is outstanding, so nothing is owed.
+    try testing.expectEqual(@as(u32, 0), client.recovery.outstanding(.initial));
+}
+
+const initial_rtt_reference = @import("Recovery.zig").initial_rtt_ns;
+
+test "a packet carrying only an ACK is not in flight" {
+    // Section 2 of RFC 9002: acknowledgement traffic must not be throttled by
+    // congestion control, or congestion feedback throttles itself.
+    var client = testClient();
+    var server = testServer();
+    try client.cryptoIn(.initial, "ClientHello");
+    _ = try deliver(&client, &server, 0);
+
+    const before = server.recovery.bytes_in_flight;
+    var datagram: [TestConnection.datagram_octets]u8 = @splat(0);
+    const octets = try server.send(&datagram, 1000);
+    try testing.expect(octets > 0);
+    // The server had nothing to say but an ACK.
+    try testing.expectEqual(before, server.recovery.bytes_in_flight);
+}
+
+test "the timer is only about what is outstanding" {
+    var client = testClient();
+    // Nothing sent, nothing to wait for.
+    try testing.expectEqual(@as(?u64, null), client.timeout());
+
+    try client.cryptoIn(.initial, "ClientHello");
+    var datagram: [TestConnection.datagram_octets]u8 = @splat(0);
+    _ = try client.send(&datagram, 0);
+    try testing.expect(client.timeout() != null);
 }

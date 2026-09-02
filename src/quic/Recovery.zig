@@ -1,0 +1,787 @@
+//! RFC 9002: loss detection and congestion control.
+//!
+//! QUIC has no retransmission in RFC 9000. A lost packet is gone, and it is this
+//! document that decides what was lost and tells the sender to send those frames
+//! again. Without it a connection stalls at the first dropped datagram; for a
+//! load generator it is worse than a stall, because a sender with no congestion
+//! control does not measure a server, it measures whether the network buffered
+//! enough.
+//!
+//! ## Pure computation over a caller's clock
+//!
+//! Nothing here reads a clock, holds a socket or knows what a packet contained.
+//! `now` is an argument in nanoseconds, and every timer is *returned* as an
+//! absolute time the caller arms. That is what makes loss recovery testable at
+//! all — a PTO that fires after a real second is a test nobody runs — and it is
+//! what lets zoxy's simulator drive a connection on a virtual clock.
+//!
+//! ## What a packet contained is the connection's business
+//!
+//! This structure tracks a packet's number, size and send time. What was *in*
+//! it — which CRYPTO offsets, which streams — it never learns. `Config.Context`
+//! is an opaque token the caller attaches on send and gets back on loss, so the
+//! connection can rebuild the frames without this file growing a dependency on
+//! what a frame is.
+//!
+//! ## The transcription is deliberate
+//!
+//! The functions below follow RFC 9002 Appendix A's pseudocode closely enough
+//! to diff against it, and are named after it. This is a place to be boring:
+//! congestion control that is subtly its own algorithm is congestion control
+//! nobody can reason about, and the failure mode is not a crash but a sender
+//! that is unfair to everything else on the path.
+
+const std = @import("std");
+
+const assert = @import("../assert.zig").assert;
+const frame = @import("frame.zig");
+const packet_number = @import("packet_number.zig");
+
+const Space = packet_number.Space;
+
+/// Section 6.1.1: packets this far before an acknowledged one are lost.
+pub const packet_threshold: u64 = 3;
+
+/// Section 6.1.2: reordering tolerated in time, as an RTT multiplier of 9/8.
+pub const time_threshold_numerator: u64 = 9;
+pub const time_threshold_denominator: u64 = 8;
+
+/// Section 6.1.2: the timer granularity, and the floor under every timer here.
+pub const granularity_ns: u64 = std.time.ns_per_ms;
+
+/// Section 6.2.2: the RTT assumed before a sample exists.
+pub const initial_rtt_ns: u64 = 333 * std.time.ns_per_ms;
+
+/// Section 7.6: consecutive PTO periods without a delivery that mean the path
+/// is gone rather than lossy.
+pub const persistent_congestion_threshold: u64 = 3;
+
+/// Section 7.3.2: what the window is multiplied by on a congestion event.
+pub const loss_reduction_divisor: u64 = 2;
+
+comptime {
+    assert(packet_threshold == 3);
+    assert(time_threshold_numerator * 8 == time_threshold_denominator * 9);
+    assert(granularity_ns == 1_000_000);
+    assert(initial_rtt_ns == 333_000_000);
+}
+
+pub const Config = struct {
+    /// Sent packets tracked per space before the oldest is forgotten.
+    sent_max: u32 = 256,
+    /// Section B.2's `max_datagram_size`, which every window here is a multiple
+    /// of. RFC 9000 section 14 puts its floor at 1200.
+    max_datagram_size: u32 = 1452,
+    /// An opaque token attached on send and handed back on loss. `void` for a
+    /// caller that only wants the congestion controller.
+    Context: type = void,
+};
+
+pub fn Recovery(comptime config: Config) type {
+    comptime {
+        assert(config.sent_max >= packet_threshold + 1);
+        assert(config.max_datagram_size >= 1200);
+    }
+
+    // Section B.1: ten datagrams, but never below two and never above 14720.
+    const initial_window: u64 = @min(
+        10 * @as(u64, config.max_datagram_size),
+        @max(14_720, 2 * @as(u64, config.max_datagram_size)),
+    );
+    // Section B.1: the floor a congestion event may not take the window below.
+    const minimum_window: u64 = 2 * @as(u64, config.max_datagram_size);
+
+    return struct {
+        const Self = @This();
+
+        pub const Context = config.Context;
+
+        pub const Sent = struct {
+            number: u64,
+            time_sent: u64,
+            octets: u32,
+            ack_eliciting: bool,
+            in_flight: bool,
+            context: Context,
+        };
+
+        const SpaceState = struct {
+            sent: [config.sent_max]Sent = undefined,
+            count: u32 = 0,
+            largest_acked: ?u64 = null,
+            /// Section A.10: when the earliest packet still in doubt becomes
+            /// lost by the time threshold, or null when none is.
+            loss_time: ?u64 = null,
+            time_of_last_ack_eliciting: ?u64 = null,
+        };
+
+        // --- Section A.3's variables, one connection's worth.
+        latest_rtt: u64 = 0,
+        smoothed_rtt: u64 = initial_rtt_ns,
+        rttvar: u64 = initial_rtt_ns / 2,
+        min_rtt: u64 = 0,
+        has_rtt_sample: bool = false,
+        pto_count: u32 = 0,
+
+        // --- Section B.2's variables.
+        congestion_window: u64 = initial_window,
+        bytes_in_flight: u64 = 0,
+        congestion_recovery_start_time: ?u64 = null,
+        ssthresh: u64 = std.math.maxInt(u64),
+
+        spaces: [Space.count]SpaceState = @splat(.{}),
+
+        /// Section 6.2.1: the handshake is confirmed once the peer's
+        /// HANDSHAKE_DONE arrives (client) or the client's Finished is
+        /// acknowledged (server). Before it, an application-data PTO is not
+        /// armed, because 1-RTT keys may not exist on both sides yet.
+        handshake_confirmed: bool = false,
+
+        /// Section 18.2's `max_ack_delay`, from the peer's transport
+        /// parameters. Held rather than read from them, because the connection
+        /// decodes those and this file decodes nothing.
+        max_ack_delay_ns: u64 = 25 * std.time.ns_per_ms,
+
+        pub const SentError = error{
+            /// More unacknowledged packets in one space than `sent_max`. The
+            /// bound exists because the list is sized at compile time; reaching
+            /// it means the peer has stopped acknowledging, which the PTO will
+            /// have been shouting about for some time.
+            TooManyOutstanding,
+        };
+
+        /// Section A.5.
+        pub fn onPacketSent(self: *Self, space: Space, sent: Sent) SentError!void {
+            const state = &self.spaces[@intFromEnum(space)];
+            if (state.count == config.sent_max) return error.TooManyOutstanding;
+            // Ascending by number, which every walk below relies on.
+            if (state.count > 0) assert(sent.number > state.sent[state.count - 1].number);
+
+            state.sent[state.count] = sent;
+            state.count += 1;
+            if (sent.ack_eliciting) state.time_of_last_ack_eliciting = sent.time_sent;
+            if (sent.in_flight) self.bytes_in_flight += sent.octets;
+        }
+
+        pub const AckResult = struct {
+            /// Packets newly acknowledged by this frame.
+            acked: u32 = 0,
+            /// Packets declared lost while processing it. Their contexts are in
+            /// the caller's `lost` slice, which is what a retransmission is
+            /// rebuilt from.
+            lost: u32 = 0,
+            /// True when the largest acknowledged number was newly
+            /// acknowledged, which is the only case section 5.1 takes an RTT
+            /// sample from.
+            rtt_sampled: bool = false,
+        };
+
+        pub const AckError = error{
+            /// The frame's ranges do not decode, or walk below zero.
+            Malformed,
+        };
+
+        /// Section A.7: process an ACK frame.
+        ///
+        /// `ack_delay_ns` is the frame's delay field already scaled by the
+        /// peer's `ack_delay_exponent` — this file does not hold that parameter
+        /// either. `lost` receives the contexts of packets declared lost, and a
+        /// caller that passes a short slice gets the first that fit; `lost` in
+        /// the result is the true count.
+        pub fn onAckReceived(
+            self: *Self,
+            space: Space,
+            ack: frame.Ack,
+            ack_delay_ns: u64,
+            now: u64,
+            lost: []Context,
+        ) AckError!AckResult {
+            const state = &self.spaces[@intFromEnum(space)];
+            if (state.largest_acked) |previous| {
+                state.largest_acked = @max(previous, ack.largest);
+            } else {
+                state.largest_acked = ack.largest;
+            }
+
+            var result: AckResult = .{};
+            const newly = try self.removeAcked(space, ack, &result);
+            if (newly == null) return result;
+            const largest = newly.?;
+
+            // Section 5.1: an RTT sample comes only from the largest
+            // acknowledged, and only when that packet was ack-eliciting —
+            // otherwise the peer was under no obligation to answer promptly and
+            // the sample is not one.
+            if (largest.number == ack.largest and largest.ack_eliciting) {
+                self.updateRtt(now - largest.time_sent, ack_delay_ns);
+                result.rtt_sampled = true;
+            }
+
+            // Section A.7's order, and it is load-bearing rather than
+            // cosmetic: loss detection is what starts a recovery period, and
+            // `onPacketsAcked` declines to grow the window for a packet sent
+            // before one began. Growing first and halving afterwards leaves the
+            // window an eighth too wide after every loss event — which is a
+            // sender that is quietly unfair to everything else on the path, and
+            // which no crash would ever reveal.
+            result.lost = self.detectAndRemoveLostPackets(space, now, lost);
+            self.onPacketsAcked(largest.time_sent);
+            // Section A.7: a delivery means the path is working, so the PTO
+            // backoff resets.
+            self.pto_count = 0;
+            return result;
+        }
+
+        /// Remove every tracked packet the frame acknowledges, returning the
+        /// largest of them.
+        fn removeAcked(self: *Self, space: Space, ack: frame.Ack, result: *AckResult) AckError!?Sent {
+            const state = &self.spaces[@intFromEnum(space)];
+            var ranges = ack.iterate();
+            var largest: ?Sent = null;
+
+            var seen: u64 = 0;
+            while (seen <= ack.range_count) : (seen += 1) {
+                const range = ranges.next() catch return error.Malformed;
+                const value = range orelse break;
+                var index: u32 = 0;
+                while (index < state.count) {
+                    const packet = state.sent[index];
+                    if (packet.number < value.smallest or packet.number > value.largest) {
+                        index += 1;
+                        continue;
+                    }
+                    if (packet.in_flight) {
+                        assert(self.bytes_in_flight >= packet.octets);
+                        self.bytes_in_flight -= packet.octets;
+                    }
+                    if (largest == null or packet.number > largest.?.number) largest = packet;
+                    result.acked += 1;
+                    self.remove(state, index);
+                }
+            }
+            return largest;
+        }
+
+        fn remove(self: *Self, state: *SpaceState, index: u32) void {
+            _ = self;
+            assert(index < state.count);
+            var at = index;
+            while (at + 1 < state.count) : (at += 1) {
+                state.sent[at] = state.sent[at + 1];
+            }
+            state.count -= 1;
+        }
+
+        /// Section 5.3.
+        fn updateRtt(self: *Self, sample: u64, ack_delay_ns: u64) void {
+            self.latest_rtt = sample;
+            if (!self.has_rtt_sample) {
+                self.min_rtt = sample;
+                self.smoothed_rtt = sample;
+                self.rttvar = sample / 2;
+                self.has_rtt_sample = true;
+                return;
+            }
+
+            self.min_rtt = @min(self.min_rtt, sample);
+            // Section 5.3: the peer's reported delay is trusted only up to what
+            // it said it would ever be, and only where subtracting it still
+            // leaves a plausible RTT. A peer that inflates it would otherwise
+            // shrink our RTT estimate and make us declare loss early.
+            const delay = @min(ack_delay_ns, self.max_ack_delay_ns);
+            const adjusted = if (sample >= self.min_rtt + delay) sample - delay else sample;
+
+            const difference = if (self.smoothed_rtt > adjusted)
+                self.smoothed_rtt - adjusted
+            else
+                adjusted - self.smoothed_rtt;
+            self.rttvar = (3 * self.rttvar + difference) / 4;
+            self.smoothed_rtt = (7 * self.smoothed_rtt + adjusted) / 8;
+        }
+
+        /// Section 6.1.2's loss delay: 9/8 of the larger RTT, floored at the
+        /// timer granularity.
+        fn lossDelay(self: *const Self) u64 {
+            const rtt = @max(self.latest_rtt, self.smoothed_rtt);
+            return @max((rtt * time_threshold_numerator) / time_threshold_denominator, granularity_ns);
+        }
+
+        /// Section A.10.
+        fn detectAndRemoveLostPackets(self: *Self, space: Space, now: u64, lost: []Context) u32 {
+            const state = &self.spaces[@intFromEnum(space)];
+            const largest_acked = state.largest_acked orelse return 0;
+            state.loss_time = null;
+
+            const delay = self.lossDelay();
+
+            var count: u32 = 0;
+            var largest_lost: ?Sent = null;
+            var index: u32 = 0;
+            while (index < state.count) {
+                const packet = state.sent[index];
+                if (packet.number > largest_acked) {
+                    index += 1;
+                    continue;
+                }
+                // Section 6.1: lost by time, or by having been sent far enough
+                // before something that did arrive.
+                //
+                // Written as `sent + delay <= now` rather than the RFC's
+                // `sent <= now - delay`, which is the same inequality over the
+                // reals and not over `u64`: early in a connection `now` is
+                // smaller than the loss delay, and a saturating subtraction
+                // clamps the threshold to zero — declaring every packet sent at
+                // time zero lost, on the first acknowledgement, forever. The
+                // tests below found it.
+                const by_time = packet.time_sent + delay <= now;
+                const by_order = largest_acked >= packet.number + packet_threshold;
+                if (!by_time and !by_order) {
+                    // Still in doubt: the timer that would settle it.
+                    const at = packet.time_sent + delay;
+                    state.loss_time = if (state.loss_time) |current| @min(current, at) else at;
+                    index += 1;
+                    continue;
+                }
+
+                if (packet.in_flight) {
+                    assert(self.bytes_in_flight >= packet.octets);
+                    self.bytes_in_flight -= packet.octets;
+                    if (largest_lost == null or packet.number > largest_lost.?.number) largest_lost = packet;
+                }
+                if (count < lost.len) lost[count] = packet.context;
+                count += 1;
+                self.remove(state, index);
+            }
+
+            if (largest_lost) |packet| self.onCongestionEvent(packet.time_sent, now);
+            return count;
+        }
+
+        // ------------------------------------------------------- section B.4-7
+
+        /// Section B.5: a delivery grows the window, unless we are recovering
+        /// from a loss the acknowledged packet predates.
+        fn onPacketsAcked(self: *Self, time_sent: u64) void {
+            if (self.inCongestionRecovery(time_sent)) return;
+            if (self.congestion_window < self.ssthresh) {
+                // Slow start: one for one.
+                self.congestion_window += config.max_datagram_size;
+                return;
+            }
+            // Congestion avoidance: roughly one datagram per round trip.
+            self.congestion_window += (@as(u64, config.max_datagram_size) * config.max_datagram_size) / self.congestion_window;
+        }
+
+        fn inCongestionRecovery(self: *const Self, time_sent: u64) bool {
+            const start = self.congestion_recovery_start_time orelse return false;
+            return time_sent <= start;
+        }
+
+        /// Section B.6: halve the window, once per recovery period.
+        fn onCongestionEvent(self: *Self, time_sent: u64, now: u64) void {
+            // Everything lost in one round trip is one event: reacting to each
+            // packet would collapse the window by a factor of two per packet.
+            if (self.inCongestionRecovery(time_sent)) return;
+            self.congestion_recovery_start_time = now;
+            self.ssthresh = @max(self.congestion_window / loss_reduction_divisor, minimum_window);
+            self.congestion_window = self.ssthresh;
+        }
+
+        /// Whether `octets` may go out now. Section 7: a sender is limited by
+        /// the congestion window, and probes are exempt because a connection
+        /// that cannot probe cannot recover.
+        pub fn canSend(self: *const Self, octets: u64) bool {
+            return self.bytes_in_flight + octets <= self.congestion_window;
+        }
+
+        // ------------------------------------------------------ section 6.2
+
+        /// When a PTO fires, and in which space. Named rather than anonymous
+        /// because two anonymous structs with identical fields are still two
+        /// types.
+        const PtoTime = struct { at: u64, space: Space };
+
+        /// Section A.6: the PTO, and the space it belongs to.
+        fn ptoTimeAndSpace(self: *const Self) ?PtoTime {
+            var duration = self.smoothed_rtt + @max(4 * self.rttvar, granularity_ns);
+            duration <<= @intCast(@min(self.pto_count, 20));
+
+            var earliest: ?PtoTime = null;
+            for (0..Space.count) |index| {
+                const space: Space = @enumFromInt(index);
+                const state = &self.spaces[index];
+                if (!self.hasAckEliciting(space)) continue;
+                // Section 6.2.1: an application-data PTO waits for the
+                // handshake, because 1-RTT keys may not exist on both sides.
+                var at = state.time_of_last_ack_eliciting orelse continue;
+                if (space == .application) {
+                    if (!self.handshake_confirmed) continue;
+                    at += (self.max_ack_delay_ns << @intCast(@min(self.pto_count, 20)));
+                }
+                at += duration;
+                if (earliest == null or at < earliest.?.at) earliest = .{ .at = at, .space = space };
+            }
+            return earliest;
+        }
+
+        fn hasAckEliciting(self: *const Self, space: Space) bool {
+            const state = &self.spaces[@intFromEnum(space)];
+            for (state.sent[0..state.count]) |packet| {
+                if (packet.ack_eliciting) return true;
+            }
+            return false;
+        }
+
+        /// Section A.8: when the caller must wake this connection.
+        ///
+        /// The earliest loss time if one is pending, otherwise the PTO, or null
+        /// when nothing is outstanding and there is nothing to wait for.
+        pub fn timeoutAt(self: *const Self) ?u64 {
+            var earliest: ?u64 = null;
+            for (self.spaces) |state| {
+                const at = state.loss_time orelse continue;
+                earliest = if (earliest) |current| @min(current, at) else at;
+            }
+            if (earliest) |at| return at;
+            const pto = self.ptoTimeAndSpace() orelse return null;
+            return pto.at;
+        }
+
+        pub const Timeout = union(enum) {
+            /// Packets were declared lost; their contexts are in the caller's
+            /// slice and the frames they held must be sent again.
+            lost: u32,
+            /// Nothing is known to be lost, but the peer has gone quiet.
+            /// Section 6.2.4: send ack-eliciting packets in this space to make
+            /// it say something. Two, because one may be lost as well.
+            probe: struct { space: Space, packets: u8 },
+            /// Nothing to do.
+            idle,
+        };
+
+        /// Section A.9.
+        pub fn onLossDetectionTimeout(self: *Self, now: u64, lost: []Context) Timeout {
+            var earliest_space: ?Space = null;
+            var earliest: ?u64 = null;
+            for (self.spaces, 0..) |state, index| {
+                const at = state.loss_time orelse continue;
+                if (earliest == null or at < earliest.?) {
+                    earliest = at;
+                    earliest_space = @enumFromInt(index);
+                }
+            }
+            if (earliest_space) |space| {
+                const count = self.detectAndRemoveLostPackets(space, now, lost);
+                return .{ .lost = count };
+            }
+
+            const pto = self.ptoTimeAndSpace() orelse return .idle;
+            // Section 6.2.1: the backoff is exponential, and it is reset by a
+            // delivery rather than by a probe being sent — a probe that is also
+            // lost must not shorten the next wait.
+            self.pto_count += 1;
+            return .{ .probe = .{ .space = pto.space, .packets = 2 } };
+        }
+
+        /// Section 6.2.3: the connection has just discarded a packet number
+        /// space, so everything outstanding in it is neither lost nor
+        /// acknowledged — it is gone.
+        pub fn discardSpace(self: *Self, space: Space) void {
+            const state = &self.spaces[@intFromEnum(space)];
+            for (state.sent[0..state.count]) |packet| {
+                if (packet.in_flight) {
+                    assert(self.bytes_in_flight >= packet.octets);
+                    self.bytes_in_flight -= packet.octets;
+                }
+            }
+            state.* = .{};
+            self.pto_count = 0;
+        }
+
+        /// Outstanding packets in one space, for a caller deciding whether to
+        /// probe.
+        pub fn outstanding(self: *const Self, space: Space) u32 {
+            return self.spaces[@intFromEnum(space)].count;
+        }
+
+        /// The context of the earliest packet still outstanding in a space.
+        ///
+        /// Section 6.2.4: a probe should carry unacknowledged data rather than
+        /// a bare PING where there is any, and this is what tells a caller
+        /// where that data starts. The list is ascending by number, so the
+        /// earliest is the first.
+        pub fn earliestContext(self: *const Self, space: Space) ?Context {
+            const state = &self.spaces[@intFromEnum(space)];
+            if (state.count == 0) return null;
+            return state.sent[0].context;
+        }
+    };
+}
+
+const testing = std.testing;
+
+const ms = std.time.ns_per_ms;
+const TestRecovery = Recovery(.{ .sent_max = 32, .max_datagram_size = 1200, .Context = u64 });
+
+fn sentPacket(number: u64, at: u64) TestRecovery.Sent {
+    return .{
+        .number = number,
+        .time_sent = at,
+        .octets = 1200,
+        .ack_eliciting = true,
+        .in_flight = true,
+        .context = number,
+    };
+}
+
+fn ackOf(largest: u64, first_range: u64) frame.Ack {
+    return .{
+        .largest = largest,
+        .delay = 0,
+        .first_range = first_range,
+        .range_count = 0,
+        .ranges = &.{},
+        .ecn = null,
+    };
+}
+
+test "the first sample sets the estimate rather than smoothing into it" {
+    var recovery: TestRecovery = .{};
+    // Before a sample, section 6.2.2's 333ms stands in.
+    try testing.expectEqual(initial_rtt_ns, recovery.smoothed_rtt);
+
+    try recovery.onPacketSent(.initial, sentPacket(0, 0));
+    var lost: [8]u64 = undefined;
+    const result = try recovery.onAckReceived(.initial, ackOf(0, 0), 0, 100 * ms, &lost);
+    try testing.expect(result.rtt_sampled);
+    try testing.expectEqual(@as(u32, 1), result.acked);
+    // Section 5.3: the first sample *is* the estimate; smoothing it against the
+    // 333ms default would leave the connection sluggish for several round trips.
+    try testing.expectEqual(@as(u64, 100 * ms), recovery.smoothed_rtt);
+    try testing.expectEqual(@as(u64, 50 * ms), recovery.rttvar);
+    try testing.expectEqual(@as(u64, 100 * ms), recovery.min_rtt);
+}
+
+test "a later sample moves the estimate by an eighth" {
+    var recovery: TestRecovery = .{};
+    var lost: [8]u64 = undefined;
+    try recovery.onPacketSent(.initial, sentPacket(0, 0));
+    _ = try recovery.onAckReceived(.initial, ackOf(0, 0), 0, 100 * ms, &lost);
+
+    try recovery.onPacketSent(.initial, sentPacket(1, 200 * ms));
+    _ = try recovery.onAckReceived(.initial, ackOf(1, 0), 0, 400 * ms, &lost);
+    // 7/8 * 100 + 1/8 * 200 = 112.5ms.
+    try testing.expectEqual(@as(u64, 112_500_000), recovery.smoothed_rtt);
+    try testing.expectEqual(@as(u64, 100 * ms), recovery.min_rtt);
+}
+
+test "an inflated ack delay cannot shrink the estimate below the minimum" {
+    var recovery: TestRecovery = .{};
+    var lost: [8]u64 = undefined;
+    try recovery.onPacketSent(.initial, sentPacket(0, 0));
+    _ = try recovery.onAckReceived(.initial, ackOf(0, 0), 0, 100 * ms, &lost);
+
+    // A peer claiming a delay far past what it advertised. Section 5.3 caps it
+    // at `max_ack_delay`; without the cap a peer could drive our RTT estimate
+    // down and make us declare loss early — retransmitting into a healthy path.
+    try recovery.onPacketSent(.initial, sentPacket(1, 200 * ms));
+    _ = try recovery.onAckReceived(.initial, ackOf(1, 0), 10_000 * ms, 300 * ms, &lost);
+    try testing.expect(recovery.smoothed_rtt >= recovery.min_rtt);
+}
+
+test "section 6.1.1: three packets past a delivery is lost" {
+    var recovery: TestRecovery = .{};
+    var lost: [8]u64 = undefined;
+    // All five together, and acknowledged soon enough that the *time* threshold
+    // cannot fire — otherwise this would not be a test of the packet threshold.
+    for (0..5) |number| try recovery.onPacketSent(.initial, sentPacket(number, 0));
+
+    // Packet 4 arrives; 0 and 1 are three or more behind it and are lost, while
+    // 2 and 3 are still in doubt.
+    const result = try recovery.onAckReceived(.initial, ackOf(4, 0), 0, 1 * ms, &lost);
+    try testing.expectEqual(@as(u32, 1), result.acked);
+    try testing.expectEqual(@as(u32, 2), result.lost);
+    try testing.expectEqual(@as(u64, 0), lost[0]);
+    try testing.expectEqual(@as(u64, 1), lost[1]);
+    try testing.expectEqual(@as(u32, 2), recovery.outstanding(.initial));
+}
+
+test "section 6.1.2: a packet old enough is lost even without three behind it" {
+    var recovery: TestRecovery = .{};
+    var lost: [8]u64 = undefined;
+    try recovery.onPacketSent(.initial, sentPacket(0, 0));
+    try recovery.onPacketSent(.initial, sentPacket(1, 0));
+    // A sample, so the loss delay is a real 9/8 of an RTT rather than the floor.
+    _ = try recovery.onAckReceived(.initial, ackOf(1, 0), 0, 100 * ms, &lost);
+    try testing.expectEqual(@as(u32, 1), recovery.outstanding(.initial));
+
+    // A later packet is acknowledged, which is what runs detection again.
+    // Packet 0 is now more than 9/8 of an RTT old and is lost by time alone —
+    // only two packets were ever sent past it, one short of the packet
+    // threshold, so nothing else could have declared it.
+    try recovery.onPacketSent(.initial, sentPacket(2, 200 * ms));
+    const result = try recovery.onAckReceived(.initial, ackOf(2, 0), 0, 1000 * ms, &lost);
+    try testing.expectEqual(@as(u32, 1), result.lost);
+    try testing.expectEqual(@as(u64, 0), lost[0]);
+}
+
+test "an ACK that acknowledges nothing new does nothing" {
+    var recovery: TestRecovery = .{};
+    var lost: [8]u64 = undefined;
+    try recovery.onPacketSent(.initial, sentPacket(0, 0));
+    try recovery.onPacketSent(.initial, sentPacket(1, 0));
+    _ = try recovery.onAckReceived(.initial, ackOf(1, 0), 0, 100 * ms, &lost);
+    const smoothed = recovery.smoothed_rtt;
+
+    // Section A.7 returns early when nothing was newly acknowledged. A
+    // retransmitted ACK is ordinary, and taking an RTT sample from one would
+    // measure the age of an acknowledgement rather than a round trip.
+    const again = try recovery.onAckReceived(.initial, ackOf(1, 0), 0, 5000 * ms, &lost);
+    try testing.expectEqual(@as(u32, 0), again.acked);
+    try testing.expect(!again.rtt_sampled);
+    try testing.expectEqual(smoothed, recovery.smoothed_rtt);
+}
+
+test "a packet still in doubt arms the timer rather than being declared lost" {
+    var recovery: TestRecovery = .{};
+    var lost: [8]u64 = undefined;
+    try recovery.onPacketSent(.initial, sentPacket(0, 0));
+    try recovery.onPacketSent(.initial, sentPacket(1, 0));
+    _ = try recovery.onAckReceived(.initial, ackOf(1, 0), 0, 100 * ms, &lost);
+
+    // Nothing lost yet, but the timer says when to look again.
+    try testing.expectEqual(@as(u32, 1), recovery.outstanding(.initial));
+    const at = recovery.timeoutAt().?;
+    try testing.expect(at > 0);
+
+    const outcome = recovery.onLossDetectionTimeout(at + 1, &lost);
+    try testing.expectEqual(@as(u32, 1), outcome.lost);
+    try testing.expectEqual(@as(u64, 0), lost[0]);
+}
+
+test "the window halves once per round trip, not once per lost packet" {
+    var recovery: TestRecovery = .{};
+    var lost: [8]u64 = undefined;
+    const before = recovery.congestion_window;
+
+    // Five packets sent together; four are lost at once. Reacting to each would
+    // take the window down by a factor of sixteen.
+    for (0..5) |number| try recovery.onPacketSent(.initial, sentPacket(number, 0));
+    _ = try recovery.onAckReceived(.initial, ackOf(4, 0), 0, 100 * ms, &lost);
+
+    try testing.expect(recovery.congestion_window < before);
+    try testing.expectEqual(@max(before / 2, 2 * @as(u64, 1200)), recovery.congestion_window);
+}
+
+test "the window never falls below two datagrams" {
+    var recovery: TestRecovery = .{};
+    var lost: [8]u64 = undefined;
+    var round: u64 = 0;
+    while (round < 20) : (round += 1) {
+        const base = round * 10;
+        for (0..5) |offset| try recovery.onPacketSent(.initial, sentPacket(base + offset, round * 100 * ms));
+        _ = try recovery.onAckReceived(.initial, ackOf(base + 4, 0), 0, (round + 1) * 100 * ms, &lost);
+    }
+    // Section B.6's floor: below two datagrams a sender cannot make progress at
+    // all, so the collapse stops there.
+    try testing.expectEqual(@as(u64, 2 * 1200), recovery.congestion_window);
+}
+
+test "slow start grows the window per delivery and stops at the threshold" {
+    var recovery: TestRecovery = .{};
+    var lost: [8]u64 = undefined;
+    const before = recovery.congestion_window;
+    try recovery.onPacketSent(.initial, sentPacket(0, 0));
+    _ = try recovery.onAckReceived(.initial, ackOf(0, 0), 0, 10 * ms, &lost);
+    try testing.expectEqual(before + 1200, recovery.congestion_window);
+}
+
+test "bytes in flight follow what is outstanding" {
+    var recovery: TestRecovery = .{};
+    var lost: [8]u64 = undefined;
+    try testing.expectEqual(@as(u64, 0), recovery.bytes_in_flight);
+    try recovery.onPacketSent(.initial, sentPacket(0, 0));
+    try recovery.onPacketSent(.initial, sentPacket(1, 0));
+    try testing.expectEqual(@as(u64, 2400), recovery.bytes_in_flight);
+
+    _ = try recovery.onAckReceived(.initial, ackOf(1, 1), 0, 10 * ms, &lost);
+    try testing.expectEqual(@as(u64, 0), recovery.bytes_in_flight);
+    try testing.expectEqual(@as(u32, 0), recovery.outstanding(.initial));
+}
+
+test "a full window stops the sender" {
+    var recovery: TestRecovery = .{};
+    try testing.expect(recovery.canSend(1200));
+    var number: u64 = 0;
+    while (recovery.canSend(1200)) : (number += 1) {
+        try recovery.onPacketSent(.initial, sentPacket(number, 0));
+    }
+    try testing.expect(!recovery.canSend(1200));
+    try testing.expect(recovery.bytes_in_flight + 1200 > recovery.congestion_window);
+}
+
+test "a silent peer produces a probe, and the backoff is exponential" {
+    var recovery: TestRecovery = .{};
+    var lost: [8]u64 = undefined;
+    try recovery.onPacketSent(.initial, sentPacket(0, 0));
+
+    const first = recovery.timeoutAt().?;
+    const outcome = recovery.onLossDetectionTimeout(first, &lost);
+    try testing.expectEqual(Space.initial, outcome.probe.space);
+    // Section 6.2.4: two, because one probe may be lost as well.
+    try testing.expectEqual(@as(u8, 2), outcome.probe.packets);
+    try testing.expectEqual(@as(u32, 1), recovery.pto_count);
+
+    // The next wait is twice as long.
+    const second = recovery.timeoutAt().?;
+    try testing.expectEqual(first * 2, second);
+
+    // And a delivery resets it — the path is working again.
+    try recovery.onPacketSent(.initial, sentPacket(1, 0));
+    _ = try recovery.onAckReceived(.initial, ackOf(1, 0), 0, 10 * ms, &lost);
+    try testing.expectEqual(@as(u32, 0), recovery.pto_count);
+}
+
+test "an application-data PTO waits for the handshake" {
+    var recovery: TestRecovery = .{};
+    try recovery.onPacketSent(.application, sentPacket(0, 0));
+    // Section 6.2.1: arming it before the handshake is confirmed would probe
+    // with keys the peer may not have installed.
+    try testing.expectEqual(@as(?u64, null), recovery.timeoutAt());
+
+    recovery.handshake_confirmed = true;
+    try testing.expect(recovery.timeoutAt() != null);
+}
+
+test "discarding a space forgets what was in flight there" {
+    var recovery: TestRecovery = .{};
+    try recovery.onPacketSent(.initial, sentPacket(0, 0));
+    try recovery.onPacketSent(.handshake, sentPacket(0, 0));
+    try testing.expectEqual(@as(u64, 2400), recovery.bytes_in_flight);
+
+    // Section 6.2.3: an Initial packet outstanding when the space goes is
+    // neither lost nor acknowledged, and leaving its octets in flight would
+    // hold the window down for the rest of the connection.
+    recovery.discardSpace(.initial);
+    try testing.expectEqual(@as(u64, 1200), recovery.bytes_in_flight);
+    try testing.expectEqual(@as(u32, 0), recovery.outstanding(.initial));
+    try testing.expectEqual(@as(u32, 1), recovery.outstanding(.handshake));
+}
+
+test "more outstanding packets than the bound is refused rather than overrun" {
+    var recovery: TestRecovery = .{};
+    for (0..32) |number| try recovery.onPacketSent(.initial, sentPacket(number, 0));
+    try testing.expectError(error.TooManyOutstanding, recovery.onPacketSent(.initial, sentPacket(32, 0)));
+}
+
+test "a caller's lost slice may be shorter than the truth" {
+    var recovery: TestRecovery = .{};
+    for (0..8) |number| try recovery.onPacketSent(.initial, sentPacket(number, 0));
+    var lost: [2]u64 = undefined;
+    const result = try recovery.onAckReceived(.initial, ackOf(7, 0), 0, 10 * ms, &lost);
+    // Five are lost; two fit. The count is the truth, so a caller can tell it
+    // did not see everything rather than quietly retransmitting less.
+    try testing.expectEqual(@as(u32, 5), result.lost);
+    try testing.expectEqual(@as(u64, 0), lost[0]);
+    try testing.expectEqual(@as(u64, 1), lost[1]);
+}

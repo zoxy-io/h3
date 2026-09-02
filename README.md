@@ -12,9 +12,10 @@ callbacks) and [zrk](https://github.com/zoxy-io/zrk) (load generator, zio green
 threads through `std.Io`), which is why it owns no socket, no clock and no TLS
 engine.
 
-**Status: in progress.** The transport's wire format and packet protection are
-built, tested, and checked against the RFCs' own vectors; the connection state
-machine, loss recovery, and QPACK's dynamic table are not written yet.
+**Status: in progress.** The transport is built: wire format, packet
+protection, the connection state machine, and loss recovery. A handshake
+completes and survives a dropped datagram. Streams, flow control and QPACK's
+field lines are not written yet, so no request has been sent over it.
 [docs/DESIGN.md §6](docs/DESIGN.md#6-what-is-built-and-what-is-next) is the
 ledger — read it before depending on this.
 
@@ -25,7 +26,8 @@ ledger — read it before depending on this.
   identifiers, error codes.
 * **RFC 9001 — packet protection.** Initial secrets, AEAD packet protection,
   header protection, the Retry integrity tag, key update.
-* **RFC 9002 — loss detection and congestion control.** *Planned.*
+* **RFC 9002 — loss detection and congestion control.** RTT estimation, both
+  loss thresholds, the PTO, and NewReno.
 * **RFC 9204 — QPACK.** The static table is here, and the prefixed integer and
   Huffman code come from [hpack](https://github.com/zoxy-io/hpack), which holds
   the RFC 7541 originals QPACK adopts unchanged. The field line representations

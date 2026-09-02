@@ -202,6 +202,10 @@ all three build legs):
   changes" and section 4.5's final size.
 - `quic/AckRanges.zig` — the received-packet set for one number space, and the
   ACK frames rendered from it (sections 13.2 and 19.3).
+- `quic/Recovery.zig` — RFC 9002 entire: RTT estimation, packet- and
+  time-threshold loss detection, the PTO, and NewReno congestion control. It
+  never learns what a packet contained; `Config.Context` is an opaque token the
+  connection attaches on send and gets back on loss.
 - `quic/Connection.zig` — the state machine: three packet number spaces, four
   encryption levels and their keys, CRYPTO reassembly per level, ACK
   generation, section 12.4's frame permissions, section 8.1's amplification
@@ -221,10 +225,12 @@ all three build legs):
 2. **RFC 9114 §4.3 message validation.** The pseudo-header and field-name rules
    that decide whether a response is a message at all. Nearly identical to
    h2's `fields/`, and the same request-smuggling surface.
-3. **RFC 9002 recovery.** RTT, loss detection, PTO, and NewReno. Pure
-   computation over a caller-supplied `now`, so it is testable without a socket.
-   This is now the item on the critical path: `Connection` holds everything a
-   retransmission needs and has nothing that decides to make one.
+3. ~~**RFC 9002 recovery.**~~ — done, and wired into the connection. RTT
+   estimation, both loss thresholds, the PTO with its exponential backoff, and
+   NewReno. Pure computation over a caller-supplied `now`, so a probe timeout is
+   tested by moving a number rather than by waiting a second. A handshake now
+   survives a dropped datagram, which is the property the whole document exists
+   for.
 4. **The connection.** The largest item, and the one everything else serves. It
    decomposes into three pieces that are worth building and reviewing apart,
    because two of them are pure data structures with no policy in them:
@@ -235,10 +241,6 @@ all three build legs):
       belong to other slices and are named at the top of `Connection.zig` so a
       reader meets them before the code:
 
-      * **Retransmission.** CRYPTO bytes stay in their send buffer after being
-        framed, so the data a retransmission needs is *held*; what is missing is
-        the loss detection that decides to send it. Slice 3. Until it lands, a
-        handshake over a lossy path stalls.
       * **Flow control and streams.** STREAM, RESET_STREAM and STOP_SENDING are
         refused rather than ignored, so a peer that opens a stream gets an error
         instead of silence. Slice 5.
