@@ -1,0 +1,23 @@
+.{
+    .name = .h3,
+    .version = "0.0.0",
+    .fingerprint = 0x532d9246f2291944, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.16.0",
+    // Zero dependencies beyond the Zig toolchain, and this stays empty.
+    // `scripts/lint.zig` forbids `@cImport`, every buffer is caller-owned, and
+    // the one thing that would otherwise pull a dependency in — packet
+    // protection — is `std.crypto`: AES-GCM, ChaCha20-Poly1305, a raw AES block
+    // for header protection, and HKDF-SHA256 are all in the standard library.
+    // The TLS *handshake* is deliberately not here; see README.md, "Where TLS
+    // attaches".
+    .dependencies = .{},
+    // What ships to a consumer. `fuzz/`, `bench/`, `checks/`, `example/` and
+    // `scripts/` are gates rather than library.
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "LICENSE",
+        "README.md",
+    },
+}

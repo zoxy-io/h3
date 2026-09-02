@@ -1,0 +1,299 @@
+# h3 — design
+
+What this package is, where its edges are, and which decisions are already made
+against which are still open. [README.md](../README.md) is the short version;
+this is the argument behind it.
+
+---
+
+## 1. The scope is five RFCs, not three
+
+The request that started this package named RFC 9114 (HTTP/3), RFC 9204 (QPACK)
+and RFC 9000 (QUIC transport). Two more are here, and they are not scope creep —
+without either one the other three do not run.
+
+**RFC 9001 — Using TLS to Secure QUIC.** RFC 9000 describes packets whose
+payloads are, without exception, encrypted. There is no plaintext mode. The bits
+that say how long a packet number is are themselves protected, so a parser that
+stops at RFC 9000 cannot read a single packet — not even the first Initial, whose
+keys are derived from a salt printed in RFC 9001 and the client's own connection
+identifier. A package containing RFC 9000 and not RFC 9001 is a package that
+cannot parse anything.
+
+**RFC 9002 — Loss Detection and Congestion Control.** QUIC has no retransmission
+in RFC 9000: a lost packet is gone, and it is RFC 9002 that decides what was
+lost and re-sends the frames that were in it. A sender without it stalls at the
+first dropped datagram. For zrk specifically it is worse than a stall — a load
+generator without congestion control does not measure a server, it measures
+whether the network buffered enough.
+
+Both are in `src/quic/`, because they are one protocol with three documents. See
+§3 for what stays outside.
+
+**What each RFC contributes:**
+
+| RFC | What comes from it | Where |
+|---|---|---|
+| 9000 | varints, packet headers, packet numbers, 20 frame types, transport parameters, stream identifiers, error codes | `src/varint.zig`, `src/quic/` |
+| 9001 | Initial secrets, packet protection, header protection, Retry integrity, key update | `src/quic/crypto/` |
+| 9002 | RTT estimation, loss detection, PTO, congestion control | `src/quic/recovery/` *(not yet written — §6)* |
+| 9204 | prefixed integers, static table, field line representations, encoder/decoder streams | `src/qpack/` |
+| 9114 | frame layer, unidirectional stream types, settings, message validation | `src/frame.zig`, `src/stream.zig`, `src/fields.zig` *(the last not yet written)* |
+
+## 2. The boundary moves, compared with h2
+
+h2 keeps the connection state machine *out*: it is a frame codec and HPACK, and
+zoxy and zrk each write their own HTTP/2 connection. That was the right call
+there, because an HTTP/2 connection state machine is thin and mostly policy — a
+few dozen lines of "what do I do about a malformed message", answered
+differently by a proxy and by a load generator.
+
+It is the wrong call here, and this is the single biggest design decision in the
+package. In QUIC the state machine **is** the protocol:
+
+- packet number spaces and the ACK ranges that track them,
+- flow control at two levels, with the connection-level accounting that stops a
+  peer opening a stream to consume the connection's whole window,
+- the amplification limit (RFC 9000 §8.1: three times what an unvalidated
+  address sent) that stops the server being a reflector,
+- loss detection and congestion control,
+- key update, and the AEAD confidentiality and integrity limits (RFC 9001 §6.6)
+  that force one.
+
+Every item on that list is security-critical, and every one of them would be
+written twice — once in zoxy, once in zrk — if this package stopped at codecs.
+Two implementations of the amplification limit is one implementation of the
+amplification limit and a reflector.
+
+So: **h3 owns the QUIC connection.** It stays sans-I/O, allocation-free and
+runtime-agnostic, which is what §3 is about.
+
+## 3. The seam: datagrams in, datagrams and events out
+
+The consumer owns exactly four things this package refuses to touch.
+
+**The socket.** `zig build lint` forbids `std.Io`, `std.posix`, `std.os`,
+`std.net` and `std.fs` under `src/`. zoxy drives libxev completion callbacks and
+zrk drives zio green threads through `std.Io`; a reader, a writer or a file
+descriptor in a signature excludes one of them. The temptation is stronger here
+than it was in h2 — a QUIC stack *wants* to own a UDP socket, because
+`recvmmsg`, GSO and ECN are all socket-level — and the answer is that those are
+the consumer's to use, with this package told the results.
+
+**The clock.** `now` is a parameter, in nanoseconds, on every function whose
+behaviour depends on time. Nothing here calls `clock_gettime`. That is what lets
+zoxy's deterministic simulator drive a QUIC connection on a virtual clock, and
+it is what makes loss recovery testable at all — a PTO that fires after a real
+second is a test nobody runs.
+
+**Randomness.** Connection identifiers, PATH_CHALLENGE payloads, stateless reset
+tokens and the client's initial packet number all need unpredictable bytes.
+This package draws none: they arrive as arguments. Same reason as zssl's
+identical rule — a seeded simulation can replay a connection byte for byte —
+and the same cost, which is that the consumer must actually supply good entropy.
+
+**The TLS handshake.** §4.
+
+**Timers** come back the other way: `Connection.timeout()` answers the absolute
+time the caller must wake it at, and the caller arms whatever its runtime uses.
+
+## 4. Where TLS attaches
+
+QUIC needs TLS 1.3. This package does not implement it, will not implement it,
+and does not depend on a package that does.
+
+The reason is concrete rather than aesthetic: **zoxy uses ztls and zrk uses
+zssl.** They are different libraries with different backends, and neither
+consumer wants the other's linked into its binary. A dependency here on either
+one would make this package unusable by the other consumer — which is the same
+argument that keeps `std.Io` out of the seam, applied to a different axis.
+
+So the handshake attaches as **data, in both directions**:
+
+```
+      consumer's TLS engine                    h3
+    ────────────────────────────────────────────────────────────
+      ClientHello octets            ──▶  cryptoIn(.initial, bytes)
+                                          (framed into CRYPTO frames,
+                                           protected, sent)
+
+      ◀── cryptoOut(.handshake)          CRYPTO frames received at a
+                                          level, reassembled in order
+
+      installSecret(.handshake, .receive, secret, suite)  ──▶
+      installSecret(.handshake, .send,    secret, suite)  ──▶
+
+      transport parameters, as the extension's octets, both ways
+```
+
+No function pointers, no vtable, no callback into the consumer's runtime. Five
+entry points and a `Level` enum, which is why `crypto.Level` and
+`crypto.Secret` are public types rather than internal ones — they are the shared
+vocabulary, not implementation detail.
+
+What the consumer owes in return: certificate verification, hostname checking,
+ALPN, and the decision about 0-RTT. Those are policy, they differ between a
+proxy and a benchmark client, and zrk already carries them for TLS over TCP
+(`src/tls.zig`) — this reuses that work rather than duplicating it.
+
+**Packet protection is a different question and lands the other way.** It is
+computation, not policy: AES-GCM, ChaCha20-Poly1305, one raw AES block for
+header protection, HKDF-SHA256/384. All of it is in `std.crypto`, so
+`src/quic/crypto/` needs no dependency and the `dependencies` table stays empty.
+Keeping the AEAD here rather than in the consumer is not optional either — the
+nonce construction, the header protection sampling offset and the key update
+accounting are where QUIC's cryptographic mistakes live, and they belong beside
+the packet parser that produces their inputs.
+
+## 5. No allocator, with a QUIC-sized asterisk
+
+h2's rule — no `std.mem.Allocator` anywhere in `src/`, every buffer caller-owned
+and caller-sized — carries over unchanged, and `zig build lint` enforces it.
+
+It is harder to keep here, because a QUIC connection has genuinely open-ended
+state: sent-packet records awaiting acknowledgement, stream send and receive
+buffers, an ACK range set, the QPACK dynamic table, and a set of connection
+identifiers per side. The answer is the one zoxy already uses for its own
+memory: **the connection is comptime-parameterised by its limits**, so every
+buffer is a fixed array whose size is a closed-form function of constants the
+consumer picked.
+
+```zig
+const Connection = h3.quic.Connection(.{
+    .streams_bidirectional_max = 128,
+    .stream_receive_buffer_octets = 64 * 1024,
+    .sent_packets_max = 1024,
+    .ack_ranges_max = 32,
+    .connection_ids_max = 8,
+});
+```
+
+That shape is what lets zoxy print a connection's exact footprint at startup,
+which is its whole pitch, and it is why the limits are comptime rather than
+runtime: a `Connection` whose size is not knowable at compile time cannot be
+placed in a pre-allocated arena of them.
+
+The two consumers will pick very different numbers. zrk wants many small
+connections; zoxy wants a bounded arena sized at startup. Neither number belongs
+in this package.
+
+## 6. What is built, and what is next
+
+**Built and tested** (115 unit tests, 10 fuzz targets, `zig build ci` green on
+all three build legs):
+
+- `varint.zig` — RFC 9000 §16, with appendix A.1's vectors.
+- `quic/packet_number.zig` — §17.1, with appendix A.2 and A.3's pseudocode.
+- `quic/ConnectionId.zig` — §5.1.
+- `quic/packet.zig` — §17's headers, both forms, all four long types, Version
+  Negotiation, and unknown versions; parse and write.
+- `quic/frame.zig` — §19's twenty frame types, parse and encode, with §12.4's
+  Table 3 and ACK ranges as an iterator over the wire bytes.
+- `quic/transport_parameters.zig` — §18, with the defaults and the ranges.
+- `quic/error_code.zig` — §20 and RFC 9114 §8.1.
+- `quic/stream_id.zig` — §2.1.
+- `quic/crypto/` — RFC 9001 §5.1, §5.2, §5.3, §5.4, §5.8 and §6.1. **Verified
+  against RFC 9001 appendix A.1's known-answer vectors**: both Initial secrets
+  and all six key/IV/header-key values.
+- `frame.zig`, `stream.zig` — RFC 9114 §6.2, §7.1, §7.2.4, §11.2.
+- `qpack/integer.zig`, `qpack/static_table.zig` — RFC 9204 §4.1.1 and appendix A.
+
+**Next, in the order they unblock each other:**
+
+1. **QPACK field lines and Huffman** (RFC 9204 §4.5, RFC 7541 §5.2). Enough to
+   decode a field section against the static table with the dynamic table
+   disabled, which is what a consumer advertising
+   `SETTINGS_QPACK_MAX_TABLE_CAPACITY = 0` needs — and zrk already makes exactly
+   that choice for HPACK, for exactly the same reason (see `zrk/src/h2conn.zig`,
+   `advertised_header_table_size`). §7 has an open decision about Huffman.
+2. **RFC 9114 §4.3 message validation.** The pseudo-header and field-name rules
+   that decide whether a response is a message at all. Nearly identical to
+   h2's `fields/`, and the same request-smuggling surface.
+3. **RFC 9002 recovery.** RTT, loss detection, PTO, and NewReno. Pure
+   computation over a caller-supplied `now`, so it is testable without a socket.
+4. **The connection.** Packet number spaces, ACK generation, CRYPTO stream
+   reassembly, flow control, the amplification limit, and the key update. This
+   is the largest slice and the one everything above exists to serve.
+5. **Streams and the HTTP/3 request layer.** Reassembly, `MAX_STREAM_DATA`
+   accounting, and the request/response mapping.
+6. **QPACK dynamic table**, encoder and decoder streams, blocked streams.
+
+**Corpus, before slice 4.** RFC 9001 appendix A carries complete worked packets —
+a client Initial, a server Initial, a Retry, and a ChaCha20-Poly1305 short
+header. They are not transcribed here yet: the appendix's key schedule values
+are (and pass), but the full packets are hundreds of octets each and belong in a
+`corpus/` directory alongside vendored encodings from other implementations, the
+way h2 does it. That is a gate, not a nicety — an implementation that passes its
+own round-trip tests and fails someone else's packet is an implementation that
+does not interoperate.
+
+## 7. Open decisions
+
+**Huffman: port, share, or rewrite?** RFC 9204 §4.1.2 uses RFC 7541's Huffman
+table unchanged — the same 256 codes h2 already implements, vectorised, fuzzed,
+and benchmarked. Three options:
+
+1. *Copy it into `src/qpack/huffman.zig`.* Keeps the empty dependency table.
+   Costs a second copy of 900 lines that must be kept in step; a bug fixed in
+   one is a bug still live in the other.
+2. *Depend on `zoxy-io/h2`.* One implementation, one fuzz corpus. Costs the "zero
+   dependencies" policy — although h2 itself has none, so the graph stays one
+   deep and both consumers already pull h2 in.
+3. *Extract `zoxy-io/hpack-primitives`.* Cleanest, and the most work; probably
+   right only if a third consumer appears.
+
+Recommendation: **(2)**, with the policy restated as "no dependency outside the
+organisation, and none that pulls in a runtime or a libcrypto". h2 is a
+zero-dependency codec both consumers already build. This wants a decision before
+slice 1 of the roadmap starts, because it decides where the file goes.
+
+**Does `-Dassertions=false` still make sense here?** In h2 the argument for it is
+that zrk is a latency-measuring tool and HPACK decode is on its hot path. Here
+the hot path includes packet protection, where the per-packet cost is dominated
+by the AEAD rather than by invariant checks. The option is implemented and
+defaults to on; the first measurement says the trade is much weaker than it was
+in h2 (`zig build bench -Druns=3 -Diterations=1000000`, one laptop, so read the
+shape rather than the digits):
+
+| row | assertions on | assertions off | delta |
+|---|---:|---:|---:|
+| varint decode | 3.84 ns | 2.85 ns | −1.0 ns |
+| quic frame parse | 8.63 ns | 2.93 ns | −5.7 ns |
+| http3 frame header | 2.94 ns | 2.62 ns | −0.3 ns |
+| packet seal (aes-128-gcm) | 389.3 ns | 386.9 ns | within noise |
+| packet seal+open | 941.0 ns | 937.3 ns | within noise |
+
+A packet costs ~390 ns to seal and carries many frames; the assertions save a
+few nanoseconds per frame against that. So the argument that carried in h2 —
+"decode is new mandatory cost on zrk's hot path" — does not obviously carry
+here, and turning the checks off in a stack that manages nonces wants a better
+reason than habit. **Recommendation: zrk inherits the default (on) until a
+profile of a real run says otherwise.** This is a change from what zrk does with
+h2, and it should be a deliberate one.
+
+**How much of RFC 9002 is policy?** NewReno is the RFC's own algorithm and
+belongs here. CUBIC and BBR are not in RFC 9002 at all, and a load generator and
+a proxy may reasonably want different ones. The likely shape is a
+comptime-selected controller behind a small interface, with NewReno as the only
+one shipped — but that is a decision for slice 3, informed by what the pluggable
+seam actually costs.
+
+## 8. Threat model
+
+The same as h2's, for the same reason: **write every parser for zoxy's threat
+model**, which is the open internet, on the assumption that the peer is trying
+to make this code allocate, loop, or read out of bounds. zrk's inputs are
+friendlier, but a stack with two threat models is a stack with one threat model
+and a bug.
+
+QUIC adds two surfaces h2 did not have, and they are worth naming because they
+are not parser bugs:
+
+- **Amplification.** An unvalidated address must not receive more than three
+  times what it sent (RFC 9000 §8.1), or the server is a DDoS reflector for
+  anyone who can spoof a source address. This is connection state, not parsing,
+  which is part of why §2 puts the connection in this package.
+- **Key commitment.** RFC 9001 §6.6 sets confidentiality and integrity limits
+  per key — a count of packets sealed, and a count of failed authentications
+  tolerated. Exceeding either is a connection error. They are counters that no
+  parser test would catch and that a consumer would not think to write.

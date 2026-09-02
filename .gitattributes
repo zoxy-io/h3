@@ -1,0 +1,6 @@
+# Check out with LF on every platform. GitHub's Windows runners set
+# core.autocrlf=true, which rewrites every line ending on checkout and makes
+# `zig fmt --check` reject the entire tree — zig fmt requires LF. Without this
+# the format gate is unrunnable on a third of the CI matrix, and a contributor
+# on Windows commits a whole-file diff the first time they touch anything.
+* text=auto eol=lf
