@@ -159,10 +159,11 @@ The reasoning behind each is in [docs/DESIGN.md](docs/DESIGN.md).
 ## Building and testing
 
 ```sh
-zig build ci                                             # fmt, unit tests, fuzz corpus, RFC corpus, example, lint
+zig build ci                                             # fmt, unit tests, fuzz corpus, RFC corpus, example, lint, requirements
 zig build ci -Doptimize=ReleaseFast                      # release, assertions on
 zig build ci -Doptimize=ReleaseFast -Dassertions=false   # release, assertions off
 zig build fuzz --fuzz                                    # coverage-guided fuzzing
+zig build requirements                                   # RFC citations against the vendored specs in specs/
 zig build bench                                          # packet protection and codec microbenchmarks
 zig build fmt-fix                                        # reformat
 ```
