@@ -45,6 +45,9 @@ pub fn main(init: std.process.Init) !void {
     run(io, "quic frame parse", benchFrameParse);
     run(io, "http3 frame header", benchHttp3Header);
     run(io, "qpack static lookup", benchStaticLookup);
+    run(io, "reassemble in order", benchReassembleOrdered);
+    run(io, "reassemble reordered", benchReassembleReordered);
+    run(io, "ack record + write", benchAckRanges);
     run(io, "packet seal (aes-128-gcm)", benchSeal);
     run(io, "packet seal+open (aes-128-gcm)", benchOpen);
 }
@@ -170,6 +173,74 @@ fn benchOpen(iterations: u64) u64 {
         const total = keys.seal(&datagram, written.packet_number_offset, written.header_octets, bench_payload_octets, index) catch unreachable; // As above.
         const opened = keys.open(datagram[0..total], written.packet_number_offset, index -| 1) catch unreachable; // Just sealed with these keys.
         sink +%= opened.payload.len;
+    }
+    return sink;
+}
+
+/// A response body's shape: 1 KiB chunks into a 16 KiB window, drained as they
+/// arrive. The drain is what makes `consume` free — it moves only the octets
+/// still held, and a reader that takes everything readable leaves none.
+const BenchStream = quic.Reassembler(.{ .capacity = 16 * 1024, .spans_max = 16 });
+const bench_chunk_octets = 1024;
+
+fn benchReassembleOrdered(iterations: u64) u64 {
+    var chunk: [bench_chunk_octets]u8 = @splat(0xab);
+    var sink: u64 = 0;
+    var index: u64 = 0;
+    while (index < iterations) : (index += 1) {
+        std.mem.doNotOptimizeAway(&chunk);
+        var stream: BenchStream = .{};
+        var offset: u64 = 0;
+        while (offset < 8 * bench_chunk_octets) : (offset += bench_chunk_octets) {
+            stream.push(offset, &chunk) catch unreachable; // Eight chunks into a sixteen-chunk window.
+            const ready = stream.readable();
+            sink +%= ready.len;
+            stream.consume(ready.len);
+        }
+    }
+    return sink;
+}
+
+/// The same bytes with every pair of chunks swapped, which is what one
+/// reordering event on the path looks like. The gap holds the run back until
+/// the missing chunk lands, so this measures the span bookkeeping rather than
+/// the copy.
+fn benchReassembleReordered(iterations: u64) u64 {
+    var chunk: [bench_chunk_octets]u8 = @splat(0xab);
+    var sink: u64 = 0;
+    var index: u64 = 0;
+    while (index < iterations) : (index += 1) {
+        std.mem.doNotOptimizeAway(&chunk);
+        var stream: BenchStream = .{};
+        var pair: u64 = 0;
+        while (pair < 4) : (pair += 1) {
+            const first = pair * 2 * bench_chunk_octets;
+            stream.push(first + bench_chunk_octets, &chunk) catch unreachable; // As above.
+            stream.push(first, &chunk) catch unreachable; // As above.
+            const ready = stream.readable();
+            sink +%= ready.len;
+            stream.consume(ready.len);
+        }
+    }
+    return sink;
+}
+
+const BenchAck = quic.AckRanges(.{ .ranges_max = 32 });
+
+/// Every other packet number, which is the shape that costs one range each and
+/// the shape a peer would choose to make this expensive.
+fn benchAckRanges(iterations: u64) u64 {
+    var target: [512]u8 = undefined;
+    var sink: u64 = 0;
+    var index: u64 = 0;
+    while (index < iterations) : (index += 1) {
+        var set: BenchAck = .{};
+        var number: u64 = 0;
+        while (number < 64) : (number += 2) {
+            set.record(number, 0, true);
+        }
+        const written = set.write(&target, 0, 3) catch unreachable; // The target holds thirty-two ranges.
+        sink +%= written.octets;
     }
     return sink;
 }

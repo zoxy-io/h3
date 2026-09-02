@@ -51,6 +51,11 @@ const input_max = 2048;
 /// The largest local connection identifier a short-header parse is offered.
 const local_connection_id_octets_max = 20;
 
+/// Operations in one reassembler or ack-range sequence, so a failing case stays
+/// short enough to read.
+const reassembler_operations_max = 64;
+const ack_operations_max = 128;
+
 /// Frames drawn into one payload, and settings into one SETTINGS frame.
 const settings_max = 16;
 
@@ -325,4 +330,148 @@ fn fuzzStaticTable(_: void, smith: *std.testing.Smith) !void {
 
 test "static table: get and lookup agree on every index" {
     try std.testing.fuzz({}, fuzzStaticTable, .{});
+}
+
+/// The reassembler against a model of what it should hold.
+///
+/// The model is a filled-map and a shadow buffer, which is a different
+/// implementation of the same idea — so an agreement between them is evidence
+/// rather than a tautology. The properties that matter are the ones a stream
+/// consumer depends on: what `readable` returns is exactly the octets pushed at
+/// those offsets, and the run it returns is the *longest* contiguous one, not
+/// merely a contiguous one.
+fn fuzzReassembler(_: void, smith: *std.testing.Smith) !void {
+    const capacity = 64;
+    const Stream = quic.Reassembler(.{ .capacity = capacity, .spans_max = 8 });
+    var stream: Stream = .{};
+
+    var filled: [capacity]bool = @splat(false);
+    var shadow: [capacity]u8 = @splat(0);
+    var base: u64 = 0;
+
+    var operations: u32 = 0;
+    while (operations < reassembler_operations_max and !smith.eosWeightedSimple(8, 1)) : (operations += 1) {
+        switch (smith.value(enum { push, consume })) {
+            .push => {
+                const offset = base + smith.valueRangeAtMost(u8, 0, capacity);
+                var chunk: [capacity]u8 = undefined;
+                const length = @min(smith.slice(&chunk), capacity);
+
+                // The model decides what the answer should be, before the
+                // structure is asked.
+                const relative = offset - base;
+                const fits = relative + length <= capacity;
+                var contradicts = false;
+                if (fits) {
+                    for (chunk[0..length], 0..) |octet, index| {
+                        const at = relative + index;
+                        if (filled[at] and shadow[at] != octet) contradicts = true;
+                    }
+                }
+
+                if (stream.push(offset, chunk[0..length])) {
+                    assert(fits);
+                    assert(!contradicts);
+                    for (chunk[0..length], 0..) |octet, index| {
+                        filled[relative + index] = true;
+                        shadow[relative + index] = octet;
+                    }
+                } else |err| switch (err) {
+                    error.BeyondWindow => assert(!fits),
+                    error.Inconsistent => assert(contradicts),
+                    // Running out of spans is a property of the structure's
+                    // bound rather than of the model, so it is admitted
+                    // without a prediction.
+                    error.TooFragmented => {},
+                    error.FinalSizeViolated => unreachable, // This target never calls `finish`.
+                }
+            },
+            .consume => {
+                const ready = stream.readable();
+                const take = if (ready.len == 0) 0 else smith.valueRangeAtMost(u8, 0, @intCast(ready.len));
+                stream.consume(take);
+                if (take > 0) {
+                    std.mem.copyForwards(bool, filled[0 .. capacity - take], filled[take..]);
+                    std.mem.copyForwards(u8, shadow[0 .. capacity - take], shadow[take..]);
+                    @memset(filled[capacity - take ..], false);
+                    base += take;
+                }
+            },
+        }
+
+        // The contiguous run is exactly what the model says it is.
+        var expected: usize = 0;
+        while (expected < capacity and filled[expected]) expected += 1;
+        const ready = stream.readable();
+        assert(ready.len == expected);
+        assert(std.mem.eql(u8, ready, shadow[0..expected]));
+        assert(stream.readOffset() == base);
+        assert(stream.limit() == base + capacity);
+    }
+}
+
+test "reassembler: the contiguous run is what was pushed, in order" {
+    try std.testing.fuzz({}, fuzzReassembler, .{});
+}
+
+/// The ack range set, against the one property whose violation breaks a peer.
+///
+/// **Never acknowledge a packet that did not arrive.** A spurious
+/// acknowledgement tells the peer a lost packet was delivered, so it never
+/// retransmits and the stream stalls forever — a liveness failure the peer
+/// cannot diagnose and this endpoint cannot see. Everything else here is an
+/// invariant; this is the oracle.
+fn fuzzAckRanges(_: void, smith: *std.testing.Smith) !void {
+    const window = 256;
+    const Set = quic.AckRanges(.{ .ranges_max = 8 });
+    var set: Set = .{};
+    var received: [window]bool = @splat(false);
+
+    var operations: u32 = 0;
+    while (operations < ack_operations_max and !smith.eosWeightedSimple(8, 1)) : (operations += 1) {
+        const number = smith.valueRangeAtMost(u8, 0, window - 1);
+        set.record(number, 0, smith.value(bool));
+        received[number] = true;
+
+        // Descending, non-overlapping, separated by at least one number.
+        assert(set.count <= 8);
+        var index: u32 = 1;
+        while (index < set.count) : (index += 1) {
+            assert(set.ranges[index - 1].smallest > set.ranges[index].largest + 1);
+            assert(set.ranges[index].largest >= set.ranges[index].smallest);
+        }
+        // Everything held was received. The set may *forget* a low range, which
+        // is legal; it may never invent one.
+        for (set.ranges[0..set.count]) |range| {
+            var at = range.smallest;
+            while (at <= range.largest) : (at += 1) assert(received[at]);
+        }
+    }
+    if (set.count == 0) return;
+
+    // The largest is the largest, and it is never forgotten: section 13.2.1
+    // forbids reneging on an acknowledgement already sent.
+    var highest: u64 = 0;
+    for (received, 0..) |seen, number| if (seen) {
+        highest = number;
+    };
+    assert(set.largest().? == highest);
+
+    // A rendered frame acknowledges only packets that arrived.
+    var target: [256]u8 = undefined;
+    const written = set.write(&target, 0, 3) catch return;
+    const parsed = h3.quic.frame.parse(target[0..written.octets]) catch unreachable; // Written by this package's own encoder.
+    var ranges = parsed.frame.ack.iterate();
+    var previous: ?u64 = null;
+    while (ranges.next() catch null) |range| {
+        assert(range.smallest <= range.largest);
+        if (previous) |lower| assert(range.largest < lower);
+        previous = range.smallest;
+        var at = range.smallest;
+        while (at <= range.largest) : (at += 1) assert(received[at]);
+    }
+}
+
+test "ack ranges: never acknowledge a packet that did not arrive" {
+    try std.testing.fuzz({}, fuzzAckRanges, .{});
 }

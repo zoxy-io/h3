@@ -197,6 +197,11 @@ all three build legs):
   and all six key/IV/header-key values.
 - `frame.zig`, `stream.zig` — RFC 9114 §6.2, §7.1, §7.2.4, §11.2.
 - `corpus/` — RFC 9001 appendix A's four worked packets, octet for octet.
+- `quic/Reassembler.zig` — ordered byte reassembly, for the CRYPTO stream and
+  for every request and response stream. Section 2.2's "data at an offset never
+  changes" and section 4.5's final size.
+- `quic/AckRanges.zig` — the received-packet set for one number space, and the
+  ACK frames rendered from it (sections 13.2 and 19.3).
 - `qpack/static_table.zig` — RFC 9204 appendix A. §4.1.1's integer and §4.1.2's
   Huffman code come from zoxy-io/hpack and are re-exported by `qpack.zig`.
 
@@ -217,17 +222,12 @@ all three build legs):
    decomposes into three pieces that are worth building and reviewing apart,
    because two of them are pure data structures with no policy in them:
 
-   a. **`Reassembler`** — offset-and-data chunks in, ordered bytes out. Serves
-      the CRYPTO stream during the handshake *and* every request stream after
-      it, so it is written once. This is where overlapping and duplicate
-      offsets bite, and it is bounded by a comptime capacity like everything
-      else here.
-   b. **`AckRanges`** — the set of packet numbers received in one space, and
-      the ACK frames generated from it. Three instances per connection, one per
-      space. The bound matters: a peer that acknowledges every other packet
-      makes this grow without one.
-   c. **The connection itself** — the state machine over (a) and (b), plus
-      flow control, the amplification limit and the key update.
+   a. ~~**`Reassembler`**~~ — done.
+   b. ~~**`AckRanges`**~~ — done.
+   c. **The connection itself** — the state machine over those two, plus the
+      CRYPTO stream per encryption level, flow control, the amplification limit
+      (section 8.1) and the key update (RFC 9001 section 6). This is what is
+      left of slice 4, and it is now assembly rather than invention.
 5. **Streams and the HTTP/3 request layer.** Reassembly, `MAX_STREAM_DATA`
    accounting, and the request/response mapping.
 6. **QPACK dynamic table**, encoder and decoder streams, blocked streams.
