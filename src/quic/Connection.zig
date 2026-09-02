@@ -81,6 +81,11 @@ const lost_report_max: usize = 32;
 /// transport parameters are decoded.
 const ack_delay_exponent_default: u6 = 3;
 
+/// The suite Initial and Handshake packets are always protected with (RFC 9001
+/// section 5.2), named so `countSealed` does not have to guess at a level whose
+/// suite was never negotiated.
+const secrets_suite_initial: crypto.Suite = crypto.secrets.initial_suite;
+
 /// The largest acknowledgement delay this endpoint will believe.
 ///
 /// An ACK frame's Delay field is a variable-length integer, so a peer may send
@@ -219,6 +224,33 @@ pub fn Connection(comptime config: Config) type {
         stream_fin: bool = false,
     };
 
+    // RFC 9001 section 6: 1-RTT keys come in generations, and the Key Phase
+    // bit of a short header says which one protected a packet. Nothing below
+    // 1-RTT updates — those levels are discarded long before any limit is near.
+    const OneRtt = struct {
+        send_secret: ?crypto.secrets.Secret = null,
+        receive_secret: ?crypto.secrets.Secret = null,
+        suite: crypto.Suite = .aes_128_gcm_sha256,
+        /// The phase this endpoint is sending with.
+        phase: bool = false,
+        /// The generation before the current one, kept so packets reordered
+        /// across an update still decrypt (section 6.3).
+        previous_receive: ?crypto.Keys = null,
+        /// The generation after, derived in advance rather than on demand.
+        /// Section 6.3: deriving keys inside the receive path is a timing
+        /// signal that leaks when an update happened, and therefore the
+        /// value of a bit that is otherwise protected.
+        next_receive: ?crypto.Keys = null,
+        /// Packets sealed under the current send key, for section 6.6's
+        /// confidentiality limit. Reset by an update, because the limit is
+        /// per key rather than per connection.
+        sealed: u64 = 0,
+        /// Section 6.1: no second update until a packet sent in the current
+        /// phase has been acknowledged, so that both peers are known to
+        /// hold the keys before another one begins.
+        phase_acknowledged: bool = true,
+    };
+
     const ConnectionStreams = StreamsOf(.{
         .streams_max = config.streams_max,
         .receive_octets = config.stream_receive_octets,
@@ -256,6 +288,15 @@ pub fn Connection(comptime config: Config) type {
         /// The Destination the client used first, which is what the Initial
         /// keys derive from and what a Retry's integrity tag binds.
         original_destination: ConnectionId,
+
+        one_rtt: OneRtt = .{},
+        /// Packets sealed per level, for section 6.6. The 1-RTT count lives in
+        /// `one_rtt.sealed`, because it belongs to a generation rather than to
+        /// the level.
+        sealed: [Level.count]u64 = @splat(0),
+        /// Section 6.6: packets that failed authentication, "within the
+        /// connection, across all keys" — so one counter, not one per key.
+        forgeries: u64 = 0,
 
         send_keys: [Level.count]?crypto.Keys = @splat(null),
         receive_keys: [Level.count]?crypto.Keys = @splat(null),
@@ -356,6 +397,25 @@ pub fn Connection(comptime config: Config) type {
                 self.state = .established;
                 self.recovery.handshake_confirmed = true;
             }
+
+            // Section 6 needs the secret, not just the keys: the next
+            // generation is `HKDF-Expand-Label(secret, "quic ku", "", len)`, so
+            // a connection that kept only the derived keys could never update.
+            if (level == .one_rtt) {
+                self.one_rtt.suite = suite;
+                switch (direction) {
+                    .send => self.one_rtt.send_secret = secret.*,
+                    .receive => {
+                        self.one_rtt.receive_secret = secret.*;
+                        // Derived now rather than when a phase change arrives;
+                        // see the note on `next_receive`. Through
+                        // `nextGeneration`, which keeps the header protection
+                        // key — section 6.1 does not update it.
+                        const next = crypto.secrets.update(suite, secret);
+                        self.one_rtt.next_receive = keys.nextGeneration(suite, &next);
+                    },
+                }
+            }
         }
 
         /// Queue handshake bytes for sending at `level`.
@@ -394,6 +454,51 @@ pub fn Connection(comptime config: Config) type {
 
         // ------------------------------------------------------------ receive
 
+        /// RFC 9001 section 6.1: move to the next generation of 1-RTT keys.
+        ///
+        /// Both directions at once. The Key Phase bit is one bit shared by both
+        /// peers, so an endpoint that updated only its write keys would be
+        /// sending in a phase its own reader does not recognise.
+        pub fn updateKeys(self: *Self) void {
+            const one = &self.one_rtt;
+            const send_secret = one.send_secret orelse return;
+            const receive_secret = one.receive_secret orelse return;
+
+            const next_send = crypto.secrets.update(one.suite, &send_secret);
+            const next_receive = crypto.secrets.update(one.suite, &receive_secret);
+
+            // The outgoing generation is kept for reading, not for writing:
+            // section 6.3 expects reordered packets from the old phase for up
+            // to a PTO after the update.
+            const current_send = self.send_keys[@intFromEnum(Level.one_rtt)] orelse return;
+            const current_receive = self.receive_keys[@intFromEnum(Level.one_rtt)] orelse return;
+
+            // Every generation below is built with `nextGeneration`, which
+            // carries the header protection key forward. Section 6.1 does not
+            // update it, and a fresh one makes the peer unable to unmask the
+            // very bit that announces the update.
+            one.previous_receive = current_receive;
+            self.send_keys[@intFromEnum(Level.one_rtt)] = current_send.nextGeneration(one.suite, &next_send);
+            self.receive_keys[@intFromEnum(Level.one_rtt)] = one.next_receive orelse
+                current_receive.nextGeneration(one.suite, &next_receive);
+
+            one.send_secret = next_send;
+            one.receive_secret = next_receive;
+            const after = crypto.secrets.update(one.suite, &next_receive);
+            one.next_receive = current_receive.nextGeneration(one.suite, &after);
+
+            one.phase = !one.phase;
+            one.sealed = 0;
+            one.phase_acknowledged = false;
+        }
+
+        /// Whether section 6.1 permits this endpoint to start an update.
+        pub fn canUpdateKeys(self: *const Self) bool {
+            if (self.state != .established) return false; // Section 6.1: not before the handshake is confirmed.
+            if (!self.one_rtt.phase_acknowledged) return false;
+            return self.one_rtt.send_secret != null and self.one_rtt.receive_secret != null;
+        }
+
         pub const ReceiveError = error{
             /// A frame that section 12.4 does not permit at this encryption
             /// level, a reserved bit set, or a malformed frame.
@@ -411,6 +516,10 @@ pub fn Connection(comptime config: Config) type {
             /// Section 4.6: more streams than this endpoint tracks.
             /// `STREAM_LIMIT_ERROR`.
             StreamLimit,
+            /// RFC 9001 section 6.6: too many packets failed authentication, or
+            /// a key reached its confidentiality limit with no update possible.
+            /// `AEAD_LIMIT_REACHED`, and the connection stops here.
+            AeadLimitReached,
         };
 
         /// Take one UDP datagram.
@@ -444,7 +553,14 @@ pub fn Connection(comptime config: Config) type {
             const keys = self.receive_keys[index] orelse return; // No keys yet: discard.
 
             const space = &self.spaces[@intFromEnum(level.space())];
-            const opened = keys.open(bytes, offset, space.received.largest()) catch return;
+            const opened = self.openPacket(level, keys, bytes, offset, space.received.largest()) catch |err| switch (err) {
+                // Section 5.4: a packet that fails to authenticate is discarded,
+                // never a connection error — an off-path attacker can inject
+                // one at will, so closing on it is the attack rather than the
+                // defence. The counter is what bounds how long that can go on.
+                error.Discard => return,
+                error.AeadLimitReached => return error.AeadLimitReached,
+            };
 
             // Section 12.3: a duplicate is discarded rather than reprocessed,
             // which is what stops a replayed packet from counting twice toward
@@ -466,6 +582,59 @@ pub fn Connection(comptime config: Config) type {
                     else => {},
                 }
             }
+        }
+
+        /// Remove protection, choosing the 1-RTT generation the Key Phase bit
+        /// names, and count a failure against section 6.6's integrity limit.
+        fn openPacket(
+            self: *Self,
+            level: Level,
+            keys: crypto.Keys,
+            bytes: []u8,
+            offset: usize,
+            largest: ?u64,
+        ) error{ Discard, AeadLimitReached }!crypto.Keys.Opened {
+            // Header protection first and on its own: RFC 9001 section 6.1
+            // keeps the header protection key across an update, so this works
+            // whichever generation protected the payload.
+            const header = keys.unprotectHeader(bytes, offset, largest) catch return error.Discard;
+
+            if (level != .one_rtt) {
+                return keys.decrypt(bytes, header) catch return self.countForgery();
+            }
+
+            const one = &self.one_rtt;
+            if (header.key_phase == one.phase) {
+                return keys.decrypt(bytes, header) catch return self.countForgery();
+            }
+
+            // A phase that is not ours is either the peer starting an update or
+            // a packet reordered from before ours. Both carry the opposite bit,
+            // so there is nothing to tell them apart but trying: the next
+            // generation first, then the previous.
+            if (one.next_receive) |next| {
+                if (next.decrypt(bytes, header)) |opened| {
+                    // Section 6.2: a packet that opens under the next generation
+                    // *is* the peer's update, and this endpoint follows it.
+                    self.updateKeys();
+                    return opened;
+                } else |_| {}
+            }
+            if (one.previous_receive) |previous| {
+                if (previous.decrypt(bytes, header)) |opened| return opened else |_| {}
+            }
+            return self.countForgery();
+        }
+
+        /// Section 6.6: count a packet that failed authentication, and close
+        /// the connection once the integrity limit for the suite is passed.
+        fn countForgery(self: *Self) error{ Discard, AeadLimitReached } {
+            self.forgeries += 1;
+            if (self.forgeries > crypto.integrityLimit(self.one_rtt.suite)) {
+                self.close(.aead_limit_reached);
+                return error.AeadLimitReached;
+            }
+            return error.Discard;
         }
 
         /// Walk the frames of one payload, returning whether any was
@@ -496,6 +665,10 @@ pub fn Connection(comptime config: Config) type {
                     // never were.
                     if (value.largest >= space.next) return error.Protocol;
                     space.largest_acked = @max(space.largest_acked orelse 0, value.largest);
+                    // Section 6.1: a second update waits for an acknowledgement
+                    // of something sent in the current phase, which is what
+                    // proves the peer has these keys.
+                    if (level == .one_rtt) self.one_rtt.phase_acknowledged = true;
 
                     // Section 13.2.5: the delay is in microseconds, scaled by
                     // the exponent the peer advertised. Until the transport
@@ -737,6 +910,38 @@ pub fn Connection(comptime config: Config) type {
             return offset;
         }
 
+        /// Section 6.6: count a packet sealed under the current key, and act
+        /// before the confidentiality limit is passed rather than after.
+        ///
+        /// "Endpoints MUST initiate a key update before sending more protected
+        /// packets than the confidentiality limit for the selected AEAD
+        /// permits. If a key update is not possible or integrity limits are
+        /// reached, the endpoint MUST stop using the connection... It is
+        /// RECOMMENDED that endpoints immediately close the connection with a
+        /// connection error of type AEAD_LIMIT_REACHED before reaching a state
+        /// where key updates are not possible."
+        ///
+        /// So: update if section 6.1 allows one, and close if it does not.
+        /// Below 1-RTT there is no update to make — those levels hold a
+        /// handshake, are discarded early, and cannot approach the limit — so
+        /// reaching it there is a close.
+        fn countSealed(self: *Self, level: Level) void {
+            if (level != .one_rtt) {
+                self.sealed[@intFromEnum(level)] += 1;
+                if (self.sealed[@intFromEnum(level)] >= crypto.confidentialityLimit(secrets_suite_initial)) {
+                    self.close(.aead_limit_reached);
+                }
+                return;
+            }
+            self.one_rtt.sealed += 1;
+            if (self.one_rtt.sealed < crypto.confidentialityLimit(self.one_rtt.suite)) return;
+            if (self.canUpdateKeys()) {
+                self.updateKeys();
+                return;
+            }
+            self.close(.aead_limit_reached);
+        }
+
         /// Section 8.1: what a server may still send before the address is
         /// validated. A client, and a validated server, are unbounded here and
         /// bounded by the datagram size instead.
@@ -810,6 +1015,7 @@ pub fn Connection(comptime config: Config) type {
                 return error.Empty;
             };
             space.next += 1;
+            self.countSealed(level);
 
             // Section 2 of RFC 9002: a packet is in flight when it is
             // ack-eliciting or padded, and only ack-eliciting packets oblige
@@ -841,6 +1047,10 @@ pub fn Connection(comptime config: Config) type {
                     .destination = self.destination,
                     .number = number,
                     .number_octets = number_octets,
+                    // Section 6: the bit that tells the peer which generation
+                    // sealed this packet. Without it an update is invisible and
+                    // the peer decrypts with the wrong keys.
+                    .key_phase = self.one_rtt.phase,
                 }),
                 .initial, .handshake => packet.writeLong(buffer, .{
                     .long_type = if (level == .initial) .initial else .handshake,
@@ -1854,4 +2064,143 @@ test "a lost FIN is sent again even though it carries no octets" {
     client.onTimeout(at);
     _ = try deliver(&client, &server, at);
     try testing.expect(server.findStream(0).?.receive_state != .receiving);
+}
+
+test "RFC 9001 section 6: a key update crosses the wire and the peer follows" {
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+    try testing.expect(!client.one_rtt.phase);
+
+    // Before: an ordinary packet in phase 0.
+    _ = try client.write(0, "before", false);
+    _ = try deliver(&client, &server, 1000);
+    try testing.expectEqualStrings("before", server.readable(0));
+    try server.consume(0, server.readable(0).len);
+
+    // Section 6.1: the update toggles the phase and moves both directions —
+    // the Key Phase bit is one bit shared by both peers.
+    try testing.expect(client.canUpdateKeys());
+    client.updateKeys();
+    try testing.expect(client.one_rtt.phase);
+    try testing.expect(client.one_rtt.previous_receive != null);
+
+    _ = try client.write(0, "after", false);
+    var datagram: [TestConnection.datagram_octets]u8 = @splat(0);
+    const octets = try client.send(&datagram, 2000);
+    // The bit is under header protection, so it is not readable here — what is
+    // checkable is that the server follows it without being told.
+    try server.receive(datagram[0..octets], 2000);
+    try testing.expectEqualStrings("after", server.readable(0));
+    // Section 6.2: opening under the next generation *is* the peer's update,
+    // so the server moved with it.
+    try testing.expect(server.one_rtt.phase);
+}
+
+test "section 6.3: a packet reordered from before an update still opens" {
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+
+    // Sealed in phase 0, then held back while the client updates.
+    _ = try client.write(0, "early", false);
+    var held: [TestConnection.datagram_octets]u8 = @splat(0);
+    const held_octets = try client.send(&held, 1000);
+
+    client.updateKeys();
+    _ = try client.write(0, "", false);
+
+    // The old packet arrives after the update. Section 6.3 expects exactly this
+    // for up to a PTO, which is why the outgoing generation is kept for reading.
+    try server.receive(held[0..held_octets], 2000);
+    try testing.expectEqualStrings("early", server.readable(0));
+    // And it did not drag the server's phase along with it.
+    try testing.expect(!server.one_rtt.phase);
+}
+
+test "section 6.1: no second update until the first is acknowledged" {
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+
+    try testing.expect(client.canUpdateKeys());
+    client.updateKeys();
+    // Until something sent in this phase comes back acknowledged, the peer is
+    // not known to hold the keys — a second update would leave it two
+    // generations behind with only one bit to describe the gap.
+    try testing.expect(!client.canUpdateKeys());
+
+    _ = try client.write(0, "x", false);
+    _ = try deliver(&client, &server, 1000);
+    _ = try deliver(&server, &client, 2000); // carries the ACK
+    try testing.expect(client.canUpdateKeys());
+}
+
+test "section 6.6: the confidentiality limit updates keys rather than closing" {
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+
+    // The real limit is 2^23 packets; reaching it honestly would be a very long
+    // test, so the counter is placed one short of it.
+    client.one_rtt.sealed = crypto.confidentialityLimit(client.one_rtt.suite) - 1;
+    const phase_before = client.one_rtt.phase;
+
+    _ = try client.write(0, "trigger", false);
+    var datagram: [TestConnection.datagram_octets]u8 = @splat(0);
+    _ = try client.send(&datagram, 1000);
+
+    // "Endpoints MUST initiate a key update before sending more protected
+    // packets than the confidentiality limit permits."
+    try testing.expect(client.one_rtt.phase != phase_before);
+    try testing.expectEqual(@as(u64, 0), client.one_rtt.sealed);
+    try testing.expectEqual(State.established, client.state);
+}
+
+test "section 6.6: the confidentiality limit closes when no update is possible" {
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+    client.one_rtt.sealed = crypto.confidentialityLimit(client.one_rtt.suite) - 1;
+    // An update already in flight and unacknowledged, so section 6.1 forbids
+    // another. The RFC's instruction then is to close rather than to keep
+    // sealing past the limit.
+    client.one_rtt.phase_acknowledged = false;
+
+    _ = try client.write(0, "trigger", false);
+    var datagram: [TestConnection.datagram_octets]u8 = @splat(0);
+    _ = try client.send(&datagram, 1000);
+    try testing.expectEqual(State.closing, client.state);
+    try testing.expectEqual(@intFromEnum(error_code.Transport.aead_limit_reached), client.close_code);
+}
+
+test "section 6.6: forgeries past the integrity limit close the connection" {
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+
+    // A real packet with one payload octet flipped. It has to get *past* header
+    // unprotection to be an authentication failure at all — an unsealed packet
+    // fails the reserved-bits check first, which is a malformed header rather
+    // than a forgery and rightly does not count.
+    _ = try client.write(0, "payload that is long enough to sample", false);
+    var datagram: [TestConnection.datagram_octets]u8 = @splat(0);
+    const octets = try client.send(&datagram, 1000);
+    datagram[octets - 1] ^= 0x01;
+
+    // Section 5.4 says one failed packet is a discard, not an error: an
+    // off-path attacker can inject them at will, so closing on one is the
+    // attack. Section 6.6's counter is what bounds how long that can go on.
+    // The real limit is 2^52, so the counter starts one short of it.
+    server.forgeries = crypto.integrityLimit(server.one_rtt.suite) - 1;
+    var first = datagram;
+    try server.receive(first[0..octets], 1000);
+    try testing.expectEqual(State.established, server.state);
+    try testing.expectEqual(crypto.integrityLimit(server.one_rtt.suite), server.forgeries);
+
+    // The one that passes the limit closes the connection and stops processing.
+    var again = datagram;
+    try testing.expectError(error.AeadLimitReached, server.receive(again[0..octets], 2000));
+    try testing.expectEqual(State.closing, server.state);
+    try testing.expectEqual(@intFromEnum(error_code.Transport.aead_limit_reached), server.close_code);
 }

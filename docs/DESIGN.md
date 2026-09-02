@@ -213,7 +213,8 @@ all three build legs):
   through an HTTP/1.1 downgrade.
 - `quic/Streams.zig` — streams, their states, and both levels of flow control.
   The connection-level window is the one that bounds memory; see the file.
-- `quic/Connection.zig` — the state machine: three packet number spaces, four
+- `quic/Connection.zig` — the state machine, including RFC 9001 section 6's key
+  update and section 6.6's AEAD confidentiality and integrity limits. The state machine: three packet number spaces, four
   encryption levels and their keys, CRYPTO reassembly per level, ACK
   generation, section 12.4's frame permissions, section 8.1's amplification
   limit, section 14.1's Initial padding, section 4.9's key discarding, and the

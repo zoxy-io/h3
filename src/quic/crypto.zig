@@ -150,6 +150,58 @@ pub const tag_octets: u8 = 16;
 /// Section 5.3: the nonce is the write IV, so it is the AEAD's nonce length.
 pub const iv_octets: u8 = 12;
 
+/// RFC 9001 section 6.6: how many packets one key may seal.
+///
+/// "Endpoints MUST count the number of encrypted packets for each set of keys.
+/// If the total number of encrypted packets with the same key exceeds the
+/// confidentiality limit for the selected AEAD, the endpoint MUST stop using
+/// those keys." Past it, an attacker's advantage in distinguishing the AEAD
+/// from a random permutation stops being negligible.
+///
+/// ChaCha20-Poly1305's limit is above the number of packets a connection can
+/// have — a packet number is 62 bits — so the RFC says it "can be disregarded".
+/// Answered as the packet number ceiling rather than as a special case, so
+/// every caller compares the same way.
+pub fn confidentialityLimit(suite: Suite) u64 {
+    return switch (suite) {
+        .aes_128_gcm_sha256, .aes_256_gcm_sha384 => 1 << 23,
+        .chacha20_poly1305_sha256 => (1 << 62) - 1,
+    };
+}
+
+/// RFC 9001 section 6.6: how many forgeries a connection may survive.
+///
+/// "If the total number of received packets that fail authentication within the
+/// connection, across all keys, exceeds the integrity limit for the selected
+/// AEAD, the endpoint MUST immediately close the connection with a connection
+/// error of type AEAD_LIMIT_REACHED and not process any more packets."
+///
+/// Across all keys, and for the whole connection — which is why the counter
+/// lives on the connection rather than beside a key. TLS closes on the first
+/// failed record; QUIC cannot, because an off-path attacker can inject packets
+/// at will, so it counts instead.
+pub fn integrityLimit(suite: Suite) u64 {
+    return switch (suite) {
+        .aes_128_gcm_sha256, .aes_256_gcm_sha384 => 1 << 52,
+        .chacha20_poly1305_sha256 => 1 << 36,
+    };
+}
+
+comptime {
+    // The numbers appendix B.1 derives, and the one section 6.6 declines to
+    // impose. Stated as a relation rather than repeated as literals: the
+    // confidentiality limit is what forces a key update, so it must be far
+    // below the space of packet numbers or an update could never be reached.
+    assert(confidentialityLimit(.aes_128_gcm_sha256) == 1 << 23);
+    assert(integrityLimit(.aes_128_gcm_sha256) == 1 << 52);
+    assert(integrityLimit(.chacha20_poly1305_sha256) == 1 << 36);
+    for (std.enums.values(Suite)) |suite| {
+        assert(confidentialityLimit(suite) <= @import("packet_number.zig").max);
+        assert(confidentialityLimit(suite) < integrityLimit(suite) or
+            suite == .chacha20_poly1305_sha256);
+    }
+}
+
 /// Section 5.4.1: the mask is five octets — one for the header's protected
 /// bits, four for the longest packet number.
 pub const header_mask_octets: u8 = 5;

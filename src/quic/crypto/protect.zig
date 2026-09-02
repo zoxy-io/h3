@@ -82,6 +82,10 @@ const reserved_mask_short: u8 = 0x18;
 /// The high bit of the first octet: set for a long header (section 17.2).
 const header_form_long: u8 = 0x80;
 
+/// RFC 9001 section 6: the Key Phase bit of a short header, which says which
+/// generation of 1-RTT keys protected the packet.
+const key_phase_bit: u8 = 0x04;
+
 /// The two low bits of the first octet carry the packet number length, minus
 /// one (sections 17.2 and 17.3).
 const packet_number_length_mask: u8 = 0x03;
@@ -89,7 +93,10 @@ const packet_number_length_mask: u8 = 0x03;
 comptime {
     assert(first_octet_mask_long == reserved_mask_long | packet_number_length_mask);
     // The short-header mask adds exactly the key phase bit to the long one.
-    assert(first_octet_mask_short == reserved_mask_short | packet_number_length_mask | 0x04);
+    assert(first_octet_mask_short == reserved_mask_short | packet_number_length_mask | key_phase_bit);
+    // The key phase is under header protection, which is why reading it needs
+    // the mask removed first — and why `unprotectHeader` exists.
+    assert(first_octet_mask_short & key_phase_bit != 0);
 }
 
 /// One direction's protection state at one encryption level.
@@ -228,6 +235,104 @@ pub const Keys = struct {
         /// not part of it.
         payload: []u8,
     };
+
+    /// RFC 9001 section 6.1: the next generation of packet protection keys.
+    ///
+    /// Takes its key and IV from the next secret and **keeps the header
+    /// protection key it already had**, because section 6.1 says so outright:
+    /// "The header protection key is not updated."
+    ///
+    /// That is not a detail. The Key Phase bit lives under header protection,
+    /// so a receiver has to unmask the header before it can know which
+    /// generation to decrypt with — which is only possible if unmasking does
+    /// not itself depend on knowing. Deriving a fresh header protection key
+    /// here makes every packet after an update unreadable by the peer, and the
+    /// failure surfaces as `ReservedBitsSet` rather than as anything mentioning
+    /// keys, because the mask that came off was not the mask that went on.
+    pub fn nextGeneration(self: *const Keys, suite: Suite, next_secret: *const secrets.Secret) Keys {
+        var keys: Keys = .fromSecret(suite, next_secret);
+        keys.header_key_storage = self.header_key_storage;
+        keys.header_key_octets = self.header_key_octets;
+        assert(std.mem.eql(u8, keys.headerKey(), self.headerKey()));
+        return keys;
+    }
+
+    /// A header with its protection removed, and what it says.
+    ///
+    /// Separated from decryption because RFC 9001 section 6.1 keeps the header
+    /// protection key across a key update — "The header protection key is not
+    /// updated" — which is exactly what makes the Key Phase bit legible
+    /// *before* choosing which generation of AEAD keys to decrypt with.
+    /// Composing the two, as `open` does, is right everywhere the phase cannot
+    /// change; at 1-RTT it is not.
+    pub const Unprotected = struct {
+        number: u64,
+        number_octets: u8,
+        header_octets: usize,
+        /// Section 17.3.1's Key Phase bit. Meaningless outside 1-RTT, where the
+        /// octet holds a long header's packet type instead.
+        key_phase: bool,
+    };
+
+    /// Section 5.4: remove header protection, and nothing else.
+    pub fn unprotectHeader(
+        self: *const Keys,
+        packet: []u8,
+        packet_number_offset: usize,
+        largest: ?u64,
+    ) OpenError!Unprotected {
+        if (packet.len < packet_number_offset + sample_offset + sample_octets) return error.Truncated;
+        assert(packet_number_offset < packet.len);
+
+        const mask = self.headerMask(packet[packet_number_offset + sample_offset ..][0..sample_octets]);
+        const long = packet[0] & header_form_long != 0;
+        packet[0] ^= mask[0] & (if (long) first_octet_mask_long else first_octet_mask_short);
+        const number_octets: u8 = (packet[0] & packet_number_length_mask) + 1;
+        assert(number_octets >= packet_number.octets_min);
+        assert(number_octets <= packet_number.octets_max);
+
+        for (packet[packet_number_offset..][0..number_octets], 0..) |*octet, index| {
+            octet.* ^= mask[1 + index];
+        }
+
+        const reserved = if (long) reserved_mask_long else reserved_mask_short;
+        if (packet[0] & reserved != 0) return error.ReservedBitsSet;
+
+        const header_octets = packet_number_offset + number_octets;
+        if (packet.len < header_octets + crypto.tag_octets) return error.Truncated;
+
+        const truncated = packet_number.read(packet[packet_number_offset..][0..number_octets]);
+        return .{
+            .number = packet_number.decode(largest, truncated, number_octets),
+            .number_octets = number_octets,
+            .header_octets = header_octets,
+            .key_phase = !long and (packet[0] & key_phase_bit) != 0,
+        };
+    }
+
+    /// Decrypt a packet whose header protection has already been removed.
+    ///
+    /// Split from `unprotectHeader` so a 1-RTT packet can be decrypted with a
+    /// *different* generation's keys than the ones that unmasked its header,
+    /// which is the whole of what a key update is.
+    pub fn decrypt(self: *const Keys, packet: []u8, header: Unprotected) OpenError!Opened {
+        assert(header.header_octets <= packet.len);
+        if (packet.len < header.header_octets + crypto.tag_octets) return error.Truncated;
+
+        const ciphertext_octets = packet.len - header.header_octets - crypto.tag_octets;
+        const ciphertext = packet[header.header_octets..][0..ciphertext_octets];
+        const tag = packet[header.header_octets + ciphertext_octets ..][0..crypto.tag_octets];
+        const packet_nonce = self.nonce(header.number);
+        self.aeadOpen(ciphertext, ciphertext, tag.*, packet[0..header.header_octets], packet_nonce) catch {
+            return error.AuthenticationFailed;
+        };
+        return .{
+            .number = header.number,
+            .number_octets = header.number_octets,
+            .header = packet[0..header.header_octets],
+            .payload = ciphertext,
+        };
+    }
 
     /// Unprotect a packet in place.
     ///
