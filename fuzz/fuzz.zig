@@ -547,6 +547,9 @@ fn fuzzConnection(_: void, smith: *std.testing.Smith) !void {
             error.StreamLimit,
             error.AeadLimitReached,
             error.StreamState,
+            // The peer broke no rule and this endpoint ran out of span budget.
+            // Still a close, so still a terminal outcome for this datagram.
+            error.TooFragmented,
             => {},
         };
 

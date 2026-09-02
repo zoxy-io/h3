@@ -221,7 +221,10 @@ all three build legs):
   `:authority` and `Host` agree. Trailer sections are a `Kind` of their own,
   because section 4.3 forbids every pseudo-header in one.
 - `quic/Streams.zig` — streams, their states, and both levels of flow control.
-  The connection-level window is the one that bounds memory; see the file.
+  The connection-level window is the one that bounds memory; see the file. Also
+  section 4.6's stream limit, which is the peer's cap on what *this* endpoint
+  opens — the peer's own streams are bounded by `streams_max`, which is the
+  limit we advertised.
 - `quic/Connection.zig` — the state machine, including RFC 9001 section 6's key
   update and section 6.6's AEAD confidentiality and integrity limits. The state machine: three packet number spaces, four
   encryption levels and their keys, CRYPTO reassembly per level, ACK
@@ -284,10 +287,19 @@ all three build legs):
 
       * Nothing. Slice 5 landed on top of it.
 5. ~~**Streams and flow control.**~~ — done. `quic/Streams.zig` carries the
-   stream states of sections 3.1 and 3.2, the final size rules of 4.5, and both
-   levels of flow control from 4.1. What is left of this item is the HTTP/3
-   request layer on top, which needs QPACK first and so has swapped places with
-   item 6.
+   stream states of sections 3.1 and 3.2, the final size rules of 4.5, both
+   levels of flow control from 4.1, and section 4.6's stream limit. What is left
+   of this item is the HTTP/3 request layer on top, which needs QPACK first and
+   so has swapped places with item 6.
+
+   The stream limit was skipped in the original slice on the stated grounds
+   that "this package opens what its comptime bound allows and no more, so a
+   larger limit changes nothing and a smaller one is already respected". The
+   second half was untrue: the peer's limit was never recorded anywhere, so a
+   peer permitting two streams while `streams_max` is sixty-four got as many as
+   the application asked for, and answered with `STREAM_LIMIT_ERROR`. A
+   justification that sounds like a design decision is worth more scepticism
+   than a missing feature, because nobody re-reads it.
 6. ~~**QPACK field line representations**~~ and ~~**RFC 9114 section 4.3
    message validation**~~ — done. An HTTP/3 request now crosses a QUIC stream
    and validates at the far end, which is the whole of what this package was

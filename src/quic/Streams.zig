@@ -78,6 +78,24 @@ pub const Config = struct {
     connection_receive_octets: u64 = 1 << 20,
 };
 
+/// Distinct received spans a *request* stream tolerates, against
+/// `Reassembler`'s own default of sixteen.
+///
+/// Lower on purpose, and the reason is arithmetic rather than taste: a
+/// connection holds `streams_max` of these at once, so a span budget is paid
+/// `streams_max` times over where the CRYPTO stream pays it once. Eight still
+/// covers ordinary reordering — a real path reorders within a few packets — and
+/// halves what a peer manufacturing gaps can pin down across every stream it
+/// opens at the same time.
+const receive_spans_max: u32 = 8;
+
+comptime {
+    // Below the general default because of the multiplier above; a value at or
+    // over it would mean this override has no reason to exist.
+    assert(receive_spans_max < Reassembler(.{ .capacity = 1 }).spans_max);
+    assert(receive_spans_max >= 2);
+}
+
 pub fn Streams(comptime config: Config) type {
     comptime {
         assert(config.streams_max >= 1);
@@ -89,7 +107,7 @@ pub fn Streams(comptime config: Config) type {
         assert(config.streams_max <= stream_id.count_max);
     }
 
-    const Receive = Reassembler(.{ .capacity = config.receive_octets, .spans_max = 8 });
+    const Receive = Reassembler(.{ .capacity = config.receive_octets, .spans_max = receive_spans_max });
 
     return struct {
         const Self = @This();
@@ -170,6 +188,12 @@ pub fn Streams(comptime config: Config) type {
         side: Side = .client,
 
         streams: [streams_max]Stream = undefined,
+        /// Section 4.6: how many streams of each kind the peer has permitted
+        /// this endpoint to open. Zero until a transport parameter or a
+        /// MAX_STREAMS frame says otherwise, which is what section 18.2's
+        /// default of zero means — an endpoint may open none until told.
+        peer_streams_bidi: u64 = 0,
+        peer_streams_uni: u64 = 0,
         count: u32 = 0,
 
         /// Section 4.1's connection-level accounting: octets of *credit* the
@@ -199,6 +223,13 @@ pub fn Streams(comptime config: Config) type {
             Protocol,
             /// The stream is not open.
             NotFound,
+            /// More distinct received spans than the reassembler holds. Not a
+            /// protocol error in the RFC's vocabulary: the peer is within its
+            /// rights and this endpoint is out of room, so `INTERNAL_ERROR` is
+            /// the honest answer. Reporting it as `FlowControl` — which this
+            /// did — tells the peer it exceeded a limit it did not exceed, and
+            /// a peer that trusts us then looks for a bug it does not have.
+            TooFragmented,
             /// Section 19.8, 19.4, 19.5 and 19.10: a frame for a stream this
             /// endpoint cannot receive on, or a write to one it cannot send on.
             /// `STREAM_STATE_ERROR`.
@@ -232,6 +263,16 @@ pub fn Streams(comptime config: Config) type {
             return null;
         }
 
+        /// Section 4.6: raise how many streams of one kind this endpoint may
+        /// open. Limits only ever rise, so a lower value is ignored rather than
+        /// refused — that is what section 4.6 says to do with a stale frame.
+        pub fn setPeerStreamLimit(self: *Self, bidirectional: bool, maximum: u64) void {
+            assert(maximum <= stream_id.count_max);
+            const limit = if (bidirectional) &self.peer_streams_bidi else &self.peer_streams_uni;
+            limit.* = @max(limit.*, maximum);
+            assert(limit.* >= maximum);
+        }
+
         /// Open a stream, or return the one already open.
         pub fn open(self: *Self, id: u64) Error!*Stream {
             assert(id <= varint.max);
@@ -240,6 +281,31 @@ pub fn Streams(comptime config: Config) type {
             self.streams[self.count] = .{ .id = id };
             self.count += 1;
             return &self.streams[self.count - 1];
+        }
+
+        /// Section 4.6: a stream this endpoint initiates has to fit inside the
+        /// limit the peer advertised. Nothing enforced this before, on the
+        /// stated grounds that "this package opens what its comptime bound
+        /// allows and no more, so a larger limit changes nothing and a smaller
+        /// one is already respected" — the second half of which was simply
+        /// untrue. The peer's limit was never recorded, so a peer permitting
+        /// two streams while `streams_max` is sixty-four got however many the
+        /// application asked for, and answered with `STREAM_LIMIT_ERROR`.
+        ///
+        /// A peer-initiated stream is not checked here: the limit on those is
+        /// the one *we* advertised, and `streams_max` is what enforces it.
+        fn checkPeerStreamLimit(self: *const Self, id: u64) Error!void {
+            assert(id <= varint.max);
+            const kind = stream_id.kindOf(id);
+            if (kind.initiator() != self.side) return;
+            const limit = if (kind.bidirectional()) self.peer_streams_bidi else self.peer_streams_uni;
+            // MAX_STREAMS counts streams, and an identifier's index counts from
+            // zero — so the highest identifier a limit of N permits has index
+            // N-1. Reading the count as an identifier is the error that lets a
+            // quarter of the offered streams through, and comparing an index
+            // against a count without the shift is how it happens.
+            const position = stream_id.index(id);
+            if (position >= limit) return error.TooManyStreams;
         }
 
         /// Take a STREAM frame.
@@ -258,7 +324,8 @@ pub fn Streams(comptime config: Config) type {
 
             try self.admit(stream, end);
             stream.received.push(offset, data) catch |err| return switch (err) {
-                error.BeyondWindow, error.TooFragmented => error.FlowControl,
+                error.BeyondWindow => error.FlowControl,
+                error.TooFragmented => error.TooFragmented,
                 error.Inconsistent => error.Protocol,
                 error.FinalSizeViolated => error.FinalSize,
             };
@@ -374,6 +441,11 @@ pub fn Streams(comptime config: Config) type {
             // receive-only here, and writing on one is this endpoint's bug
             // rather than the peer's.
             if (!self.weMaySend(id)) return error.StreamState;
+            // Section 4.6, and here rather than in `open` because `open` is
+            // also how a peer's own frame creates a stream: the peer's
+            // MAX_STREAMS governs what *this* endpoint opens on its own
+            // initiative, not what the peer's frames bring into being.
+            try self.checkPeerStreamLimit(id);
             const stream = try self.open(id);
             if (!stream.writable()) return error.Protocol;
 
@@ -453,8 +525,21 @@ const Set = Streams(.{
     .connection_receive_octets = 128,
 });
 
-test "data arrives, is read, and the window moves forward with the reader" {
+/// A set whose peer has permitted the streams this endpoint may hold.
+///
+/// Section 18.2 defaults every stream limit to zero, so a bare `Set{}` has been
+/// permitted nothing and cannot open a locally-initiated stream — which is
+/// correct, and which is why every test that opens one goes through here rather
+/// than through `.{}`. The tests that are *about* the limit build their own.
+fn testSet() Set {
     var set: Set = .{};
+    set.setPeerStreamLimit(true, Set.streams_max);
+    set.setPeerStreamLimit(false, Set.streams_max);
+    return set;
+}
+
+test "data arrives, is read, and the window moves forward with the reader" {
+    var set = testSet();
     try set.receive(0, 0, "hello", false);
     const stream = set.find(0).?;
     try testing.expectEqualStrings("hello", stream.readable());
@@ -469,7 +554,7 @@ test "data arrives, is read, and the window moves forward with the reader" {
 }
 
 test "a peer may not send past a stream's limit" {
-    var set: Set = .{};
+    var set = testSet();
     const oversized: [Set.receive_octets + 1]u8 = @splat('x');
     try testing.expectError(error.FlowControl, set.receive(0, 0, &oversized, false));
 
@@ -481,7 +566,7 @@ test "a peer may not send past a stream's limit" {
 }
 
 test "the connection limit binds across streams, which is what bounds memory" {
-    var set: Set = .{};
+    var set = testSet();
     // Two streams' worth fits the connection window; a third does not, even
     // though each is within its own stream limit. Without this a peer's memory
     // budget is the per-stream window times the stream count.
@@ -497,7 +582,7 @@ test "the connection limit binds across streams, which is what bounds memory" {
 }
 
 test "a retransmission does not consume the window twice" {
-    var set: Set = .{};
+    var set = testSet();
     try set.receive(0, 0, "hello", false);
     try testing.expectEqual(@as(u64, 5), set.received_total);
     // The same octets again: ordinary retransmission. Charging for them would
@@ -511,7 +596,7 @@ test "a retransmission does not consume the window twice" {
 }
 
 test "a reset stream keeps its accounting" {
-    var set: Set = .{};
+    var set = testSet();
     try set.receive(0, 0, "hello", false);
     try set.reset(0, 7, 5);
     try testing.expectEqual(ReceiveState.reset, set.find(0).?.receive_state);
@@ -527,7 +612,7 @@ test "a reset stream keeps its accounting" {
 }
 
 test "a reset that retracts data already charged is refused" {
-    var set: Set = .{};
+    var set = testSet();
     try set.receive(0, 0, "hello", false);
     // Section 4.5: a final size below what has arrived contradicts the peer's
     // own earlier frames, and accepting it would give back window credit.
@@ -538,7 +623,7 @@ test "a reset that retracts data already charged is refused" {
 }
 
 test "a FIN completes a stream once everything has been read" {
-    var set: Set = .{};
+    var set = testSet();
     try set.receive(0, 0, "hel", false);
     try set.receive(0, 3, "lo", true);
     const stream = set.find(0).?;
@@ -550,13 +635,13 @@ test "a FIN completes a stream once everything has been read" {
 }
 
 test "an empty FIN completes a stream with nothing to read" {
-    var set: Set = .{};
+    var set = testSet();
     try set.receive(0, 0, "", true);
     try testing.expect(set.find(0).?.isComplete());
 }
 
 test "section 4.5: the final size may not move" {
-    var set: Set = .{};
+    var set = testSet();
     try set.receive(0, 0, "hello", true);
     try testing.expectError(error.FinalSize, set.receive(0, 5, "more", false));
     // A different final size on a second FIN.
@@ -564,13 +649,13 @@ test "section 4.5: the final size may not move" {
 }
 
 test "section 2.2: data at an offset never changes" {
-    var set: Set = .{};
+    var set = testSet();
     try set.receive(0, 0, "hello", false);
     try testing.expectError(error.Protocol, set.receive(0, 0, "HELLO", false));
 }
 
 test "writes are bounded by the peer's limits, in both levels" {
-    var set: Set = .{};
+    var set = testSet();
     // No limits yet: the peer has offered nothing, so nothing may go out.
     try testing.expectEqual(@as(usize, 0), try set.write(0, "hello", false));
 
@@ -582,7 +667,7 @@ test "writes are bounded by the peer's limits, in both levels" {
 test "the connection's send limit binds independently of a stream's" {
     // A fresh set, because a limit never falls — lowering the connection's to
     // observe it would be observing nothing.
-    var set: Set = .{};
+    var set = testSet();
     try set.setSendLimit(0, 1000);
     set.setConnectionSendLimit(2);
     // The stream would take all five; the connection allows two.
@@ -595,7 +680,7 @@ test "the connection's send limit binds independently of a stream's" {
 }
 
 test "a limit never falls" {
-    var set: Set = .{};
+    var set = testSet();
     try set.setSendLimit(0, 100);
     try set.setSendLimit(0, 10);
     // Section 4.1: a smaller limit is ignored rather than an error. A reordered
@@ -608,7 +693,7 @@ test "a limit never falls" {
 }
 
 test "a FIN closes the send half to further writes" {
-    var set: Set = .{};
+    var set = testSet();
     try set.setSendLimit(0, 1000);
     set.setConnectionSendLimit(1000);
     _ = try set.write(0, "hello", true);
@@ -617,7 +702,7 @@ test "a FIN closes the send half to further writes" {
 }
 
 test "a partial write does not carry the FIN" {
-    var set: Set = .{};
+    var set = testSet();
     try set.setSendLimit(0, 2);
     set.setConnectionSendLimit(1000);
     // Only two octets fit, so the stream is not finished — a FIN at the wrong
@@ -628,7 +713,7 @@ test "a partial write does not carry the FIN" {
 }
 
 test "more streams than the bound is refused rather than grown into" {
-    var set: Set = .{};
+    var set = testSet();
     for (0..Set.streams_max) |index| _ = try set.open(@as(u64, index) * 4);
     try testing.expectError(error.TooManyStreams, set.open(1000));
     // An already-open stream is found rather than opened again.
@@ -637,7 +722,7 @@ test "more streams than the bound is refused rather than grown into" {
 }
 
 test "rewinding re-frames a lost range" {
-    var set: Set = .{};
+    var set = testSet();
     try set.setSendLimit(0, 1000);
     set.setConnectionSendLimit(1000);
     _ = try set.write(0, "hello", false);
@@ -655,6 +740,10 @@ test "section 19.8: a peer may not send on a stream it cannot send on" {
     // — send-only here, receive-only for the peer. A STREAM or RESET_STREAM
     // arriving on one is the peer writing where it cannot.
     var set: Set = .{ .side = .client };
+    // The peer permits what this test needs to open; section 4.6's limit is a
+    // separate rule with its own tests below.
+    set.setPeerStreamLimit(true, Set.streams_max);
+    set.setPeerStreamLimit(false, Set.streams_max);
     const ours = stream_id.make(.client_unidirectional, 0);
     try testing.expectError(error.StreamState, set.receive(ours, 0, "x", false));
     try testing.expectError(error.StreamState, set.reset(ours, 0, 1));
@@ -674,7 +763,7 @@ test "section 19.8: a peer may not send on a stream it cannot send on" {
 }
 
 test "section 4.5: a RESET_STREAM may not move a final size a FIN already fixed" {
-    var set: Set = .{};
+    var set = testSet();
     try set.receive(0, 0, "hello", true); // the FIN fixes it at 5
     // "Once a final size for a stream is known, it cannot change." Before this
     // check the reset was accepted, `received_highest` moved to 9, and the
@@ -687,7 +776,7 @@ test "section 4.5: a RESET_STREAM may not move a final size a FIN already fixed"
 }
 
 test "section 4.1: a reset stream gives its credit back" {
-    var set: Set = .{};
+    var set = testSet();
     // Octets a reset claimed are never delivered, so they can never be
     // consumed. Without a release they hold connection credit forever: two
     // RESET_STREAM frames, eight octets of peer input, and the window was
@@ -700,4 +789,76 @@ test "section 4.1: a reset stream gives its credit back" {
     try testing.expect(set.receiveLimit() > set.received_total);
     try set.receive(8, 0, "real data", false);
     try testing.expectEqualStrings("real data", set.find(8).?.readable());
+}
+
+test "a resource limit is not reported as the peer's fault" {
+    // `TooFragmented` used to arrive as `FlowControl`, which tells the peer it
+    // exceeded a window it did not exceed. The peer is within its rights here —
+    // gaps are what a lossy path produces — and this endpoint is the one out of
+    // room, so the two answers have to be distinguishable to a consumer
+    // choosing a close code.
+    var set = testSet();
+    var offset: u64 = 0;
+    var refused: ?anyerror = null;
+    // Every other octet, which is the cheapest way for a peer to manufacture
+    // spans. Bounded by the window so `BeyondWindow` cannot be what fires.
+    for (0..Set.receive_octets / 2) |_| {
+        set.receive(0, offset, "x", false) catch |err| {
+            refused = err;
+            break;
+        };
+        offset += 2;
+    }
+    try testing.expectEqual(@as(?anyerror, error.TooFragmented), refused);
+}
+
+test "section 4.6: this endpoint may not open past the peer's limit" {
+    var set: Set = .{ .side = .client };
+    // Section 18.2's default: permitted nothing until told otherwise.
+    const first = stream_id.make(.client_bidirectional, 0);
+    set.setConnectionSendLimit(1000);
+    try testing.expectError(error.TooManyStreams, set.write(first, "x", false));
+
+    // Two streams permitted means indices 0 and 1, not identifiers 0 and 1 —
+    // MAX_STREAMS counts streams and an identifier carries a two-bit type tag,
+    // so reading the count as an identifier admits a quarter of what was
+    // offered.
+    set.setPeerStreamLimit(true, 2);
+    try set.setSendLimit(first, 1000);
+    _ = try set.write(first, "x", false);
+    const second = stream_id.make(.client_bidirectional, 1);
+    try set.setSendLimit(second, 1000);
+    _ = try set.write(second, "x", false);
+    const third = stream_id.make(.client_bidirectional, 2);
+    try testing.expectError(error.TooManyStreams, set.write(third, "x", false));
+
+    // Raising the limit lets the next one through; lowering it is ignored.
+    set.setPeerStreamLimit(true, 3);
+    try set.setSendLimit(third, 1000);
+    _ = try set.write(third, "x", false);
+    set.setPeerStreamLimit(true, 1);
+    try testing.expectEqual(@as(u64, 3), set.peer_streams_bidi);
+}
+
+test "section 4.6: the peer's limit does not govern the peer's own streams" {
+    // The limit is on what *we* open. A stream the peer initiates is bounded by
+    // the limit we advertised, which is `streams_max`, and applying the peer's
+    // number to it would refuse traffic the peer was entitled to send.
+    var set: Set = .{ .side = .client };
+    try testing.expectEqual(@as(u64, 0), set.peer_streams_uni);
+    const theirs = stream_id.make(.server_unidirectional, 0);
+    try set.receive(theirs, 0, "hello", false);
+    try testing.expectEqualStrings("hello", set.find(theirs).?.readable());
+}
+
+test "the two stream kinds carry separate limits" {
+    var set: Set = .{ .side = .client };
+    set.setConnectionSendLimit(1000);
+    set.setPeerStreamLimit(false, 1);
+    const uni = stream_id.make(.client_unidirectional, 0);
+    try set.setSendLimit(uni, 1000);
+    _ = try set.write(uni, "x", false);
+    // Unidirectional permission says nothing about bidirectional.
+    const bidi = stream_id.make(.client_bidirectional, 0);
+    try testing.expectError(error.TooManyStreams, set.write(bidi, "x", false));
 }

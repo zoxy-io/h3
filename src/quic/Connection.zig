@@ -324,10 +324,15 @@ pub fn Connection(comptime config: Config) type {
 
         /// Sections 2, 3 and 4: the streams and their flow control.
         streams: ConnectionStreams = .{},
-        /// The limits last advertised, so a new one goes out only when it has
+        /// The limit last advertised, so a new one goes out only when it has
         /// moved enough to be worth a frame.
+        ///
+        /// There was a `max_streams_sent` beside this, written nowhere and read
+        /// nowhere. This endpoint's stream limit is `streams_max`, a comptime
+        /// bound that never moves, so there is no "last advertised" value to
+        /// remember and no MAX_STREAMS to re-send — the field was a placeholder
+        /// for a frame this package does not generate.
         max_data_sent: u64 = 0,
-        max_streams_sent: u64 = 0,
 
         /// Set by a CONNECTION_CLOSE in either direction.
         close_code: u64 = 0,
@@ -466,10 +471,28 @@ pub fn Connection(comptime config: Config) type {
         }
 
         /// Hand over the peer's transport parameters extension.
-        pub fn transportParametersIn(self: *Self, octets: []const u8) error{TooLarge}!void {
+        pub fn transportParametersIn(
+            self: *Self,
+            octets: []const u8,
+        ) (error{TooLarge} || transport_parameters.ParseError)!void {
             if (octets.len > config.transport_parameters_octets) return error.TooLarge;
+            // Parsed before it is kept, so a malformed extension is refused
+            // rather than stored and handed back to a consumer as if it were a
+            // peer's settings. Section 18 makes either failure a
+            // `TRANSPORT_PARAMETER_ERROR`.
+            const parsed = try transport_parameters.parse(octets);
+
+            // Section 4.6: the peer's initial stream limits are limits on *us*,
+            // and until this they were parsed by nobody. The data limits are
+            // deliberately not applied here — `setConnectionSendLimit` and
+            // `setSendLimit` are the consumer's seam for those and are already
+            // driven by MAX_DATA and MAX_STREAM_DATA on the same path.
+            self.streams.setPeerStreamLimit(true, parsed.initial_max_streams_bidi);
+            self.streams.setPeerStreamLimit(false, parsed.initial_max_streams_uni);
+
             @memcpy(self.peer_parameters[0..octets.len], octets);
             self.peer_parameters_len = @intCast(octets.len);
+            assert(self.peer_parameters_len == octets.len);
         }
 
         // ------------------------------------------------------------ receive
@@ -543,6 +566,11 @@ pub fn Connection(comptime config: Config) type {
             /// a key reached its confidentiality limit with no update possible.
             /// `AEAD_LIMIT_REACHED`, and the connection stops here.
             AeadLimitReached,
+            /// A stream arrived in more pieces than the reassembler holds. The
+            /// peer broke no rule and this endpoint ran out of room, so the
+            /// honest close is `INTERNAL_ERROR` rather than a code that accuses
+            /// the peer of something.
+            TooFragmented,
         };
 
         /// Take one UDP datagram.
@@ -748,11 +776,15 @@ pub fn Connection(comptime config: Config) type {
                 .max_stream_data => |value| self.streams.setSendLimit(value.stream, value.maximum) catch |err| {
                     return streamError(err);
                 },
-                // Section 4.6's stream limits are the peer telling us how many
-                // we may open. This package opens what its comptime bound
-                // allows and no more, so a larger limit changes nothing and a
-                // smaller one is already respected.
-                .max_streams => {},
+                // Section 4.6: the peer telling us how many streams we may
+                // open. The claim that stood here — that "this package opens
+                // what its comptime bound allows and no more, so a larger limit
+                // changes nothing and a smaller one is already respected" — was
+                // half false, and the false half mattered: the peer's limit was
+                // never recorded, so a peer permitting two streams while
+                // `streams_max` is sixty-four got as many as the application
+                // asked for and answered with `STREAM_LIMIT_ERROR`.
+                .max_streams => |value| self.streams.setPeerStreamLimit(value.bidirectional, value.maximum),
                 // Section 4.1 and 4.6: the peer says it is blocked. Purely
                 // informational — it is a signal that our advertised limit is
                 // too low, and raising it is what `writePayload` already does
@@ -864,6 +896,7 @@ pub fn Connection(comptime config: Config) type {
                 error.FinalSize => error.FinalSize,
                 error.TooManyStreams => error.StreamLimit,
                 error.StreamState => error.StreamState,
+                error.TooFragmented => error.TooFragmented,
                 error.Protocol, error.NotFound => error.Protocol,
             };
         }
@@ -1871,6 +1904,15 @@ fn established(client: *TestConnection, server: *TestConnection) !void {
     var payload: [16]u8 = @splat(0);
     const written = try frame.encode(&payload, .handshake_done);
     _ = try client.receiveFrames(.one_rtt, payload[0..written], 0);
+
+    // Section 18.2 defaults every stream limit to zero, so a peer that never
+    // says otherwise has permitted nothing. A real handshake carries these in
+    // the transport parameters; this is that exchange, spelled out.
+    const permitted = @TypeOf(client.streams).streams_max;
+    client.streams.setPeerStreamLimit(true, permitted);
+    client.streams.setPeerStreamLimit(false, permitted);
+    server.streams.setPeerStreamLimit(true, permitted);
+    server.streams.setPeerStreamLimit(false, permitted);
 
     client.streams.setConnectionSendLimit(1 << 20);
     server.streams.setConnectionSendLimit(1 << 20);
