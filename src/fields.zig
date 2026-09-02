@@ -551,6 +551,11 @@ pub const MessageValidator = struct {
     /// Section 4.3.1's two rules that need the whole section: the authority has
     /// to be there under a scheme that mandates one, and a `:path` under `http`
     /// or `https` may not be empty.
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3.1
+    //# If the :scheme pseudo-header field identifies a scheme that has a
+    //# mandatory authority component (including "http" and "https"), the
+    //# request MUST contain either an :authority pseudo-header field or a
+    //# Host header field.
     fn checkAuthority(self: *const MessageValidator) Error!void {
         assert(self.kind == .request);
 
@@ -845,6 +850,12 @@ test "section 4.3.1: an empty path is the scheme's question, not a blanket rule"
     }));
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9114#section-4.3.1
+//# If the :scheme pseudo-header field identifies a scheme that has a
+//# mandatory authority component (including "http" and "https"), the
+//# request MUST contain either an :authority pseudo-header field or a
+//# Host header field.
+//= type=test
 test "section 4.3.1: an http request names an authority somehow" {
     // "the request MUST contain either an :authority pseudo-header field or a
     // Host header field". Neither leaves a proxy nothing to write into the

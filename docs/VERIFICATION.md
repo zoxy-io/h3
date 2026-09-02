@@ -73,10 +73,12 @@ moves a datagram from one `Connection` to another.
 | `corpus/`, RFC 9001 appendix A | The key schedule, AEAD, nonce, sampling offset and mask are right at once | Anything after the first flight |
 | `zig build lint` | No I/O, no allocator, no unbounded loop | Nothing about behaviour |
 | The `tiger-style-reviewer` agent | Assertion density, function length, named bounds | It is a reader, not a gate: it found the twenty above, and it will not find the same class twice at the same cost |
+| `zig build requirements` | That every RFC quote in the source is really in the section it cites, and that every exception states a reason | Coverage — the sentence extraction is a heuristic, so `7 cited / 571 mandatory` is a trend to move, not a threshold to pass |
 
-Missing outright: a seeded simulator, a requirement ledger, an interop image, a
-QPACK cross-implementation corpus, qlog output, and any run of the fuzz targets
-in a release mode.
+Missing outright: a seeded simulator, an interop image, a QPACK
+cross-implementation corpus, qlog output, and any run of the fuzz targets in a
+release mode. The requirement ledger of §5.1 now exists; §5.2's simulator is
+the next item, and it is the one the ledger's oracles feed.
 
 ## 3. What the other stacks do
 
@@ -188,7 +190,7 @@ should_activate |= !is_largest;
 In the order that each one unblocks or cheapens the next, with a cost that is
 an estimate rather than a promise.
 
-### 5.1 A requirement ledger — first, days
+### 5.1 A requirement ledger — first, days — **started**
 
 Vendor the five RFC texts under `specs/`; `corpus/extract.py` already parses
 RFC 9001's. Adopt duvet's convention in `src/` and in tests: a `//=` line naming
@@ -203,6 +205,37 @@ reviewer did. It also turns "canSend has no callers" into a mechanical finding:
 a requirement whose only citation is in a function the tests never enter. It
 comes before the simulator because a simulator finds only what an oracle
 states, and the ledger is where the oracles come from.
+
+**Status.** `specs/` holds RFC 9000, 9001, 9002, 9204 and 9114.
+`scripts/requirements.zig` runs as `zig build requirements` and is part of
+`zig build ci`. It reads 501 sections and finds **790 normative sentences, 571
+of them mandatory**. Seven are cited, four of those by a test — the seven are
+the requirements behind the defects in §1's table, cited first precisely so the
+ledger's premise can be checked rather than asserted.
+
+Two of its checks are gates and the rest is a report, which is a deliberate
+split:
+
+- **A quote must appear in the section it cites.** This one has already earned
+  its place: the first `//#` block written for RFC 9002 §7.6.2 was paraphrased
+  from memory rather than copied, and the gate rejected it. A citation that
+  misquotes an RFC is worse than no citation, because it is a claim of
+  diligence a reader will believe.
+- **An exception must carry a `reason=`.** Without one, "deliberately not
+  done" and "forgotten" are the same string.
+- **Coverage is a report.** Extracting "the requirements" from prose is a
+  heuristic — `splitSentences` breaks on a full stop before a capital, with a
+  short abbreviation list — and a gate resting on a heuristic teaches everyone
+  to work around the heuristic rather than to cite the RFC. The number to watch
+  is the trend, and the honest reading of `7 / 571` is that this has started
+  rather than that it is done.
+
+The work left is the annotation, and it is the bulk of it: 564 mandatory
+requirements with nothing said about them. Not all are in scope — migration,
+0-RTT, the QPACK dynamic table and version negotiation are all out, and each
+wants a `type=exception` naming that rather than silence. Distinguishing "out
+of scope" from "nobody looked" is the whole product of this exercise, and it is
+what makes the next 57-finding review smaller than the last.
 
 ### 5.2 A `sim/` in this package — one to two weeks
 

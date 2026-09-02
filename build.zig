@@ -76,6 +76,29 @@ pub fn build(b: *std.Build) void {
     const lint_step = b.step("lint", "Boundary lint: no I/O types, no allocator, no unbounded loops");
     lint_step.dependOn(&lint_run.step);
 
+    // The requirement ledger of docs/VERIFICATION.md section 5.1. Reads the
+    // vendored RFC texts under specs/ and the `//=` citations in the source,
+    // and checks that every quote really is in the section it cites. Its own
+    // tests ride the `test` step for the same reason the lint's do.
+    const requirements_exe = b.addExecutable(.{
+        .name = "h3-requirements",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("scripts/requirements.zig"),
+            .target = b.graph.host,
+        }),
+    });
+    const requirements_tests = b.addRunArtifact(b.addTest(.{ .root_module = requirements_exe.root_module }));
+
+    const requirements_run = b.addRunArtifact(requirements_exe);
+    requirements_run.addDirectoryArg(b.path("specs"));
+    requirements_run.addDirectoryArg(b.path("src"));
+    // Tests carry `type=test` citations, and they live beside the code here
+    // rather than in a tests/ tree, so `src` covers both. corpus/ holds the RFC
+    // vectors and cites the sections they come from.
+    requirements_run.addDirectoryArg(b.path("corpus"));
+    const requirements_step = b.step("requirements", "Requirement ledger: RFC citations against the vendored specs");
+    requirements_step.dependOn(&requirements_run.step);
+
     // The fuzz gate. `zig build fuzz` replays the corpus as regression; with
     // `--fuzz` it runs coverage-guided. See fuzz/fuzz.zig for why the harness
     // lives outside `src/`.
@@ -184,6 +207,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests, the lint's own tests, and the fuzz corpus");
     test_step.dependOn(&module_tests.step);
     test_step.dependOn(&lint_tests.step);
+    test_step.dependOn(&requirements_tests.step);
     // A corpus replayed only under `zig build fuzz` is a corpus that rots.
     test_step.dependOn(&fuzz_run.step);
     test_step.dependOn(&corpus_run.step);
@@ -212,4 +236,5 @@ pub fn build(b: *std.Build) void {
     ci_step.dependOn(fmt_step);
     ci_step.dependOn(test_step);
     ci_step.dependOn(lint_step);
+    ci_step.dependOn(requirements_step);
 }

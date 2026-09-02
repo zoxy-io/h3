@@ -294,6 +294,8 @@ pub fn Streams(comptime config: Config) type {
         ///
         /// A peer-initiated stream is not checked here: the limit on those is
         /// the one *we* advertised, and `streams_max` is what enforces it.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-4.6
+        //# Endpoints MUST NOT exceed the limit set by their peer.
         fn checkPeerStreamLimit(self: *const Self, id: u64) Error!void {
             assert(id <= varint.max);
             const kind = stream_id.kindOf(id);
@@ -812,6 +814,9 @@ test "a resource limit is not reported as the peer's fault" {
     try testing.expectEqual(@as(?anyerror, error.TooFragmented), refused);
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9000#section-4.6
+//# Endpoints MUST NOT exceed the limit set by their peer.
+//= type=test
 test "section 4.6: this endpoint may not open past the peer's limit" {
     var set: Set = .{ .side = .client };
     // Section 18.2's default: permitted nothing until told otherwise.

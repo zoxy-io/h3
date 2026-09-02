@@ -612,6 +612,10 @@ pub fn Connection(comptime config: Config) type {
             // would sell amplification allowance for forty octets — the padding
             // requirement exists precisely so a server knows the path carries a
             // handshake before it commits anything to it.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-14.1
+            //# A server MUST discard an Initial packet that is carried in a UDP
+            //# datagram with a payload that is smaller than the smallest allowed
+            //# maximum datagram size of 1200 bytes.
             if (self.side == .server and datagram.len < initial_datagram_min) {
                 const first = packet.parse(datagram, self.source.length) catch return;
                 if (first.header == .initial) return;
@@ -1095,8 +1099,11 @@ pub fn Connection(comptime config: Config) type {
         /// handshake, are discarded early, and cannot approach the limit — so
         /// reaching it there is a close.
         fn countSealed(self: *Self, level: Level) void {
-            // RFC 9001 section 6.6: a count per key, kept because exceeding the
-            // confidentiality limit is a break rather than a degradation.
+            //= https://www.rfc-editor.org/rfc/rfc9001#section-6.6
+            //# Endpoints MUST count the number of encrypted packets for each set of
+            //# keys.
+            // Kept because exceeding the confidentiality limit is a break rather
+            // than a degradation.
             assert(@intFromEnum(level) < self.sealed.len);
             if (level != .one_rtt) {
                 assert(self.sealed[@intFromEnum(level)] < std.math.maxInt(u64));
@@ -1120,6 +1127,11 @@ pub fn Connection(comptime config: Config) type {
         /// Section 8.1: what a server may still send before the address is
         /// validated. A client, and a validated server, are unbounded here and
         /// bounded by the datagram size instead.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-8
+        //# Therefore, after receiving packets from an address that is not yet
+        //# validated, an endpoint MUST limit the amount of data it sends to the
+        //# unvalidated address to three times the amount of data received from
+        //# that address.
         fn sendRoom(self: *const Self) u64 {
             if (self.address_validated) return config.datagram_octets;
             const allowance = self.received_octets * amplification_factor;
@@ -1208,6 +1220,11 @@ pub fn Connection(comptime config: Config) type {
             // acknowledgements would throttle the feedback the window itself
             // depends on. A probe is exempt because a connection that cannot
             // probe cannot discover that the path recovered.
+            //= https://www.rfc-editor.org/rfc/rfc9002#section-7
+            //# An endpoint MUST NOT send a packet if it would cause bytes_in_flight
+            //# (see Appendix B.2) to be larger than the congestion window, unless
+            //# the packet is sent on a PTO timer expiration (see Section 6.2) or
+            //# when entering recovery (see Section 7.3.2).
             const in_flight_estimate = header.header_octets + payload_octets + crypto.tag_octets;
             if (written.ack_eliciting and space.probes_pending == 0 and
                 !self.recovery.canSend(in_flight_estimate))
@@ -2533,6 +2550,12 @@ test "section 14.1: an undersized Initial is discarded and buys no allowance" {
     try testing.expect(server.sendRoom() > 0);
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9002#section-7
+//# An endpoint MUST NOT send a packet if it would cause bytes_in_flight
+//# (see Appendix B.2) to be larger than the congestion window, unless
+//# the packet is sent on a PTO timer expiration (see Section 6.2) or
+//# when entering recovery (see Section 7.3.2).
+//= type=test
 test "RFC 9002 section 7: a full congestion window stops the sender" {
     var client = testClient();
     var server = testServer();

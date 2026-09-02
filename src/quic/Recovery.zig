@@ -505,6 +505,11 @@ pub fn Recovery(comptime config: Config) type {
         /// matters: without one `smoothed_rtt` is the 333 ms default, and a
         /// connection that lost its whole first flight would declare the path
         /// dead on the strength of a number nobody measured.
+        //= https://www.rfc-editor.org/rfc/rfc9002#section-7.6.2
+        //# When persistent congestion is declared, the sender's congestion
+        //# window MUST be reduced to the minimum congestion window
+        //# (kMinimumWindow), similar to a TCP sender's response on an RTO
+        //# [RFC5681].
         fn inPersistentCongestion(self: *const Self, earliest: ?u64, latest: ?u64) bool {
             if (!self.has_rtt_sample) return false;
             const from = earliest orelse return false;
@@ -995,6 +1000,12 @@ test "appendix B.5: an ACK-only packet grows nothing" {
     try testing.expectEqual(before, recovery.congestion_window);
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9002#section-7.6.2
+//# When persistent congestion is declared, the sender's congestion
+//# window MUST be reduced to the minimum congestion window
+//# (kMinimumWindow), similar to a TCP sender's response on an RTO
+//# [RFC5681].
+//= type=test
 test "section 7.6: losing everything across several PTOs collapses the window" {
     var recovery: TestRecovery = .{};
     var lost: [16]u64 = undefined;

@@ -28,6 +28,14 @@ threads through `std.Io`). Read before writing code:
   else, so only a release mode tests that the checks are gone, and only a
   release mode reaches the undefined behaviour a `catch unreachable` guarded by
   a removed assertion becomes. CI runs all three legs.
+- `zig build requirements` — the requirement ledger of docs/VERIFICATION.md
+  §5.1, and part of `zig build ci`. It checks that every `//=` RFC citation in
+  the source quotes the section it names **verbatim**, and that every
+  `type=exception` states a `reason=`. When you implement something an RFC
+  requires, cite it: a `//=` URL line, `//#` lines copied out of `specs/`, and
+  `//= type=test` on the test. Copy the quote from the vendored text rather
+  than typing it — the gate exists because the first citation written for this
+  package was paraphrased from memory and was wrong.
 - `zig build bench` — the performance gate. **Not optional for a change that
   touches a protection or codec path.** Compare bands across runs, never single
   numbers: a 3% move between two runs on a laptop is noise, and reporting it as
