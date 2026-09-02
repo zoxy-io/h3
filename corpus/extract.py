@@ -4,9 +4,24 @@
 Transcription is exactly where a codec's test vectors go wrong, and quietly: a
 mistyped byte string still decodes to *something*, so the test fails against a
 plausible answer and the reader blames the decoder. So the vectors are lifted
-from the RFC text rather than typed, and every extraction is checked against a
-length the RFC states in prose — if an anchor ever matches the wrong block, the
-byte count disagrees and this script fails instead of emitting a wrong fixture.
+from the RFC text rather than typed, and every extraction is checked against an
+expected octet count: if an anchor matches a block of the wrong length, this
+script fails instead of emitting a wrong fixture.
+
+How much that check is worth varies, and the docstring used to overstate it by
+calling every count "a length the RFC states in prose". Some are — the
+destination connection identifier's eight octets, the 1162-octet payload, the
+1200-octet protected packet. Most are the algorithm's own output sizes supplied
+here: a 32-octet secret is SHA-256's digest, a 16-octet key is AES-128's. Those
+catch a *mistyped* extraction but not an anchor that matched a different block
+of the same size, of which the appendix has several.
+
+The check that does not have that weakness is on the Zig side: rfc9001.zig
+recomputes the key schedule from the connection identifier and compares every
+derived value against the extracted one, so a secret lifted from the wrong
+block disagrees with the HKDF output rather than merely being the right length.
+This script's job is to make that comparison possible without anyone typing
+1200 octets by hand.
 
 Usage: python3 extract.py rfc9001.txt > rfc9001_vectors.zig
 """

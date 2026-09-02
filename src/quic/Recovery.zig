@@ -10,7 +10,7 @@
 //! ## Pure computation over a caller's clock
 //!
 //! Nothing here reads a clock, holds a socket or knows what a packet contained.
-//! `now` is an argument in nanoseconds, and every timer is *returned* as an
+//! `now_ns` is an argument in nanoseconds, and every timer is *returned* as an
 //! absolute time the caller arms. That is what makes loss recovery testable at
 //! all — a PTO that fires after a real second is a test nobody runs — and it is
 //! what lets zoxy's simulator drive a connection on a virtual clock.
@@ -222,7 +222,7 @@ pub fn Recovery(comptime config: Config) type {
             space: Space,
             ack: frame.Ack,
             ack_delay_ns: u64,
-            now: u64,
+            now_ns: u64,
             lost: []Context,
         ) AckError!AckResult {
             const state = &self.spaces[@intFromEnum(space)];
@@ -243,7 +243,7 @@ pub fn Recovery(comptime config: Config) type {
             // otherwise the peer was under no obligation to answer promptly and
             // the sample is not one.
             if (largest.number == ack.largest and largest.ack_eliciting) {
-                self.updateRtt(now - largest.time_sent, ack_delay_ns);
+                self.updateRtt(now_ns - largest.time_sent, ack_delay_ns);
                 result.rtt_sampled = true;
             }
 
@@ -254,7 +254,7 @@ pub fn Recovery(comptime config: Config) type {
             // window an eighth too wide after every loss event — which is a
             // sender that is quietly unfair to everything else on the path, and
             // which no crash would ever reveal.
-            result.lost = self.detectAndRemoveLostPackets(space, now, lost);
+            result.lost = self.detectAndRemoveLostPackets(space, now_ns, lost);
             // Section B.5, one call per acknowledged packet, and after loss
             // detection so a packet sent before a recovery period does not grow
             // the window that loss just halved.
@@ -376,7 +376,7 @@ pub fn Recovery(comptime config: Config) type {
         }
 
         /// Section A.10.
-        fn detectAndRemoveLostPackets(self: *Self, space: Space, now: u64, lost: []Context) u32 {
+        fn detectAndRemoveLostPackets(self: *Self, space: Space, now_ns: u64, lost: []Context) u32 {
             const state = &self.spaces[@intFromEnum(space)];
             const largest_acked = state.largest_acked orelse return 0;
             state.loss_time = null;
@@ -403,12 +403,12 @@ pub fn Recovery(comptime config: Config) type {
                 //
                 // Written as `sent + delay <= now` rather than the RFC's
                 // `sent <= now - delay`, which is the same inequality over the
-                // reals and not over `u64`: early in a connection `now` is
+                // reals and not over `u64`: early in a connection `now_ns` is
                 // smaller than the loss delay, and a saturating subtraction
                 // clamps the threshold to zero — declaring every packet sent at
                 // time zero lost, on the first acknowledgement, forever. The
                 // tests below found it.
-                const by_time = packet.time_sent + delay <= now;
+                const by_time = packet.time_sent + delay <= now_ns;
                 const by_order = largest_acked >= packet.number + packet_threshold;
                 if (!by_time and !by_order) {
                     // Still in doubt: the timer that would settle it.
@@ -437,7 +437,7 @@ pub fn Recovery(comptime config: Config) type {
             }
 
             if (largest_lost) |packet| {
-                self.onCongestionEvent(packet.time_sent, now);
+                self.onCongestionEvent(packet.time_sent, now_ns);
                 // Section 7.6: losing everything across more than a few PTOs is
                 // not congestion, it is a path that has gone away — so the
                 // window collapses to the floor rather than halving, and the
@@ -502,12 +502,12 @@ pub fn Recovery(comptime config: Config) type {
         }
 
         /// Section B.6: halve the window, once per recovery period.
-        fn onCongestionEvent(self: *Self, time_sent: u64, now: u64) void {
+        fn onCongestionEvent(self: *Self, time_sent: u64, now_ns: u64) void {
             // Everything lost in one round trip is one event: reacting to each
             // packet would collapse the window by a factor of two per packet.
             if (self.inCongestionRecovery(time_sent)) return;
             assert(self.congestion_window >= minimum_window);
-            self.congestion_recovery_start_time = now;
+            self.congestion_recovery_start_time = now_ns;
             self.ssthresh = @max(self.congestion_window / loss_reduction_divisor, minimum_window);
             // Section 7.3.2: the window never goes below two datagrams, or a
             // sender in recovery could not put a packet on the wire to find out
@@ -595,7 +595,7 @@ pub fn Recovery(comptime config: Config) type {
         };
 
         /// Section A.9.
-        pub fn onLossDetectionTimeout(self: *Self, now: u64, lost: []Context) Timeout {
+        pub fn onLossDetectionTimeout(self: *Self, now_ns: u64, lost: []Context) Timeout {
             var earliest_space: ?Space = null;
             var earliest: ?u64 = null;
             for (self.spaces, 0..) |state, index| {
@@ -606,7 +606,7 @@ pub fn Recovery(comptime config: Config) type {
                 }
             }
             if (earliest_space) |space| {
-                const count = self.detectAndRemoveLostPackets(space, now, lost);
+                const count = self.detectAndRemoveLostPackets(space, now_ns, lost);
                 return .{ .lost = count };
             }
 

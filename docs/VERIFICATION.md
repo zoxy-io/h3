@@ -207,7 +207,7 @@ states, and the ledger is where the oracles come from.
 ### 5.2 A `sim/` in this package — one to two weeks
 
 Cheaper than zoxy's, because there is no I/O layer to virtualize: the seam
-already takes datagrams and `now`. A seed derives a topology and a schedule.
+already takes datagrams and `now_ns`. A seed derives a topology and a schedule.
 
 - **Nodes.** Two or more `Connection`s, the constant-secret fake TLS the tests
   already use, a scripted application on each side, and an adversary that
@@ -226,7 +226,7 @@ already takes datagrams and `now`. A seed derives a topology and a schedule.
   must happen, persistent congestion must collapse a window, a FIN must be
   retransmitted, a Retry must be honoured. A counter no seed moves is a finding.
 - **Fault injection.** A send buffer that is sometimes too small, which is the
-  `writePayload` bug; a seal that fails; a `now` that jumps.
+  `writePayload` bug; a seal that fails; a `now_ns` that jumps.
 - **Cadence.** 4096 seeds per change under all three build legs, a nightly
   range, replay by seed, a quarter of seeds clean so the oracles tighten from
   prefix-legality to exact outcomes.

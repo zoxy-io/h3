@@ -71,7 +71,7 @@ later.
 
 ## What is new
 
-### `now` is a parameter
+### `now_ns` is a parameter
 
 Nothing here reads a clock. Every function whose behaviour depends on time takes
 `now_ns: u64`, and the connection answers `timeout()` with the absolute time it

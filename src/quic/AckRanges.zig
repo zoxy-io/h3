@@ -104,17 +104,17 @@ pub fn AckRanges(comptime config: Config) type {
         /// Rises when eviction forgets a range, and never falls.
         minimum: u64 = 0,
 
-        /// Note that `number` arrived at `now`.
+        /// Note that `number` arrived at `now_ns`.
         ///
         /// Idempotent: a duplicate changes nothing, which matters because a
         /// duplicate is exactly what a retransmitted packet looks like.
-        pub fn record(self: *Self, number: u64, now: u64, ack_eliciting: bool) void {
+        pub fn record(self: *Self, number: u64, now_ns: u64, ack_eliciting: bool) void {
             assert(number <= packet_number.max);
             if (ack_eliciting) self.ack_eliciting_pending = true;
             if (self.contains(number)) return;
 
             if (self.count == 0 or number > self.ranges[0].largest) {
-                self.largest_received_at = now;
+                self.largest_received_at = now_ns;
             }
             self.insert(number);
             self.assertInvariants();
@@ -231,10 +231,10 @@ pub fn AckRanges(comptime config: Config) type {
 
         /// Render an ACK frame into `target`.
         ///
-        /// `now` and `ack_delay_exponent` come from the caller: the delay is
+        /// `now_ns` and `ack_delay_exponent` come from the caller: the delay is
         /// measured against a clock this structure does not read, and scaled by
         /// a transport parameter it does not hold.
-        pub fn write(self: *Self, target: []u8, now: u64, ack_delay_exponent: u6) WriteError!Written {
+        pub fn write(self: *Self, target: []u8, now_ns: u64, ack_delay_exponent: u6) WriteError!Written {
             if (self.count == 0) return error.Empty;
             self.assertInvariants();
 
@@ -242,13 +242,13 @@ pub fn AckRanges(comptime config: Config) type {
             // exponent the peer advertised.
             //
             // Saturating, and the assertion states why rather than enforcing
-            // it. `now` is a parameter by policy, so a caller that reads its
+            // it. `now_ns` is a parameter by policy, so a caller that reads its
             // clock once per batch rather than once per packet passes a value
             // below the receive time — and with assertions compiled out a bare
-            // subtraction there is unsigned overflow. A stale `now` producing a
+            // subtraction there is unsigned overflow. A stale `now_ns` producing a
             // zero delay is a correct answer; undefined behaviour is not.
-            assert(now >= self.largest_received_at);
-            const delay_us = (now -| self.largest_received_at) / std.time.ns_per_us;
+            assert(now_ns >= self.largest_received_at);
+            const delay_us = (now_ns -| self.largest_received_at) / std.time.ns_per_us;
             const delay = delay_us >> ack_delay_exponent;
 
             var writer: Writer = .{ .target = target };

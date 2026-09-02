@@ -715,11 +715,11 @@ fn fuzzRecovery(_: void, smith: *std.testing.Smith) !void {
     // The model: what this target believes is outstanding and in flight.
     var outstanding: [64]?u32 = @splat(null);
     var next_number: u64 = 0;
-    var now: u64 = 0;
+    var now_ns: u64 = 0;
 
     var operations: u32 = 0;
     while (operations < recovery_operations_max and !smith.eosWeightedSimple(6, 1)) : (operations += 1) {
-        now += @as(u64, smith.valueRangeAtMost(u8, 0, 200)) * std.time.ns_per_ms;
+        now_ns += @as(u64, smith.valueRangeAtMost(u8, 0, 200)) * std.time.ns_per_ms;
 
         switch (smith.value(enum { send, ack, timeout })) {
             .send => {
@@ -728,7 +728,7 @@ fn fuzzRecovery(_: void, smith: *std.testing.Smith) !void {
                 const in_flight = smith.value(bool);
                 recovery.onPacketSent(.initial, .{
                     .number = next_number,
-                    .time_sent = now,
+                    .time_sent = now_ns,
                     .octets = octets,
                     .ack_eliciting = smith.value(bool),
                     .in_flight = in_flight,
@@ -759,7 +759,7 @@ fn fuzzRecovery(_: void, smith: *std.testing.Smith) !void {
                     .ranges = range_bytes[0..drawn.octets],
                     .ecn = null,
                 };
-                const result = recovery.onAckReceived(.initial, ack, smith.value(u16), now, &lost) catch |err| switch (err) {
+                const result = recovery.onAckReceived(.initial, ack, smith.value(u16), now_ns, &lost) catch |err| switch (err) {
                     // A malformed ACK is a FRAME_ENCODING_ERROR and the
                     // connection is torn down, so there is no "carry on" to
                     // model. Note that `removeAcked` has already applied every
@@ -783,7 +783,7 @@ fn fuzzRecovery(_: void, smith: *std.testing.Smith) !void {
             },
             .timeout => {
                 const at = recovery.timeoutAt() orelse continue;
-                const outcome = recovery.onLossDetectionTimeout(@max(now, at), &lost);
+                const outcome = recovery.onLossDetectionTimeout(@max(now_ns, at), &lost);
                 switch (outcome) {
                     .lost => |count| for (lost[0..@min(count, lost.len)]) |context| {
                         outstanding[context] = null;

@@ -2,7 +2,7 @@
 //!
 //! Datagrams in, datagrams out, and handshake bytes crossing in both directions
 //! as plain data. Nothing here opens a socket, reads a clock or runs a TLS
-//! handshake — `now` is an argument, the caller owns the buffers, and the five
+//! handshake — `now_ns` is an argument, the caller owns the buffers, and the five
 //! entry points docs/DESIGN.md section 4 committed to are the whole of the TLS
 //! seam:
 //!
@@ -580,7 +580,7 @@ pub fn Connection(comptime config: Config) type {
         /// attacker can inject anything, and tearing the connection down on one
         /// is the attack. So a decryption failure ends the datagram quietly and
         /// only a protocol violation by the authenticated peer returns an error.
-        pub fn receive(self: *Self, datagram: []u8, now: u64) ReceiveError!void {
+        pub fn receive(self: *Self, datagram: []u8, now_ns: u64) ReceiveError!void {
             if (self.state == .draining) return;
 
             // Section 14.1: "A server MUST discard an Initial packet that is
@@ -607,12 +607,12 @@ pub fn Connection(comptime config: Config) type {
                 const parsed = packet.parse(datagram[offset..], self.source.length) catch return;
                 const consumed = parsed.octets;
                 assert(consumed >= 1);
-                try self.receivePacket(datagram[offset..][0..consumed], parsed.header, now);
+                try self.receivePacket(datagram[offset..][0..consumed], parsed.header, now_ns);
                 offset += consumed;
             }
         }
 
-        fn receivePacket(self: *Self, bytes: []u8, header: packet.Header, now: u64) ReceiveError!void {
+        fn receivePacket(self: *Self, bytes: []u8, header: packet.Header, now_ns: u64) ReceiveError!void {
             const level = header.level() orelse return; // Retry, Version Negotiation: not this slice.
             const offset = header.packetNumberOffset() orelse return;
             const index = @intFromEnum(level);
@@ -638,8 +638,8 @@ pub fn Connection(comptime config: Config) type {
             // keys only the real one could have, which validates the address.
             if (level == .handshake) self.address_validated = true;
 
-            const eliciting = try self.receiveFrames(level, opened.payload, now);
-            space.received.record(opened.number, now, eliciting);
+            const eliciting = try self.receiveFrames(level, opened.payload, now_ns);
+            space.received.record(opened.number, now_ns, eliciting);
 
             // Section 7.2: a client's Source Connection ID is chosen once and
             // fixed for the connection, so a server adopts it from the first
@@ -737,7 +737,7 @@ pub fn Connection(comptime config: Config) type {
 
         /// Walk the frames of one payload, returning whether any was
         /// ack-eliciting.
-        fn receiveFrames(self: *Self, level: Level, payload: []const u8, now: u64) ReceiveError!bool {
+        fn receiveFrames(self: *Self, level: Level, payload: []const u8, now_ns: u64) ReceiveError!bool {
             var iterator: frame.Iterator = .init(payload);
             var eliciting = false;
             var count: u32 = 0;
@@ -748,15 +748,15 @@ pub fn Connection(comptime config: Config) type {
                 // application data accepted before anyone is authenticated.
                 if (!value.frameType().allowedIn(level)) return error.Protocol;
                 if (value.ackEliciting()) eliciting = true;
-                try self.receiveFrame(level, value, now);
+                try self.receiveFrame(level, value, now_ns);
             }
             return eliciting;
         }
 
-        fn receiveFrame(self: *Self, level: Level, one: frame.Frame, now: u64) ReceiveError!void {
+        fn receiveFrame(self: *Self, level: Level, one: frame.Frame, now_ns: u64) ReceiveError!void {
             switch (one) {
                 .padding, .ping => {},
-                .ack => |value| try self.receiveAck(level, value, now),
+                .ack => |value| try self.receiveAck(level, value, now_ns),
                 .crypto => |value| try self.receiveCrypto(level, value),
                 .handshake_done => try self.receiveHandshakeDone(),
                 .connection_close => |value| {
@@ -813,7 +813,7 @@ pub fn Connection(comptime config: Config) type {
         }
 
         /// Section 13.2 and RFC 9002 section 5: what an acknowledgement moves.
-        fn receiveAck(self: *Self, level: Level, value: frame.Ack, now: u64) ReceiveError!void {
+        fn receiveAck(self: *Self, level: Level, value: frame.Ack, now_ns: u64) ReceiveError!void {
             // The caller applied section 12.4's Table 3 before dispatching, so
             // an ACK cannot arrive at a level that forbids one.
             assert(frame.Type.ack.allowedIn(level));
@@ -850,7 +850,7 @@ pub fn Connection(comptime config: Config) type {
                 level.space(),
                 value,
                 delay_ns,
-                now,
+                now_ns,
                 &lost,
             ) catch return error.Protocol;
             // `onPacketsLost` indexes `lost`, so the count has to be clamped to
@@ -995,9 +995,9 @@ pub fn Connection(comptime config: Config) type {
         }
 
         /// Section A.9 of RFC 9002: the timer fired.
-        pub fn onTimeout(self: *Self, now: u64) void {
+        pub fn onTimeout(self: *Self, now_ns: u64) void {
             var lost: [lost_report_max]PacketContext = undefined;
-            switch (self.recovery.onLossDetectionTimeout(now, &lost)) {
+            switch (self.recovery.onLossDetectionTimeout(now_ns, &lost)) {
                 .lost => |count| self.onPacketsLost(lost[0..@min(count, lost.len)]),
                 // Section 6.2.4: nothing is known to be lost and the peer has
                 // gone quiet, so send something it must answer — and where
@@ -1029,7 +1029,7 @@ pub fn Connection(comptime config: Config) type {
         /// One datagram per call rather than as many as will fit, because the
         /// caller owns the socket and the pacing: a loop here would be this
         /// package deciding how fast to send.
-        pub fn send(self: *Self, buffer: []u8, now: u64) SendError!usize {
+        pub fn send(self: *Self, buffer: []u8, now_ns: u64) SendError!usize {
             if (buffer.len < config.datagram_octets) return error.BufferTooSmall;
             if (self.state == .draining) return 0;
 
@@ -1041,7 +1041,7 @@ pub fn Connection(comptime config: Config) type {
             // Section 12.2: levels are coalesced oldest first, so a peer that
             // has not yet installed later keys still gets the earlier packet.
             for ([_]Level{ .initial, .handshake, .one_rtt }) |level| {
-                offset += self.sendPacket(buffer[offset..limit], level, now) catch 0;
+                offset += self.sendPacket(buffer[offset..limit], level, now_ns) catch 0;
             }
             if (offset == 0) return 0;
 
@@ -1117,7 +1117,7 @@ pub fn Connection(comptime config: Config) type {
 
         /// One packet at one level, or `error.Empty` when the level has nothing
         /// to say.
-        fn sendPacket(self: *Self, buffer: []u8, level: Level, now: u64) !usize {
+        fn sendPacket(self: *Self, buffer: []u8, level: Level, now_ns: u64) !usize {
             const index = @intFromEnum(level);
             const keys = self.send_keys[index] orelse return error.Empty;
             const space = &self.spaces[@intFromEnum(level.space())];
@@ -1154,7 +1154,7 @@ pub fn Connection(comptime config: Config) type {
                 .close_pending = self.close_pending,
                 .crypto_framed = self.levels[index].framed,
             };
-            const written = self.writePayload(buffer[header.header_octets..][0..payload_room], level, now);
+            const written = self.writePayload(buffer[header.header_octets..][0..payload_room], level, now_ns);
             const payload_octets = written.octets;
             if (payload_octets == 0) {
                 self.rollback(level, undo, written);
@@ -1211,7 +1211,7 @@ pub fn Connection(comptime config: Config) type {
             // it depends on.
             self.recovery.onPacketSent(level.space(), .{
                 .number = number,
-                .time_sent = now,
+                .time_sent = now_ns,
                 .octets = @intCast(total),
                 .ack_eliciting = written.ack_eliciting,
                 .in_flight = written.ack_eliciting,
@@ -1303,7 +1303,7 @@ pub fn Connection(comptime config: Config) type {
 
         /// Fill a payload: an ACK if one is owed, then whatever handshake bytes
         /// are waiting.
-        fn writePayload(self: *Self, payload: []u8, level: Level, now: u64) Payload {
+        fn writePayload(self: *Self, payload: []u8, level: Level, now_ns: u64) Payload {
             var result: Payload = .{};
             var offset: usize = 0;
             const space = &self.spaces[@intFromEnum(level.space())];
@@ -1312,7 +1312,7 @@ pub fn Connection(comptime config: Config) type {
                 // Section 13.2.5's delay exponent is the peer's transport
                 // parameter; until this package decodes them it uses the
                 // default, which is what section 18.2 says an absent one means.
-                const written = space.received.write(payload[offset..], now, 3) catch null;
+                const written = space.received.write(payload[offset..], now_ns, 3) catch null;
                 if (written) |value| offset += value.octets;
             }
 
@@ -1542,11 +1542,11 @@ fn installBoth(a: *TestConnection, b: *TestConnection, level: Level, seed: u8) !
 }
 
 /// Move one datagram from `from` to `to`, returning its length.
-fn deliver(from: *TestConnection, to: *TestConnection, now: u64) !usize {
+fn deliver(from: *TestConnection, to: *TestConnection, now_ns: u64) !usize {
     var datagram: [TestConnection.datagram_octets]u8 = @splat(0);
-    const octets = try from.send(&datagram, now);
+    const octets = try from.send(&datagram, now_ns);
     if (octets == 0) return 0;
-    try to.receive(datagram[0..octets], now);
+    try to.receive(datagram[0..octets], now_ns);
     return octets;
 }
 
@@ -1592,30 +1592,30 @@ test "the server's reply completes the Initial exchange in both directions" {
 test "a handshake reaches 1-RTT through all three levels" {
     var client = testClient();
     var server = testServer();
-    var now: u64 = 0;
+    var now_ns: u64 = 0;
 
     try client.cryptoIn(.initial, "ClientHello");
-    _ = try deliver(&client, &server, now);
+    _ = try deliver(&client, &server, now_ns);
 
     // Both sides derive Handshake keys. Installing them discards Initial, which
     // is section 4.9.1 of RFC 9001: keys anyone who saw the first packet can
     // compute are not kept.
-    now += 1000;
+    now_ns += 1000;
     try installBoth(&server, &client, .handshake, 0x11);
     try installBoth(&client, &server, .handshake, 0x22);
     try testing.expect(client.send_keys[@intFromEnum(Level.initial)] == null);
     try testing.expect(server.receive_keys[@intFromEnum(Level.initial)] == null);
 
     try server.cryptoIn(.handshake, "EncryptedExtensions, Certificate, Finished");
-    _ = try deliver(&server, &client, now);
+    _ = try deliver(&server, &client, now_ns);
     try testing.expectEqualStrings("EncryptedExtensions, Certificate, Finished", client.cryptoOut(.handshake));
 
     // 1-RTT keys, and the server confirms the handshake.
-    now += 1000;
+    now_ns += 1000;
     try installBoth(&server, &client, .one_rtt, 0x33);
     try installBoth(&client, &server, .one_rtt, 0x44);
     try client.cryptoIn(.handshake, "Finished");
-    _ = try deliver(&client, &server, now);
+    _ = try deliver(&client, &server, now_ns);
     try testing.expectEqualStrings("Finished", server.cryptoOut(.handshake));
 
     // HANDSHAKE_DONE is the server's alone, and it is what establishes the
@@ -1623,7 +1623,7 @@ test "a handshake reaches 1-RTT through all three levels" {
     try testing.expectEqual(State.handshaking, client.state);
     var datagram: [TestConnection.datagram_octets]u8 = @splat(0);
     const written = try frame.encode(&datagram, .handshake_done);
-    try client.receiveFrame(.one_rtt, (try frame.parse(datagram[0..written])).frame, now);
+    try client.receiveFrame(.one_rtt, (try frame.parse(datagram[0..written])).frame, now_ns);
     try testing.expectEqual(State.established, client.state);
 }
 
@@ -1814,29 +1814,29 @@ test "a handshake survives a dropped datagram" {
     // handshake that never starts.
     var client = testClient();
     var server = testServer();
-    var now: u64 = 0;
+    var now_ns: u64 = 0;
 
     try client.cryptoIn(.initial, "ClientHello");
 
     // The first flight goes out and is dropped on the floor.
     var datagram: [TestConnection.datagram_octets]u8 = @splat(0);
-    const dropped = try client.send(&datagram, now);
+    const dropped = try client.send(&datagram, now_ns);
     try testing.expect(dropped > 0);
     try testing.expectEqualStrings("", server.cryptoOut(.initial));
 
     // Nothing is owed until the probe timeout, and the client knows when.
     const at = client.timeout().?;
-    try testing.expect(at > now);
+    try testing.expect(at > now_ns);
     try testing.expect(!client.wantsSend());
 
     // The timer fires. Section 6.2.4: the probe carries the unacknowledged
     // handshake data rather than a bare PING, so the retransmission is the
     // thing that makes progress.
-    now = at;
-    client.onTimeout(now);
+    now_ns = at;
+    client.onTimeout(now_ns);
     try testing.expect(client.wantsSend());
 
-    const octets = try deliver(&client, &server, now);
+    const octets = try deliver(&client, &server, now_ns);
     try testing.expect(octets > 0);
     try testing.expectEqualStrings("ClientHello", server.cryptoOut(.initial));
 }
@@ -1959,20 +1959,20 @@ test "a response larger than one packet arrives in order" {
     var rounds: u32 = 0;
     var received: [4096]u8 = undefined;
     var received_len: usize = 0;
-    // `now` only ever moves forward. A connection whose clock goes backwards is
+    // `now_ns` only ever moves forward. A connection whose clock goes backwards is
     // one whose ACK delay is negative, and `AckRanges.write` asserts against it
     // — which is how the first version of this test failed.
-    var now: u64 = 1000;
+    var now_ns: u64 = 1000;
     while (rounds < 16 and received_len < body.len) : (rounds += 1) {
-        now += 1000;
-        _ = try deliver(&server, &client, now);
+        now_ns += 1000;
+        _ = try deliver(&server, &client, now_ns);
         const ready = client.readable(0);
         @memcpy(received[received_len..][0..ready.len], ready);
         received_len += ready.len;
         try client.consume(0, ready.len);
         // The client's acknowledgements are what free the server's window.
-        now += 1000;
-        _ = try deliver(&client, &server, now);
+        now_ns += 1000;
+        _ = try deliver(&client, &server, now_ns);
     }
     try testing.expectEqual(body.len, received_len);
     try testing.expectEqualSlices(u8, &body, received[0..body.len]);
@@ -2005,15 +2005,15 @@ test "the window is raised as the application reads" {
     var body: [40 * 1024]u8 = @splat('x');
     var queued: usize = 0;
     var rounds: u32 = 0;
-    var now: u64 = 1000;
+    var now_ns: u64 = 1000;
     while (rounds < 64 and queued < body.len) : (rounds += 1) {
         queued += try client.write(0, body[queued..], false);
-        now += 1000;
-        _ = try deliver(&client, &server, now);
+        now_ns += 1000;
+        _ = try deliver(&client, &server, now_ns);
         const ready = server.readable(0);
         if (ready.len > 0) try server.consume(0, ready.len);
-        now += 1000;
-        _ = try deliver(&server, &client, now);
+        now_ns += 1000;
+        _ = try deliver(&server, &client, now_ns);
     }
     try testing.expect(queued > 0);
     // Section 4.1: reading is what moves the limit, and the peer learns about
@@ -2247,10 +2247,10 @@ test "a FIN is framed once, and the connection stops wanting to send" {
     _ = try client.write(0, "body", true);
 
     var rounds: u32 = 0;
-    var now: u64 = 1000;
+    var now_ns: u64 = 1000;
     while (rounds < 8 and client.wantsSend()) : (rounds += 1) {
-        now += 1000;
-        _ = try deliver(&client, &server, now);
+        now_ns += 1000;
+        _ = try deliver(&client, &server, now_ns);
     }
     try testing.expect(!client.wantsSend());
     try testing.expectEqualStrings("body", server.readable(0));

@@ -80,7 +80,7 @@ than it was in h2 — a QUIC stack *wants* to own a UDP socket, because
 `recvmmsg`, GSO and ECN are all socket-level — and the answer is that those are
 the consumer's to use, with this package told the results.
 
-**The clock.** `now` is a parameter, in nanoseconds, on every function whose
+**The clock.** `now_ns` is a parameter, in nanoseconds, on every function whose
 behaviour depends on time. Nothing here calls `clock_gettime`. That is what lets
 zoxy's deterministic simulator drive a QUIC connection on a virtual clock, and
 it is what makes loss recovery testable at all — a PTO that fires after a real
@@ -261,7 +261,7 @@ all three build legs):
    that was confirmed to fail without its fix, and `fuzz/` has a target.
 3. ~~**RFC 9002 recovery.**~~ — done, and wired into the connection. RTT
    estimation, both loss thresholds, the PTO with its exponential backoff, and
-   NewReno. Pure computation over a caller-supplied `now`, so a probe timeout is
+   NewReno. Pure computation over a caller-supplied `now_ns`, so a probe timeout is
    tested by moving a number rather than by waiting a second. A handshake now
    survives a dropped datagram, which is the property the whole document exists
    for.

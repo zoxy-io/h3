@@ -79,7 +79,7 @@ and [§4](docs/DESIGN.md#4-where-tls-attaches).
   removes them for a consumer that has made that argument — see
   [`src/assert.zig`](src/assert.zig) for why this is not `std.debug.assert`.
 * Datagrams in, events out — no socket, no reader, no writer and no `std.Io` in
-  the seam. `now` is an argument; randomness is an argument; TLS handshake bytes
+  the seam. `now_ns` is an argument; randomness is an argument; TLS handshake bytes
   are arguments in both directions. `zig build lint` enforces the first.
 
 ## Verified against the RFCs' own vectors

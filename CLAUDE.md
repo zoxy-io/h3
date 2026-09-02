@@ -70,7 +70,7 @@ not represented by any test that runs on a laptop.
   than it was in h2: a QUIC stack wants to own a UDP socket, because `recvmmsg`,
   GSO and ECN are socket-level. It cannot — the two consumers do not share a
   runtime. Datagrams in, datagrams and events out.
-- **`now` and randomness are parameters.** Nothing here reads a clock or draws
+- **`now_ns` and randomness are parameters.** Nothing here reads a clock or draws
   entropy. That is what makes loss recovery testable and what lets zoxy's
   simulator replay a connection.
 - **TLS is the consumer's.** zoxy has ztls, zrk has zssl; this package takes

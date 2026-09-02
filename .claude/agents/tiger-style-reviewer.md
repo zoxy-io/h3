@@ -72,7 +72,14 @@ not the ones you may remember from h2 or zoxy.
 - **Naming:** TitleCase types, camelCase functions, snake_case
   variables/fields/constants; no abbreviations (`source`, not `src`);
   most-significant word first with units/qualifiers last (`header_bytes_max`);
-  files are TitleCase.zig only when the top-level struct has fields.
+  files are TitleCase.zig when the file's export is a type — either a struct
+  with fields (`ConnectionId.zig`) or a `fn (comptime Config) type` that
+  produces one (`Connection.zig`, `Recovery.zig`, `Streams.zig`,
+  `AckRanges.zig`, `Reassembler.zig`). A file that is a bag of functions and
+  constants is lowercase (`frame.zig`, `packet.zig`, `stream_id.zig`). The
+  rule inherited from h2 said "only when the top-level struct has fields",
+  which none of the five generics satisfy — read literally it condemns all of
+  them, so it was read as condemning two, which is worse than either answer.
 - **Comments are complete sentences** explaining why/how, not what.
 - **Hygiene:** arguments > 16 bytes passed as `*const`; variables at smallest
   scope.
