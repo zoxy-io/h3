@@ -81,6 +81,34 @@ const lost_report_max: usize = 32;
 /// transport parameters are decoded.
 const ack_delay_exponent_default: u6 = 3;
 
+/// The largest acknowledgement delay this endpoint will believe.
+///
+/// An ACK frame's Delay field is a variable-length integer, so a peer may send
+/// any value up to 2^62-1, and RFC 9000 section 19.3 puts no ceiling on it.
+/// Scaling one — `delay << exponent`, then microseconds to nanoseconds —
+/// overflows `u64` well before that, which is a panic in the safe builds and a
+/// wraparound in the `-Dassertions=false` one. Section 18.2 caps
+/// `max_ack_delay` at 2^14 milliseconds, so anything past that is a delay the
+/// protocol cannot mean.
+///
+/// Saturated rather than refused. Section 13.2.5 makes an inflated delay the
+/// peer's own loss — `Recovery.updateRtt` clamps it again against
+/// `max_ack_delay`, and a larger delay only shrinks the peer's own RTT credit —
+/// so closing the connection over it would let a peer kill a connection by
+/// lying about a field that costs us nothing.
+const ack_delay_ns_max: u64 = (1 << 14) * std.time.ns_per_ms;
+
+/// The same ceiling expressed in the units the wire carries, so the clamp
+/// happens before the shift rather than after it.
+const ack_delay_units_max: u64 = (ack_delay_ns_max / std.time.ns_per_us) >> ack_delay_exponent_default;
+
+comptime {
+    // The clamp is what makes the arithmetic below total: at the ceiling it
+    // reproduces the ceiling exactly, and it cannot exceed it.
+    assert((ack_delay_units_max << ack_delay_exponent_default) * std.time.ns_per_us == ack_delay_ns_max);
+    assert(ack_delay_ns_max < std.math.maxInt(u64));
+}
+
 /// RFC 9000 section 8.1: before a peer's address is validated, a server may
 /// send no more than this multiple of what it has received. Without it a server
 /// is a reflector for anyone who can spoof a source address.
@@ -470,8 +498,16 @@ pub fn Connection(comptime config: Config) type {
                     // Section 13.2.5: the delay is in microseconds, scaled by
                     // the exponent the peer advertised. Until the transport
                     // parameters are decoded this uses section 18.2's default,
-                    // which is what an absent one means.
-                    const delay_ns = (value.delay << ack_delay_exponent_default) * std.time.ns_per_us;
+                    // which is what an absent one means. Clamped before the
+                    // shift — see `ack_delay_units_max`.
+                    // The `u64` annotation is load-bearing. `@min` narrows its
+                    // result type to fit the comptime-known bound, so
+                    // `@min(x, 2_048_000)` is a `u21` — and `u21 << 3` needs
+                    // twenty-four bits and overflows. The clamp written without
+                    // it *created* the overflow it was added to prevent.
+                    const delay_units: u64 = @min(value.delay, ack_delay_units_max);
+                    const delay_ns: u64 = (delay_units << ack_delay_exponent_default) * std.time.ns_per_us;
+                    assert(delay_ns <= ack_delay_ns_max);
                     var lost: [lost_report_max]PacketContext = undefined;
                     const result = self.recovery.onAckReceived(
                         level.space(),
@@ -722,7 +758,19 @@ pub fn Connection(comptime config: Config) type {
             const header = try self.writeHeader(buffer, level, number, number_octets);
 
             // The payload goes after the header, leaving room for the tag.
-            const payload_room = buffer.len - header.header_octets - crypto.tag_octets;
+            // Checked, not assumed. `send` hands this a slice whose length is
+            // `min(sendRoom(), datagram_octets)`, and for an unvalidated server
+            // `sendRoom()` is `3 * received - sent` — a number the peer tunes by
+            // choosing how much it sends. Land it in the sixteen-octet window
+            // where a header fits but the header plus the tag does not, and the
+            // subtraction below underflows: a panic in the safe builds and an
+            // out-of-bounds slice in the `-Dassertions=false` one. Found by
+            // review, reproduced by walking `sent_octets` across the window.
+            const overhead = header.header_octets + crypto.tag_octets;
+            if (buffer.len <= overhead) return error.Empty;
+            const payload_room = buffer.len - overhead;
+            assert(payload_room >= 1);
+            assert(overhead + payload_room == buffer.len);
             const written = self.writePayload(buffer[header.header_octets..][0..payload_room], level, now);
             const payload_octets = written.octets;
             if (payload_octets == 0) return error.Empty;
@@ -1664,4 +1712,49 @@ test "a response crosses back, and a malformed one is caught" {
     var validator: h3.fields.MessageValidator = .init(.response);
     while (try iterator.next()) |one| try validator.field(&one);
     try testing.expectError(error.PseudoMissing, validator.finish());
+}
+
+test "the amplification limit cannot be tuned into an underflow" {
+    // Found by review and reproduced before it was fixed: an unvalidated
+    // server's send room is `3 * received - sent`, which the peer chooses. Land
+    // it where a header fits but the header plus the AEAD tag does not, and
+    // `sendPacket` used to underflow computing the payload room — a panic in
+    // the safe builds, an out-of-bounds slice in the one zrk ships.
+    var client = testClient();
+    var server = testServer();
+    try client.cryptoIn(.initial, "ClientHello");
+    _ = try deliver(&client, &server, 0);
+
+    var spare: u64 = 0;
+    while (spare < 128) : (spare += 1) {
+        var probe = server;
+        probe.sent_octets = probe.received_octets * amplification_factor - spare;
+        var datagram: [TestConnection.datagram_octets]u8 = @splat(0);
+        const octets = try probe.send(&datagram, 1000);
+        // Whatever it decides, it must be a packet that fits or no packet.
+        try testing.expect(octets <= datagram.len);
+    }
+}
+
+test "an inflated ACK delay is clamped rather than overflowing" {
+    // The Delay field is an unbounded varint, and scaling it overflows `u64`
+    // long before 2^62. Section 18.2 caps what the field can mean at 2^14 ms.
+    var client = testClient();
+    var payload: [32]u8 = @splat(0);
+    try client.cryptoIn(.initial, "ClientHello");
+    var datagram: [TestConnection.datagram_octets]u8 = @splat(0);
+    _ = try client.send(&datagram, 0);
+
+    for ([_]u64{ varint.max, varint.max - 1, 1 << 40, ack_delay_units_max, ack_delay_units_max + 1 }) |delay| {
+        const written = try frame.encode(&payload, .{ .ack = .{
+            .largest = 0,
+            .delay = delay,
+            .first_range = 0,
+            .range_count = 0,
+            .ranges = &.{},
+            .ecn = null,
+        } });
+        var probe = client;
+        _ = try probe.receiveFrames(.initial, payload[0..written], 1_000_000);
+    }
 }

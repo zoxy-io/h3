@@ -175,13 +175,29 @@ pub fn parsePrefix(source: []const u8) Error!Prefix {
         error.TooLarge => error.DecompressionFailed,
     };
 
+    // Widened before any arithmetic, and the annotations are load-bearing.
+    // `Decoded.value` is a `u62` at this width, and Zig does not widen operands
+    // to a declared result type — `count.value + delta.value` and
+    // `delta.value + 1` both overflow inside `u62` for values a peer encodes in
+    // nine octets, which is a panic in the safe builds and undefined behaviour
+    // in the `-Dassertions=false` one. Both are reachable from the first
+    // twenty-one octets of a field section, before any other check runs.
+    const insert_count: u64 = count.value;
+    const delta_base: u64 = delta.value;
+    comptime {
+        // Two 62-bit values and one cannot reach 64 bits, which is what makes
+        // the addition below total once both are `u64`.
+        assert(@bitSizeOf(@TypeOf(count.value)) <= 62);
+        assert(@bitSizeOf(@TypeOf(delta.value)) <= 62);
+    }
+
     // Section 4.5.1: a negative sign means the base is below the insert count,
     // which only happens when a section references entries it itself inserted.
     // With no dynamic table both are zero and the sign cannot be set.
     const base: u64 = if (negative)
-        std.math.sub(u64, count.value, delta.value + 1) catch return error.DecompressionFailed
+        std.math.sub(u64, insert_count, delta_base + 1) catch return error.DecompressionFailed
     else
-        count.value + delta.value;
+        insert_count + delta_base;
 
     return .{
         .required_insert_count = count.value,
@@ -577,4 +593,24 @@ test "a target too small is refused rather than truncated" {
     try testing.expectError(error.ListTooLarge, encode(&target, &.{
         .{ .name = "x-long-name-here", .value = "and a long value too" },
     }));
+}
+
+test "a field section prefix at the encoding's limits does not overflow" {
+    // Found by review: `Decoded.value` is a `u62`, and Zig does not widen
+    // operands to a declared result type, so `count.value + delta.value` and
+    // `delta.value + 1` overflowed inside `u62`. Twenty-one octets of peer
+    // input reach both, before any other check runs — a panic in the safe
+    // builds and undefined behaviour in the one zrk ships.
+    var buffer: [64]u8 = undefined;
+    var wire: [32]u8 = undefined;
+
+    // A Required Insert Count and a Delta Base both at the width's maximum,
+    // with the sign bit clear and then set.
+    for ([_]u8{ 0x00, 0x80 }) |sign| {
+        var offset: u32 = 0;
+        offset += try integer.encode(wire[offset..], std.math.maxInt(u62), required_insert_count_prefix_bits, 0);
+        offset += try integer.encode(wire[offset..], std.math.maxInt(u62), delta_base_prefix_bits, sign);
+        // Either answer is fine; not crashing is the point.
+        _ = iterate(wire[0..offset], &buffer, 1 << 16) catch {};
+    }
 }
