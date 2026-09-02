@@ -12,6 +12,9 @@ threads through `std.Io`). Read before writing code:
 - [docs/TIGER_STYLE.md](docs/TIGER_STYLE.md) — enforced coding rules. h2's,
   plus the deltas owning a transport forces; the deltas are the part to read.
 - [README.md](README.md) — scope, and what is permanently out of it.
+- [docs/VERIFICATION.md](docs/VERIFICATION.md) — the gaps in the evidence and
+  the plan to close them. A slice is not done until it has a ledger citation
+  and, once `sim/` exists, a scenario.
 
 ## Gates — run before every commit
 

@@ -182,3 +182,6 @@ zig build example # build and run the usage example above
   what is built and what is next, and the decisions still open.
 * [docs/TIGER_STYLE.md](docs/TIGER_STYLE.md) — the enforced coding rules: h2's,
   plus the deltas that owning a transport rather than a codec forces.
+* [docs/VERIFICATION.md](docs/VERIFICATION.md) — why the review finds what the
+  gates miss, what the other QUIC stacks run, and the order in which to close
+  the gap: requirement ledger, simulator, interop shim.
