@@ -15,13 +15,27 @@
 //! packet. Unbounded, that is a structure an attacker sizes. Bounded, something
 //! has to be dropped, and *which* end is dropped is the decision.
 //!
-//! The low end goes. Section 13.2.4 permits an endpoint to limit what it
+//! The low end goes. Section 13.2.3 permits an endpoint to limit what it
 //! acknowledges, and the cost of forgetting a low range is that the peer may
 //! retransmit data we already have — wasteful, and handled, because
 //! `Reassembler` treats a duplicate as free. The cost of forgetting a *high*
 //! range would be acknowledging a packet number below one already sent in an
-//! earlier ACK, which section 13.2.1 forbids outright: an ACK frame's ranges
-//! must be descending and an endpoint must not renege on what it acknowledged.
+//! earlier ACK, and section 19.3 forbids that outright: "QUIC acknowledgments
+//! are irrevocable. Once acknowledged, a packet remains acknowledged, even if
+//! it does not appear in a future ACK frame."
+//!
+//! ## Forgetting a range obliges us to refuse it
+//!
+//! Section 13.2.3 attaches a condition to that permission, and it is the whole
+//! of `minimum` below: "A receiver MUST retain an ACK Range unless it can
+//! ensure that it will not subsequently accept packets with numbers in that
+//! range. Maintaining a minimum packet number that increases as ranges are
+//! discarded is one way to achieve this with minimal state."
+//!
+//! Without it, dropping a range makes `contains` answer false for every number
+//! in it, so a replay of one of those packets is recorded as new and its frames
+//! are processed a second time. That is the duplicate-suppression the whole
+//! structure exists to provide, defeated by the eviction that keeps it bounded.
 //!
 //! ## What it does not do
 //!
@@ -85,6 +99,10 @@ pub fn AckRanges(comptime config: Config) type {
         /// Whether anything ack-eliciting has arrived since the last ACK was
         /// written. Section 13.2.1: an ACK frame is owed only for those.
         ack_eliciting_pending: bool = false,
+        /// Section 13.2.3's minimum packet number: everything below this is
+        /// treated as already seen, whether or not a range still records it.
+        /// Rises when eviction forgets a range, and never falls.
+        minimum: u64 = 0,
 
         /// Note that `number` arrived at `now`.
         ///
@@ -103,6 +121,11 @@ pub fn AckRanges(comptime config: Config) type {
         }
 
         pub fn contains(self: *const Self, number: u64) bool {
+            // Section 13.2.3: a number below the floor is one this endpoint has
+            // undertaken never to accept again, which is what makes forgetting
+            // its range legal. Answered before the walk, because the range that
+            // would have said so is exactly the one that is gone.
+            if (number < self.minimum) return true;
             for (self.ranges[0..self.count]) |range| {
                 if (range.contains(number)) return true;
                 // Descending, so once a range sits entirely below `number`
@@ -149,13 +172,26 @@ pub fn AckRanges(comptime config: Config) type {
 
         /// Open a new range at `index`, shifting the rest down and forgetting
         /// the lowest if the set is full. See the module comment for why the
-        /// low end is the end that goes.
+        /// low end is the end that goes, and why forgetting one obliges this to
+        /// raise `minimum`.
         fn open(self: *Self, index: u32, number: u64) void {
             assert(index <= self.count);
+            const floor_before = self.minimum;
             if (self.count == ranges_max) {
-                if (index == ranges_max) return; // Lower than everything held.
+                if (index == ranges_max) {
+                    // Lower than everything held, and no room to hold it. It is
+                    // never recorded, so it must never be accepted either.
+                    self.minimum = @max(self.minimum, number + 1);
+                    assert(self.minimum >= floor_before);
+                    return;
+                }
+                // The lowest range is about to go; undertake never to accept a
+                // number in it again.
+                const dropped = self.ranges[self.count - 1];
+                self.minimum = @max(self.minimum, dropped.largest + 1);
                 self.count -= 1;
             }
+            assert(self.minimum >= floor_before);
             var at = self.count;
             while (at > index) : (at -= 1) {
                 self.ranges[at] = self.ranges[at - 1];
@@ -255,6 +291,10 @@ pub fn AckRanges(comptime config: Config) type {
                 const range = self.ranges[index];
                 assert(range.largest >= range.smallest);
                 assert(range.largest <= packet_number.max);
+                // Nothing held may sit below the floor, or `contains` would
+                // answer true for a number a range still records — two sources
+                // of truth disagreeing.
+                assert(range.smallest >= self.minimum);
                 // Descending, and separated by at least one number: a gap of
                 // zero would mean the merge failed to run.
                 if (index > 0) assert(self.ranges[index - 1].smallest > range.largest + 1);
@@ -339,11 +379,17 @@ test "the lowest range is what a full set forgets" {
 
     set.record(8, 0, true);
     try testing.expectEqual(@as(u32, 4), set.count);
-    // The high end survives, because section 13.2.1 forbids reneging on an
-    // acknowledgement already sent; the low end is merely a retransmission.
+    // The high end survives, because section 19.3 makes an acknowledgement
+    // irrevocable; the low end is merely a retransmission.
     try testing.expectEqual(@as(u64, 8), set.largest().?);
-    try testing.expect(!set.contains(0));
     try testing.expect(set.contains(2));
+
+    // The *range* holding 0 is gone, but 0 is still refused — section 13.2.3
+    // only permits forgetting a range if the numbers in it will not be accepted
+    // again. This assertion used to read `!set.contains(0)`, which asserted the
+    // violation as though it were the design.
+    try testing.expect(set.contains(0));
+    try testing.expect(set.minimum > 0);
 }
 
 test "a number below a full set is dropped rather than displacing a higher one" {
@@ -351,8 +397,10 @@ test "a number below a full set is dropped rather than displacing a higher one" 
     for ([_]u64{ 10, 12, 14, 16 }) |number| set.record(number, 0, true);
     set.record(2, 0, true);
     try testing.expectEqual(@as(u32, 4), set.count);
-    try testing.expect(!set.contains(2));
     try testing.expectEqual(@as(u64, 10), set.ranges[3].largest);
+    // Not recorded, and therefore refused: an untracked number that could still
+    // be accepted is a replay window. This too used to assert the opposite.
+    try testing.expect(set.contains(2));
 }
 
 test "a written ACK frame parses back to the ranges that went in" {
@@ -431,4 +479,51 @@ test "writing an ACK clears the debt an ack-eliciting packet created" {
     var target: [64]u8 = @splat(0);
     _ = try set.write(&target, 0, 3);
     try testing.expect(!set.ack_eliciting_pending);
+}
+
+test "section 13.2.3: forgetting a range means refusing it forever" {
+    var set: Set = .{};
+    // Every other number, which is the shape that costs one range each.
+    for ([_]u64{ 0, 2, 4, 6 }) |number| set.record(number, 0, true);
+    try testing.expect(set.contains(0));
+
+    set.record(8, 0, true);
+    try testing.expectEqual(@as(u32, 4), set.count);
+    // The range holding 0 is gone — and section 13.2.3 requires that dropping
+    // it come with an undertaking never to accept those numbers again.
+    // Otherwise a replay is recorded as new and its frames are processed twice,
+    // which is the duplicate suppression this structure exists to provide.
+    try testing.expect(set.contains(0));
+    try testing.expectEqual(@as(u64, 1), set.minimum);
+
+    // A replay changes nothing: no new range, no new acknowledgement.
+    const before = set.count;
+    set.record(0, 0, true);
+    try testing.expectEqual(before, set.count);
+}
+
+test "the floor rises with eviction and never falls" {
+    var set: Set = .{};
+    var number: u64 = 0;
+    while (number < 40) : (number += 2) set.record(number, 0, true);
+    const floor = set.minimum;
+    try testing.expect(floor > 0);
+
+    // A number below the floor is refused rather than recorded.
+    set.record(0, 0, true);
+    try testing.expectEqual(floor, set.minimum);
+    try testing.expect(set.contains(0));
+    // And the floor never moves backwards.
+    set.record(1000, 0, true);
+    try testing.expect(set.minimum >= floor);
+}
+
+test "a number too low to hold when full is refused rather than dropped" {
+    var set: Set = .{};
+    for ([_]u64{ 10, 12, 14, 16 }) |n| set.record(n, 0, true);
+    // Lower than everything held, and there is no room. It cannot be recorded,
+    // so it must not be acceptable either — otherwise it is a replay window.
+    set.record(2, 0, true);
+    try testing.expect(set.contains(2));
+    try testing.expectEqual(@as(u32, 4), set.count);
 }
