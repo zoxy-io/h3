@@ -55,6 +55,7 @@ const local_connection_id_octets_max = 20;
 /// short enough to read.
 const reassembler_operations_max = 64;
 const ack_operations_max = 128;
+const connection_datagrams_max = 24;
 
 /// Frames drawn into one payload, and settings into one SETTINGS frame.
 const settings_max = 16;
@@ -96,34 +97,16 @@ test "varint: decode, re-encode at the same length, and the minimal rule" {
     try std.testing.fuzz({}, fuzzVarint, .{});
 }
 
-/// A QPACK integer terminates at every prefix width, and round-trips.
-///
-/// The bound is the property: section 4.1.1 sets no limit on continuation
-/// octets, so an input of nothing but `0xff` is legal-looking and endless.
-fn fuzzQpackInteger(_: void, smith: *std.testing.Smith) !void {
-    const prefix_bits = smith.valueRangeAtMost(u4, 1, h3.qpack.integer.prefix_bits_max);
-    var buffer: [input_max]u8 = undefined;
-    const length = smith.slice(&buffer);
-    const source = buffer[0..length];
-
-    const decoded = h3.qpack.integer.decode(source, prefix_bits) catch return;
-    assert(decoded.octets >= 1);
-    assert(decoded.octets <= source.len);
-    assert(decoded.octets <= h3.qpack.integer.continuation_octets_max + 1);
-    assert(decoded.value <= h3.qpack.integer.value_max);
-    assert(decoded.octets == h3.qpack.integer.encodedLength(decoded.value, prefix_bits));
-
-    var target: [h3.qpack.integer.continuation_octets_max + 1]u8 = undefined;
-    const prefix_mask: u8 = @intCast((@as(u16, 1) << prefix_bits) - 1);
-    const tag = source[0] & ~prefix_mask;
-    const written = h3.qpack.integer.encode(&target, decoded.value, prefix_bits, tag) catch unreachable; // The target holds the widest encoding, and the value came out of one.
-    assert(written == decoded.octets);
-    assert(std.mem.eql(u8, target[0..written], source[0..written]));
-}
-
-test "qpack integer: an unbounded continuation run still terminates" {
-    try std.testing.fuzz({}, fuzzQpackInteger, .{});
-}
+// The QPACK integer's fuzz target is not here. RFC 7541 section 5.1's prefixed
+// integer moved to zoxy-io/hpack, and its targets went with it — including the
+// one this file used to carry, which asserted that a decode re-encodes to the
+// same octets. That is false by design: section 5.1 permits a non-minimal
+// encoding, so `{0x1f, 0x80, 0x00}` and `{0x1f, 0x00}` are both 31 behind a
+// five-bit prefix, and a coverage-guided run finds the difference in seconds.
+// hpack's target asserts the *value* round-trips instead, at both widths.
+//
+// It stayed behind when the code moved, and a fuzzer found it. Tests belong
+// with the code they cover.
 
 /// A packet header parses or is refused, and never claims more of the datagram
 /// than there is.
@@ -474,4 +457,93 @@ fn fuzzAckRanges(_: void, smith: *std.testing.Smith) !void {
 
 test "ack ranges: never acknowledge a packet that did not arrive" {
     try std.testing.fuzz({}, fuzzAckRanges, .{});
+}
+
+/// Octets drawn for one connection-level datagram.
+const connection_input_max = 1500;
+
+const FuzzConnection = quic.Connection(.{ .crypto_octets = 4096, .ack_ranges_max = 8 });
+
+/// Arbitrary datagrams into a connection, most of them properly sealed.
+///
+/// Random bytes are cheap coverage: nearly all of them fail the AEAD and never
+/// reach the frame handling, which is where the interesting states are. So this
+/// target draws a *payload* and seals it under the keys the connection expects,
+/// which puts arbitrary frame sequences past the authentication and into the
+/// state machine — the position a real peer occupies once its handshake
+/// succeeds, and the only position from which a protocol bug is reachable.
+///
+/// The oracle is that a connection never panics and never leaves a state its
+/// own invariants forbid, whatever it is told. A peer that authenticated is
+/// still not trusted.
+fn fuzzConnection(_: void, smith: *std.testing.Smith) !void {
+    const original = quic.ConnectionId.init(&.{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 }) catch unreachable; // Eight octets.
+    const source = quic.ConnectionId.init(&.{ 0xaa, 0xbb }) catch unreachable; // Two octets.
+    var connection: FuzzConnection = .init(.{
+        .side = .server,
+        .original_destination = original,
+        .source = source,
+    });
+    // The keys a client's Initial packets arrive under.
+    const keys: quic.crypto.Keys = .initial(original.bytes(), .client);
+
+    var datagrams: u32 = 0;
+    while (datagrams < connection_datagrams_max and !smith.eosWeightedSimple(6, 1)) : (datagrams += 1) {
+        var buffer: [connection_input_max]u8 = @splat(0);
+
+        const octets = switch (smith.value(enum { raw, sealed })) {
+            // Straight garbage: has to be discarded rather than crash.
+            .raw => blk: {
+                var drawn: [connection_input_max]u8 = undefined;
+                const length = smith.slice(&drawn);
+                @memcpy(buffer[0..length], drawn[0..length]);
+                break :blk length;
+            },
+            // A well-formed Initial packet whose payload is whatever was drawn.
+            .sealed => blk: {
+                var payload: [512]u8 = undefined;
+                const payload_len = @min(smith.slice(&payload), payload.len);
+                const written = quic.packet.writeLong(&buffer, .{
+                    .long_type = .initial,
+                    .destination = source,
+                    .source = original,
+                    .payload_octets = payload_len,
+                    .number = smith.valueRangeAtMost(u8, 0, 8),
+                    .number_octets = 4,
+                }) catch break :blk 0;
+                @memcpy(buffer[written.header_octets..][0..payload_len], payload[0..payload_len]);
+                break :blk keys.seal(
+                    &buffer,
+                    written.packet_number_offset,
+                    written.header_octets,
+                    payload_len,
+                    smith.valueRangeAtMost(u8, 0, 8),
+                ) catch 0;
+            },
+        };
+        if (octets == 0) continue;
+
+        // Reject or accept, never a third outcome.
+        connection.receive(buffer[0..octets], @as(u64, datagrams) * 1000) catch |err| switch (err) {
+            error.Protocol, error.CryptoBufferExceeded, error.Unsupported => {},
+        };
+
+        // A connection that took a protocol error is finished with, but it must
+        // still answer without crashing — which is what a caller does before it
+        // closes.
+        var out: [FuzzConnection.datagram_octets]u8 = undefined;
+        const sent = connection.send(&out, @as(u64, datagrams) * 1000 + 1) catch 0;
+        assert(sent <= out.len);
+        // Section 8.1: a server that has not validated the address may never
+        // send more than three times what it received. This is the invariant
+        // whose violation makes a reflector, and nothing a peer sends may break
+        // it.
+        if (!connection.address_validated) {
+            assert(connection.sent_octets <= connection.received_octets * quic.connection.amplification_factor);
+        }
+    }
+}
+
+test "connection: authenticated does not mean trusted" {
+    try std.testing.fuzz({}, fuzzConnection, .{});
 }

@@ -18,6 +18,8 @@ pub const ConnectionId = @import("quic/ConnectionId.zig");
 pub const crypto = @import("quic/crypto.zig");
 pub const error_code = @import("quic/error_code.zig");
 pub const frame = @import("quic/frame.zig");
+pub const connection = @import("quic/Connection.zig");
+pub const Connection = connection.Connection;
 pub const Reassembler = @import("quic/Reassembler.zig").Reassembler;
 pub const packet = @import("quic/packet.zig");
 pub const packet_number = @import("quic/packet_number.zig");
@@ -30,6 +32,7 @@ test {
     _ = crypto;
     _ = error_code;
     _ = frame;
+    _ = connection;
     _ = @import("quic/Reassembler.zig");
     _ = packet;
     _ = packet_number;

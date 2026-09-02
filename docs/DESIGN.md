@@ -202,6 +202,11 @@ all three build legs):
   changes" and section 4.5's final size.
 - `quic/AckRanges.zig` — the received-packet set for one number space, and the
   ACK frames rendered from it (sections 13.2 and 19.3).
+- `quic/Connection.zig` — the state machine: three packet number spaces, four
+  encryption levels and their keys, CRYPTO reassembly per level, ACK
+  generation, section 12.4's frame permissions, section 8.1's amplification
+  limit, section 14.1's Initial padding, section 4.9's key discarding, and the
+  close sequence. The TLS seam of §4 above, implemented.
 - `qpack/static_table.zig` — RFC 9204 appendix A. §4.1.1's integer and §4.1.2's
   Huffman code come from zoxy-io/hpack and are re-exported by `qpack.zig`.
 
@@ -218,16 +223,25 @@ all three build legs):
    h2's `fields/`, and the same request-smuggling surface.
 3. **RFC 9002 recovery.** RTT, loss detection, PTO, and NewReno. Pure
    computation over a caller-supplied `now`, so it is testable without a socket.
+   This is now the item on the critical path: `Connection` holds everything a
+   retransmission needs and has nothing that decides to make one.
 4. **The connection.** The largest item, and the one everything else serves. It
    decomposes into three pieces that are worth building and reviewing apart,
    because two of them are pure data structures with no policy in them:
 
    a. ~~**`Reassembler`**~~ — done.
    b. ~~**`AckRanges`**~~ — done.
-   c. **The connection itself** — the state machine over those two, plus the
-      CRYPTO stream per encryption level, flow control, the amplification limit
-      (section 8.1) and the key update (RFC 9001 section 6). This is what is
-      left of slice 4, and it is now assembly rather than invention.
+   c. ~~**The connection itself**~~ — done, less the two things below, which
+      belong to other slices and are named at the top of `Connection.zig` so a
+      reader meets them before the code:
+
+      * **Retransmission.** CRYPTO bytes stay in their send buffer after being
+        framed, so the data a retransmission needs is *held*; what is missing is
+        the loss detection that decides to send it. Slice 3. Until it lands, a
+        handshake over a lossy path stalls.
+      * **Flow control and streams.** STREAM, RESET_STREAM and STOP_SENDING are
+        refused rather than ignored, so a peer that opens a stream gets an error
+        instead of silence. Slice 5.
 5. **Streams and the HTTP/3 request layer.** Reassembly, `MAX_STREAM_DATA`
    accounting, and the request/response mapping.
 6. **QPACK dynamic table**, encoder and decoder streams, blocked streams.

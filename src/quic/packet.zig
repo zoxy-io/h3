@@ -230,7 +230,18 @@ fn parseShort(datagram: []const u8, local_connection_id_octets: u8) ParseError!P
     if (datagram[0] & fixed_bit == 0) return error.FixedBitUnset;
 
     const offset = 1 + @as(usize, local_connection_id_octets);
-    if (datagram.len < offset) return error.Truncated;
+    // Strictly greater, not `>=`: a datagram that ends exactly where the packet
+    // number begins has no packet number, and every packet has one (section
+    // 17.3.1). Accepting it would answer a `packet_number_offset` equal to the
+    // packet's own length — an offset one past the end, which a caller is
+    // entitled to slice at.
+    //
+    // Found by the fuzz target, which asserts that a parsed offset lies inside
+    // the packet it came from. Nothing downstream would have been unsafe —
+    // `crypto.Keys.open` refuses anything without room for a sample — but a
+    // parser that answers a nonsense offset is a parser whose next caller has
+    // to know that.
+    if (datagram.len <= offset) return error.Truncated;
     const destination = ConnectionId.init(datagram[1..offset]) catch return error.ConnectionIdTooLong;
 
     assert(offset <= datagram.len);
@@ -443,6 +454,19 @@ pub const LongOptions = struct {
     /// Octets of plaintext the payload will hold. The Length field covers the
     /// packet number, this, and the AEAD tag.
     payload_octets: usize,
+    /// Pin the Length field to this many octets rather than the fewest that
+    /// hold it.
+    ///
+    /// Section 16 permits a variable-length integer to be encoded in any length
+    /// that can hold it, and this is the one thing that permission is for: a
+    /// sender that does not yet know how long its payload will be reserves the
+    /// field at a width it is sure of, builds the payload, and writes the real
+    /// length back into the same octets. Without it a header has to be written
+    /// twice, and the second write can change the header's own length and move
+    /// everything after it.
+    ///
+    /// `Written.packet_number_offset` minus this is where the field starts.
+    length_octets: ?u8 = null,
     number: u64,
     number_octets: u8,
 };
@@ -475,7 +499,16 @@ pub fn writeLong(target: []u8, options: LongOptions) WriteError!Written {
     // tag. Computed here rather than asked for, because a caller that got it
     // wrong would produce a packet the peer discards without saying why.
     const length = @as(u64, options.number_octets) + options.payload_octets + crypto.tag_octets;
-    try writeVarint(target, &cursor, length);
+    if (options.length_octets) |octets| {
+        const at = cursor;
+        try put(target, &cursor, octets);
+        varint.encodeIn(target[at..cursor], length, octets) catch |err| return switch (err) {
+            error.OutputTooLong => error.OutputTooLong,
+            error.ValueTooLarge => error.ValueTooLarge,
+        };
+    } else {
+        try writeVarint(target, &cursor, length);
+    }
 
     const packet_number_offset = cursor;
     try put(target, &cursor, options.number_octets);
@@ -625,6 +658,21 @@ test "a Retry ends in its integrity tag" {
     try testing.expectEqual(datagram.len, parsed.octets);
 }
 
+test "a short header with no room for a packet number is truncated" {
+    // The datagram ends exactly where the packet number would begin.
+    const exact = [_]u8{ 0x40, 0x11, 0x22, 0x33, 0x44 };
+    try testing.expectError(error.Truncated, parse(&exact, 4));
+    // One more octet, and there is a packet number to point at.
+    const enough = [_]u8{ 0x40, 0x11, 0x22, 0x33, 0x44, 0x55 };
+    const parsed = try parse(&enough, 4);
+    try testing.expectEqual(@as(usize, 5), parsed.header.short.packet_number_offset);
+    try testing.expect(parsed.header.short.packet_number_offset < parsed.octets);
+
+    // And the zero-length connection identifier case, which is the one a
+    // minimal short header uses.
+    try testing.expectError(error.Truncated, parse(&.{0x40}, 0));
+}
+
 test "the fixed bit is what tells QUIC from anything else on the port" {
     const long = [_]u8{ 0x80 | 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x04 } ++ [_]u8{0} ** 4;
     try testing.expectError(error.FixedBitUnset, parse(&long, 0));
@@ -693,6 +741,43 @@ test "a written short header parses back at the length it was given" {
     const parsed = try parse(target[0..40], 3);
     try testing.expect(parsed.header.short.spin);
     try testing.expectEqual(@as(usize, 4), parsed.header.short.packet_number_offset);
+}
+
+test "a pinned Length field is a reservation to write back into" {
+    var target: [256]u8 = @splat(0);
+    const written = try writeLong(&target, .{
+        .long_type = .handshake,
+        .destination = try ConnectionId.init(&.{ 1, 2 }),
+        .source = try ConnectionId.init(&.{}),
+        .payload_octets = 0,
+        .number = 0,
+        .number_octets = 1,
+        .length_octets = 4,
+    });
+    // The field sits directly before the packet number, which is what lets a
+    // caller find it again without being told where it is.
+    const at = written.packet_number_offset - 4;
+
+    // Back-fill it the way a sender does once the payload is built.
+    const length: u64 = 1 + 120 + crypto.tag_octets;
+    try varint.encodeIn(target[at..][0..4], length, 4);
+
+    const parsed = try parse(target[0 .. written.header_octets + 120 + crypto.tag_octets], 0);
+    try testing.expectEqual(written.packet_number_offset, parsed.header.handshake.packet_number_offset);
+    try testing.expectEqual(written.header_octets + 120 + crypto.tag_octets, parsed.octets);
+
+    // And a pinned width does not change with the value, which is the property
+    // the reservation depends on.
+    const narrow = try writeLong(&target, .{
+        .long_type = .handshake,
+        .destination = try ConnectionId.init(&.{ 1, 2 }),
+        .source = try ConnectionId.init(&.{}),
+        .payload_octets = 3,
+        .number = 0,
+        .number_octets = 1,
+        .length_octets = 4,
+    });
+    try testing.expectEqual(written.header_octets, narrow.header_octets);
 }
 
 test "a header longer than the target is refused rather than truncated" {
