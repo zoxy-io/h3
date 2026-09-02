@@ -1998,7 +1998,7 @@ test "an HTTP/3 request crosses a QUIC stream and validates" {
         &buffer,
         1 << 16,
     );
-    var validator: h3.fields.MessageValidator = .init(.request);
+    var validator: h3.fields.MessageValidator = .init(.{ .kind = .request });
     var seen: usize = 0;
     while (try iterator.next()) |one| {
         try validator.field(&one);
@@ -2038,7 +2038,7 @@ test "a response crosses back, and a malformed one is caught" {
         &buffer,
         1 << 16,
     );
-    var validator: h3.fields.MessageValidator = .init(.response);
+    var validator: h3.fields.MessageValidator = .init(.{ .kind = .response });
     while (try iterator.next()) |one| try validator.field(&one);
     try testing.expectError(error.PseudoMissing, validator.finish());
 }

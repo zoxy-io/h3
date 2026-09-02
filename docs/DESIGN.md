@@ -216,7 +216,10 @@ all three build legs):
   directions, against the static table with the dynamic table disabled.
 - `fields.zig` — RFC 9114 sections 4.2 and 4.3: the octet rules and the
   pseudo-header rules, which between them are the guard against smuggling
-  through an HTTP/1.1 downgrade.
+  through an HTTP/1.1 downgrade. Also RFC 9220's extended CONNECT, RFC 9110
+  section 8.6's `content-length` syntax, and section 4.3.1's requirement that
+  `:authority` and `Host` agree. Trailer sections are a `Kind` of their own,
+  because section 4.3 forbids every pseudo-header in one.
 - `quic/Streams.zig` — streams, their states, and both levels of flow control.
   The connection-level window is the one that bounds memory; see the file.
 - `quic/Connection.zig` — the state machine, including RFC 9001 section 6's key
@@ -236,9 +239,23 @@ all three build legs):
    already makes exactly that choice for HPACK, for exactly the same reason (see
    `zrk/src/h2conn.zig`, `advertised_header_table_size`). Huffman is no longer
    part of this slice: it arrives from hpack already fuzzed.
-2. **RFC 9114 §4.3 message validation.** The pseudo-header and field-name rules
-   that decide whether a response is a message at all. Nearly identical to
-   h2's `fields/`, and the same request-smuggling surface.
+2. ~~**RFC 9114 §4.3 message validation.**~~ — done. The pseudo-header and
+   field-name rules that decide whether a response is a message at all, the
+   same request-smuggling surface h2's `fields/` covers.
+
+   "Nearly identical to h2's `fields/`" was the plan and became the bug. The
+   first pass was a partial port that kept the shape and dropped five rules,
+   and a validator missing a rule is worse than no validator, because a
+   consumer trusts the verdict: `:protocol` was read *after* section 4.4
+   instead of before, so every conforming WebSocket-over-HTTP/3 request was
+   rejected and a bare CONNECT carrying a `:protocol` was accepted; no
+   pseudo-header's *value* was read at all, so a `:status` of `banana` was a
+   well-formed response; section 4.3.1's `:authority`-or-`Host` requirement and
+   the rule that the two must agree were both absent, which is the pair a
+   forwarded HTTP/1.1 request line is built from; a trailer section had no
+   `Kind`, so pseudo-headers were legal in one; and `content-length` was
+   unvalidated, so two disagreeing lengths passed. All five now have a test
+   that was confirmed to fail without its fix, and `fuzz/` has a target.
 3. ~~**RFC 9002 recovery.**~~ — done, and wired into the connection. RTT
    estimation, both loss thresholds, the PTO with its exponential backoff, and
    NewReno. Pure computation over a caller-supplied `now`, so a probe timeout is

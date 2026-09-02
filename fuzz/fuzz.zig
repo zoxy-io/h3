@@ -803,3 +803,85 @@ fn fuzzFieldLine(_: void, smith: *std.testing.Smith) !void {
 test "qpack: a field section decodes safely and round-trips exactly" {
     try std.testing.fuzz({}, fuzzFieldLine, .{});
 }
+
+/// The message rules are the request-smuggling boundary, so the property is the
+/// same reject-or-parse the decoders get: a section is well-formed or it is
+/// refused, and there is no third outcome where a validator returns success
+/// having quietly skipped a rule.
+fn fuzzFields(_: void, smith: *std.testing.Smith) anyerror!void {
+    const kinds = [_]h3.fields.Kind{ .request, .response, .trailer };
+    const options: h3.fields.Options = .{
+        .kind = kinds[smith.valueRangeAtMost(u8, 0, kinds.len - 1)],
+        .extended_connect = smith.value(bool),
+    };
+
+    // Drawn from the vocabulary a real section uses rather than from arbitrary
+    // octets: the interesting bugs are in which combinations of *valid* names
+    // are accepted together, and random bytes reach almost none of them.
+    const names = [_][]const u8{
+        ":method",        ":scheme",   ":authority", ":path",
+        ":status",        ":protocol", ":invented",  "host",
+        "content-length", "te",        "connection", "user-agent",
+    };
+    const values = [_][]const u8{
+        "GET", "CONNECT", "https", "ftp",                  "example.com", "evil.example",
+        "/",   "",        "200",   "20",                   "websocket",   "trailers",
+        "10",  "10, 10",  "007",   "99999999999999999999",
+    };
+
+    // The draw is recorded rather than consumed, so the section can be replayed
+    // and the invariants below can be computed from the input independently of
+    // anything the validator itself reports.
+    const fields_max = 8;
+    var drawn: [fields_max]h3.qpack.Field = undefined;
+    const count = smith.valueRangeAtMost(u8, 0, fields_max);
+    for (0..count) |index| {
+        drawn[index] = .{
+            .name = names[smith.valueRangeAtMost(u8, 0, names.len - 1)],
+            .value = values[smith.valueRangeAtMost(u8, 0, values.len - 1)],
+        };
+    }
+    const section = drawn[0..count];
+
+    if (!accepts(options, section)) return;
+
+    // Two rules restated as properties of the *input*, so that a validator
+    // which lost one of them cannot also hide it. Section 4.3: "Pseudo-header
+    // fields MUST NOT appear in trailer sections."
+    if (options.kind == .trailer) {
+        for (section) |one| assert(one.name[0] != ':');
+    }
+    // RFC 9220 section 3: `:protocol` exists only where it was negotiated, and
+    // section 4.3 makes an undefined pseudo-header malformed.
+    if (!options.extended_connect) {
+        for (section) |one| assert(!std.mem.eql(u8, one.name, ":protocol"));
+    }
+    // A response's pseudo-header may not appear in a request, nor the reverse.
+    if (options.kind == .request) {
+        for (section) |one| assert(!std.mem.eql(u8, one.name, ":status"));
+    }
+    if (options.kind == .response) {
+        for (section) |one| assert(one.name[0] != ':' or std.mem.eql(u8, one.name, ":status"));
+    }
+
+    // The verdict may not depend on state left over from a previous walk: a
+    // second validator over the same section must agree with the first.
+    assert(accepts(options, section));
+}
+
+/// Walk one section through a fresh validator and report only the verdict.
+/// A validator is spent once it refuses — every violation in section 4.1.2 is a
+/// malformed message and a malformed message is refused whole — so there is no
+/// partial verdict for `finish` to add to.
+fn accepts(options: h3.fields.Options, section: []const h3.qpack.Field) bool {
+    var validator: h3.fields.MessageValidator = .init(options);
+    for (section) |one| {
+        validator.field(&one) catch return false;
+    }
+    validator.finish() catch return false;
+    return true;
+}
+
+test "fields: a field section is a message or it is refused" {
+    try std.testing.fuzz({}, fuzzFields, .{});
+}

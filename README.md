@@ -42,8 +42,9 @@ ledger — read it before depending on this.
 * **RFC 9114 — HTTP/3.** The frame layer, the unidirectional stream types, the
   settings, and sections 4.2 and 4.3's message validation — the octet rules and
   the pseudo-header rules that between them guard against request smuggling
-  through an HTTP/1.1 downgrade. The control stream and SETTINGS exchange are
-  planned.
+  through an HTTP/1.1 downgrade, including RFC 9220's extended CONNECT, the
+  `:authority`/`Host` agreement section 4.3.1 requires, and `content-length`'s
+  own syntax. The control stream and SETTINGS exchange are planned.
 
 RFC 9001 and RFC 9002 were not in the original ask and are not optional
 additions: RFC 9000 describes packets whose payloads are always encrypted, so a
