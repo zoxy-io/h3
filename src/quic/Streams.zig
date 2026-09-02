@@ -159,6 +159,11 @@ pub fn Streams(comptime config: Config) type {
             }
         };
 
+        /// Which endpoint this is. Section 19.8's rules are all of the form
+        /// "not on a stream you cannot send on", and that is unanswerable
+        /// without knowing which side you are.
+        side: Side = .client,
+
         streams: [streams_max]Stream = undefined,
         count: u32 = 0,
 
@@ -189,7 +194,28 @@ pub fn Streams(comptime config: Config) type {
             Protocol,
             /// The stream is not open.
             NotFound,
+            /// Section 19.8, 19.4, 19.5 and 19.10: a frame for a stream this
+            /// endpoint cannot receive on, or a write to one it cannot send on.
+            /// `STREAM_STATE_ERROR`.
+            StreamState,
         };
+
+        /// Whether the peer may send to us on this stream — section 2.1's
+        /// addressing, read from the identifier itself.
+        ///
+        /// A unidirectional stream this endpoint opened is send-only for us and
+        /// receive-only for the peer, so a STREAM, RESET_STREAM or FIN arriving
+        /// on one is the peer writing where it cannot. Section 19.8 makes that
+        /// a `STREAM_STATE_ERROR` rather than something to ignore.
+        fn peerMaySend(self: *const Self, id: u64) bool {
+            const kind = stream_id.kindOf(id);
+            return kind.bidirectional() or kind.initiator() != self.side;
+        }
+
+        /// And the mirror: whether this endpoint may write on it.
+        fn weMaySend(self: *const Self, id: u64) bool {
+            return stream_id.sendable(id, self.side);
+        }
 
         pub fn find(self: *Self, id: u64) ?*Stream {
             for (self.streams[0..self.count]) |*stream| {
@@ -215,6 +241,7 @@ pub fn Streams(comptime config: Config) type {
             // it happens rather than tested after: `receive` is public, offsets
             // are 62-bit and peer-chosen, and an overflow lands ahead of any
             // check that was meant to catch it.
+            if (!self.peerMaySend(id)) return error.StreamState;
             if (offset > varint.max or data.len > varint.max - offset) return error.FinalSize;
             const end = offset + data.len;
 
@@ -282,15 +309,36 @@ pub fn Streams(comptime config: Config) type {
 
         /// Section 19.4: the peer abandoned a stream.
         pub fn reset(self: *Self, id: u64, code: u64, final_size: u64) Error!void {
+            if (!self.peerMaySend(id)) return error.StreamState;
+            if (final_size > varint.max) return error.FinalSize;
             const stream = try self.open(id);
             if (stream.receive_state == .reset) return;
-            // Section 4.5: a reset names the final size, and it must agree with
-            // everything already seen — otherwise a peer could retract data it
-            // already charged to the connection's window.
+
+            // Section 4.5: "Once a final size for a stream is known, it cannot
+            // change." A FIN fixes it, and a RESET_STREAM afterwards naming a
+            // different one is a peer contradicting itself — which, before this
+            // check, moved `received_highest` and charged the difference to the
+            // connection's window.
+            if (stream.received.final_size) |known| {
+                if (known != final_size) return error.FinalSize;
+            }
+            // And a size below what has already arrived would retract data the
+            // peer itself sent.
             if (final_size < stream.received_highest) return error.FinalSize;
             try self.admit(stream, final_size);
             stream.receive_state = .reset;
             stream.reset_code = code;
+
+            // Section 4.1 leaves the release policy to the implementation, and
+            // the policy has to be *some* release: the octets a reset claimed
+            // will never be delivered, so they can never be consumed, so
+            // without this they hold connection credit for the rest of the
+            // connection. Two RESET_STREAM frames of four octets each were
+            // enough to exhaust the window permanently and refuse every
+            // subsequent byte of real data.
+            assert(final_size >= stream.consumed);
+            self.consumed_total += final_size - stream.consumed;
+            stream.consumed = final_size;
         }
 
         /// Queue bytes for sending, returning how many were taken.
@@ -299,6 +347,10 @@ pub fn Streams(comptime config: Config) type {
         /// control limit is not ours to exceed. A caller loops, or waits for
         /// `MAX_STREAM_DATA`.
         pub fn write(self: *Self, id: u64, data: []const u8, fin: bool) Error!usize {
+            // Section 19.8's mirror: a unidirectional stream the peer opened is
+            // receive-only here, and writing on one is this endpoint's bug
+            // rather than the peer's.
+            if (!self.weMaySend(id)) return error.StreamState;
             const stream = try self.open(id);
             if (!stream.writable()) return error.Protocol;
 
@@ -325,6 +377,9 @@ pub fn Streams(comptime config: Config) type {
 
         /// Section 19.10 and 19.9: raise a peer's limits.
         pub fn setSendLimit(self: *Self, id: u64, limit: u64) Error!void {
+            // Section 19.10: MAX_STREAM_DATA for a stream this endpoint cannot
+            // send on is the peer raising a limit that could never apply.
+            if (!self.weMaySend(id)) return error.StreamState;
             const stream = try self.open(id);
             // Limits only ever rise; a peer lowering one is ignored rather than
             // an error, which is what section 4.1 says to do.
@@ -563,4 +618,56 @@ test "rewinding re-frames a lost range" {
     set.rewind(0, 2, false);
     try testing.expectEqual(@as(u32, 2), stream.framed);
     try testing.expect(set.wantsSend());
+}
+
+test "section 19.8: a peer may not send on a stream it cannot send on" {
+    // `Set` is a client, so stream 2 is *this endpoint's* unidirectional stream
+    // — send-only here, receive-only for the peer. A STREAM or RESET_STREAM
+    // arriving on one is the peer writing where it cannot.
+    var set: Set = .{ .side = .client };
+    const ours = stream_id.make(.client_unidirectional, 0);
+    try testing.expectError(error.StreamState, set.receive(ours, 0, "x", false));
+    try testing.expectError(error.StreamState, set.reset(ours, 0, 1));
+
+    // The peer's own unidirectional stream is the other way round.
+    const theirs = stream_id.make(.server_unidirectional, 0);
+    try set.receive(theirs, 0, "x", false);
+    try testing.expectError(error.StreamState, set.write(theirs, "x", false));
+    try testing.expectError(error.StreamState, set.setSendLimit(theirs, 1000));
+
+    // A bidirectional stream is legal in both directions.
+    const both = stream_id.make(.client_bidirectional, 0);
+    try set.receive(both, 0, "x", false);
+    try set.setSendLimit(both, 1000);
+    set.setConnectionSendLimit(1000);
+    _ = try set.write(both, "x", false);
+}
+
+test "section 4.5: a RESET_STREAM may not move a final size a FIN already fixed" {
+    var set: Set = .{};
+    try set.receive(0, 0, "hello", true); // the FIN fixes it at 5
+    // "Once a final size for a stream is known, it cannot change." Before this
+    // check the reset was accepted, `received_highest` moved to 9, and the
+    // difference was charged to the connection's window.
+    try testing.expectError(error.FinalSize, set.reset(0, 0, 9));
+    try testing.expectError(error.FinalSize, set.reset(0, 0, 3));
+    try testing.expectEqual(@as(u64, 5), set.received_total);
+    // The size it actually named is still accepted.
+    try set.reset(0, 0, 5);
+}
+
+test "section 4.1: a reset stream gives its credit back" {
+    var set: Set = .{};
+    // Octets a reset claimed are never delivered, so they can never be
+    // consumed. Without a release they hold connection credit forever: two
+    // RESET_STREAM frames, eight octets of peer input, and the window was
+    // exhausted for the rest of the connection.
+    try set.reset(0, 7, Set.receive_octets);
+    try set.reset(4, 7, Set.receive_octets);
+    try testing.expectEqual(Set.connection_receive_octets, set.received_total);
+
+    // The credit came back, so real data still fits.
+    try testing.expect(set.receiveLimit() > set.received_total);
+    try set.receive(8, 0, "real data", false);
+    try testing.expectEqualStrings("real data", set.find(8).?.readable());
 }

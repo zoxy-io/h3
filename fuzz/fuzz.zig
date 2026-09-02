@@ -546,6 +546,7 @@ fn fuzzConnection(_: void, smith: *std.testing.Smith) !void {
             error.FinalSize,
             error.StreamLimit,
             error.AeadLimitReached,
+            error.StreamState,
             => {},
         };
 

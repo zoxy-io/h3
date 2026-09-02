@@ -288,6 +288,10 @@ pub fn Connection(comptime config: Config) type {
         /// The Destination the client used first, which is what the Initial
         /// keys derive from and what a Retry's integrity tag binds.
         original_destination: ConnectionId,
+        /// The peer's Source Connection ID, once seen. Section 7.2 fixes it for
+        /// the connection, so a second, different one is a protocol violation
+        /// rather than a change of address.
+        peer_source: ?ConnectionId = null,
 
         one_rtt: OneRtt = .{},
         /// Packets sealed per level, for section 6.6. The 1-RTT count lives in
@@ -349,6 +353,7 @@ pub fn Connection(comptime config: Config) type {
                 // Section 8.1: a client picked the address it is talking to, so
                 // there is nothing to validate and nothing to amplify.
                 .address_validated = options.side == .client,
+                .streams = .{ .side = options.side },
             };
             // Section 5.2 of RFC 9001: both sides can compute both halves from
             // the client's first Destination Connection ID.
@@ -516,6 +521,9 @@ pub fn Connection(comptime config: Config) type {
             /// Section 4.6: more streams than this endpoint tracks.
             /// `STREAM_LIMIT_ERROR`.
             StreamLimit,
+            /// Sections 19.4, 19.5, 19.8 and 19.10: a frame for a stream the
+            /// peer cannot send on. `STREAM_STATE_ERROR`.
+            StreamState,
             /// RFC 9001 section 6.6: too many packets failed authentication, or
             /// a key reached its confidentiality limit with no update possible.
             /// `AEAD_LIMIT_REACHED`, and the connection stops here.
@@ -530,8 +538,24 @@ pub fn Connection(comptime config: Config) type {
         /// is the attack. So a decryption failure ends the datagram quietly and
         /// only a protocol violation by the authenticated peer returns an error.
         pub fn receive(self: *Self, datagram: []u8, now: u64) ReceiveError!void {
-            self.received_octets += datagram.len;
             if (self.state == .draining) return;
+
+            // Section 14.1: "A server MUST discard an Initial packet that is
+            // carried in a UDP datagram with a payload that is smaller than the
+            // smallest allowed maximum datagram size of 1200 bytes."
+            //
+            // Discarded before the octets are credited, which is the half that
+            // matters. `received_octets` is what section 8.1 multiplies by
+            // three, so counting a datagram this endpoint refuses to process
+            // would sell amplification allowance for forty octets — the padding
+            // requirement exists precisely so a server knows the path carries a
+            // handshake before it commits anything to it.
+            if (self.side == .server and datagram.len < initial_datagram_min) {
+                const first = packet.parse(datagram, self.source.length) catch return;
+                if (first.header == .initial) return;
+            }
+
+            self.received_octets += datagram.len;
 
             var offset: usize = 0;
             var packets: u32 = 0;
@@ -574,11 +598,27 @@ pub fn Connection(comptime config: Config) type {
             const eliciting = try self.receiveFrames(level, opened.payload, now);
             space.received.record(opened.number, now, eliciting);
 
-            // A server adopts the client's source identifier as its destination
-            // once it has a packet it could decrypt.
+            // Section 7.2: a client's Source Connection ID is chosen once and
+            // fixed for the connection, so a server adopts it from the first
+            // Initial it can open and refuses a different one afterwards.
+            //
+            // Re-adopting on every Initial was a hole rather than a nicety.
+            // Initial keys derive from a connection identifier that travels in
+            // cleartext, so anyone who saw the first flight can seal a valid
+            // Initial packet — passing the AEAD at this level is not evidence
+            // of anything. An off-path observer could therefore point all of a
+            // server's subsequent packets at an identifier the real client
+            // discards, and the connection dies with neither endpoint at fault.
             if (self.side == .server) {
                 switch (header) {
-                    .initial => |value| self.destination = value.source,
+                    .initial => |value| {
+                        if (self.peer_source) |known| {
+                            if (!known.eql(&value.source)) return error.Protocol;
+                        } else {
+                            self.peer_source = value.source;
+                            self.destination = value.source;
+                        }
+                    },
                     else => {},
                 }
             }
@@ -766,6 +806,7 @@ pub fn Connection(comptime config: Config) type {
                 error.FlowControl => error.FlowControl,
                 error.FinalSize => error.FinalSize,
                 error.TooManyStreams => error.StreamLimit,
+                error.StreamState => error.StreamState,
                 error.Protocol, error.NotFound => error.Protocol,
             };
         }
@@ -2203,4 +2244,53 @@ test "section 6.6: forgeries past the integrity limit close the connection" {
     try testing.expectError(error.AeadLimitReached, server.receive(again[0..octets], 2000));
     try testing.expectEqual(State.closing, server.state);
     try testing.expectEqual(@intFromEnum(error_code.Transport.aead_limit_reached), server.close_code);
+}
+
+test "section 7.2: a client's source connection id is fixed for the connection" {
+    var client = testClient();
+    var server = testServer();
+    try client.cryptoIn(.initial, "ClientHello");
+    _ = try deliver(&client, &server, 0);
+    try testing.expectEqualSlices(u8, &client_source, server.destination.bytes());
+
+    // Initial keys derive from a connection identifier that travels in
+    // cleartext, so anyone who watched the first flight can seal a valid
+    // Initial. Re-adopting from one would let an off-path observer point every
+    // subsequent server packet at an identifier the real client discards.
+    var impostor = testClient();
+    impostor.source = try ConnectionId.init(&.{ 0xde, 0xad, 0xbe, 0xef });
+    // A packet number the server has not already seen, or duplicate suppression
+    // discards it before the identifier is ever looked at — which is a real
+    // defence, and would have made this test pass without the fix.
+    impostor.spaces[@intFromEnum(Space.initial)].next = 9;
+    try impostor.cryptoIn(.initial, "ClientHello");
+    var datagram: [TestConnection.datagram_octets]u8 = @splat(0);
+    const octets = try impostor.send(&datagram, 1000);
+
+    try testing.expectError(error.Protocol, server.receive(datagram[0..octets], 1000));
+    try testing.expectEqualSlices(u8, &client_source, server.destination.bytes());
+}
+
+test "section 14.1: an undersized Initial is discarded and buys no allowance" {
+    var server = testServer();
+    var client = testClient();
+    try client.cryptoIn(.initial, "ClientHello");
+
+    // A real first flight, truncated to below the 1200-octet floor. The padding
+    // requirement exists so a server knows the path carries a handshake before
+    // it commits anything; crediting a datagram it refuses to process would
+    // sell three times its length in amplification allowance.
+    var datagram: [TestConnection.datagram_octets]u8 = @splat(0);
+    const full = try client.send(&datagram, 0);
+    try testing.expectEqual(@as(usize, initial_datagram_min), full);
+    try server.receive(datagram[0..600], 0);
+
+    try testing.expectEqual(@as(u64, 0), server.received_octets);
+    try testing.expectEqual(@as(u64, 0), server.sendRoom());
+    try testing.expectEqualStrings("", server.cryptoOut(.initial));
+
+    // The full-sized one is processed and does buy allowance.
+    try server.receive(datagram[0..full], 0);
+    try testing.expectEqual(@as(u64, initial_datagram_min), server.received_octets);
+    try testing.expect(server.sendRoom() > 0);
 }
