@@ -215,6 +215,8 @@ pub fn Connection(comptime config: Config) type {
         stream: u64 = 0,
         stream_start: u32 = 0,
         stream_end: u32 = 0,
+        /// Whether the packet carried a FIN, which no byte range can express.
+        stream_fin: bool = false,
     };
 
     const ConnectionStreams = StreamsOf(.{
@@ -652,8 +654,8 @@ pub fn Connection(comptime config: Config) type {
                     const level = &self.levels[@intFromEnum(context.level)];
                     level.framed = @min(level.framed, context.crypto_start);
                 }
-                if (context.stream_end > context.stream_start) {
-                    self.streams.rewind(context.stream, context.stream_start);
+                if (context.stream_end > context.stream_start or context.stream_fin) {
+                    self.streams.rewind(context.stream, context.stream_start, context.stream_fin);
                 }
             }
         }
@@ -771,9 +773,25 @@ pub fn Connection(comptime config: Config) type {
             const payload_room = buffer.len - overhead;
             assert(payload_room >= 1);
             assert(overhead + payload_room == buffer.len);
+            // `writePayload` commits as it builds: it clears the ACK debt,
+            // advances the CRYPTO and stream cursors, spends a probe and clears
+            // `close_pending`. If sealing then fails, every one of those
+            // believes a packet went out that did not — a dropped ACK, a
+            // handshake that deadlocks because its bytes are marked framed and
+            // never resent, a CONNECTION_CLOSE the peer never hears. So the
+            // undo is captured first.
+            const undo: Undo = .{
+                .ack_eliciting_pending = space.received.ack_eliciting_pending,
+                .probes_pending = space.probes_pending,
+                .close_pending = self.close_pending,
+                .crypto_framed = self.levels[index].framed,
+            };
             const written = self.writePayload(buffer[header.header_octets..][0..payload_room], level, now);
             const payload_octets = written.octets;
-            if (payload_octets == 0) return error.Empty;
+            if (payload_octets == 0) {
+                self.rollback(level, undo, written);
+                return error.Empty;
+            }
 
             // A long header's Length field was reserved at a fixed width above
             // and is written back now that the payload's size is known. This is
@@ -787,7 +805,10 @@ pub fn Connection(comptime config: Config) type {
                 varint.encodeIn(buffer[at..][0..length_field_octets], length, length_field_octets) catch unreachable; // The width was chosen at comptime to hold any length this datagram can carry.
             }
 
-            const total = keys.seal(buffer, header.packet_number_offset, header.header_octets, payload_octets, number) catch return error.Empty;
+            const total = keys.seal(buffer, header.packet_number_offset, header.header_octets, payload_octets, number) catch {
+                self.rollback(level, undo, written);
+                return error.Empty;
+            };
             space.next += 1;
 
             // Section 2 of RFC 9002: a packet is in flight when it is
@@ -808,6 +829,7 @@ pub fn Connection(comptime config: Config) type {
                     .stream = written.stream,
                     .stream_start = written.stream_start,
                     .stream_end = written.stream_end,
+                    .stream_fin = written.stream_fin,
                 },
             }) catch {};
             return total;
@@ -835,6 +857,28 @@ pub fn Connection(comptime config: Config) type {
             };
         }
 
+        /// The send-side state `writePayload` commits, captured so it can be
+        /// put back when the packet turns out not to exist.
+        const Undo = struct {
+            ack_eliciting_pending: bool,
+            probes_pending: u8,
+            close_pending: bool,
+            crypto_framed: u32,
+        };
+
+        /// Put back everything `writePayload` committed. Called on every path
+        /// out of `sendPacket` that does not produce a packet.
+        fn rollback(self: *Self, level: Level, undo: Undo, written: Payload) void {
+            const space = &self.spaces[@intFromEnum(level.space())];
+            space.received.ack_eliciting_pending = undo.ack_eliciting_pending;
+            space.probes_pending = undo.probes_pending;
+            self.close_pending = undo.close_pending;
+            self.levels[@intFromEnum(level)].framed = undo.crypto_framed;
+            if (written.stream_end > written.stream_start or written.stream_fin) {
+                self.streams.rewind(written.stream, written.stream_start, written.stream_fin);
+            }
+        }
+
         const Payload = struct {
             octets: usize = 0,
             /// Section 2 of RFC 9002: whether anything here obliges the peer to
@@ -848,6 +892,10 @@ pub fn Connection(comptime config: Config) type {
             stream: u64 = 0,
             stream_start: u32 = 0,
             stream_end: u32 = 0,
+            /// Whether this packet carried the stream's FIN. Tracked apart from
+            /// the range because a FIN carries no octets, so a lost one has no
+            /// byte range to rewind.
+            stream_fin: bool = false,
         };
 
         /// Fill a payload: an ACK if one is owed, then whatever handshake bytes
@@ -946,7 +994,10 @@ pub fn Connection(comptime config: Config) type {
         fn writeStream(self: *Self, target: []u8, result: *Payload) usize {
             for (self.streams.streams[0..self.streams.count]) |*stream| {
                 const waiting = stream.send_len - stream.framed;
-                const fin_owed = stream.send_fin and stream.framed == stream.send_len;
+                // Owed once. Without `fin_framed` this was permanently true,
+                // so every packet carried another empty FIN and `wantsSend`
+                // never answered false again.
+                const fin_owed = stream.send_fin and !stream.fin_framed;
                 if (waiting == 0 and !fin_owed) continue;
 
                 // Type, stream id, offset and length, each at its widest.
@@ -960,10 +1011,13 @@ pub fn Connection(comptime config: Config) type {
                     .fin = stream.send_fin and stream.framed + take == stream.send_len,
                 } }) catch return 0;
 
+                const carries_fin = stream.send_fin and stream.framed + take == stream.send_len;
                 result.stream = stream.id;
                 result.stream_start = stream.framed;
                 stream.framed += @intCast(take);
                 result.stream_end = stream.framed;
+                result.stream_fin = carries_fin;
+                if (carries_fin) stream.fin_framed = true;
                 return written;
             }
             return 0;
@@ -1757,4 +1811,47 @@ test "an inflated ACK delay is clamped rather than overflowing" {
         var probe = client;
         _ = try probe.receiveFrames(.initial, payload[0..written], 1_000_000);
     }
+}
+
+test "a FIN is framed once, and the connection stops wanting to send" {
+    // Before this was tracked, `wantsSend()` stayed true forever: nothing
+    // recorded that the FIN had gone out, so every packet carried another empty
+    // FIN frame. A consumer's loop that drains until `wantsSend()` is false
+    // never terminated, and because each of those packets is ack-eliciting it
+    // was a two-endpoint packet loop as well.
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+    _ = try client.write(0, "body", true);
+
+    var rounds: u32 = 0;
+    var now: u64 = 1000;
+    while (rounds < 8 and client.wantsSend()) : (rounds += 1) {
+        now += 1000;
+        _ = try deliver(&client, &server, now);
+    }
+    try testing.expect(!client.wantsSend());
+    try testing.expectEqualStrings("body", server.readable(0));
+    try testing.expect(server.findStream(0).?.receive_state != .receiving);
+}
+
+test "a lost FIN is sent again even though it carries no octets" {
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+    // The FIN rides alone: the data goes first, then the FIN in its own packet.
+    _ = try client.write(0, "body", false);
+    _ = try deliver(&client, &server, 1000);
+    _ = try client.write(0, "", true);
+
+    var datagram: [TestConnection.datagram_octets]u8 = @splat(0);
+    _ = try client.send(&datagram, 2000); // dropped
+    try testing.expect(server.findStream(0).?.receive_state == .receiving);
+
+    // A FIN records an empty byte range, so rewinding by offset cannot bring it
+    // back — it is tracked separately for exactly this case.
+    const at = client.timeout().?;
+    client.onTimeout(at);
+    _ = try deliver(&client, &server, at);
+    try testing.expect(server.findStream(0).?.receive_state != .receiving);
 }

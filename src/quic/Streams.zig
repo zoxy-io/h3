@@ -121,6 +121,11 @@ pub fn Streams(comptime config: Config) type {
             framed: u32 = 0,
             send_offset: u64 = 0,
             send_fin: bool = false,
+            /// Whether the FIN has been put in a packet. Without it nothing
+            /// records that the FIN went out, `wantsSend` stays true forever
+            /// and every packet carries another empty FIN — a loop that only
+            /// stops when the connection does.
+            fin_framed: bool = false,
             /// The peer's `MAX_STREAM_DATA` for this stream.
             send_limit: u64 = 0,
 
@@ -326,15 +331,22 @@ pub fn Streams(comptime config: Config) type {
         pub fn wantsSend(self: *const Self) bool {
             for (self.streams[0..self.count]) |*stream| {
                 if (stream.framed < stream.send_len) return true;
-                if (stream.send_fin and stream.framed == stream.send_len and stream.send_state != .reset) return true;
+                if (stream.send_state == .reset) continue;
+                // A FIN is owed once, not once per poll.
+                if (stream.send_fin and !stream.fin_framed) return true;
             }
             return false;
         }
 
         /// Undo the framing of a lost range, so it is sent again.
-        pub fn rewind(self: *Self, id: u64, from: u32) void {
+        ///
+        /// `fin_lost` is separate because a FIN carries no octets: an empty
+        /// FIN frame records an empty range, so a lost one would otherwise have
+        /// no way back — it is the one thing a byte range cannot describe.
+        pub fn rewind(self: *Self, id: u64, from: u32, fin_lost: bool) void {
             const stream = self.find(id) orelse return;
             stream.framed = @min(stream.framed, from);
+            if (fin_lost) stream.fin_framed = false;
         }
     };
 }
@@ -540,7 +552,7 @@ test "rewinding re-frames a lost range" {
     stream.framed = 5;
     try testing.expect(!set.wantsSend());
 
-    set.rewind(0, 2);
+    set.rewind(0, 2, false);
     try testing.expectEqual(@as(u32, 2), stream.framed);
     try testing.expect(set.wantsSend());
 }
