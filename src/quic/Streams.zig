@@ -210,8 +210,13 @@ pub fn Streams(comptime config: Config) type {
 
         /// Take a STREAM frame.
         pub fn receive(self: *Self, id: u64, offset: u64, data: []const u8, fin: bool) Error!void {
+            // Section 19.8 puts the sum past 2^62-1 in the same sentence as
+            // FRAME_ENCODING_ERROR, and the addition has to be guarded before
+            // it happens rather than tested after: `receive` is public, offsets
+            // are 62-bit and peer-chosen, and an overflow lands ahead of any
+            // check that was meant to catch it.
+            if (offset > varint.max or data.len > varint.max - offset) return error.FinalSize;
             const end = offset + data.len;
-            if (end > varint.max) return error.FinalSize;
 
             const stream = try self.open(id);
             if (stream.receive_state == .reset) return; // Section 3.2: discard.
@@ -254,7 +259,10 @@ pub fn Streams(comptime config: Config) type {
         /// Release bytes the application has read.
         pub fn consume(self: *Self, id: u64, octets: usize) Error!void {
             const stream = self.find(id) orelse return error.NotFound;
-            assert(octets <= stream.readable().len);
+            // Checked, not asserted: `consume` is application-facing and takes
+            // an unvalidated count, and `Reassembler.consume`'s own guard is an
+            // assertion that the shipping build removes.
+            if (octets > stream.readable().len) return error.Protocol;
             stream.received.consume(octets);
             stream.consumed += octets;
             self.consumed_total += octets;

@@ -233,8 +233,12 @@ pub const Iterator = struct {
     list_size_max: u64,
 
     pub fn next(self: *Iterator) Error!?Field {
+        // `>=` rather than `==`: with assertions compiled out the equality test
+        // does not catch an offset past the end, and the read below is then out
+        // of bounds. The assertion states the invariant; the comparison is what
+        // holds when it is gone.
         assert(self.offset <= self.section.len);
-        if (self.offset == self.section.len) return null;
+        if (self.offset >= self.section.len) return null;
         // Each representation begins a new field, so the buffer is reused from
         // the start — which is what makes the borrow above a real constraint
         // rather than a formality.
@@ -308,7 +312,10 @@ pub const Iterator = struct {
     fn stringAt(self: *Iterator, prefix_bits: u4, coded: bool) Error![]const u8 {
         const length_value = try self.integerAt(prefix_bits);
         const length = std.math.cast(usize, length_value) orelse return error.DecompressionFailed;
-        if (self.section.len - self.offset < length) return error.Truncated;
+        // Written against the remaining slice rather than as a subtraction: if
+        // `offset` were ever past the end, `len - offset` wraps to a huge
+        // number, the check passes, and the slice below reads out of bounds.
+        if (self.section[self.offset..].len < length) return error.Truncated;
         const raw = self.section[self.offset..][0..length];
         self.offset += length;
 

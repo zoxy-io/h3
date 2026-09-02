@@ -120,7 +120,11 @@ pub fn Reassembler(comptime config: Config) type {
         /// still relevant is kept and the rest dropped, because a retransmission
         /// covering consumed data is ordinary rather than an error.
         pub fn push(self: *Self, offset: u64, data: []const u8) PushError!void {
-            assert(offset <= varint.max);
+            // Checked rather than asserted: `push` is public, so the 62-bit
+            // bound is a precondition a consumer can break, and the addition
+            // below overflows `u64` in the build that has no assertions.
+            if (offset > varint.max) return error.BeyondWindow;
+            if (data.len > varint.max - offset) return error.BeyondWindow;
             const end = offset + data.len;
             if (self.final_size) |final| {
                 if (end > final) return error.FinalSizeViolated;
@@ -208,9 +212,15 @@ pub fn Reassembler(comptime config: Config) type {
 
         /// Drop `octets` from the front, freeing that much window.
         pub fn consume(self: *Self, octets: usize) void {
+            // The assertion states the precondition; the clamp is what enforces
+            // it. `-Dassertions=false` is one of the two builds that ship, and
+            // without the clamp an over-reported count reaches `@intCast`,
+            // `spans[span_count - 1]` with no spans, and `held - shift` — an
+            // illegal cast, an out-of-bounds read and an underflow, none of
+            // them checked.
             assert(octets <= self.readable().len);
-            if (octets == 0) return;
-            const shift: u32 = @intCast(octets);
+            const shift: u32 = @intCast(@min(octets, self.readable().len));
+            if (shift == 0) return;
 
             // The move is over the octets still *held*, not over the capacity:
             // a caller that drains everything readable moves nothing, which is
@@ -248,11 +258,14 @@ pub fn Reassembler(comptime config: Config) type {
                 if (final != size) return error.FinalSizeViolated;
                 return;
             }
-            // A final size below what is already held contradicts data the peer
-            // itself sent.
-            if (self.span_count > 0 and self.base + self.spans[self.span_count - 1].end > size) {
-                return error.FinalSizeViolated;
-            }
+            // A final size below what has already been *received* contradicts
+            // data the peer itself sent. `base` counts what has been consumed
+            // and is gone, so it belongs in the comparison: without it, a
+            // stream drained to empty had no spans left and the check was
+            // skipped entirely, and `finish` below what was already read
+            // succeeded.
+            const received_end = self.base + if (self.span_count > 0) self.spans[self.span_count - 1].end else 0;
+            if (received_end > size) return error.FinalSizeViolated;
             self.final_size = size;
         }
 
@@ -439,4 +452,46 @@ test "a long stream drains through a small window" {
     try testing.expectEqual(@as(usize, 64), seen_len);
     try testing.expectEqual(@as(u64, 64), stream.readOffset());
     try testing.expectEqualStrings("0123", seen[0..4]);
+}
+
+test "a final size below what was already consumed is refused" {
+    // Section 4.5: data at or beyond the final size is an error "even after a
+    // stream is closed". Once everything is drained there are no spans left, so
+    // the check that looked only at spans was skipped entirely and a peer could
+    // claim a final size below octets it had already delivered — leaving
+    // `isComplete` true for a stream that never was, and every honest
+    // retransmission rejected afterwards.
+    var stream: Small = .{};
+    try stream.push(0, "abcdef");
+    stream.consume(6);
+    try testing.expectEqual(@as(u32, 0), stream.span_count);
+    try testing.expectError(error.FinalSizeViolated, stream.finish(3));
+    // The true size is still accepted.
+    try stream.finish(6);
+    try testing.expect(stream.isComplete());
+}
+
+test "consume clamps rather than trusting its caller" {
+    // Only meaningful in the build that ships without assertions. With them on,
+    // an over-reported count is a caller bug and the assertion is *supposed* to
+    // fire — that is the contract. What this checks is the other half: that the
+    // same call in the `-Dassertions=false` leg clamps instead of reaching an
+    // illegal cast, an out-of-bounds read and an underflow.
+    if (@import("../assert.zig").enabled) return error.SkipZigTest;
+
+    var stream: Small = .{};
+    try stream.push(0, "abc");
+    stream.consume(99);
+    try testing.expectEqual(@as(u64, 3), stream.readOffset());
+    try testing.expectEqualStrings("", stream.readable());
+    // And on an empty reassembler, where the old code indexed span_count - 1.
+    var empty: Small = .{};
+    empty.consume(5);
+    try testing.expectEqual(@as(u64, 0), empty.readOffset());
+}
+
+test "an offset past the encoding's range is refused, not wrapped" {
+    var stream: Small = .{};
+    try testing.expectError(error.BeyondWindow, stream.push(varint.max, "x"));
+    try testing.expectError(error.BeyondWindow, stream.push(varint.max - 1, "abc"));
 }

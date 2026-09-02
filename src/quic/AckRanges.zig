@@ -215,6 +215,10 @@ pub fn AckRanges(comptime config: Config) type {
             Empty,
             /// `target` cannot hold even the frame's fixed fields.
             OutputTooLong,
+            /// A packet number past what a variable-length integer can carry.
+            /// Returned rather than asserted: `record` is public and takes a
+            /// `u64`, so the 62-bit bound is a caller's to break.
+            ValueTooLarge,
         };
 
         pub const Written = struct {
@@ -232,23 +236,31 @@ pub fn AckRanges(comptime config: Config) type {
         /// a transport parameter it does not hold.
         pub fn write(self: *Self, target: []u8, now: u64, ack_delay_exponent: u6) WriteError!Written {
             if (self.count == 0) return error.Empty;
-            assert(now >= self.largest_received_at);
+            self.assertInvariants();
 
             // Section 13.2.5: the delay is in microseconds, scaled down by the
             // exponent the peer advertised.
-            const delay_us = (now - self.largest_received_at) / std.time.ns_per_us;
+            //
+            // Saturating, and the assertion states why rather than enforcing
+            // it. `now` is a parameter by policy, so a caller that reads its
+            // clock once per batch rather than once per packet passes a value
+            // below the receive time — and with assertions compiled out a bare
+            // subtraction there is unsigned overflow. A stale `now` producing a
+            // zero delay is a correct answer; undefined behaviour is not.
+            assert(now >= self.largest_received_at);
+            const delay_us = (now -| self.largest_received_at) / std.time.ns_per_us;
             const delay = delay_us >> ack_delay_exponent;
 
             var writer: Writer = .{ .target = target };
-            try writer.varint(@intFromEnum(frame.Type.ack));
-            try writer.varint(self.ranges[0].largest);
-            try writer.varint(@min(delay, varint.max));
+            try writer.writeVarint(@intFromEnum(frame.Type.ack));
+            try writer.writeVarint(self.ranges[0].largest);
+            try writer.writeVarint(@min(delay, varint.max));
             // The range count is written before the ranges are known to fit, so
             // it is reserved at its widest and back-filled. The alternative is
             // serializing the ranges twice to find out how many there are.
             const count_at = writer.offset;
             try writer.reserve(varint.octets_max);
-            try writer.varint(self.ranges[0].count() - 1);
+            try writer.writeVarint(self.ranges[0].count() - 1);
 
             const emitted = try self.writeRanges(&writer);
             varint.encodeIn(target[count_at..][0..varint.octets_max], emitted, varint.octets_max) catch unreachable; // The space was reserved above and `emitted` is at most `ranges_max`.
@@ -268,13 +280,19 @@ pub fn AckRanges(comptime config: Config) type {
                 assert(previous > range.largest);
                 // Section 19.3.1: the gap is the count of unacknowledged packets
                 // between the ranges, less one.
+                // Section 19.3.1's gap needs two clear numbers between the
+                // ranges. The separation invariant guarantees it, and this
+                // checks it rather than trusting it: with assertions compiled
+                // out, a broken invariant would underflow here and encode a
+                // gap that acknowledges packets never received.
+                if (previous < range.largest + 2) break;
                 const gap = previous - range.largest - 2;
                 const saved = writer.offset;
-                writer.varint(gap) catch {
+                writer.writeVarint(gap) catch {
                     writer.offset = saved;
                     break;
                 };
-                writer.varint(range.count() - 1) catch {
+                writer.writeVarint(range.count() - 1) catch {
                     writer.offset = saved;
                     break;
                 };
@@ -307,10 +325,18 @@ const Writer = struct {
     target: []u8,
     offset: usize = 0,
 
-    fn varint(self: *Writer, value: u64) error{OutputTooLong}!void {
-        const length = @import("../varint.zig").encodedLength(value);
+    /// Named `writeVarint` rather than `varint` so it does not shadow the
+    /// module import — which is why this used to spell `@import("../varint.zig")`
+    /// inline at every use.
+    fn writeVarint(self: *Writer, value: u64) error{ OutputTooLong, ValueTooLarge }!void {
+        // Returned, not asserted. `varint.encode` has two failure modes and
+        // `reserve` only rules out one of them; the other is a value past 62
+        // bits, whose only previous guard was an assertion in `record` — and an
+        // assertion is not a guard in the build that removes it.
+        if (value > varint.max) return error.ValueTooLarge;
+        const length = varint.encodedLength(value);
         try self.reserve(length);
-        _ = @import("../varint.zig").encode(self.target[self.offset - length ..][0..length], value) catch unreachable; // `reserve` sized the slice from `encodedLength`.
+        _ = varint.encode(self.target[self.offset - length ..][0..length], value) catch unreachable; // `reserve` sized the slice from `encodedLength` and the range check above bounded the value.
     }
 
     fn reserve(self: *Writer, octets: u8) error{OutputTooLong}!void {
