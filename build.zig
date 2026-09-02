@@ -17,6 +17,16 @@ pub fn build(b: *std.Build) void {
     const assertions = b.option(bool, "assertions", "Compile in run-time assertions (default true)") orelse true;
     const h3_options = b.addOptions();
     h3_options.addOption(bool, "assertions", assertions);
+    // A marker, so this package's generated options file is distinct from
+    // another's. Zig content-addresses the file `addOptions` produces, and a
+    // file cannot be the root of two modules — so two packages whose options
+    // hold nothing but `assertions: bool` with the same value collide with
+    // "file exists in modules 'build_options' and 'build_options0'".
+    //
+    // hpack learned this against its consumers. The same trap sits one level
+    // up: zrk depends on h2 *and* h3, and their options were byte-for-byte
+    // identical. The marker is never read; its whole job is to differ.
+    h3_options.addOption([]const u8, "package", "h3");
 
     // RFC 7541's Huffman code and prefixed integer, which RFC 9204 sections
     // 4.1.2 and 4.1.1 adopt unchanged. The assertions option is **forwarded**,
