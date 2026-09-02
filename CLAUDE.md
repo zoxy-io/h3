@@ -47,11 +47,16 @@ not represented by any test that runs on a laptop.
 
 ## Policies
 
-- **No dependencies.** `build.zig.zon` has an empty `dependencies` table.
-  `@cImport` is lint-forbidden. Packet protection is the one place that would
-  otherwise reach for libcrypto, and `std.crypto` covers it. Note
-  [docs/DESIGN.md §7](docs/DESIGN.md#7-open-decisions) has an open question
-  about sharing Huffman with h2, which is the one thing that might change this.
+- **One dependency, and the rule that replaced "none".**
+  [hpack](https://github.com/zoxy-io/hpack) holds RFC 7541, of which QPACK
+  adopts the Huffman code and the prefixed integer unchanged; it has no
+  dependencies of its own. The policy is **no dependency outside the
+  organisation, and none that pulls in a runtime or a libcrypto**. `@cImport`
+  stays lint-forbidden, and packet protection reaches no further than
+  `std.crypto`.
+- **`-Dassertions` is forwarded to hpack, not defaulted.** hpack sits two levels
+  below a binary, so a consumer that turned assertions off would otherwise still
+  be running hpack's. The line is in build.zig and a review should check it.
 - **No allocator, anywhere.** `std.mem.Allocator` does not appear in `src/`, and
   `zig build lint` enforces it. Every buffer is caller-owned and caller-sized. A
   connection's state is comptime-parameterised by its limits, so **a limit that

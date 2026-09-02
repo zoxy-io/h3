@@ -26,8 +26,10 @@ ledger — read it before depending on this.
 * **RFC 9001 — packet protection.** Initial secrets, AEAD packet protection,
   header protection, the Retry integrity tag, key update.
 * **RFC 9002 — loss detection and congestion control.** *Planned.*
-* **RFC 9204 — QPACK.** The prefixed integer and the static table are here; the
-  field line representations, Huffman and the dynamic table are planned.
+* **RFC 9204 — QPACK.** The static table is here, and the prefixed integer and
+  Huffman code come from [hpack](https://github.com/zoxy-io/hpack), which holds
+  the RFC 7541 originals QPACK adopts unchanged. The field line representations
+  and the dynamic table are planned.
 * **RFC 9114 — HTTP/3.** The frame layer, the unidirectional stream types and
   the settings are here; message validation is planned.
 
@@ -53,10 +55,13 @@ and [§4](docs/DESIGN.md#4-where-tls-attaches).
   data and an ACK's ranges all borrow from the caller's datagram.
 * Caller-owned, caller-sized buffers. Packet protection works in place, in the
   buffer the datagram arrived in.
-* **Zero dependencies beyond the Zig toolchain.** Packet protection is the one
-  thing that would normally reach for libcrypto, and `std.crypto` covers all of
-  it: AES-GCM, ChaCha20-Poly1305, a raw AES block for header protection, and
-  HKDF-SHA256/384.
+* One dependency, [hpack](https://github.com/zoxy-io/hpack), which has none of
+  its own — it carries RFC 7541, of which QPACK adopts the Huffman code and the
+  prefixed integer unchanged. The rule is **no dependency outside the
+  organisation, and none that pulls in a runtime or a libcrypto**. Packet
+  protection is the one thing that would normally reach for libcrypto, and
+  `std.crypto` covers all of it: AES-GCM, ChaCha20-Poly1305, a raw AES block for
+  header protection, and HKDF-SHA256/384.
 * Assertions ship by default, in every optimize mode. `-Dassertions=false`
   removes them for a consumer that has made that argument — see
   [`src/assert.zig`](src/assert.zig) for why this is not `std.debug.assert`.
@@ -79,7 +84,7 @@ against itself:
 | Server key, IV and header-protection key | RFC 9001 §A.1 |
 | Variable-length integer encodings | RFC 9000 §A.1 |
 | Packet number encoding and decoding | RFC 9000 §A.2, §A.3 |
-| Prefixed integers | RFC 7541 §C.1, via RFC 9204 §4.1.1 |
+| Prefixed integers | RFC 7541 §C.1, via RFC 9204 §4.1.1 (in hpack) |
 
 ## Usage
 

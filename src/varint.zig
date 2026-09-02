@@ -16,7 +16,8 @@
 //! types and their fields (RFC 9000 section 19), transport parameters (section
 //! 18), HTTP/3 frame types and lengths (RFC 9114 section 7.1), and HTTP/3
 //! settings identifiers. It is not QPACK's integer — RFC 9204 section 4.1.1
-//! keeps HPACK's N-bit prefix encoding, which lives in `qpack/integer.zig`.
+//! keeps HPACK's N-bit prefix encoding, which comes from zoxy-io/hpack and is
+//! re-exported as `qpack.integer`.
 //!
 //! ## Non-minimal encodings are legal, and that is a trap
 //!

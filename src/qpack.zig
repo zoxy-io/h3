@@ -8,24 +8,50 @@
 //! unidirectional streams and to have each field section declare, in its
 //! prefix, how much of the table it depends on — the Required Insert Count.
 //!
-//! What is here today is the part that does not need that machinery: the
-//! prefixed integer both HPACK and QPACK use, and the static table. A decoder
-//! that advertises `SETTINGS_QPACK_MAX_TABLE_CAPACITY = 0` — which is what zrk
-//! does for HPACK today, and for the same reason — never blocks and never keeps
-//! per-connection compression state, so the static table and the literal
-//! representations are the whole of what it needs.
+//! ## Two of these pieces are not QPACK's
 //!
-//! The dynamic table, the encoder and decoder streams, and Huffman are the next
-//! slice. docs/DESIGN.md records why Huffman is a port rather than a rewrite:
-//! it is RFC 7541's table unchanged, and zoxy-io/h2 already has a fuzzed,
-//! vectorised implementation of it.
+//! Section 4.1.1 adopts RFC 7541 section 5.1's prefixed integer and section
+//! 4.1.2 adopts section 5.2's Huffman code, both unchanged and the Huffman with
+//! the same 257-symbol table. They come from
+//! [zoxy-io/hpack](https://github.com/zoxy-io/hpack), which holds RFC 7541, and
+//! are re-exported here so that a caller working in QPACK never has to know
+//! which RFC a given piece came from.
+//!
+//! The one thing that differs between the two protocols is how wide an integer
+//! can be, and it is a parameter rather than a fork: HPACK's values are bounded
+//! by HTTP/2 SETTINGS, which are `u32`, while QPACK's are bounded by a QUIC
+//! stream offset, which is 62 bits. Hence `Integer(u62)` below.
+//!
+//! ## What is here, and what is next
+//!
+//! The static table, and the two borrowed primitives. A decoder that advertises
+//! `SETTINGS_QPACK_MAX_TABLE_CAPACITY = 0` — which is what zrk does for HPACK
+//! today, and for the same reason — never blocks and never keeps per-connection
+//! compression state, so those plus the literal representations are the whole
+//! of what it needs.
+//!
+//! The field line representations, the dynamic table and the encoder and
+//! decoder streams are the next slices; see docs/DESIGN.md section 6.
 
 const std = @import("std");
 
-pub const integer = @import("qpack/integer.zig");
+const hpack = @import("hpack");
+
+/// RFC 9204 section 4.1.1's prefixed integer, at QPACK's width.
+///
+/// `u62` because every QPACK index and length is ultimately bounded by a QUIC
+/// stream offset (RFC 9000 section 16). Naming the width here is what makes the
+/// bound visible at every call site instead of buried in a constant.
+pub const integer = hpack.integer.Integer(u62);
+
+/// RFC 9204 section 4.1.2's Huffman code, which is RFC 7541 section 5.2's
+/// unchanged. `huffman.decode` is the one to call; `huffman.decodeReference` is
+/// the second kernel it is proved against.
+pub const huffman = hpack.huffman;
+
+/// RFC 9204 appendix A: the ninety-nine entry table, indexed from zero.
 pub const static_table = @import("qpack/static_table.zig");
 
 test {
-    _ = integer;
     _ = static_table;
 }

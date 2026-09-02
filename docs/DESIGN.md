@@ -196,16 +196,17 @@ all three build legs):
   against RFC 9001 appendix A.1's known-answer vectors**: both Initial secrets
   and all six key/IV/header-key values.
 - `frame.zig`, `stream.zig` — RFC 9114 §6.2, §7.1, §7.2.4, §11.2.
-- `qpack/integer.zig`, `qpack/static_table.zig` — RFC 9204 §4.1.1 and appendix A.
+- `qpack/static_table.zig` — RFC 9204 appendix A. §4.1.1's integer and §4.1.2's
+  Huffman code come from zoxy-io/hpack and are re-exported by `qpack.zig`.
 
 **Next, in the order they unblock each other:**
 
-1. **QPACK field lines and Huffman** (RFC 9204 §4.5, RFC 7541 §5.2). Enough to
-   decode a field section against the static table with the dynamic table
-   disabled, which is what a consumer advertising
-   `SETTINGS_QPACK_MAX_TABLE_CAPACITY = 0` needs — and zrk already makes exactly
-   that choice for HPACK, for exactly the same reason (see `zrk/src/h2conn.zig`,
-   `advertised_header_table_size`). §7 has an open decision about Huffman.
+1. **QPACK field lines** (RFC 9204 §4.5). Enough to decode a field section
+   against the static table with the dynamic table disabled, which is what a
+   consumer advertising `SETTINGS_QPACK_MAX_TABLE_CAPACITY = 0` needs — and zrk
+   already makes exactly that choice for HPACK, for exactly the same reason (see
+   `zrk/src/h2conn.zig`, `advertised_header_table_size`). Huffman is no longer
+   part of this slice: it arrives from hpack already fuzzed.
 2. **RFC 9114 §4.3 message validation.** The pseudo-header and field-name rules
    that decide whether a response is a message at all. Nearly identical to
    h2's `fields/`, and the same request-smuggling surface.
@@ -229,23 +230,25 @@ does not interoperate.
 
 ## 7. Open decisions
 
-**Huffman: port, share, or rewrite?** RFC 9204 §4.1.2 uses RFC 7541's Huffman
-table unchanged — the same 256 codes h2 already implements, vectorised, fuzzed,
-and benchmarked. Three options:
+**Huffman: port, share, or rewrite? — settled.** RFC 9204 §4.1.2 uses RFC 7541's
+Huffman code unchanged, and §4.1.1 its prefixed integer. Three options were on
+the table: copy them, depend on `zoxy-io/h2`, or extract a shared package.
 
-1. *Copy it into `src/qpack/huffman.zig`.* Keeps the empty dependency table.
-   Costs a second copy of 900 lines that must be kept in step; a bug fixed in
-   one is a bug still live in the other.
-2. *Depend on `zoxy-io/h2`.* One implementation, one fuzz corpus. Costs the "zero
-   dependencies" policy — although h2 itself has none, so the graph stays one
-   deep and both consumers already pull h2 in.
-3. *Extract `zoxy-io/hpack-primitives`.* Cleanest, and the most work; probably
-   right only if a third consumer appears.
+The answer was to extract, and to extract *more* than the shared part:
+[zoxy-io/hpack](https://github.com/zoxy-io/hpack) now holds RFC 7541 whole — the
+Huffman code, the integer, both tables and the representations — and h2
+re-exports it as `h2.hpack`. Taking only the two shared pieces was tried first
+and produced a package called hpack whose README had to open by explaining that
+it was not HPACK; moving the whole RFC made the name true and gave h2 one job.
 
-Recommendation: **(2)**, with the policy restated as "no dependency outside the
-organisation, and none that pulls in a runtime or a libcrypto". h2 is a
-zero-dependency codec both consumers already build. This wants a decision before
-slice 1 of the roadmap starts, because it decides where the file goes.
+This package builds against `huffman` and `integer` and nothing else there. The
+policy that replaced "zero dependencies" is **no dependency outside the
+organisation, and none that pulls in a runtime or a libcrypto**; hpack has none
+of its own, so the graph is one deep.
+
+The width is the one thing the two protocols differ on, and it is a parameter:
+`Integer(u32)` in h2, `Integer(u62)` here, because QPACK's values are bounded by
+a QUIC stream offset rather than by an HTTP/2 SETTINGS value.
 
 **Does `-Dassertions=false` still make sense here?** In h2 the argument for it is
 that zrk is a latency-measuring tool and HPACK decode is on its hot path. Here

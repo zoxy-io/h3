@@ -3,14 +3,29 @@
     .version = "0.0.0",
     .fingerprint = 0x532d9246f2291944, // Changing this has security and trust implications.
     .minimum_zig_version = "0.16.0",
-    // Zero dependencies beyond the Zig toolchain, and this stays empty.
-    // `scripts/lint.zig` forbids `@cImport`, every buffer is caller-owned, and
-    // the one thing that would otherwise pull a dependency in — packet
-    // protection — is `std.crypto`: AES-GCM, ChaCha20-Poly1305, a raw AES block
-    // for header protection, and HKDF-SHA256 are all in the standard library.
-    // The TLS *handshake* is deliberately not here; see README.md, "Where TLS
-    // attaches".
-    .dependencies = .{},
+    // One dependency, and the policy it replaces is worth stating rather than
+    // quietly dropping. This package used to say "zero dependencies beyond the
+    // Zig toolchain"; it now says **no dependency outside the organisation, and
+    // none that pulls in a runtime or a libcrypto**. hpack is a zero-dependency
+    // codec both of this package's consumers already build, so the graph stays
+    // one deep.
+    //
+    // What it buys: QPACK's Huffman code and prefixed integer are RFC 7541's,
+    // adopted verbatim by RFC 9204 sections 4.1.1 and 4.1.2, and h2 already had
+    // a fuzzed, vectorised implementation of both. The alternative was a second
+    // 900-line copy of a Huffman decoder in the same organisation, where a bug
+    // fixed in one stays live in the other. See docs/DESIGN.md section 7.
+    //
+    // `scripts/lint.zig` still forbids `@cImport`, and packet protection still
+    // reaches no further than `std.crypto` — AES-GCM, ChaCha20-Poly1305, a raw
+    // AES block for header protection, and HKDF-SHA256/384. The TLS *handshake*
+    // is deliberately not here; see README.md, "Where TLS attaches".
+    .dependencies = .{
+        .hpack = .{
+            .url = "git+https://github.com/zoxy-io/hpack#e627db06ae0c8e13269ff0b1408f5bb95edaca31",
+            .hash = "hpack-0.0.0-rFnmJ56YAwB60V75llyS-laQLcbknwnHJH2yHIVoHI3U",
+        },
+    },
     // What ships to a consumer. `fuzz/`, `bench/`, `checks/`, `example/` and
     // `scripts/` are gates rather than library.
     .paths = .{

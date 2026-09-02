@@ -18,6 +18,18 @@ pub fn build(b: *std.Build) void {
     const h3_options = b.addOptions();
     h3_options.addOption(bool, "assertions", assertions);
 
+    // RFC 7541's Huffman code and prefixed integer, which RFC 9204 sections
+    // 4.1.2 and 4.1.1 adopt unchanged. The assertions option is **forwarded**,
+    // not defaulted: hpack sits two levels below a binary, so a consumer that
+    // turned assertions off would otherwise still be running hpack's, with no
+    // way to tell. This line is load-bearing.
+    const hpack_dependency = b.dependency("hpack", .{
+        .target = target,
+        .optimize = optimize,
+        .assertions = assertions,
+    });
+    const hpack_module = hpack_dependency.module("hpack");
+
     // The public module: consumers `@import("h3")` this.
     const h3_module = b.addModule("h3", .{
         .root_source_file = b.path("src/root.zig"),
@@ -25,6 +37,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "build_options", .module = h3_options.createModule() },
+            .{ .name = "hpack", .module = hpack_module },
         },
     });
 
