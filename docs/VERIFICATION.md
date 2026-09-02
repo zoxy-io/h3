@@ -30,13 +30,23 @@ Each finding, with the gate that would have caught it first:
 | Three overflows on peer-chosen 62-bit values | `3e5a7ae` | Fuzz targets that draw the field at its wire width. The recovery target draws `delay` as a `u16`, so the overflow at 2^62 was unreachable by construction |
 | Seven `catch unreachable` and subtractions guarded only by an assertion | `d23c798` | Fuzz and simulation run under `-Doptimize=ReleaseFast -Dassertions=false`. Today the fuzz corpus replays in Debug with assertions on, so the build that ships is never the build that is fuzzed |
 | A comptime "proof" that set 256 flags and checked 256 flags | `6f46be7` | Nothing automated short of mutation testing; noted for honesty |
+| Two fuzz targets could not reach the paths their comments claimed: the connection target never padded to 1200 and drew the packet number twice, so no packet it built ever authenticated; the recovery target pinned `range_count = 0`, so the ACK range walk was unreachable | `b9c796d` | A coverage report over a fuzz run. Both targets passed for years of CPU time because "discarded" is a legal outcome, and neither a corpus replay nor a crash-free `--fuzz` run can tell covering a path from never reaching it |
 
-Two patterns in that table are worth more than the rows.
+Three patterns in that table are worth more than the rows.
 
 **Half the findings are a MUST that was never implemented, or was implemented
 and never wired in.** No quantity of unit tests finds a requirement nobody wrote
 down as missing. That needs a list of requirements derived from the RFC text,
 not from the code.
+
+**A target that cannot reach a path still passes.** This is the fuzz-shaped
+version of the row below it, and it is worse, because a fuzz target reports
+CPU-hours rather than a verdict a reader can check. Both defects were in the
+*generator*, not the code, and both were invisible to every gate: the corpus
+replayed, `--fuzz` found nothing, and the reason was that the input was refused
+at the door. Any target whose accept path is not itself asserted by a
+deterministic test is a target that may be proving nothing — which is why
+`b9c796d` adds four such tests rather than only fixing the draws.
 
 **The `AckRanges` tests asserted the bug.** `expect(!set.contains(0))` after an
 eviction was the violation, written down as the design. A test written by the
@@ -59,7 +69,7 @@ moves a datagram from one `Connection` to another.
 | Gate | What it proves | What it cannot prove |
 |---|---|---|
 | 252 `test` blocks | Each function does what its author meant | That the author read the RFC correctly, or that anything calls the function |
-| 16 fuzz targets, Debug, assertions on | Decoders reject or parse with no third outcome | Anything about the shipping builds; anything a `u16` draw cannot reach |
+| 16 fuzz targets, Debug, assertions on | Decoders reject or parse with no third outcome | Anything about the shipping builds; anything a `u16` draw cannot reach; and — until `b9c796d` — whether a target reaches its accept path at all, which two of them did not |
 | `corpus/`, RFC 9001 appendix A | The key schedule, AEAD, nonce, sampling offset and mask are right at once | Anything after the first flight |
 | `zig build lint` | No I/O, no allocator, no unbounded loop | Nothing about behaviour |
 | The `tiger-style-reviewer` agent | Assertion density, function length, named bounds | It is a reader, not a gate: it found the twenty above, and it will not find the same class twice at the same cost |
@@ -241,6 +251,11 @@ a `u62` where the wire carries one. Add model-based targets: `AckRanges`
 against a bitset, `Reassembler` against a byte array, `Streams` against a
 flow-control ledger. Each of the three data-structure findings in §1 is a
 model disagreeing with the structure.
+
+Pair every target with a deterministic test that its *accepted* input really is
+accepted. `b9c796d` is the argument for it: two targets spent every run being
+refused at the door, and nothing in the gate output distinguished that from
+coverage.
 
 ### 5.5 An interop shim — one to two weeks, needs TLS glue
 
