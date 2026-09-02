@@ -74,8 +74,18 @@ const literal_name_tag: u8 = 0x20;
 const literal_name_never_bit: u8 = 0x10;
 const literal_name_huffman_bit: u8 = 0x08;
 const indexed_post_base_tag: u8 = 0x10;
-const literal_post_base_tag: u8 = 0x00;
 const string_huffman_bit: u8 = 0x80;
+
+/// Section 4.5.1's field section prefix: a Required Insert Count and a Delta
+/// Base. A stateless encoder writes zero for both, and zero encodes in one
+/// octet at either prefix width, so the prefix this package writes is always
+/// exactly this long. It was a bare `2` at the one call site.
+const prefix_octets: u32 = 2;
+
+comptime {
+    // Two varints, each at their narrowest.
+    assert(prefix_octets == 1 + 1);
+}
 
 /// Which representation a first octet belongs to, by section 4.5's tags.
 ///
@@ -147,7 +157,16 @@ pub const Error = error{
     /// than the `SETTINGS_MAX_FIELD_SECTION_SIZE` it advertised. The first is a
     /// caller's sizing decision; the second is section 4.2.2's, and both are
     /// the compression-bomb defence.
+    ///
+    /// Decoding only. This error used to cover the encoder's "your target is
+    /// too small" as well, which put a remote peer's compression bomb and a
+    /// local caller's undersized buffer behind one name — two different
+    /// parties, two different fixes, and a consumer logging one could not tell
+    /// which had happened.
     ListTooLarge,
+    /// The caller's `target` cannot hold the encoding. Encoding only, and never
+    /// the peer's doing: the fix is a bigger buffer.
+    OutputTooSmall,
 };
 
 /// Section 4.5.1: the two integers every field section begins with.
@@ -208,10 +227,10 @@ pub fn parsePrefix(source: []const u8) Error!Prefix {
 
 /// Write the prefix a stateless encoder always writes: no table dependency.
 pub fn writePrefix(target: []u8) Error!u32 {
-    if (target.len < 2) return error.ListTooLarge;
+    if (target.len < prefix_octets) return error.OutputTooSmall;
     target[0] = 0;
     target[1] = 0;
-    return 2;
+    return prefix_octets;
 }
 
 /// Walks the representations of one field section.
@@ -367,7 +386,7 @@ pub fn encodeField(target: []u8, field: Field) Error!u32 {
             // The index came out of the static table, so it cannot be too
             // large for the encoding; a target too small is the only failure.
             return integer.encode(target, @intCast(match.index), indexed_prefix_bits, indexed_tag | indexed_static_bit) catch
-                return error.ListTooLarge;
+                return error.OutputTooSmall;
         }
         var offset = integer.encode(
             target,
@@ -375,7 +394,7 @@ pub fn encodeField(target: []u8, field: Field) Error!u32 {
             literal_name_reference_prefix_bits,
             literal_name_reference_tag | literal_name_reference_static_bit |
                 (if (field.never_indexed) literal_name_reference_never_bit else 0),
-        ) catch return error.ListTooLarge;
+        ) catch return error.OutputTooSmall;
         offset += try encodeString(target[offset..], field.value);
         return offset;
     }
@@ -409,14 +428,14 @@ fn encodeStringAt(target: []u8, text: []const u8, prefix_bits: u4, tag: u8, huff
 
     const header = integer.encode(
         target,
-        std.math.cast(u62, length) orelse return error.ListTooLarge,
+        std.math.cast(u62, length) orelse return error.OutputTooSmall,
         prefix_bits,
         tag | (if (coded) huffman_bit else 0),
-    ) catch return error.ListTooLarge;
-    if (target.len - header < length) return error.ListTooLarge;
+    ) catch return error.OutputTooSmall;
+    if (target.len - header < length) return error.OutputTooSmall;
 
     if (coded) {
-        _ = huffman.encode(target[header..], text) catch return error.ListTooLarge;
+        _ = huffman.encode(target[header..], text) catch return error.OutputTooSmall;
     } else {
         @memcpy(target[header..][0..text.len], text);
     }
@@ -597,7 +616,7 @@ test "a decoded string borrows only until the next field" {
 
 test "a target too small is refused rather than truncated" {
     var target: [4]u8 = undefined;
-    try testing.expectError(error.ListTooLarge, encode(&target, &.{
+    try testing.expectError(error.OutputTooSmall, encode(&target, &.{
         .{ .name = "x-long-name-here", .value = "and a long value too" },
     }));
 }

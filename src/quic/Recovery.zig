@@ -78,8 +78,22 @@ comptime {
 
     assert(packet_threshold == 3);
     assert(time_threshold_numerator * 8 == time_threshold_denominator * 9);
-    assert(granularity_ns == 1_000_000);
-    assert(initial_rtt_ns == 333_000_000);
+    // `assert(granularity_ns == 1_000_000)` and `assert(initial_rtt_ns ==
+    // 333_000_000)` stood here and proved nothing: each restated the literal on
+    // the line that defines it, so the only edit either could catch is one that
+    // changes the constant and not the assertion — which is the edit a reader
+    // makes deliberately. Replaced with the relations that do constrain them.
+    //
+    // Section 6.1.2: the timer granularity has to be reachable by a clock, and
+    // it bounds every timeout below, so a granularity above the initial RTT
+    // would make the first probe fire on the floor rather than on the estimate.
+    assert(granularity_ns > 0);
+    assert(granularity_ns < initial_rtt_ns);
+    // Section 6.2.2: the initial RTT is used until a sample exists, and the
+    // first PTO is `initial_rtt + 4 * initial_rtt`, which must not overflow
+    // before `pto_base_max` above gets to shift it.
+    assert(initial_rtt_ns > 0);
+    assert(initial_rtt_ns <= pto_base_max / 5);
 }
 
 pub const Config = struct {
@@ -300,14 +314,17 @@ pub fn Recovery(comptime config: Config) type {
                         .in_flight = packet.in_flight,
                     };
                     result.acked += 1;
-                    self.remove(state, index);
+                    remove(state, index);
                 }
             }
             return largest;
         }
 
-        fn remove(self: *Self, state: *SpaceState, index: u32) void {
-            _ = self;
+        /// A free function rather than a method: it touches only `state`, and
+        /// taking a `self` it immediately discards invited a reader to look for
+        /// the recovery state it changes. It changes none — `bytes_in_flight`
+        /// is adjusted by the caller, before this runs.
+        fn remove(state: *SpaceState, index: u32) void {
             assert(index < state.count);
             var at = index;
             while (at + 1 < state.count) : (at += 1) {
@@ -337,8 +354,17 @@ pub fn Recovery(comptime config: Config) type {
             // leaves a plausible RTT. A peer that inflates it would otherwise
             // shrink our RTT estimate and make us declare loss early.
             assert(self.min_rtt <= sample);
-            const delay = @min(ack_delay_ns, self.max_ack_delay_ns);
-            assert(delay <= self.max_ack_delay_ns);
+            // Section 5.3: the peer's reported delay is clamped to what it said
+            // it would ever be — but only once the handshake is confirmed,
+            // because `max_ack_delay` arrives in the peer's transport
+            // parameters and before that this endpoint is comparing against its
+            // own default rather than against anything the peer promised.
+            // Clamping earlier shrank the subtrahend and biased the estimate up.
+            const delay = if (self.handshake_confirmed)
+                @min(ack_delay_ns, self.max_ack_delay_ns)
+            else
+                ack_delay_ns;
+            if (self.handshake_confirmed) assert(delay <= self.max_ack_delay_ns);
             // The comparison is the guard on the subtraction, not the assertion
             // beside it: both terms come from the peer, and section 5.3 is
             // explicit that a peer inflating its reported delay must not be
@@ -433,7 +459,7 @@ pub fn Recovery(comptime config: Config) type {
                 }
                 if (count < lost.len) lost[count] = packet.context;
                 count += 1;
-                self.remove(state, index);
+                remove(state, index);
             }
 
             if (largest_lost) |packet| {

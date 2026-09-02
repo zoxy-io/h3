@@ -83,7 +83,13 @@ def field(name, hex_text, expect_octets=None):
         raise SystemExit(f'{name}: extracted {octets} octets, RFC states {expect_octets}')
     grouped = [hex_text[i:i + 32] for i in range(0, len(hex_text), 32)]
     body = '\n'.join('    "' + g + '" ++' for g in grouped)
-    body = body.rstrip(' ++')
+    # `rstrip(' ++')` would strip a *character set* — every trailing space and
+    # `+` — rather than the suffix. It happens to be right here only because a
+    # quote terminates every line, so there is nothing else for it to eat; make
+    # the intent the code rather than the accident.
+    suffix = ' ++'
+    assert body.endswith(suffix), body[-8:]
+    body = body[: -len(suffix)]
     return f'/// {octets} octets.\npub const {name} = hexed(\n{body},\n);\n'
 
 

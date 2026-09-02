@@ -3,10 +3,17 @@
 //!
 //! Three of these per connection — Initial, Handshake, application — because
 //! the spaces are separate and an acknowledgement in one says nothing about
-//! another (section 12.3). `packet_number.Space` exists so a caller cannot pass
-//! the wrong one by accident, and this structure is deliberately *not* an array
-//! of three: which spaces are alive changes over a connection's life, and a
+//! another (section 12.3). This structure is deliberately *not* an array of
+//! three: which spaces are alive changes over a connection's life, and a
 //! discarded space's set should be gone rather than idle.
+//!
+//! It holds no `packet_number.Space` and takes none. An earlier version of this
+//! comment claimed the type "exists so a caller cannot pass the wrong one by
+//! accident", which is a property `Recovery` has — it is keyed by space and
+//! takes one on every call — and this file does not. Keeping the right set
+//! beside the right space is the connection's job, and `Connection.spaces`
+//! indexes both from the same enum, which is where that safety actually comes
+//! from.
 //!
 //! ## The bound is the whole design problem
 //!

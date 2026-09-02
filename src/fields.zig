@@ -239,6 +239,11 @@ const connect_method = "CONNECT";
 /// which is the accept-a-malformed-message direction.
 const authority_bearing_schemes = [_][]const u8{ "http", "https" };
 
+const te_field_name = "te";
+/// The one value section 4.2 permits in a `te`, and the one kind of section it
+/// permits the field in.
+const te_permitted_value = "trailers";
+
 const host_field_name = "host";
 const content_length_field_name = "content-length";
 
@@ -395,12 +400,23 @@ pub const MessageValidator = struct {
     fn regularField(self: *MessageValidator, one: *const Field) Error!void {
         assert(one.name[0] != ':');
 
-        // Section 4.2's TE exception: it may appear, and only with the one
-        // value that means something in HTTP/3.
-        if (std.mem.eql(u8, one.name, "te")) {
-            if (!std.mem.eql(u8, one.value, "trailers")) return error.ConnectionSpecific;
-        } else if (connectionSpecific(one.name)) {
-            return error.ConnectionSpecific;
+        // Section 4.2's TE exception, which is narrower than it was read as
+        // being: "the TE header field, which MAY be present in an HTTP/3
+        // request; when it is, it MUST NOT contain any value other than
+        // 'trailers'". A request, and that one value — a `te` in a response was
+        // being waved through here, and a trailer section is not a request's
+        // header section either. Transfer-coding negotiation after the content
+        // has been sent means nothing in any case.
+        if (std.mem.eql(u8, one.name, te_field_name)) {
+            if (self.kind != .request) return error.ConnectionSpecific;
+            // Case-insensitively: RFC 9110 section 10.1.4 defines the value
+            // through ABNF, and RFC 5234 section 2.3 makes ABNF string literals
+            // case-insensitive, so `TRAILERS` is a conforming spelling this
+            // package has no business refusing.
+            if (!std.ascii.eqlIgnoreCase(one.value, te_permitted_value)) return error.ConnectionSpecific;
+        }
+        if (!std.mem.eql(u8, one.name, te_field_name)) {
+            if (connectionSpecific(one.name)) return error.ConnectionSpecific;
         }
 
         if (std.mem.eql(u8, one.name, host_field_name)) try self.checkHost(one.value);
@@ -962,4 +978,28 @@ test "section 4.3: a trailer section carries no pseudo-header at all" {
     }));
     // And nothing is required of one.
     try validate(.trailer, &.{});
+}
+
+test "section 4.2: te belongs to a request, and only with one value" {
+    // "the TE header field, which MAY be present in an HTTP/3 *request*". A
+    // response carrying one was accepted before, which is the connection-
+    // specific field the exception exists to carve out of.
+    try testing.expectError(error.ConnectionSpecific, validate(.response, &.{
+        .{ .name = ":status", .value = "200" },
+        .{ .name = "te", .value = "trailers" },
+    }));
+    try testing.expectError(error.ConnectionSpecific, validate(.trailer, &.{
+        .{ .name = "te", .value = "trailers" },
+    }));
+    // RFC 5234 section 2.3: an ABNF string literal is case-insensitive, so
+    // these are conforming spellings rather than evasions.
+    for ([_][]const u8{ "trailers", "TRAILERS", "Trailers" }) |value| {
+        try validate(.request, &.{
+            .{ .name = ":method", .value = "GET" },
+            .{ .name = ":scheme", .value = "https" },
+            .{ .name = ":authority", .value = "example.com" },
+            .{ .name = ":path", .value = "/" },
+            .{ .name = "te", .value = value },
+        });
+    }
 }

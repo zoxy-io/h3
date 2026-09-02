@@ -269,9 +269,17 @@ pub fn Reassembler(comptime config: Config) type {
             self.final_size = size;
         }
 
-        /// True when every octet up to the final size has arrived and been
-        /// consumed. The caller's cue that a request body or a CRYPTO stream is
-        /// complete.
+        /// True when every octet up to the final size has *arrived*, whether or
+        /// not the caller has read it. The cue that a request body or a CRYPTO
+        /// stream is whole.
+        ///
+        /// The doc comment said "arrived and been consumed", which the code has
+        /// never checked: `readable()` is what is held and unread, so this goes
+        /// true the moment the last octet lands and stays true until it is
+        /// taken. A caller that read this as "nothing left to do" would drop
+        /// data still sitting in the buffer. `Streams.settle` asks both
+        /// questions — this one and `readable().len == 0` — which is what the
+        /// comment was describing.
         pub fn isComplete(self: *const Self) bool {
             const final = self.final_size orelse return false;
             return self.base + self.readable().len >= final;

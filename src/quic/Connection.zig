@@ -75,7 +75,26 @@ pub const initial_datagram_min: u32 = 1200;
 /// did not see everything — and this package's response to a loss is to rewind
 /// a cursor, which the *earliest* lost packet decides. Seeing the rest changes
 /// nothing.
-const lost_report_max: usize = 32;
+const lost_report_max: u32 = 32;
+
+comptime {
+    // A report array smaller than what one ACK can retire means the caller sees
+    // a prefix, which is what the comment above promises. Stated as a relation
+    // so that raising `sent_max` without raising this stays a deliberate act
+    // rather than a silent narrowing.
+    assert(lost_report_max >= 1);
+    assert(lost_report_max <= connection_config_sent_max_ceiling);
+}
+
+/// The largest payload a UDP datagram can carry: 65535 minus the eight-octet
+/// UDP header. A `datagram_octets` above this names a datagram no socket can
+/// send, so the bound is the transport's rather than this package's.
+const udp_payload_octets_max: u32 = 65_535 - 8;
+
+/// The largest `sent_max` this file's fixed arrays are written for. Not a limit
+/// on `Config` — `Recovery` owns that — but the number `lost_report_max` is
+/// checked against, so that the two cannot drift apart unnoticed.
+const connection_config_sent_max_ceiling: u32 = 1024;
 
 /// RFC 9000 section 18.2's default `ack_delay_exponent`, used until the peer's
 /// transport parameters are decoded.
@@ -169,7 +188,7 @@ pub fn Connection(comptime config: Config) type {
         // A datagram smaller than section 14.1's floor could not carry a client
         // Initial, so the connection could never start.
         assert(config.datagram_octets >= initial_datagram_min);
-        assert(config.datagram_octets <= 65_527);
+        assert(config.datagram_octets <= udp_payload_octets_max);
     }
 
     const CryptoLevel = struct {
@@ -1205,10 +1224,22 @@ pub fn Connection(comptime config: Config) type {
             self.countSealed(level);
 
             // Section 2 of RFC 9002: a packet is in flight when it is
-            // ack-eliciting or padded, and only ack-eliciting packets oblige
-            // the peer to answer. A packet carrying nothing but an ACK is
-            // neither, so that congestion control cannot throttle the feedback
-            // it depends on.
+            // ack-eliciting *or contains a PADDING frame*. The second half
+            // never applies to a packet this endpoint sends — section 14.1's
+            // padding is written into the datagram after the sealed packet
+            // rather than into the payload before it (see `send`), so no packet
+            // built here carries a PADDING frame and `ack_eliciting` decides
+            // both. A packet carrying nothing but an ACK is neither, which is
+            // what stops congestion control throttling the feedback it depends
+            // on.
+            //
+            // The consequence, named rather than left implicit: the octets of
+            // datagram padding are counted for section 8.1's amplification
+            // limit (`sent_octets`) and not for the congestion window. On the
+            // first flight that is roughly 950 octets the window does not see.
+            // It is not binding — the initial window is ten datagrams — but a
+            // reader comparing this against another stack's accounting should
+            // know which of the two numbers it is looking at.
             self.recovery.onPacketSent(level.space(), .{
                 .number = number,
                 .time_sent = now_ns,
@@ -1303,10 +1334,46 @@ pub fn Connection(comptime config: Config) type {
 
         /// Fill a payload: an ACK if one is owed, then whatever handshake bytes
         /// are waiting.
+        /// Section 10.2's closing state: a CONNECTION_CLOSE and nothing else.
+        ///
+        /// Separate from `writePayload` rather than a branch inside it, because
+        /// "nothing else" is the whole content of the rule and a reader should
+        /// be able to see that this function cannot reach the ACK, CRYPTO or
+        /// STREAM paths at all.
+        fn writeClose(self: *Self, payload: []u8, result: *Payload) Payload {
+            assert(self.state == .closing);
+            if (!self.close_pending) return result.*;
+            // Section 19.19: a transport close carries the frame type that
+            // triggered it and an application close does not. Writing `null`
+            // for both makes a type 0x1c frame that omits a field the peer's
+            // parser requires, which is a close the peer cannot read.
+            const written = frame.encode(payload, .{ .connection_close = .{
+                .application = self.close_is_application,
+                .code = self.close_code,
+                .triggered_by = if (self.close_is_application) null else 0,
+                .reason = &.{},
+            } }) catch return result.*;
+            self.close_pending = false;
+            result.octets = written;
+            result.ack_eliciting = false;
+            assert(result.octets <= payload.len);
+            return result.*;
+        }
+
         fn writePayload(self: *Self, payload: []u8, level: Level, now_ns: u64) Payload {
             var result: Payload = .{};
             var offset: usize = 0;
             const space = &self.spaces[@intFromEnum(level.space())];
+
+            // Section 10.2: an endpoint in the closing state "retains only
+            // enough information to generate a packet containing a
+            // CONNECTION_CLOSE frame", and sends that in response to an
+            // incoming packet. It does not go on acknowledging, framing
+            // handshake data or opening streams — this gated only on
+            // `.draining`, so a closing endpoint kept doing all three, which is
+            // both wasted work and a peer being told about progress on a
+            // connection that is over.
+            if (self.state == .closing) return self.writeClose(payload, &result);
 
             if (space.received.ack_eliciting_pending) {
                 // Section 13.2.5's delay exponent is the peer's transport
@@ -2508,4 +2575,32 @@ test "a full window does not throttle acknowledgements" {
     const octets = try server.send(&datagram, 2000);
     try testing.expect(octets > 0);
     try testing.expect(!server.spaces[@intFromEnum(Space.application)].received.ack_eliciting_pending);
+}
+
+test "section 10.2: a closing endpoint sends only CONNECTION_CLOSE" {
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+
+    // Give the client something it would otherwise want to send, and an
+    // acknowledgement it would otherwise owe.
+    _ = try client.write(0, "never sent", false);
+    _ = try deliver(&server, &client, 1000);
+    try testing.expect(client.spaces[@intFromEnum(Space.application)].received.ack_eliciting_pending);
+
+    client.close(.protocol_violation);
+    var datagram: [TestConnection.datagram_octets]u8 = @splat(0);
+    const octets = try client.send(&datagram, 2000);
+    try testing.expect(octets > 0);
+
+    // Exactly one frame, and it is the close. Before this gated on `.closing`,
+    // the packet also carried the ACK and the STREAM data — section 10.2 keeps
+    // "only enough information to generate a packet containing a
+    // CONNECTION_CLOSE frame", and sending progress on a connection that is
+    // over tells the peer something untrue.
+    _ = try server.receive(datagram[0..octets], 2001);
+    try testing.expectEqual(State.draining, server.state);
+    try testing.expectEqualStrings("", server.readable(0));
+    // The stream data stayed queued rather than going out with the close.
+    try testing.expect(client.streams.wantsSend());
 }

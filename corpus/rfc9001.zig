@@ -259,3 +259,22 @@ test "A.5: the nonce the appendix prints" {
     for (padded, 0..) |octet, index| nonce[nonce.len - padded.len + index] ^= octet;
     try std.testing.expectEqualSlices(u8, &vectors.chacha_nonce, &nonce);
 }
+
+test "A.2: the header protection sample is drawn from the offset the RFC prints" {
+    // The RFC prints this sample explicitly, and it was extracted and then
+    // referenced by nothing — so the one step of header protection that a
+    // wrong constant silently breaks had no vector behind it. Section 5.4.2
+    // puts the sample four octets past the start of the packet number field,
+    // which is chosen so it never overlaps a packet number of any width: get
+    // the offset wrong and every packet still encrypts, still decrypts against
+    // your own implementation, and is unreadable by every other stack.
+    const protected = vectors.client_initial_protected;
+    const from = client_packet_number_offset + quic.crypto.protect.sample_offset;
+    const sample = protected[from..][0..quic.crypto.protect.sample_octets];
+    try std.testing.expectEqualSlices(u8, &vectors.client_initial_sample, sample);
+
+    // And the sample sits entirely past the widest packet number, which is the
+    // property the offset exists to have.
+    try std.testing.expect(from >= client_packet_number_offset + quic.packet_number.octets_max);
+    try std.testing.expectEqual(@as(usize, 4), quic.crypto.protect.sample_offset);
+}
