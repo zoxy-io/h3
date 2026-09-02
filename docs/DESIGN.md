@@ -196,6 +196,7 @@ all three build legs):
   against RFC 9001 appendix A.1's known-answer vectors**: both Initial secrets
   and all six key/IV/header-key values.
 - `frame.zig`, `stream.zig` — RFC 9114 §6.2, §7.1, §7.2.4, §11.2.
+- `corpus/` — RFC 9001 appendix A's four worked packets, octet for octet.
 - `qpack/static_table.zig` — RFC 9204 appendix A. §4.1.1's integer and §4.1.2's
   Huffman code come from zoxy-io/hpack and are re-exported by `qpack.zig`.
 
@@ -212,21 +213,33 @@ all three build legs):
    h2's `fields/`, and the same request-smuggling surface.
 3. **RFC 9002 recovery.** RTT, loss detection, PTO, and NewReno. Pure
    computation over a caller-supplied `now`, so it is testable without a socket.
-4. **The connection.** Packet number spaces, ACK generation, CRYPTO stream
-   reassembly, flow control, the amplification limit, and the key update. This
-   is the largest slice and the one everything above exists to serve.
+4. **The connection.** The largest item, and the one everything else serves. It
+   decomposes into three pieces that are worth building and reviewing apart,
+   because two of them are pure data structures with no policy in them:
+
+   a. **`Reassembler`** — offset-and-data chunks in, ordered bytes out. Serves
+      the CRYPTO stream during the handshake *and* every request stream after
+      it, so it is written once. This is where overlapping and duplicate
+      offsets bite, and it is bounded by a comptime capacity like everything
+      else here.
+   b. **`AckRanges`** — the set of packet numbers received in one space, and
+      the ACK frames generated from it. Three instances per connection, one per
+      space. The bound matters: a peer that acknowledges every other packet
+      makes this grow without one.
+   c. **The connection itself** — the state machine over (a) and (b), plus
+      flow control, the amplification limit and the key update.
 5. **Streams and the HTTP/3 request layer.** Reassembly, `MAX_STREAM_DATA`
    accounting, and the request/response mapping.
 6. **QPACK dynamic table**, encoder and decoder streams, blocked streams.
 
-**Corpus, before slice 4.** RFC 9001 appendix A carries complete worked packets —
-a client Initial, a server Initial, a Retry, and a ChaCha20-Poly1305 short
-header. They are not transcribed here yet: the appendix's key schedule values
-are (and pass), but the full packets are hundreds of octets each and belong in a
-`corpus/` directory alongside vendored encodings from other implementations, the
-way h2 does it. That is a gate, not a nicety — an implementation that passes its
-own round-trip tests and fails someone else's packet is an implementation that
-does not interoperate.
+**Corpus — done.** RFC 9001 appendix A's four worked packets are in `corpus/`,
+machine-lifted from the RFC text and checked octet for octet. The strongest case
+is A.2: sealing the appendix's header and payload reproduces its 1200-octet
+protected packet exactly, which needs the nonce, the associated data, the AEAD,
+the sampling offset, the mask and the masked bits all correct at once. See
+`corpus/README.md` for why that is a different kind of evidence from a
+round-trip, and for the second corpus — encodings from other implementations —
+which is still outstanding and belongs with the connection slice.
 
 ## 7. Open decisions
 
