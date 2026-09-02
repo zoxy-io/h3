@@ -77,23 +77,63 @@ const indexed_post_base_tag: u8 = 0x10;
 const literal_post_base_tag: u8 = 0x00;
 const string_huffman_bit: u8 = 0x80;
 
-comptime {
-    // The tags have to partition the first octet, or a representation would be
-    // two representations. Checked over every octet rather than argued about.
-    var seen: [256]bool = @splat(false);
-    for (0..256) |value| {
-        const octet: u8 = @intCast(value);
-        seen[value] = true;
-        _ = octet;
+/// Which representation a first octet belongs to, by section 4.5's tags.
+///
+/// The single source of truth for the dispatch: `Iterator.decode` walks these
+/// arms in order, and the comptime block below proves the arms partition the
+/// octet. Two copies of this decision — one to dispatch on and one to prove —
+/// would be one copy that can go stale.
+const Representation = enum {
+    indexed,
+    literal_name_reference,
+    literal_name,
+    indexed_post_base,
+    literal_post_base,
+
+    fn of(first: u8) Representation {
+        if (first & indexed_tag != 0) return .indexed;
+        if (first & literal_name_reference_tag != 0) return .literal_name_reference;
+        if (first & literal_name_tag != 0) return .literal_name;
+        if (first & indexed_post_base_tag != 0) return .indexed_post_base;
+        return .literal_post_base;
     }
-    for (seen) |value| assert(value);
-    // And the five tags are mutually exclusive by construction: each is
-    // distinguished by a longer prefix of high bits than the last.
-    assert(indexed_tag == 0x80);
-    assert(literal_name_reference_tag == 0x40);
-    assert(literal_name_tag == 0x20);
-    assert(indexed_post_base_tag == 0x10);
-    assert(literal_post_base_tag == 0x00);
+};
+
+comptime {
+    // The tags must partition the first octet, or a representation would be
+    // two representations. Walked over all 256 rather than argued about, and
+    // each octet is checked against the tag constants *independently* of the
+    // dispatch that classified it — so the two have to agree, which is what
+    // makes this a proof rather than a restatement.
+    @setEvalBranchQuota(20_000);
+    var counts = [_]u32{0} ** 5;
+    for (0..256) |value| {
+        const first: u8 = @intCast(value);
+        const which = Representation.of(first);
+        counts[@intFromEnum(which)] += 1;
+
+        // The independent statement of each arm: exactly the octets with this
+        // prefix of high bits and no higher one.
+        const expected: Representation = if (first >= 0x80)
+            .indexed
+        else if (first >= 0x40)
+            .literal_name_reference
+        else if (first >= 0x20)
+            .literal_name
+        else if (first >= 0x10)
+            .indexed_post_base
+        else
+            .literal_post_base;
+        assert(which == expected);
+    }
+    // And the section's own arithmetic: each tag claims half of what the one
+    // above it left, down to the last two which split the final sixteen.
+    assert(counts[0] == 128); // 0x80..0xff
+    assert(counts[1] == 64); //  0x40..0x7f
+    assert(counts[2] == 32); //  0x20..0x3f
+    assert(counts[3] == 16); //  0x10..0x1f
+    assert(counts[4] == 16); //  0x00..0x0f
+    assert(counts[0] + counts[1] + counts[2] + counts[3] + counts[4] == 256);
 }
 
 pub const Error = error{
@@ -193,12 +233,15 @@ pub const Iterator = struct {
     }
 
     fn decode(self: *Iterator, first: u8) Error!Field {
-        if (first & indexed_tag != 0) return self.indexed(first);
-        if (first & literal_name_reference_tag != 0) return self.literalNameReference(first);
-        if (first & literal_name_tag != 0) return self.literalName(first);
-        // Section 4.5.3 and 4.5.5: both post-base forms address the dynamic
-        // table by construction, so neither can be honoured without one.
-        return error.DecompressionFailed;
+        return switch (Representation.of(first)) {
+            .indexed => self.indexed(first),
+            .literal_name_reference => self.literalNameReference(first),
+            .literal_name => self.literalName(first),
+            // Sections 4.5.3 and 4.5.5: both post-base forms address the
+            // dynamic table by construction, so neither can be honoured
+            // without one.
+            .indexed_post_base, .literal_post_base => error.DecompressionFailed,
+        };
     }
 
     /// Section 4.5.2.
