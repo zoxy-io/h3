@@ -206,6 +206,11 @@ all three build legs):
   time-threshold loss detection, the PTO, and NewReno congestion control. It
   never learns what a packet contained; `Config.Context` is an opaque token the
   connection attaches on send and gets back on loss.
+- `qpack/field_line.zig` — RFC 9204 section 4.5's representations, both
+  directions, against the static table with the dynamic table disabled.
+- `fields.zig` — RFC 9114 sections 4.2 and 4.3: the octet rules and the
+  pseudo-header rules, which between them are the guard against smuggling
+  through an HTTP/1.1 downgrade.
 - `quic/Streams.zig` — streams, their states, and both levels of flow control.
   The connection-level window is the one that bounds memory; see the file.
 - `quic/Connection.zig` — the state machine: three packet number spaces, four
@@ -249,9 +254,25 @@ all three build legs):
    levels of flow control from 4.1. What is left of this item is the HTTP/3
    request layer on top, which needs QPACK first and so has swapped places with
    item 6.
-6. **QPACK field line representations** (RFC 9204 section 4.5), then the HTTP/3
-   request layer, then QPACK's dynamic table and its encoder and decoder
-   streams. This is now the only thing between the transport and a request.
+6. ~~**QPACK field line representations**~~ and ~~**RFC 9114 section 4.3
+   message validation**~~ — done. An HTTP/3 request now crosses a QUIC stream
+   and validates at the far end, which is the whole of what this package was
+   asked for.
+
+   What remains is depth rather than reach:
+
+   * **QPACK's dynamic table**, its encoder and decoder streams, and blocked
+     streams. Not needed by a consumer advertising
+     `SETTINGS_QPACK_MAX_TABLE_CAPACITY = 0`, which is the choice zrk already
+     makes for HPACK; needed to compress as well as a browser does.
+   * **The HTTP/3 connection layer** — the control stream, SETTINGS exchange,
+     GOAWAY, and the request/response state machine over `Streams`. The frames
+     and stream types are built; what is missing is the sequencing.
+   * **Migration, stateless reset, 0-RTT, and ECN.**
+   * **A second corpus**: encodings captured from other implementations, the
+     way hpack vendors http2jp/hpack-test-case. RFC 9001 appendix A proves
+     agreement with the specification, not with the implementations a real peer
+     is running.
 
 **Corpus — done.** RFC 9001 appendix A's four worked packets are in `corpus/`,
 machine-lifted from the RFC text and checked octet for octet. The strongest case
@@ -263,6 +284,14 @@ round-trip, and for the second corpus — encodings from other implementations �
 which is still outstanding and belongs with the connection slice.
 
 ## 7. Open decisions
+
+**The field syntax is stated twice.** `fields.zig`'s octet rules are RFC 9110's
+and so are h2's `fields/syntax.zig`'s, which means the two files say the same
+thing in two repositories — the same situation RFC 7541's primitives were in
+before hpack. It is smaller (a hundred lines against nine hundred) and h2's
+version is vectorised where this one is not, so the trade is not identical. Left
+alone deliberately, and recorded here so the next person notices it on purpose
+rather than by surprise.
 
 **Huffman: port, share, or rewrite? — settled.** RFC 9204 §4.1.2 uses RFC 7541's
 Huffman code unchanged, and §4.1.1 its prefixed integer. Three options were on

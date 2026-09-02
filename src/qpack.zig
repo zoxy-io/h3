@@ -52,6 +52,14 @@ pub const huffman = hpack.huffman;
 /// RFC 9204 appendix A: the ninety-nine entry table, indexed from zero.
 pub const static_table = @import("qpack/static_table.zig");
 
+/// RFC 9204 section 4.5: encoded field sections, both directions.
+pub const field_line = @import("qpack/field_line.zig");
+
+/// A decoded field. RFC 9204 keeps RFC 7541's notion of one, so this is
+/// hpack's rather than a second type with the same shape.
+pub const Field = field_line.Field;
+
 test {
     _ = static_table;
+    _ = field_line;
 }

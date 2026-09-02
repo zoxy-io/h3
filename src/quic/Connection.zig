@@ -1568,3 +1568,100 @@ test "a STREAM frame before 1-RTT is a protocol violation" {
     // level that is permitted by the table but not by this package.
     try testing.expectError(error.Protocol, server.receiveFrames(.initial, payload[0..written], 0));
 }
+
+test "an HTTP/3 request crosses a QUIC stream and validates" {
+    // The whole stack, end to end: QPACK encodes the field section, the HTTP/3
+    // frame layer wraps it, a QUIC stream carries it, and the far side decodes
+    // and checks it against RFC 9114 section 4.3. This is what everything in
+    // this repository has been building toward.
+    const h3 = @import("../root.zig");
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+
+    const request = [_]h3.qpack.Field{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "example.com" },
+        .{ .name = ":path", .value = "/catalog?page=3" },
+        .{ .name = "user-agent", .value = "zrk" },
+    };
+
+    // QPACK, then the HEADERS frame around it.
+    var section: [512]u8 = undefined;
+    const section_octets = try h3.qpack.field_line.encode(&section, &request);
+    var payload: [512]u8 = undefined;
+    const header_octets = try h3.frame.writeHeader(&payload, .headers, section_octets);
+    @memcpy(payload[header_octets..][0..section_octets], section[0..section_octets]);
+    const message = payload[0 .. header_octets + section_octets];
+
+    // RFC 9114 section 6.1: a request goes on a client-initiated bidirectional
+    // stream, and stream 0 is the first of them.
+    const id = h3.quic.stream_id.make(.client_bidirectional, 0);
+    try testing.expectEqual(@as(u64, 0), id);
+    var queued: usize = 0;
+    var attempts: u32 = 0;
+    while (attempts < 8 and queued < message.len) : (attempts += 1) {
+        queued += try client.write(id, message[queued..], queued + 1 >= message.len);
+    }
+    try testing.expectEqual(message.len, queued);
+    _ = try deliver(&client, &server, 1000);
+
+    // And the far side reads it back.
+    const received = server.readable(id);
+    try testing.expectEqual(message.len, received.len);
+
+    const frame_header = try h3.frame.parseHeader(received);
+    try testing.expectEqual(h3.frame.Type.headers, frame_header.frame_type);
+    try testing.expectEqual(@as(u64, section_octets), frame_header.length);
+
+    var buffer: [512]u8 = undefined;
+    var iterator = try h3.qpack.field_line.iterate(
+        received[frame_header.octets..][0..@intCast(frame_header.length)],
+        &buffer,
+        1 << 16,
+    );
+    var validator: h3.fields.MessageValidator = .init(.request);
+    var seen: usize = 0;
+    while (try iterator.next()) |one| {
+        try validator.field(&one);
+        try testing.expectEqualStrings(request[seen].name, one.name);
+        try testing.expectEqualStrings(request[seen].value, one.value);
+        seen += 1;
+    }
+    try validator.finish();
+    try testing.expectEqual(request.len, seen);
+}
+
+test "a response crosses back, and a malformed one is caught" {
+    const h3 = @import("../root.zig");
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+
+    // A response missing `:status` is not a message at all, and section 4.3.2
+    // is what says so — the transport carried it perfectly well.
+    var section: [256]u8 = undefined;
+    const octets = try h3.qpack.field_line.encode(&section, &.{
+        .{ .name = "content-length", .value = "0" },
+    });
+    var payload: [256]u8 = undefined;
+    const header_octets = try h3.frame.writeHeader(&payload, .headers, octets);
+    @memcpy(payload[header_octets..][0..octets], section[0..octets]);
+
+    const id = h3.quic.stream_id.make(.client_bidirectional, 0);
+    _ = try server.write(id, payload[0 .. header_octets + octets], true);
+    _ = try deliver(&server, &client, 1000);
+
+    const received = client.readable(id);
+    const frame_header = try h3.frame.parseHeader(received);
+    var buffer: [256]u8 = undefined;
+    var iterator = try h3.qpack.field_line.iterate(
+        received[frame_header.octets..][0..@intCast(frame_header.length)],
+        &buffer,
+        1 << 16,
+    );
+    var validator: h3.fields.MessageValidator = .init(.response);
+    while (try iterator.next()) |one| try validator.field(&one);
+    try testing.expectError(error.PseudoMissing, validator.finish());
+}

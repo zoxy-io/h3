@@ -12,11 +12,12 @@ callbacks) and [zrk](https://github.com/zoxy-io/zrk) (load generator, zio green
 threads through `std.Io`), which is why it owns no socket, no clock and no TLS
 engine.
 
-**Status: in progress.** The transport is built: wire format, packet
-protection, the connection state machine, loss recovery, streams and flow
-control. A handshake completes, survives a dropped datagram, and carries bytes
-on a stream in both directions. QPACK's field line representations are the
-remaining piece before an HTTP/3 request can go over it.
+**Status: in progress, and it works end to end.** A handshake completes,
+survives a dropped datagram, and an HTTP/3 request crosses a QUIC stream and
+validates at the far end. What is left is depth rather than reach — QPACK's
+dynamic table, the HTTP/3 control stream and SETTINGS exchange, migration, and
+a corpus from other implementations. See
+[docs/DESIGN.md §6](docs/DESIGN.md#6-what-is-built-and-what-is-next).
 [docs/DESIGN.md §6](docs/DESIGN.md#6-what-is-built-and-what-is-next) is the
 ledger — read it before depending on this.
 
@@ -30,12 +31,17 @@ ledger — read it before depending on this.
   header protection, the Retry integrity tag, key update.
 * **RFC 9002 — loss detection and congestion control.** RTT estimation, both
   loss thresholds, the PTO, and NewReno.
-* **RFC 9204 — QPACK.** The static table is here, and the prefixed integer and
-  Huffman code come from [hpack](https://github.com/zoxy-io/hpack), which holds
-  the RFC 7541 originals QPACK adopts unchanged. The field line representations
-  and the dynamic table are planned.
-* **RFC 9114 — HTTP/3.** The frame layer, the unidirectional stream types and
-  the settings are here; message validation is planned.
+* **RFC 9204 — QPACK.** The static table and section 4.5's field line
+  representations, both directions. The prefixed integer and the Huffman code
+  come from [hpack](https://github.com/zoxy-io/hpack), which holds the RFC 7541
+  originals QPACK adopts unchanged. The dynamic table is planned — an endpoint
+  advertising `SETTINGS_QPACK_MAX_TABLE_CAPACITY = 0` does not need it, and
+  that is the choice zrk already makes for HPACK.
+* **RFC 9114 — HTTP/3.** The frame layer, the unidirectional stream types, the
+  settings, and sections 4.2 and 4.3's message validation — the octet rules and
+  the pseudo-header rules that between them guard against request smuggling
+  through an HTTP/1.1 downgrade. The control stream and SETTINGS exchange are
+  planned.
 
 RFC 9001 and RFC 9002 were not in the original ask and are not optional
 additions: RFC 9000 describes packets whose payloads are always encrypted, so a

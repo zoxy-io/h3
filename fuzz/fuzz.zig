@@ -739,3 +739,65 @@ fn fuzzStreams(_: void, smith: *std.testing.Smith) !void {
 test "streams: the connection window is never exceeded and never returned" {
     try std.testing.fuzz({}, fuzzStreams, .{});
 }
+
+/// QPACK field sections: decode never panics, and encode round-trips.
+///
+/// Two properties, and the second is the one that matters. A field section is
+/// the most attacker-shaped input in HTTP/3 — a peer chooses every octet, the
+/// lengths are its own, and a Huffman string expands. The decode side asserts
+/// reject-or-parse and that the decoded strings stay inside the buffer that
+/// bounds the expansion. The encode side asserts that anything this package
+/// writes, it reads back identically, which is what stops the two halves of
+/// section 4.5 from drifting apart into two spellings of one header.
+fn fuzzFieldLine(_: void, smith: *std.testing.Smith) !void {
+    var section: [512]u8 = undefined;
+    const length = @min(smith.slice(&section), section.len);
+
+    var buffer: [2048]u8 = undefined;
+    if (h3.qpack.field_line.iterate(section[0..length], &buffer, 1 << 16)) |start| {
+        var iterator = start;
+        var count: u32 = 0;
+        while (count <= length) : (count += 1) {
+            const one = iterator.next() catch break;
+            const field = one orelse break;
+            // Whatever came out is inside what the caller lent, and inside the
+            // list bound it advertised.
+            assert(field.name.len + field.value.len <= buffer.len + section.len);
+            assert(iterator.used <= buffer.len);
+            assert(iterator.list_size <= iterator.list_size_max);
+            assert(iterator.offset <= length);
+        }
+    } else |_| {}
+
+    // The other direction, on drawn text rather than drawn octets.
+    var names: [4][]const u8 = undefined;
+    var values: [4][]const u8 = undefined;
+    var storage: [4][64]u8 = undefined;
+    var value_storage: [4][64]u8 = undefined;
+    var fields: [4]h3.qpack.Field = undefined;
+    const count = smith.valueRangeAtMost(u8, 1, 4);
+
+    for (0..count) |index| {
+        const name_len = @max(1, @min(smith.slice(&storage[index]), storage[index].len));
+        const value_len = @min(smith.slice(&value_storage[index]), value_storage[index].len);
+        names[index] = storage[index][0..name_len];
+        values[index] = value_storage[index][0..value_len];
+        fields[index] = .{ .name = names[index], .value = values[index], .never_indexed = smith.value(bool) };
+    }
+
+    var wire: [2048]u8 = undefined;
+    const written = h3.qpack.field_line.encode(&wire, fields[0..count]) catch return;
+    var back: [2048]u8 = undefined;
+    var reader = h3.qpack.field_line.iterate(wire[0..written], &back, 1 << 20) catch unreachable; // Written by this package's own encoder.
+    for (fields[0..count]) |expected| {
+        const got = (reader.next() catch unreachable).?; // As above.
+        assert(std.mem.eql(u8, got.name, expected.name));
+        assert(std.mem.eql(u8, got.value, expected.value));
+        assert(got.never_indexed == expected.never_indexed);
+    }
+    assert((reader.next() catch unreachable) == null); // As above.
+}
+
+test "qpack: a field section decodes safely and round-trips exactly" {
+    try std.testing.fuzz({}, fuzzFieldLine, .{});
+}

@@ -25,6 +25,9 @@ pub const quic = @import("quic.zig");
 /// RFC 9204: QPACK field compression.
 pub const qpack = @import("qpack.zig");
 
+/// RFC 9114 sections 4.2 and 4.3: what makes a field section a message.
+pub const fields = @import("fields.zig");
+
 /// RFC 9114 section 7: the HTTP/3 frame layer, on top of QUIC streams.
 pub const frame = @import("frame.zig");
 
@@ -36,6 +39,7 @@ test {
     _ = varint;
     _ = quic;
     _ = qpack;
+    _ = fields;
     _ = frame;
     _ = stream;
 }
