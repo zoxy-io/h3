@@ -165,6 +165,12 @@ pub const Error = error{
 };
 
 /// The entry at `index`.
+//= https://www.rfc-editor.org/rfc/rfc9204#section-3.1
+//# If this index is received on the encoder
+//# stream, this MUST be treated as a connection error of type
+//# QPACK_ENCODER_STREAM_ERROR.
+//= type=exception
+//= reason=there is no encoder stream: this endpoint advertises SETTINGS_QPACK_MAX_TABLE_CAPACITY = 0 and sends no encoder instructions, so an invalid index can only arrive in a field line representation, where get returns IndexOutOfRange and field_line.zig maps it to QPACK_DECOMPRESSION_FAILED
 pub fn get(index: u64) Error!Entry {
     if (index >= count) return error.IndexOutOfRange;
     return entries[@intCast(index)];
