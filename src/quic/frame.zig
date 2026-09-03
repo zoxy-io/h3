@@ -136,14 +136,98 @@ pub const Type = enum(u64) {
 };
 
 /// Section 19.15: the token that travels with a new connection identifier.
+///
+/// The four migration frames are decoded and encoded here in full, because a
+/// conforming peer may send them and a codec that could not read one would
+/// mis-frame the rest of the payload. What is *not* here, and is not anywhere
+/// in this package, is the state they drive: an endpoint that issues no second
+/// connection identifier has no set of active identifiers to add to, retire
+/// from, or overflow. Every rule below is that decision, written down.
+//= https://www.rfc-editor.org/rfc/rfc9000#section-19.15
+//# An endpoint MUST NOT send this frame if it currently requires that
+//# its peer send packets with a zero-length Destination Connection ID.
+//= type=exception
+//= reason=no NEW_CONNECTION_ID frame is ever sent, because this endpoint issues exactly one connection identifier for the life of the connection; issuing more is migration, which docs/DESIGN.md section 2 and section 6 place out of scope.
+//
+//= https://www.rfc-editor.org/rfc/rfc9000#section-19.15
+//# An endpoint that is sending packets with a zero-length Destination
+//# Connection ID MUST treat receipt of a NEW_CONNECTION_ID frame as a
+//# connection error of type PROTOCOL_VIOLATION.
+//= type=exception
+//= reason=migration is out of scope, so a received NEW_CONNECTION_ID is parsed and ignored rather than acted on or refused; see docs/DESIGN.md section 2 and section 6.
+//
+//= https://www.rfc-editor.org/rfc/rfc9000#section-19.15
+//# Receipt of the same frame multiple times MUST NOT be treated as a
+//# connection error.
+//= type=exception
+//= reason=satisfied vacuously and for the wrong reason: no NEW_CONNECTION_ID is retained, so a repeat is indistinguishable from a first and neither is an error. Migration is out of scope; see docs/DESIGN.md section 2 and section 6.
+//
+//= https://www.rfc-editor.org/rfc/rfc9000#section-19.15
+//# A receiver MUST ignore any Retire Prior To fields that do not
+//# increase the largest received Retire Prior To value.
+//= type=exception
+//= reason=every Retire Prior To field is ignored, increasing or not, because no largest received value is tracked; migration is out of scope per docs/DESIGN.md section 2 and section 6.
+//
+//= https://www.rfc-editor.org/rfc/rfc9000#section-19.15
+//# An endpoint that receives a NEW_CONNECTION_ID frame with a sequence
+//# number smaller than the Retire Prior To field of a previously
+//# received NEW_CONNECTION_ID frame MUST send a corresponding
+//# RETIRE_CONNECTION_ID frame that retires the newly received
+//# connection ID, unless it has already done so for that sequence
+//# number.
+//= type=exception
+//= reason=no RETIRE_CONNECTION_ID frame is ever sent, because no connection identifier of the peer's is ever adopted or retired; migration is out of scope per docs/DESIGN.md section 2 and section 6.
 pub const stateless_reset_token_octets: usize = 16;
+
+// Section 19.16: RETIRE_CONNECTION_ID carries one sequence number, and the
+// rules that give it meaning are all about the set of identifiers this endpoint
+// has issued — a set with one member here, and therefore no bookkeeping to be
+// wrong about.
+//= https://www.rfc-editor.org/rfc/rfc9000#section-19.16
+//# Receipt of a RETIRE_CONNECTION_ID frame containing a sequence number
+//# greater than any previously sent to the peer MUST be treated as a
+//# connection error of type PROTOCOL_VIOLATION.
+//= type=exception
+//= reason=this endpoint sends no NEW_CONNECTION_ID and so has issued no sequence numbers to compare against; the frame is parsed and ignored. Migration is out of scope per docs/DESIGN.md section 2 and section 6.
+//
+//= https://www.rfc-editor.org/rfc/rfc9000#section-19.16
+//# The sequence number specified in a RETIRE_CONNECTION_ID frame MUST
+//# NOT refer to the Destination Connection ID field of the packet in
+//# which the frame is contained.
+//= type=exception
+//= reason=no RETIRE_CONNECTION_ID frame is ever sent, so there is no sequence number of ours that could name the packet's own destination identifier; migration is out of scope per docs/DESIGN.md section 2 and section 6.
+//
+//= https://www.rfc-editor.org/rfc/rfc9000#section-19.16
+//# An endpoint that provides a zero- length connection ID MUST treat
+//# receipt of a RETIRE_CONNECTION_ID frame as a connection error of
+//# type PROTOCOL_VIOLATION.
+//= type=exception
+//= reason=migration is out of scope, so a received RETIRE_CONNECTION_ID is parsed and ignored at every identifier length rather than refused at one; see docs/DESIGN.md section 2 and section 6.
 
 /// Section 19.17 and 19.18: PATH_CHALLENGE and PATH_RESPONSE carry exactly
 /// eight octets of unpredictable data.
+//= https://www.rfc-editor.org/rfc/rfc9000#section-19.17
+//# The recipient of this frame MUST generate a PATH_RESPONSE frame
+//# (Section 19.18) containing the same Data value.
+//= type=exception
+//= reason=path validation belongs to migration and is out of scope; a connection here has one path and never sees an address change, because the seam of docs/DESIGN.md section 3 takes datagrams rather than sockets. See docs/DESIGN.md section 2 and section 6.
 pub const path_data_octets: usize = 8;
 
 /// Section 19.11: a streams limit above this cannot be encoded as a stream
 /// identifier, so a frame carrying one is a `FRAME_ENCODING_ERROR`.
+///
+/// The same bound governs STREAMS_BLOCKED, which section 19.14 lets an endpoint
+/// answer with either error code; `streamsLimit` enforces one number for both
+/// frames rather than two that could drift.
+//= https://www.rfc-editor.org/rfc/rfc9000#section-19.11
+//# Receipt of a frame that permits opening of a stream larger than this
+//# limit MUST be treated as a connection error of type
+//# FRAME_ENCODING_ERROR.
+//
+//= https://www.rfc-editor.org/rfc/rfc9000#section-19.14
+//# Receipt of a frame that encodes a larger stream ID MUST be treated
+//# as a connection error of type STREAM_LIMIT_ERROR or
+//# FRAME_ENCODING_ERROR.
 pub const streams_max: u64 = 1 << 60;
 
 comptime {
@@ -159,6 +243,25 @@ pub const ParseError = error{
     Truncated,
     /// A frame type this version does not define. Section 12.4: a frame has no
     /// length prefix, so there is no way to skip one — `FRAME_ENCODING_ERROR`.
+    ///
+    /// This is also what closes section 19.21 off: an extension frame is a
+    /// frame type this version does not define, and there is no negotiation
+    /// here that could make one understood.
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-12.4
+    //# An endpoint MUST treat the receipt of a frame of unknown type as a
+    //# connection error of type FRAME_ENCODING_ERROR.
+    //
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-19.21
+    //# An extension to QUIC that wishes to use a new type of frame MUST
+    //# first ensure that a peer is able to understand the frame.
+    //= type=exception
+    //= reason=this package defines and negotiates no extension frame, so it never has a peer's understanding to ensure; every type outside section 19's registry is refused here. See docs/DESIGN.md section 2 for the scope.
+    //
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-19.21
+    //# Extension frames MUST be congestion controlled and MUST cause an ACK
+    //# frame to be sent.
+    //= type=exception
+    //= reason=no extension frame is ever sent or accepted, so there is none to congestion control or acknowledge; see docs/DESIGN.md section 2.
     UnknownType,
     /// A field the frame's own rules forbid: a `retire_prior_to` above the
     /// sequence number it arrived with, a stream offset that would put the
@@ -243,6 +346,9 @@ pub const RangeIterator = struct {
         // `previous_smallest - gap - 2`, and both subtractions can underflow on
         // a hostile frame. Written as two guarded steps rather than one
         // expression so that the error names which one failed to hold.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-19.3.1
+        //# If any computed packet number is negative, an endpoint MUST generate
+        //# a connection error of type FRAME_ENCODING_ERROR.
         if (self.next_largest < gap + 2) return error.Malformed;
         const largest = self.next_largest - gap - 2;
         if (length > largest) return error.Malformed;
@@ -287,6 +393,15 @@ pub const Frame = union(enum) {
         /// Section 19.19: the frame type that triggered the close, present only
         /// on a transport close.
         triggered_by: ?u64,
+        /// The reason phrase, borrowed from the packet buffer and never
+        /// interpreted here.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-19.19
+        //# This SHOULD be a UTF-8 encoded string [RFC3629], though the frame
+        //# does not carry information, such as language tags, that would aid
+        //# comprehension by any entity other than the one that created the
+        //# text.
+        //= type=exception
+        //= reason=the reason phrase is octets in and octets out: this codec neither composes one nor validates a received one, because the text is the consumer's to write and to display. Validating it on receipt would also make a peer's encoding choice a connection error, which section 19.19 does not ask for.
         reason: []const u8,
     },
     handshake_done,
@@ -376,6 +491,9 @@ pub fn parse(payload: []const u8) ParseError!Parsed {
     // encoding, so a longer spelling is refused rather than decoded. Without
     // this every frame type has four names and a `switch` has four ways to be
     // surprised.
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-12.4
+    //# To ensure simple and efficient implementations of frame parsing, a
+    //# frame type MUST use the shortest possible encoding.
     const decoded = varint.decodeMinimal(payload) catch |err| return switch (err) {
         error.Incomplete => error.Truncated,
         error.NotMinimal => error.UnknownType,
@@ -413,6 +531,16 @@ fn parseBody(cursor: *Cursor, frame_type: Type, payload: []const u8) ParseError!
             .code = @enumFromInt(try cursor.varint()),
         } },
         .crypto => try parseCrypto(cursor),
+        // A zero-length token parses here rather than being refused, which is
+        // wrong: the length check belongs beside the other `Malformed` field
+        // rules in this file, and a client is required to close the connection
+        // on one. Left as a todo rather than fixed, because this pass adds no
+        // behaviour.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-19.7
+        //# The token MUST NOT be empty. A client MUST treat receipt of a
+        //# NEW_TOKEN frame with an empty Token field as a connection error of
+        //# type FRAME_ENCODING_ERROR.
+        //= type=todo
         .new_token => .{ .new_token = .{ .token = try takeLengthPrefixed(cursor) } },
         .stream => try parseStream(cursor, frame_type),
         .max_data => .{ .max_data = .{ .maximum = try cursor.varint() } },
@@ -499,6 +627,10 @@ fn parseCrypto(cursor: *Cursor) ParseError!Frame {
     const data = try takeLengthPrefixed(cursor);
     // Section 19.6: the end of the data must fit the offset space, or the
     // stream's final size would be unrepresentable.
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-19.6
+    //# Receipt of a frame that exceeds this limit MUST be treated as a
+    //# connection error of type FRAME_ENCODING_ERROR or
+    //# CRYPTO_BUFFER_EXCEEDED.
     if (offset + data.len > varint.max) return error.Malformed;
     return .{ .crypto = .{ .offset = offset, .data = data } };
 }
@@ -517,6 +649,11 @@ fn parseStream(cursor: *Cursor, frame_type: Type) ParseError!Frame {
         try takeLengthPrefixed(cursor)
     else
         try cursor.take(cursor.remaining());
+    // Section 19.8: the same 2^62-1 ceiling CRYPTO has, for the same reason —
+    // a final size the offset space cannot name.
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-19.8
+    //# Receipt of a frame that exceeds this limit MUST be treated as a
+    //# connection error of type FRAME_ENCODING_ERROR or FLOW_CONTROL_ERROR.
     if (offset + data.len > varint.max) return error.Malformed;
     return .{ .stream = .{
         .stream = stream,
@@ -532,8 +669,21 @@ fn parseNewConnectionId(cursor: *Cursor) ParseError!Frame {
     // Section 19.15: retiring more than has been issued is a
     // `FRAME_ENCODING_ERROR`, and it matters — a peer that could would force us
     // to retire identifiers we are still using.
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-19.15
+    //# The value in the Retire Prior To field MUST be less than or equal to
+    //# the value in the Sequence Number field.
+    //
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-19.15
+    //# Receiving a value in the Retire Prior To field that is greater than
+    //# that in the Sequence Number field MUST be treated as a connection
+    //# error of type FRAME_ENCODING_ERROR.
     if (retire_prior_to > sequence) return error.Malformed;
     const length = try cursor.byte();
+    // Section 19.15: the length is an eight-bit field, but only 1 through 20
+    // are identifiers; the rest are a frame this version has no reading of.
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-19.15
+    //# Values less than 1 and greater than 20 are invalid and MUST be
+    //# treated as a connection error of type FRAME_ENCODING_ERROR.
     if (length < 1 or length > ConnectionId.octets_max) return error.Malformed;
     const bytes = try cursor.take(length);
     const connection_id = ConnectionId.init(bytes) catch return error.Malformed;
@@ -562,6 +712,15 @@ fn parseConnectionClose(cursor: *Cursor, frame_type: Type) ParseError!Frame {
 
 fn streamsLimit(cursor: *Cursor) ParseError!u64 {
     const maximum = try cursor.varint();
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-19.11
+    //# Receipt of a frame that permits opening of a stream larger than this
+    //# limit MUST be treated as a connection error of type
+    //# FRAME_ENCODING_ERROR.
+    //
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-19.14
+    //# Receipt of a frame that encodes a larger stream ID MUST be treated
+    //# as a connection error of type STREAM_LIMIT_ERROR or
+    //# FRAME_ENCODING_ERROR.
     if (maximum > streams_max) return error.Malformed;
     return maximum;
 }
@@ -576,6 +735,16 @@ fn takeLengthPrefixed(cursor: *Cursor) ParseError![]const u8 {
 /// Bounded structurally: every frame consumes at least one octet, so the loop
 /// runs at most `payload.len` times. The assertion in `next` is what makes that
 /// a checked claim rather than a comment.
+///
+/// An empty payload yields no frames and no error, and the caller in
+/// `Connection.receiveFrames` does not check for that either — so a packet
+/// whose Length covers only the packet number and the AEAD tag is accepted
+/// silently today. It should be a connection error, and neither this iterator
+/// nor its caller makes it one.
+//= https://www.rfc-editor.org/rfc/rfc9000#section-12.4
+//# An endpoint MUST treat receipt of a packet containing no frames as a
+//# connection error of type PROTOCOL_VIOLATION.
+//= type=todo
 pub const Iterator = struct {
     payload: []const u8,
     offset: usize = 0,
@@ -762,6 +931,10 @@ test "a STREAM frame's flag bits are three optional fields" {
     try testing.expect(!rest.frame.stream.fin);
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9000#section-19.3.1
+//# The value of the Gap field establishes the largest packet number
+//# value for the subsequent ACK Range using the following formula:
+//= type=test
 test "an ACK frame's ranges walk downward without materializing" {
     // Largest 100, delay 0, two ranges, first range 10 (so 90..100),
     // then gap 1 length 2 (so 86..88 -- 90 - 1 - 2 = 87? see below),
@@ -787,6 +960,10 @@ test "an ACK frame's ranges walk downward without materializing" {
     try testing.expectEqual(@as(?Range, null), try iterator.next());
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9000#section-19.3.1
+//# If any computed packet number is negative, an endpoint MUST generate
+//# a connection error of type FRAME_ENCODING_ERROR.
+//= type=test
 test "an ACK whose ranges would go below zero is malformed" {
     // Largest 5, first range 10: the range starts below packet number zero.
     const under = [_]u8{ 0x02, 0x05, 0x00, 0x00, 0x0a };
@@ -806,6 +983,15 @@ test "an ACK claiming more ranges than the payload holds is truncated" {
     try testing.expectError(error.Truncated, parse(&wire));
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9000#section-19.15
+//# Receiving a value in the Retire Prior To field that is greater than
+//# that in the Sequence Number field MUST be treated as a connection
+//# error of type FRAME_ENCODING_ERROR.
+//
+//= https://www.rfc-editor.org/rfc/rfc9000#section-19.15
+//# Values less than 1 and greater than 20 are invalid and MUST be
+//# treated as a connection error of type FRAME_ENCODING_ERROR.
+//= type=test
 test "NEW_CONNECTION_ID refuses to retire more than it issued" {
     // Sequence 1, retire_prior_to 5.
     const wire = [_]u8{ 0x18, 0x01, 0x05, 0x02, 0xaa, 0xbb } ++ [_]u8{0x11} ** 16;
@@ -842,6 +1028,11 @@ test "the two CONNECTION_CLOSE forms differ by one field" {
     try testing.expectEqualStrings("no", app_parsed.frame.connection_close.reason);
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9000#section-19.11
+//# Receipt of a frame that permits opening of a stream larger than this
+//# limit MUST be treated as a connection error of type
+//# FRAME_ENCODING_ERROR.
+//= type=test
 test "a streams limit above 2^60 is refused" {
     var wire: [9]u8 = undefined;
     wire[0] = 0x12;
@@ -849,6 +1040,10 @@ test "a streams limit above 2^60 is refused" {
     try testing.expectError(error.Malformed, parse(&wire));
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9000#section-12.4
+//# To ensure simple and efficient implementations of frame parsing, a
+//# frame type MUST use the shortest possible encoding.
+//= type=test
 test "a non-minimal frame type is not a frame type" {
     // 0x4001 decodes to 1, which is PING, in two octets rather than one.
     // Section 12.4 makes that a `FRAME_ENCODING_ERROR`, and accepting it would
@@ -857,12 +1052,20 @@ test "a non-minimal frame type is not a frame type" {
     try testing.expectEqual(Frame.ping, (try parse(&.{0x01})).frame);
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9000#section-12.4
+//# An endpoint MUST treat the receipt of a frame of unknown type as a
+//# connection error of type FRAME_ENCODING_ERROR.
+//= type=test
 test "an unknown frame type cannot be skipped" {
     // 0x3f is not a defined type, and a QUIC frame has no length prefix, so
     // there is nothing to skip past.
     try testing.expectError(error.UnknownType, parse(&.{0x3f}));
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9000#section-12.4
+//# An endpoint MUST treat receipt of a frame in a packet type that is
+//# not permitted as a connection error of type PROTOCOL_VIOLATION.
+//= type=test
 test "section 12.4 table 3: where a frame is allowed" {
     const Level = @import("crypto.zig").Level;
     // A STREAM frame in an Initial packet is application data before anyone is
