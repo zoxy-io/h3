@@ -55,6 +55,13 @@ const assert = @import("assert.zig").assert;
 
 const Field = @import("qpack.zig").Field;
 
+//= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.2
+//# Intermediaries that process HTTP requests or responses (i.e., any
+//# intermediary not acting as a tunnel) MUST NOT forward a malformed
+//# request or response.  Malformed requests or responses that are
+//# detected MUST be treated as a stream error of type H3_MESSAGE_ERROR.
+//= type=exception
+//= reason=fields.zig reports a malformed message and never acts on one; whether to forward it or to raise H3_MESSAGE_ERROR belongs to the consumer, per this file's header and docs/DESIGN.md section 3's seam
 pub const Error = error{
     /// An octet section 4.2 does not permit in a field name, an uppercase
     /// letter among them.
@@ -87,6 +94,11 @@ pub const Error = error{
 /// Uppercase is deliberately absent — HTTP/3 field names are lowercase, and a
 /// validator that tolerated uppercase would let `Content-Length` and
 /// `content-length` be two different fields to whatever it feeds.
+//= https://www.rfc-editor.org/rfc/rfc9114#section-4.2
+//# Characters in field names MUST be
+//# converted to lowercase prior to their encoding.  A request or
+//# response containing uppercase characters in field names MUST be
+//# treated as malformed.
 fn nameOctetValid(octet: u8) bool {
     return switch (octet) {
         'a'...'z', '0'...'9' => true,
@@ -155,6 +167,18 @@ pub fn pseudo(name: []const u8) bool {
 /// Section 4.2: fields that exist to describe a single hop and cannot cross
 /// one. `Transfer-Encoding` is the sharpest — it is HTTP/1.1's framing, and a
 /// message carrying both it and a length is the classic smuggling pair.
+//= https://www.rfc-editor.org/rfc/rfc9114#section-4.2
+//# An intermediary transforming an HTTP/1.x message to HTTP/3 MUST
+//# remove connection-specific header fields as discussed in
+//# Section 7.6.1 of [HTTP], or their messages will be treated by other
+//# HTTP/3 endpoints as malformed.
+//= type=exception
+//= reason=this package validates a field section and never transforms one; docs/DESIGN.md section 3 puts message translation in the consumer, which is the only party holding the HTTP/1.x side
+//= https://www.rfc-editor.org/rfc/rfc9114#section-4.2
+//# An endpoint MUST NOT generate
+//# an HTTP/3 field section containing connection-specific fields; any
+//# message containing connection-specific fields MUST be treated as
+//# malformed.
 fn connectionSpecific(name: []const u8) bool {
     const forbidden = [_][]const u8{
         "connection",
@@ -187,6 +211,10 @@ const Pseudo = enum {
     /// Whether this one is defined for requests. Section 4.3: "Pseudo-header
     /// fields defined for requests MUST NOT appear in responses; pseudo-header
     /// fields defined for responses MUST NOT appear in requests."
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3
+    //# Pseudo-header fields defined for requests MUST NOT appear
+    //# in responses; pseudo-header fields defined for responses MUST NOT
+    //# appear in requests.
     fn forRequest(which: Pseudo) bool {
         return which != .status;
     }
@@ -213,6 +241,9 @@ pub const Kind = enum {
     /// A trailer section. Section 4.3: "Pseudo-header fields MUST NOT appear in
     /// trailer sections" — so every one of them is misplaced here, in either
     /// direction, and there is nothing a trailer section is required to carry.
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3
+    //# Pseudo-header fields MUST NOT appear in trailer
+    //# sections.
     trailer,
 };
 
@@ -331,8 +362,17 @@ pub const MessageValidator = struct {
 
         // Section 4.3: all pseudo-headers precede every ordinary field, so a
         // receiver can decide what kind of message it has without buffering.
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3
+        //# All pseudo-header fields MUST appear in the header section before
+        //# regular header fields.  Any request or response that contains a
+        //# pseudo-header field that appears in a header section after a regular
+        //# header field MUST be treated as malformed.
         if (self.ordinary_seen) return error.PseudoInvalid;
 
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3
+        //# Endpoints MUST NOT
+        //# generate pseudo-header fields other than those defined in this
+        //# document.
         const which = Pseudo.parse(one.name) orelse return error.PseudoInvalid;
         // RFC 9220 defines `:protocol` only where it was negotiated; anywhere
         // else section 4.3 makes it an undefined pseudo-header.
@@ -355,6 +395,9 @@ pub const MessageValidator = struct {
     /// way to be malformed, distinct from a missing or misplaced one. Before
     /// this existed, every value here was accepted unread: a `:status` of
     /// `banana`, an `:authority` of nothing at all.
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3
+    //# Endpoints MUST treat a request or response that contains
+    //# undefined or invalid pseudo-header fields as malformed.
     fn pseudoValue(self: *MessageValidator, which: Pseudo, value: []const u8) Error!void {
         assert(self.seen.contains(which));
 
@@ -383,6 +426,11 @@ pub const MessageValidator = struct {
         }
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3.1
+    //# The authority MUST NOT include the
+    //# deprecated userinfo subcomponent for URIs of scheme "http" or
+    //# "https".
+    //= type=todo
     fn rememberAuthority(self: *MessageValidator, value: []const u8) void {
         if (value.len > authority_octets_max) {
             // Kept unverifiable rather than rejected: a long `:authority` on
@@ -407,6 +455,10 @@ pub const MessageValidator = struct {
         // being waved through here, and a trailer section is not a request's
         // header section either. Transfer-coding negotiation after the content
         // has been sent means nothing in any case.
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2
+        //# The only exception to this is the TE header field, which MAY be
+        //# present in an HTTP/3 request header; when it is, it MUST NOT contain
+        //# any value other than "trailers".
         if (std.mem.eql(u8, one.name, te_field_name)) {
             if (self.kind != .request) return error.ConnectionSpecific;
             // Case-insensitively: RFC 9110 section 10.1.4 defines the value
@@ -433,6 +485,9 @@ pub const MessageValidator = struct {
     /// Compared literally, which is what that sentence asks for — it says the
     /// same *value*, not an equivalent authority. Whether two spellings name
     /// the same origin needs a URI parser and stays with the consumer.
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3.1
+    //# If these fields are present, they MUST NOT be
+    //# empty.  If both fields are present, they MUST contain the same value.
     fn checkHost(self: *MessageValidator, value: []const u8) Error!void {
         assert(!self.host_seen or self.ordinary_seen);
         self.host_seen = true;
@@ -464,6 +519,11 @@ pub const MessageValidator = struct {
     /// has to compare it against the DATA frames it goes on to read. Section
     /// 4.1.2 makes that comparison a malformed-message check, and it is not one
     /// a field section can make on its own.
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.2
+    //# A request or response that is defined as having content when it
+    //# contains a Content-Length header field (Section 8.6 of [HTTP]) is
+    //# malformed if the value of the Content-Length header field does not
+    //# equal the sum of the DATA frame lengths received.
     pub fn contentLength(self: *const MessageValidator) ?u64 {
         if (!self.content_length_seen) return null;
         return self.content_length;
@@ -481,6 +541,10 @@ pub const MessageValidator = struct {
             .trailer => return,
             .request => return self.finishRequest(),
             // Section 4.3.2: `:status` "MUST be included in all responses".
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3.2
+            //# This pseudo-
+            //# header field MUST be included in all responses; otherwise, the
+            //# response is malformed (see Section 4.1.2).
             .response => if (!self.seen.contains(.status)) return error.PseudoMissing,
         }
     }
@@ -521,6 +585,13 @@ pub const MessageValidator = struct {
 
     /// Section 4.4: CONNECT without a `:protocol`, which is a tunnel rather
     /// than a request for a resource.
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-4.4
+    //# A CONNECT request MUST be constructed as follows:
+    //# *  The :method pseudo-header field is set to "CONNECT"
+    //# *  The :scheme and :path pseudo-header fields are omitted
+    //# *  The :authority pseudo-header field contains the host and port to
+    //# connect to (equivalent to the authority-form of the request-target
+    //# of CONNECT requests; see Section 7.1 of [HTTP]).
     fn finishConnect(self: *const MessageValidator) Error!void {
         assert(self.method_is_connect);
         assert(!self.seen.contains(.protocol));
@@ -535,6 +606,10 @@ pub const MessageValidator = struct {
     }
 
     /// Section 4.3.1: everything that is not a CONNECT of either kind.
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3.1
+    //# All HTTP/3 requests MUST include exactly one value for the :method,
+    //# :scheme, and :path pseudo-header fields, unless the request is a
+    //# CONNECT request; see Section 4.4.
     fn finishOrdinary(self: *const MessageValidator) Error!void {
         assert(!self.method_is_connect);
         assert(!self.seen.contains(.protocol));
@@ -572,11 +647,20 @@ pub const MessageValidator = struct {
         // URIs with scheme 'http' and 'https'", and refusing an empty path
         // under some other scheme — as this did — rejects a conforming
         // translated request.
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3.1
+        //# This pseudo-header field MUST NOT be empty for "http" or "https"
+        //# URIs; "http" or "https" URIs that do not contain a path component
+        //# MUST include a value of / (ASCII 0x2f).
         if (self.scheme_bears_authority and self.path_is_empty) return error.PseudoValueInvalid;
     }
 };
 
 /// Whether a scheme is one section 4.3.1 names as mandating an authority.
+//= https://www.rfc-editor.org/rfc/rfc9114#section-4.3.1
+//# If the scheme does not have a mandatory authority component and none
+//# is provided in the request target, the request MUST NOT contain the
+//# :authority pseudo-header or Host header fields.
+//= type=todo
 fn bearsAuthority(scheme: []const u8) bool {
     for (authority_bearing_schemes) |candidate| {
         if (std.ascii.eqlIgnoreCase(scheme, candidate)) return true;
@@ -624,6 +708,12 @@ test "a well-formed request and response" {
     });
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9114#section-4.2
+//# Characters in field names MUST be
+//# converted to lowercase prior to their encoding.  A request or
+//# response containing uppercase characters in field names MUST be
+//# treated as malformed.
+//= type=test
 test "section 4.2: an uppercase field name is malformed" {
     // The rule most likely to be lost in a port of an HTTP/2 validator, where
     // it was softer. Without it `Content-Length` and `content-length` are two
@@ -653,6 +743,12 @@ test "a value may not begin or end in whitespace" {
     try validateValue("");
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9114#section-4.2
+//# An endpoint MUST NOT generate
+//# an HTTP/3 field section containing connection-specific fields; any
+//# message containing connection-specific fields MUST be treated as
+//# malformed.
+//= type=test
 test "section 4.2: connection-specific fields may not cross a hop" {
     for ([_][]const u8{ "connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade" }) |name| {
         try testing.expectError(error.ConnectionSpecific, validate(.response, &.{
@@ -677,6 +773,12 @@ test "section 4.2: connection-specific fields may not cross a hop" {
     }));
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9114#section-4.3
+//# All pseudo-header fields MUST appear in the header section before
+//# regular header fields.  Any request or response that contains a
+//# pseudo-header field that appears in a header section after a regular
+//# header field MUST be treated as malformed.
+//= type=test
 test "section 4.3: pseudo-headers come first, once each, and belong to a kind" {
     // After an ordinary field.
     try testing.expectError(error.PseudoInvalid, validate(.response, &.{
@@ -700,6 +802,11 @@ test "section 4.3: pseudo-headers come first, once each, and belong to a kind" {
     }));
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9114#section-4.3.1
+//# All HTTP/3 requests MUST include exactly one value for the :method,
+//# :scheme, and :path pseudo-header fields, unless the request is a
+//# CONNECT request; see Section 4.4.
+//= type=test
 test "section 4.3: what a message must carry" {
     try testing.expectError(error.PseudoMissing, validate(.response, &.{
         .{ .name = "server", .value = "x" },
@@ -716,6 +823,14 @@ test "section 4.3: what a message must carry" {
     }));
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9114#section-4.4
+//# A CONNECT request MUST be constructed as follows:
+//# *  The :method pseudo-header field is set to "CONNECT"
+//# *  The :scheme and :path pseudo-header fields are omitted
+//# *  The :authority pseudo-header field contains the host and port to
+//# connect to (equivalent to the authority-form of the request-target
+//# of CONNECT requests; see Section 7.1 of [HTTP]).
+//= type=test
 test "section 4.4: CONNECT names a tunnel rather than a resource" {
     try validate(.request, &.{
         .{ .name = ":method", .value = "CONNECT" },
@@ -806,6 +921,10 @@ test "section 4.4: a plain CONNECT still names a tunnel" {
     }));
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9114#section-4.3
+//# Endpoints MUST treat a request or response that contains
+//# undefined or invalid pseudo-header fields as malformed.
+//= type=test
 test "section 4.1.2: a pseudo-header value is read, not just counted" {
     // Every one of these was accepted before, because nothing looked at a
     // pseudo-header's value at all.
@@ -832,6 +951,11 @@ test "section 4.1.2: a pseudo-header value is read, not just counted" {
     }));
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9114#section-4.3.1
+//# This pseudo-header field MUST NOT be empty for "http" or "https"
+//# URIs; "http" or "https" URIs that do not contain a path component
+//# MUST include a value of / (ASCII 0x2f).
+//= type=test
 test "section 4.3.1: an empty path is the scheme's question, not a blanket rule" {
     // `:scheme` "is not restricted to URIs with scheme 'http' and 'https'", and
     // the empty-path rule is written only for those two. Refusing it everywhere
@@ -880,6 +1004,10 @@ test "section 4.3.1: an http request names an authority somehow" {
     });
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9114#section-4.3.1
+//# If these fields are present, they MUST NOT be
+//# empty.  If both fields are present, they MUST contain the same value.
+//= type=test
 test "section 4.3.1: :authority and Host must agree" {
     // The smuggling pair. One value routes the request and the other is written
     // into the forwarded request line; a proxy that accepts a disagreement lets
@@ -975,6 +1103,10 @@ test "the content-length is handed to the consumer that can finish the check" {
     try testing.expectEqual(@as(?u64, 4096), validator.contentLength());
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9114#section-4.3
+//# Pseudo-header fields MUST NOT appear in trailer
+//# sections.
+//= type=test
 test "section 4.3: a trailer section carries no pseudo-header at all" {
     try validate(.trailer, &.{
         .{ .name = "grpc-status", .value = "0" },
@@ -991,6 +1123,11 @@ test "section 4.3: a trailer section carries no pseudo-header at all" {
     try validate(.trailer, &.{});
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9114#section-4.2
+//# The only exception to this is the TE header field, which MAY be
+//# present in an HTTP/3 request header; when it is, it MUST NOT contain
+//# any value other than "trailers".
+//= type=test
 test "section 4.2: te belongs to a request, and only with one value" {
     // "the TE header field, which MAY be present in an HTTP/3 *request*". A
     // response carrying one was accepted before, which is the connection-
