@@ -457,6 +457,9 @@ pub const Keys = struct {
             octet.* ^= mask[1 + index];
         }
 
+        // Section 9.5's todo on `unprotectHeader` is this line too: the verdict
+        // is reached before the AEAD has said whether the peer wrote these bits
+        // at all.
         const reserved = if (long) reserved_mask_long else reserved_mask_short;
         if (packet[0] & reserved != 0) return error.ReservedBitsSet;
 
