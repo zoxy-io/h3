@@ -96,7 +96,7 @@ const varint = @import("varint.zig");
 //# and servers MUST allow the peer to create at least three
 //# unidirectional streams.
 //= type=exception
-//= reason=QUIC transport parameters are the consumer's to advertise, per docs/DESIGN.md section 3's seam; this file classifies a stream type and opens no stream
+//= reason=the value advertised for initial_max_streams_uni comes from the limits a consumer parameterises quic/Connection with (docs/DESIGN.md section 5), and quic/transport_parameters.zig is what encodes it; this file classifies the type on a stream that already exists and opens none
 //= https://www.rfc-editor.org/rfc/rfc9114#section-11.2.4
 //# In addition to common fields as described in Section 11.2, permanent
 //# registrations in this registry MUST include the following fields:
@@ -108,7 +108,7 @@ const varint = @import("varint.zig");
 //# of the stream type, including the layout and semantics of the stream
 //# contents.
 //= type=exception
-//= reason=a requirement on the specification that registers a stream type, not on code; this package implements the two types Table 5 registers and names the two RFC 9204 section 4.2 adds
+//= reason=a requirement on the specification that registers a stream type, not on code; Type names the two types Table 5 registers and the two RFC 9204 section 4.2 adds, which is what an implementation has to say about a registry
 pub const Type = enum(u64) {
     //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.1
     //# A control stream is indicated by a stream type of 0x00.  Data on this
