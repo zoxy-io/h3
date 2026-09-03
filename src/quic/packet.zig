@@ -59,6 +59,14 @@ pub const header_form_long: u8 = 0x80;
 /// version. A zero there is how QUIC is told apart from other UDP protocols
 /// sharing a port, so a packet without it is discarded rather than refused —
 /// it was probably never ours.
+//= https://www.rfc-editor.org/rfc/rfc9000#section-17.2
+//# Packets containing a zero value for this bit are not valid packets
+//# in this version and MUST be discarded.
+//
+//= https://www.rfc-editor.org/rfc/rfc9000#section-17.3.1
+//# Fixed Bit: The next bit (0x40) of byte 0 is set to 1. Packets
+//# containing a zero value for this bit are not valid packets in this
+//# version and MUST be discarded.
 pub const fixed_bit: u8 = 0x40;
 
 /// Section 17.2: bits 5 and 4 of a long header's first octet.
@@ -122,6 +130,73 @@ pub const Header = union(Kind) {
     zero_rtt: Protected,
     /// Section 17.2.4.
     handshake: Protected,
+    /// A Retry packet parses to its fields, and nothing here acts on one:
+    /// honouring a Retry means re-deriving Initial keys from a new destination
+    /// identifier and re-sending the first flight, which `Connection` does not
+    /// do. Every client-side Retry rule below is that decision.
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.5.1
+    //# This value MUST NOT be equal to the Destination Connection ID field
+    //# of the packet sent by the client.
+    //= type=exception
+    //= reason=Retry is out of scope and no Retry packet is ever written; see docs/DESIGN.md section 2 for what this package owns and section 6 for the not-built list Retry sits on.
+    //
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.5.1
+    //# A client MUST discard a Retry packet that contains a Source
+    //# Connection ID field that is identical to the Destination Connection
+    //# ID field of its Initial packet.
+    //= type=exception
+    //= reason=every Retry packet is discarded, whatever its Source Connection ID, because honouring one is out of scope; see docs/DESIGN.md section 2 and section 6.
+    //
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.5.1
+    //# The client MUST use the value from the Source Connection ID field of
+    //# the Retry packet in the Destination Connection ID field of
+    //# subsequent packets that it sends.
+    //= type=exception
+    //= reason=no Retry is honoured, so no destination identifier is ever adopted from one; see docs/DESIGN.md section 2 and section 6.
+    //
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.5.1
+    //# A server MUST NOT send more than one Retry packet in response to a
+    //# single UDP datagram.
+    //= type=exception
+    //= reason=a server here sends no Retry packet at all; issuing one needs a token, which needs randomness and a clock that docs/DESIGN.md section 3 keeps outside the seam. See docs/DESIGN.md section 2 and section 6.
+    //
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.5.2
+    //# After the client has received and processed an Initial or Retry
+    //# packet from the server, it MUST discard any subsequent Retry packets
+    //# that it receives.
+    //= type=exception
+    //= reason=every Retry packet is discarded, first or subsequent, because none is processed; see docs/DESIGN.md section 2 and section 6.
+    //
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.5.2
+    //# Clients MUST discard Retry packets that have a Retry Integrity Tag
+    //# that cannot be validated; see Section 5.8 of [QUIC-TLS].
+    //= type=exception
+    //= reason=the integrity tag is parsed out and never checked, because no Retry is honoured; crypto/retry.zig can compute one and nothing calls it. See docs/DESIGN.md section 2 and section 6.
+    //
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.5.2
+    //# A client MUST discard a Retry packet with a zero-length Retry Token
+    //# field.
+    //= type=exception
+    //= reason=a zero-length token parses to an empty slice and the packet is discarded with every other Retry; see docs/DESIGN.md section 2 and section 6.
+    //
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.5.2
+    //# The client MUST NOT change the Source Connection ID because the
+    //# server could include the connection ID as part of its token
+    //# validation logic; see Section 8.1.4.
+    //= type=exception
+    //= reason=nothing here changes a Source Connection ID after the handshake begins, and no Retry is processed that could prompt it; see docs/DESIGN.md section 2 and section 6.
+    //
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.5.3
+    //# A client MUST use the same cryptographic handshake message it
+    //# included in this packet.
+    //= type=exception
+    //= reason=no first flight is ever re-sent in answer to a Retry, because Retry is out of scope; the handshake bytes are the consumer's TLS engine's anyway, per docs/DESIGN.md section 4. See docs/DESIGN.md section 2 and section 6.
+    //
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.5.3
+    //# A client MUST NOT reset the packet number for any packet number
+    //# space after processing a Retry packet.
+    //= type=exception
+    //= reason=no Retry packet is processed, so no packet number space is ever reset; see docs/DESIGN.md section 2 and section 6.
     /// Section 17.2.5. No packet number and no length: the rest of the datagram
     /// is the token followed by the 16-octet integrity tag.
     retry: struct {
@@ -130,6 +205,37 @@ pub const Header = union(Kind) {
         token: []const u8,
         integrity_tag: *const [crypto.tag_octets]u8,
     },
+    /// A Version Negotiation packet is parsed, so that a client can see one and
+    /// a consumer can act on it. Sending one is a server's answer to a version
+    /// it does not implement, and building that answer is out of scope here —
+    /// which is what the four rules below say.
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.1
+    //# The Version field of a Version Negotiation packet MUST be set to
+    //# 0x00000000. The server MUST include the value from the Source
+    //# Connection ID field of the packet it receives in the Destination
+    //# Connection ID field.
+    //= type=exception
+    //= reason=version negotiation is out of scope; nothing here writes a Version Negotiation packet, because a connection in this package speaks one version. See docs/DESIGN.md section 2, which leaves the packet types that begin a *different* connection to the consumer, and section 6.
+    //
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.1
+    //# The value for Source Connection ID MUST be copied from the
+    //# Destination Connection ID of the received packet, which is initially
+    //# randomly selected by a client.
+    //= type=exception
+    //= reason=no Version Negotiation packet is ever written, so there is no Source Connection ID of ours to copy into one; see docs/DESIGN.md section 2 and section 6.
+    //
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.1
+    //# Version- specific rules for the connection ID therefore MUST NOT
+    //# influence a decision about whether to send a Version Negotiation
+    //# packet.
+    //= type=exception
+    //= reason=this package makes no decision about whether to send a Version Negotiation packet, because it never sends one; see docs/DESIGN.md section 2 and section 6.
+    //
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.1
+    //# A server MUST NOT send more than one Version Negotiation packet in
+    //# response to a single UDP datagram.
+    //= type=exception
+    //= reason=none is sent at all, so none can be sent twice; version negotiation is out of scope per docs/DESIGN.md section 2 and section 6.
     /// Section 17.2.1. The versions are left as raw octets rather than decoded
     /// into a slice of `u32`, because decoding them would need somewhere to put
     /// them and this package has no allocator. `versionAt` reads one.
@@ -227,6 +333,10 @@ pub fn parse(datagram: []const u8, local_connection_id_octets: u8) ParseError!Pa
 /// in a short header's first octet is under header protection.
 fn parseShort(datagram: []const u8, local_connection_id_octets: u8) ParseError!Parsed {
     assert(datagram.len >= 1);
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-17.3.1
+    //# Fixed Bit: The next bit (0x40) of byte 0 is set to 1. Packets
+    //# containing a zero value for this bit are not valid packets in this
+    //# version and MUST be discarded.
     if (datagram[0] & fixed_bit == 0) return error.FixedBitUnset;
 
     const offset = 1 + @as(usize, local_connection_id_octets);
@@ -274,6 +384,8 @@ fn parseLong(datagram: []const u8) ParseError!Parsed {
 
     // Order matters: a Version Negotiation packet has no fixed bit requirement
     // (section 17.2.1 lets a server set the unused bits to anything), so the
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.1
+    //# Clients MUST ignore the value of this field.
     // fixed-bit check has to come after this branch rather than before it.
     if (version == version_negotiation) {
         return .{
@@ -285,6 +397,9 @@ fn parseLong(datagram: []const u8) ParseError!Parsed {
             } },
         };
     }
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2
+    //# Packets containing a zero value for this bit are not valid packets
+    //# in this version and MUST be discarded.
     if (datagram[0] & fixed_bit == 0) return error.FixedBitUnset;
     if (version != version_1) {
         return .{
@@ -319,6 +434,15 @@ fn parseInitial(
         return error.LengthMalformed) catch return error.LengthMalformed;
     if (token_end > datagram.len) return error.Truncated;
     const token = datagram[cursor..token_end];
+    // A token is read at both roles and at any length. A client is required to
+    // refuse one from a server, and neither this parser nor `Connection` does:
+    // the role is not known here, and nothing downstream asks.
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.2
+    //# Initial packets sent by the server MUST set the Token Length field
+    //# to 0; clients that receive an Initial packet with a non-zero Token
+    //# Length field MUST either discard the packet or generate a connection
+    //# error of type PROTOCOL_VIOLATION.
+    //= type=todo
     cursor = token_end;
 
     const body = try readBody(datagram, &cursor);
@@ -367,6 +491,11 @@ fn parseRetry(
     source: ConnectionId,
 ) ParseError!Parsed {
     assert(start <= datagram.len);
+    // Nothing reads the low four bits of the first octet, which is the whole of
+    // this rule: they are the server's to choose and a client's to ignore.
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.5
+    //# The value in the Unused field is set to an arbitrary value by the
+    //# server; a client MUST ignore these bits.
     if (datagram.len < start + crypto.tag_octets) return error.Truncated;
     const token_end = datagram.len - crypto.tag_octets;
     assert(token_end >= start);
@@ -410,6 +539,21 @@ fn readConnectionId(datagram: []const u8, cursor: *usize) ParseError!ConnectionI
     if (cursor.* >= datagram.len) return error.Truncated;
     const length = datagram[cursor.*];
     cursor.* += 1;
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2
+    //# In QUIC version 1, this value MUST NOT exceed 20 bytes. Endpoints
+    //# that receive a version 1 long header with a value larger than 20
+    //# MUST drop the packet.
+    //
+    // The cap is applied before the version is looked at, which costs the
+    // SHOULD below: a long header in another QUIC version carrying a 21-octet
+    // identifier is refused here rather than parsed into `.unsupported_version`
+    // for a server to answer with.
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2
+    //# In order to properly form a Version Negotiation packet, servers
+    //# SHOULD be able to read longer connection IDs from other QUIC
+    //# versions.
+    //= type=exception
+    //= reason=writing a Version Negotiation packet is out of scope, so the only reader that would need the longer identifier does not exist here; a version 1 endpoint is otherwise required to refuse it. See docs/DESIGN.md section 2 and section 6.
     if (length > ConnectionId.octets_max) return error.ConnectionIdTooLong;
     const end = cursor.* + length;
     if (end > datagram.len) return error.Truncated;
@@ -480,6 +624,11 @@ pub fn writeLong(target: []u8, options: LongOptions) WriteError!Written {
 
     var cursor: usize = 0;
     try put(target, &cursor, 1);
+    // The two reserved bits (0x0c) are absent from this expression, which is
+    // how they are set to zero: header protection then masks them, and a peer
+    // that finds them non-zero after unmasking has found a violation.
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2
+    //# The value included prior to protection MUST be set to 0.
     target[0] = header_form_long | fixed_bit |
         (@as(u8, @intFromEnum(options.long_type)) << long_type_shift) |
         (options.number_octets - 1);
@@ -527,6 +676,32 @@ pub const ShortOptions = struct {
     /// RFC 9000 section 17.3.1. A client that does not participate should send
     /// a random value on each connection rather than a constant, which is the
     /// caller's business: this package draws no randomness.
+    ///
+    /// Defaulting to false is section 17.4's "disabled": nothing here derives a
+    /// spin value from the packets it has seen, so the feature is off unless a
+    /// caller turns it on per packet, and no incoming value is ever acted on.
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-17.4
+    //# An endpoint that does not support this feature MUST disable it, as
+    //# defined below.
+    //
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-17.4
+    //# Implementations MUST allow administrators of clients and servers to
+    //# disable the spin bit either globally or on a per-connection basis.
+    //
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-17.4
+    //# When the spin bit is disabled, endpoints MAY set the spin bit to any
+    //# value and MUST ignore any incoming value.
+    //
+    // The one in sixteen below is the half this package cannot do: choosing a
+    // random subset of paths needs entropy, and the seam keeps entropy out.
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-17.4
+    //# Even when the spin bit is not disabled by the administrator,
+    //# endpoints MUST disable their use of the spin bit for a random
+    //# selection of at least one in every 16 network paths, or for one in
+    //# every 16 connection IDs, in order to ensure that QUIC connections
+    //# that disable the spin bit are commonly observed on the network.
+    //= type=exception
+    //= reason=the spin bit is off by default and never set by this package, so the sixteenth connection is as disabled as the other fifteen; drawing the random selection would need entropy, which docs/DESIGN.md section 3 keeps outside the seam.
     spin: bool = false,
 };
 
@@ -538,6 +713,10 @@ pub fn writeShort(target: []u8, options: ShortOptions) WriteError!Written {
 
     var cursor: usize = 0;
     try put(target, &cursor, 1);
+    // A short header's reserved bits are 0x18, and the same reasoning applies:
+    // they are left out of the expression rather than cleared afterwards.
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-17.3.1
+    //# The value included prior to protection MUST be set to 0.
     target[0] = fixed_bit | (options.number_octets - 1);
     if (options.key_phase) target[0] |= 0x04;
     if (options.spin) target[0] |= spin_bit;
@@ -673,6 +852,15 @@ test "a short header with no room for a packet number is truncated" {
     try testing.expectError(error.Truncated, parse(&.{0x40}, 0));
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9000#section-17.2
+//# Packets containing a zero value for this bit are not valid packets
+//# in this version and MUST be discarded.
+//
+//= https://www.rfc-editor.org/rfc/rfc9000#section-17.3.1
+//# Fixed Bit: The next bit (0x40) of byte 0 is set to 1. Packets
+//# containing a zero value for this bit are not valid packets in this
+//# version and MUST be discarded.
+//= type=test
 test "the fixed bit is what tells QUIC from anything else on the port" {
     const long = [_]u8{ 0x80 | 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x04 } ++ [_]u8{0} ** 4;
     try testing.expectError(error.FixedBitUnset, parse(&long, 0));
@@ -688,6 +876,11 @@ test "a length past the end of the datagram is truncation, not a short read" {
     try testing.expectError(error.Truncated, parse(&datagram, 0));
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9000#section-17.2
+//# In QUIC version 1, this value MUST NOT exceed 20 bytes. Endpoints
+//# that receive a version 1 long header with a value larger than 20
+//# MUST drop the packet.
+//= type=test
 test "a connection identifier past twenty octets is a protocol violation" {
     const datagram = [_]u8{ 0xc3, 0x00, 0x00, 0x00, 0x01, 21 } ++ [_]u8{0xaa} ** 32;
     try testing.expectError(error.ConnectionIdTooLong, parse(&datagram, 0));
