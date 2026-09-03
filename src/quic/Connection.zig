@@ -406,6 +406,92 @@ pub fn Connection(comptime config: Config) type {
         levels: [Level.count]CryptoLevel = @splat(.{}),
         spaces: [Space.count]PacketSpace = @splat(.{}),
 
+        // Section 9 in full. There is no field below for a path, and that is the
+        // whole of the argument: an address never crosses the seam, so this endpoint
+        // cannot observe a change of one, cannot initiate a move to another, and has
+        // no "last validated peer address" to revert to.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-9
+        //# An endpoint MUST NOT initiate connection migration before the
+        //# handshake is confirmed, as defined in Section 4.1.2 of [QUIC-TLS].
+        //= type=exception
+        //= reason=connection migration is out of scope: a connection here has exactly one path and never learns an address, because the seam of docs/DESIGN.md section 3 hands over a datagram rather than a peer. There is no second path to probe, revert to or reset a controller for. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-9
+        //# If the peer sent the disable_active_migration transport parameter,
+        //# an endpoint also MUST NOT send packets (including probing packets;
+        //# see Section 9.1) from a different local address to the address the
+        //# peer used during the handshake, unless the endpoint has acted on a
+        //# preferred_address transport parameter from the peer.
+        //= type=exception
+        //= reason=connection migration is out of scope: a connection here has exactly one path and never learns an address, because the seam of docs/DESIGN.md section 3 hands over a datagram rather than a peer. There is no second path to probe, revert to or reset a controller for. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-9
+        //# If the peer violates this requirement, the endpoint MUST either drop
+        //# the incoming packets on that path without generating a Stateless
+        //# Reset or proceed with path validation and allow the peer to migrate.
+        //= type=exception
+        //= reason=connection migration is out of scope: a connection here has exactly one path and never learns an address, because the seam of docs/DESIGN.md section 3 hands over a datagram rather than a peer. There is no second path to probe, revert to or reset a controller for. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-9
+        //# If a client receives packets from an unknown server address, the
+        //# client MUST discard these packets.
+        //= type=exception
+        //= reason=connection migration is out of scope: a connection here has exactly one path and never learns an address, because the seam of docs/DESIGN.md section 3 hands over a datagram rather than a peer. There is no second path to probe, revert to or reset a controller for. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-9.3
+        //# If the recipient permits the migration, it MUST send subsequent
+        //# packets to the new peer address and MUST initiate path validation
+        //# (Section 8.2) to verify the peer's ownership of the address if
+        //# validation is not already underway.
+        //= type=exception
+        //= reason=connection migration is out of scope: a connection here has exactly one path and never learns an address, because the seam of docs/DESIGN.md section 3 hands over a datagram rather than a peer. There is no second path to probe, revert to or reset a controller for. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-9.3
+        //# An endpoint MAY send data to an unvalidated peer address, but it
+        //# MUST protect against potential attacks as described in Sections
+        //# 9.3.1 and 9.3.2. An endpoint MAY skip validation of a peer address
+        //# if that address has been seen recently.
+        //= type=exception
+        //= reason=connection migration is out of scope: a connection here has exactly one path and never learns an address, because the seam of docs/DESIGN.md section 3 hands over a datagram rather than a peer. There is no second path to probe, revert to or reset a controller for. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-9.3.2
+        //# To protect the connection from failing due to such a spurious
+        //# migration, an endpoint MUST revert to using the last validated peer
+        //# address when validation of a new peer address fails.
+        //= type=exception
+        //= reason=connection migration is out of scope: a connection here has exactly one path and never learns an address, because the seam of docs/DESIGN.md section 3 hands over a datagram rather than a peer. There is no second path to probe, revert to or reset a controller for. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-9.3.2
+        //# If an endpoint has no state about the last validated peer address,
+        //# it MUST close the connection silently by discarding all connection
+        //# state.
+        //= type=exception
+        //= reason=connection migration is out of scope: a connection here has exactly one path and never learns an address, because the seam of docs/DESIGN.md section 3 hands over a datagram rather than a peer. There is no second path to probe, revert to or reset a controller for. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-9.3.3
+        //# In response to an apparent migration, endpoints MUST validate the
+        //# previously active path using a PATH_CHALLENGE frame.
+        //= type=exception
+        //= reason=connection migration is out of scope: a connection here has exactly one path and never learns an address, because the seam of docs/DESIGN.md section 3 hands over a datagram rather than a peer. There is no second path to probe, revert to or reset a controller for. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-9.5
+        //# An endpoint MUST NOT reuse a connection ID when sending from more
+        //# than one local address -- for example, when initiating connection
+        //# migration as described in Section 9.2 or when probing a new network
+        //# path as described in Section 9.1. Similarly, an endpoint MUST NOT
+        //# reuse a connection ID when sending to more than one destination
+        //# address.
+        //= type=exception
+        //= reason=connection migration is out of scope: a connection here has exactly one path and never learns an address, because the seam of docs/DESIGN.md section 3 hands over a datagram rather than a peer. There is no second path to probe, revert to or reset a controller for. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-9.7
+        //# The flow label generation MUST be designed to minimize the chances
+        //# of linkability with a previously used flow label, as a stable flow
+        //# label would enable correlating activity on multiple paths; see
+        //# Section 9.5. [RFC6437] suggests deriving values using a pseudorandom
+        //# function to generate flow labels.
+        //= type=exception
+        //= reason=an IPv6 flow label is a field of an IP header, and this package writes no IP header and opens no socket: the seam of docs/DESIGN.md section 3 is a UDP payload. See docs/DESIGN.md section 2 and section 6.
         /// Section 8.1's accounting. A client validates its peer by construction
         /// — it chose the address — so this only ever restrains a server.
         address_validated: bool,
@@ -418,6 +504,29 @@ pub fn Connection(comptime config: Config) type {
         peer_parameters: [config.transport_parameters_octets]u8 = @splat(0),
         peer_parameters_len: u32 = 0,
 
+        // Section 9.4 is what a migration would owe the controller below, and the
+        // reason `Recovery` holds one window and one round-trip estimate rather than
+        // one per path: there is only ever one path to hold them for.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-9.4
+        //# Packets sent on the old path MUST NOT contribute to congestion
+        //# control or RTT estimation for the new path.
+        //= type=exception
+        //= reason=connection migration is out of scope: a connection here has exactly one path and never learns an address, because the seam of docs/DESIGN.md section 3 hands over a datagram rather than a peer. There is no second path to probe, revert to or reset a controller for. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-9.4
+        //# On confirming a peer's ownership of its new address, an endpoint
+        //# MUST immediately reset the congestion controller and round-trip time
+        //# estimator for the new path to initial values (see Appendices A.3 and
+        //# B.3 of [QUIC-RECOVERY]) unless the only change in the peer's address
+        //# is its port number.
+        //= type=exception
+        //= reason=connection migration is out of scope: a connection here has exactly one path and never learns an address, because the seam of docs/DESIGN.md section 3 hands over a datagram rather than a peer. There is no second path to probe, revert to or reset a controller for. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-9.4
+        //# This timer SHOULD be set as described in Section 6.2.1 of
+        //# [QUIC-RECOVERY] and MUST NOT be more aggressive.
+        //= type=exception
+        //= reason=connection migration is out of scope: a connection here has exactly one path and never learns an address, because the seam of docs/DESIGN.md section 3 hands over a datagram rather than a peer. There is no second path to probe, revert to or reset a controller for. See docs/DESIGN.md section 2 and section 6.
         /// RFC 9002: what decides that a packet was lost, and when to probe.
         recovery: Recovery = .{},
 
@@ -672,6 +781,64 @@ pub fn Connection(comptime config: Config) type {
             // deliberately not applied here — `setConnectionSendLimit` and
             // `setSendLimit` are the consumer's seam for those and are already
             // driven by MAX_DATA and MAX_STREAM_DATA on the same path.
+            //
+            // `preferred_address` is one of the parameters parsed above and one of the
+            // four a client may not send, and nothing reads it: section 9.6's whole
+            // exchange is a migration the consumer would have to route, and routing is
+            // on the other side of the seam.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-9.6.1
+            //# If path validation fails, the client MUST continue sending all
+            //# future packets to the server's original IP address.
+            //= type=exception
+            //= reason=a server's preferred address is migration by another name and is out of scope: this package never sends the preferred_address transport parameter and never acts on one, and the address it would name is outside the seam of docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-9.6.2
+            //# A client that migrates to a preferred address MUST validate the
+            //# address it chooses before migrating; see Section 21.5.3. A
+            //# server might receive a packet addressed to its preferred IP
+            //# address at any time after it accepts a connection.
+            //= type=exception
+            //= reason=a server's preferred address is migration by another name and is out of scope: this package never sends the preferred_address transport parameter and never acts on one, and the address it would name is outside the seam of docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-9.6.2
+            //# If this packet contains a PATH_CHALLENGE frame, the server sends
+            //# a packet containing a PATH_RESPONSE frame as per Section 8.2.
+            //# The server MUST send non- probing packets from its original
+            //# address until it receives a non- probing packet from the client
+            //# at its preferred address and until the server has validated the
+            //# new path.
+            //= type=exception
+            //= reason=a server's preferred address is migration by another name and is out of scope: this package never sends the preferred_address transport parameter and never acts on one, and the address it would name is outside the seam of docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-9.6.2
+            //# The server MUST probe on the path toward the client from its
+            //# preferred address.
+            //= type=exception
+            //= reason=a server's preferred address is migration by another name and is out of scope: this package never sends the preferred_address transport parameter and never acts on one, and the address it would name is outside the seam of docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-9.6.2
+            //# A client MUST NOT use these for other connections, including
+            //# connections that are resumed from the current connection.
+            //= type=exception
+            //= reason=a server's preferred address is migration by another name and is out of scope: this package never sends the preferred_address transport parameter and never acts on one, and the address it would name is outside the seam of docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-9.6.3
+            //# If path validation of the server's preferred address succeeds,
+            //# the client MUST abandon validation of the original address and
+            //# migrate to using the server's preferred address.
+            //= type=exception
+            //= reason=a server's preferred address is migration by another name and is out of scope: this package never sends the preferred_address transport parameter and never acts on one, and the address it would name is outside the seam of docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-9.6.3
+            //# If packets received at the server's preferred address have a
+            //# different source address than observed from the client during
+            //# the handshake, the server MUST protect against potential attacks
+            //# as described in Sections 9.3.1 and 9.3.2. In addition to
+            //# intentional simultaneous migration, this might also occur
+            //# because the client's access network used a different NAT binding
+            //# for the server's preferred address.
+            //= type=exception
+            //= reason=a server's preferred address is migration by another name and is out of scope: this package never sends the preferred_address transport parameter and never acts on one, and the address it would name is outside the seam of docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
             self.streams.setPeerStreamLimit(true, parsed.initial_max_streams_bidi);
             self.streams.setPeerStreamLimit(false, parsed.initial_max_streams_uni);
 
