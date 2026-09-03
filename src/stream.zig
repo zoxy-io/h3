@@ -34,12 +34,49 @@ const varint = @import("varint.zig");
 /// RFC 9114 section 11.2.4's stream type registry, plus RFC 9204 section 4.2's
 /// two QPACK streams.
 pub const Type = enum(u64) {
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.1
+    //# Each side MUST initiate a single control stream at the beginning of
+    //# the connection and send its SETTINGS frame as the first frame on this
+    //# stream.  If the first frame of the control stream is any other frame
+    //# type, this MUST be treated as a connection error of type
+    //# H3_MISSING_SETTINGS.
+    //= type=exception
+    //= reason=the control stream and its SETTINGS exchange are the HTTP/3 connection layer docs/DESIGN.md section 6 lists as next rather than built; this file names the stream type and nothing sequences it yet
     control = 0x00,
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.2
+    //# Only servers can push; if a server receives a client-initiated push
+    //# stream, this MUST be treated as a connection error of type
+    //# H3_STREAM_CREATION_ERROR.
+    //= type=exception
+    //= reason=server push is not implemented and is not on docs/DESIGN.md section 6's list; the type is named so an unknown-stream path can be told apart from a push one when it is
     push = 0x01,
+    //= https://www.rfc-editor.org/rfc/rfc9204#section-4.2
+    //# Each endpoint
+    //# MUST initiate, at most, one encoder stream and, at most, one decoder
+    //# stream.  Receipt of a second instance of either stream type MUST be
+    //# treated as a connection error of type H3_STREAM_CREATION_ERROR.
+    //= type=exception
+    //= reason=the QPACK encoder and decoder streams carry dynamic table instructions, which this package does not have: it advertises SETTINGS_QPACK_MAX_TABLE_CAPACITY = 0 and decodes static-only, per docs/DESIGN.md section 6
     qpack_encoder = 0x02,
+    //= https://www.rfc-editor.org/rfc/rfc9204#section-4.2
+    //# The sender MUST NOT close either of these streams, and the receiver
+    //# MUST NOT request that the sender close either of these streams.
+    //# Closure of either unidirectional stream type MUST be treated as a
+    //# connection error of type H3_CLOSED_CRITICAL_STREAM.
+    //= type=exception
+    //= reason=the QPACK encoder and decoder streams are not built, per docs/DESIGN.md section 6; Type.critical names them so the connection layer can raise H3_CLOSED_CRITICAL_STREAM when it exists
     qpack_decoder = 0x03,
     _,
 
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2
+    //# Recipients of unknown stream types MUST
+    //# either abort reading of the stream or discard incoming data without
+    //# further processing.
+    //= type=exception
+    //= reason=aborting a read or discarding a stream's data is an action on a QUIC stream, which docs/DESIGN.md section 3 puts on the consumer's side of the seam; Type.known is what tells it which streams those are
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2
+    //# The recipient MUST NOT consider unknown stream types
+    //# to be a connection error of any kind.
     pub fn known(stream_type: Type) bool {
         return switch (stream_type) {
             .control, .push, .qpack_encoder, .qpack_decoder => true,
@@ -48,6 +85,14 @@ pub const Type = enum(u64) {
     }
 
     /// Section 6.2.3: `0x1f * N + 0x21`.
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.3
+    //# Stream types of the format 0x1f * N + 0x21 for non-negative integer
+    //# values of N are reserved to exercise the requirement that unknown
+    //# types be ignored.  These streams have no semantics, and they can be
+    //# sent when application-layer padding is desired.  They MAY also be
+    //# sent on connections where no data is currently being transferred.
+    //# Endpoints MUST NOT consider these streams to have any meaning upon
+    //# receipt.
     pub fn isReserved(stream_type: Type) bool {
         const value = @intFromEnum(stream_type);
         if (value < 0x21) return false;
@@ -57,6 +102,16 @@ pub const Type = enum(u64) {
     /// Sections 6.2.1 and 6.2.2, and RFC 9204 section 4.2: exactly one of each
     /// of these may exist per direction, and closing one is
     /// `H3_CLOSED_CRITICAL_STREAM`. A second is `H3_STREAM_CREATION_ERROR`.
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.1
+    //# Only one control stream per peer is permitted;
+    //# receipt of a second stream claiming to be a control stream MUST be
+    //# treated as a connection error of type H3_STREAM_CREATION_ERROR.  The
+    //# sender MUST NOT close the control stream, and the receiver MUST NOT
+    //# request that the sender close the control stream.  If either control
+    //# stream is closed at any point, this MUST be treated as a connection
+    //# error of type H3_CLOSED_CRITICAL_STREAM.
+    //= type=exception
+    //= reason=counting control streams and noticing one close are facts about a connection, and the HTTP/3 connection layer that would hold them is next rather than built (docs/DESIGN.md section 6); critical() is the classification it will ask
     pub fn critical(stream_type: Type) bool {
         return switch (stream_type) {
             .control, .qpack_encoder, .qpack_decoder => true,
@@ -81,6 +136,10 @@ pub const Parsed = struct {
     octets: u8,
 };
 
+//= https://www.rfc-editor.org/rfc/rfc9114#section-6.2
+//# A receiver MUST tolerate unidirectional streams being
+//# closed or reset prior to the reception of the unidirectional stream
+//# header.
 pub fn parse(source: []const u8) ParseError!Parsed {
     const decoded = varint.decodeMinimal(source) catch |err| return switch (err) {
         error.Incomplete => error.Incomplete,
@@ -96,6 +155,12 @@ pub const WriteError = error{
     OutputTooLong,
 };
 
+//= https://www.rfc-editor.org/rfc/rfc9114#section-6.2
+//# However, stream types that could modify the state or
+//# semantics of existing protocol components, including QPACK or other
+//# extensions, MUST NOT be sent until the peer is known to support them.
+//= type=exception
+//= reason=knowing whether a peer supports a stream type needs its SETTINGS, which the connection layer docs/DESIGN.md section 6 lists as next holds; write() encodes a type and decides nothing about when to send it
 pub fn write(target: []u8, stream_type: Type) WriteError!u8 {
     return varint.encode(target, @intFromEnum(stream_type)) catch |err| switch (err) {
         error.OutputTooLong => error.OutputTooLong,
@@ -116,6 +181,11 @@ test "the four stream types RFC 9114 and RFC 9204 define" {
     try testing.expectEqual(Type.qpack_decoder, (try parse(&.{0x03})).stream_type);
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9114#section-6.2
+//# A receiver MUST tolerate unidirectional streams being
+//# closed or reset prior to the reception of the unidirectional stream
+//# header.
+//= type=test
 test "a type split across packets is incomplete, not malformed" {
     try testing.expectError(error.Incomplete, parse(&.{}));
     try testing.expectError(error.Incomplete, parse(&.{0x40}));
@@ -127,6 +197,19 @@ test "a type split across packets is incomplete, not malformed" {
     try testing.expectEqual(@as(u8, 2), parsed.octets);
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.3
+//# Stream types of the format 0x1f * N + 0x21 for non-negative integer
+//# values of N are reserved to exercise the requirement that unknown
+//# types be ignored.  These streams have no semantics, and they can be
+//# sent when application-layer padding is desired.  They MAY also be
+//# sent on connections where no data is currently being transferred.
+//# Endpoints MUST NOT consider these streams to have any meaning upon
+//# receipt.
+//= type=test
+//= https://www.rfc-editor.org/rfc/rfc9114#section-6.2
+//# The recipient MUST NOT consider unknown stream types
+//# to be a connection error of any kind.
+//= type=test
 test "the reserved family is unknown but not an error" {
     var n: u64 = 0;
     while (n < 8) : (n += 1) {

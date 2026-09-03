@@ -47,6 +47,11 @@ pub const Type = enum(u64) {
     /// Section 11.2.1: the four values HTTP/2 used for frames HTTP/3 does not
     /// have. Receiving one is a connection error of type `H3_FRAME_UNEXPECTED`,
     /// not an unknown type to ignore.
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.8
+    //# Frame types that were used in HTTP/2 where there is no corresponding
+    //# HTTP/3 frame have also been reserved (Section 11.2.1).  These frame
+    //# types MUST NOT be sent, and their receipt MUST be treated as a
+    //# connection error of type H3_FRAME_UNEXPECTED.
     pub fn isHttp2Reserved(frame_type: Type) bool {
         return switch (@intFromEnum(frame_type)) {
             0x02, 0x06, 0x08, 0x09 => true,
@@ -56,12 +61,22 @@ pub const Type = enum(u64) {
 
     /// Section 7.2.8: `0x1f * N + 0x21`, the family an endpoint may send to
     /// check that its peer really does ignore what it does not know.
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.8
+    //# Frame types of the format 0x1f * N + 0x21 for non-negative integer
+    //# values of N are reserved to exercise the requirement that unknown
+    //# types be ignored (Section 9).  These frames have no semantics, and
+    //# they MAY be sent on any stream where frames are allowed to be sent.
+    //# This enables their use for application-layer padding.  Endpoints MUST
+    //# NOT consider these frames to have any meaning upon receipt.
     pub fn isReserved(frame_type: Type) bool {
         const value = @intFromEnum(frame_type);
         if (value < 0x21) return false;
         return (value - 0x21) % 0x1f == 0;
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-9
+    //# Implementations MUST ignore unknown or unsupported values in all
+    //# extensible protocol elements.
     pub fn known(frame_type: Type) bool {
         return switch (frame_type) {
             .data, .headers, .cancel_push, .settings, .push_promise, .goaway, .max_push_id => true,
@@ -72,6 +87,14 @@ pub const Type = enum(u64) {
     /// Section 6.2.1: which frames may appear on the control stream, and which
     /// may not appear anywhere else. Getting this wrong is how a SETTINGS frame
     /// on a request stream becomes an accepted reconfiguration mid-request.
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.1
+    //# DATA frames MUST be associated with an HTTP request or response.  If
+    //# a DATA frame is received on a control stream, the recipient MUST
+    //# respond with a connection error of type H3_FRAME_UNEXPECTED.
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.2
+    //# HEADERS frames can only be sent on request streams or push streams.
+    //# If a HEADERS frame is received on a control stream, the recipient
+    //# MUST respond with a connection error of type H3_FRAME_UNEXPECTED.
     pub fn allowedOnControlStream(frame_type: Type) bool {
         return switch (frame_type) {
             .cancel_push, .settings, .goaway, .max_push_id => true,
@@ -80,6 +103,22 @@ pub const Type = enum(u64) {
         };
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4
+    //# SETTINGS frames MUST NOT be sent on any stream other than the control
+    //# stream.  If an endpoint receives a SETTINGS frame on a different
+    //# stream, the endpoint MUST respond with a connection error of type
+    //# H3_FRAME_UNEXPECTED.
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.3
+    //# Receiving a
+    //# CANCEL_PUSH frame on a stream other than the control stream MUST be
+    //# treated as a connection error of type H3_FRAME_UNEXPECTED.
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.6
+    //# A client MUST treat a GOAWAY frame on a stream other than
+    //# the control stream as a connection error of type H3_FRAME_UNEXPECTED.
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.7
+    //# Receipt
+    //# of a MAX_PUSH_ID frame on any other stream MUST be treated as a
+    //# connection error of type H3_FRAME_UNEXPECTED.
     pub fn allowedOnRequestStream(frame_type: Type) bool {
         return switch (frame_type) {
             .data, .headers, .push_promise => true,
@@ -98,6 +137,12 @@ pub const Header = struct {
     octets: u8,
 };
 
+//= https://www.rfc-editor.org/rfc/rfc9114#section-7.1
+//# When a stream terminates cleanly, if the last frame on the stream was
+//# truncated, this MUST be treated as a connection error of type
+//# H3_FRAME_ERROR.
+//= type=exception
+//= reason=parseHeader answers Incomplete and never sees a stream end; whether a truncated last frame closed a stream cleanly is a fact about the stream, which docs/DESIGN.md section 3 puts on the consumer's side of the seam
 pub const ParseError = error{
     /// The header is not all here yet. On a stream this is ordinary — more
     /// octets are coming — which is why it is a separate error from the two
@@ -156,6 +201,14 @@ pub fn writeHeader(target: []u8, frame_type: Type, length: u64) EncodeError!u8 {
 }
 
 /// RFC 9114 section 7.2.4.1's settings identifiers, plus RFC 9220's.
+//= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4
+//# A SETTINGS frame MUST be sent as the first frame of
+//# each control stream (see Section 6.2.1) by each peer, and it MUST NOT
+//# be sent subsequently.  If an endpoint receives a second SETTINGS
+//# frame on the control stream, the endpoint MUST respond with a
+//# connection error of type H3_FRAME_UNEXPECTED.
+//= type=exception
+//= reason=the SETTINGS exchange needs the control stream, which is the HTTP/3 connection layer docs/DESIGN.md section 6 lists as next rather than built; this file is the codec for the frame, not the sequencer
 pub const Setting = enum(u64) {
     qpack_max_table_capacity = 0x01,
     max_field_section_size = 0x06,
@@ -168,6 +221,12 @@ pub const Setting = enum(u64) {
     /// have. Receiving one is `H3_SETTINGS_ERROR`, for the same reason the
     /// reserved frame types are an error — so that a translating proxy cannot
     /// pass one through and have it mean something else.
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4.1
+    //# Setting identifiers that were defined in [HTTP/2] where there is no
+    //# corresponding HTTP/3 setting have also been reserved
+    //# (Section 11.2.2).  These reserved settings MUST NOT be sent, and
+    //# their receipt MUST be treated as a connection error of type
+    //# H3_SETTINGS_ERROR.
     pub fn isHttp2Reserved(setting: Setting) bool {
         return switch (@intFromEnum(setting)) {
             0x02, 0x03, 0x04, 0x05 => true,
@@ -176,6 +235,9 @@ pub const Setting = enum(u64) {
     }
 
     /// Section 7.2.4.1: the same `0x1f * N + 0x21` family as the frame types.
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4.1
+    //# Endpoints MUST NOT consider such settings to have
+    //# any meaning upon receipt.
     pub fn isReserved(setting: Setting) bool {
         const value = @intFromEnum(setting);
         if (value < 0x21) return false;
@@ -204,6 +266,12 @@ pub const SettingPair = struct {
 /// Duplicate detection is the consumer's, because "which duplicates matter" is
 /// a policy question — section 7.2.4 makes any repeat an error, but a proxy
 /// forwarding settings and a client reading them do different things about it.
+//= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4
+//# The same setting identifier MUST NOT occur more than once in the
+//# SETTINGS frame.  A receiver MAY treat the presence of duplicate
+//# setting identifiers as a connection error of type H3_SETTINGS_ERROR.
+//= type=exception
+//= reason=which duplicates matter is the consumer's policy, as this struct's header says: the iterator hands every pair to the caller so a proxy can forward what it received, and an iterator that refused a repeat would deny it that
 pub const SettingsIterator = struct {
     payload: []const u8,
     offset: usize = 0,
@@ -212,6 +280,9 @@ pub const SettingsIterator = struct {
         return .{ .payload = payload };
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4
+    //# An implementation MUST ignore any parameter with an identifier it
+    //# does not understand.
     pub fn next(self: *SettingsIterator) SettingsError!?SettingPair {
         assert(self.offset <= self.payload.len);
         if (self.offset == self.payload.len) return null;
@@ -244,6 +315,13 @@ pub fn writeSetting(target: []u8, setting: Setting, value: u64) EncodeError!u8 {
 /// GOAWAY's single field is a stream identifier from a server and a push
 /// identifier from a client, which is a distinction the caller makes and this
 /// function cannot.
+//= https://www.rfc-editor.org/rfc/rfc9114#section-7.1
+//# Each frame's payload MUST contain exactly the fields identified in
+//# its description.  A frame payload that contains additional bytes
+//# after the identified fields or a frame payload that terminates before
+//# the end of the identified fields MUST be treated as a connection
+//# error of type H3_FRAME_ERROR.  In particular, redundant length
+//# encodings MUST be verified to be self-consistent; see Section 10.8.
 pub fn parseSingleVarint(payload: []const u8) SettingsError!u64 {
     const decoded = varint.decode(payload) catch return error.Truncated;
     // Section 7.2.3, 7.2.6 and 7.2.7 all make a payload of any other length a
@@ -268,6 +346,12 @@ test "a header that has not all arrived is incomplete, not malformed" {
     try testing.expectError(error.Incomplete, parseHeader(&.{ 0x01, 0x40 }));
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.8
+//# Frame types that were used in HTTP/2 where there is no corresponding
+//# HTTP/3 frame have also been reserved (Section 11.2.1).  These frame
+//# types MUST NOT be sent, and their receipt MUST be treated as a
+//# connection error of type H3_FRAME_UNEXPECTED.
+//= type=test
 test "HTTP/2's leftover frame types are an error, not an unknown type" {
     // Section 11.2.1: 0x02 was PRIORITY, 0x06 PING, 0x08 WINDOW_UPDATE, 0x09
     // CONTINUATION. Skipping one would let a translating proxy pass a frame
@@ -277,6 +361,10 @@ test "HTTP/2's leftover frame types are an error, not an unknown type" {
     }
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9114#section-9
+//# Implementations MUST ignore unknown or unsupported values in all
+//# extensible protocol elements.
+//= type=test
 test "an unknown type is skippable because it carries its length" {
     const header = try parseHeader(&.{ 0x21, 0x04, 0xde, 0xad, 0xbe, 0xef });
     try testing.expect(!header.frame_type.known());
@@ -287,6 +375,14 @@ test "an unknown type is skippable because it carries its length" {
     try testing.expectEqual(@as(usize, 6), header.octets + header.length);
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.8
+//# Frame types of the format 0x1f * N + 0x21 for non-negative integer
+//# values of N are reserved to exercise the requirement that unknown
+//# types be ignored (Section 9).  These frames have no semantics, and
+//# they MAY be sent on any stream where frames are allowed to be sent.
+//# This enables their use for application-layer padding.  Endpoints MUST
+//# NOT consider these frames to have any meaning upon receipt.
+//= type=test
 test "the reserved family is what section 7.2.8 describes" {
     var n: u64 = 0;
     while (n < 8) : (n += 1) {
@@ -303,6 +399,17 @@ test "a non-minimal type or length is refused" {
     try testing.expectError(error.NotMinimal, parseHeader(&.{ 0x01, 0x40, 0x01 }));
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4
+//# SETTINGS frames MUST NOT be sent on any stream other than the control
+//# stream.  If an endpoint receives a SETTINGS frame on a different
+//# stream, the endpoint MUST respond with a connection error of type
+//# H3_FRAME_UNEXPECTED.
+//= type=test
+//= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.1
+//# DATA frames MUST be associated with an HTTP request or response.  If
+//# a DATA frame is received on a control stream, the recipient MUST
+//# respond with a connection error of type H3_FRAME_UNEXPECTED.
+//= type=test
 test "where a frame is allowed depends on the stream it arrived on" {
     // A SETTINGS frame on a request stream would be a reconfiguration in the
     // middle of a request; a DATA frame on the control stream would be a body
@@ -347,6 +454,13 @@ test "a SETTINGS payload walks as pairs" {
     try testing.expectEqual(@as(?SettingPair, null), try iterator.next());
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4.1
+//# Setting identifiers that were defined in [HTTP/2] where there is no
+//# corresponding HTTP/3 setting have also been reserved
+//# (Section 11.2.2).  These reserved settings MUST NOT be sent, and
+//# their receipt MUST be treated as a connection error of type
+//# H3_SETTINGS_ERROR.
+//= type=test
 test "HTTP/2's leftover settings identifiers are a settings error" {
     for ([_]u8{ 0x02, 0x03, 0x04, 0x05 }) |value| {
         var iterator: SettingsIterator = .init(&.{ value, 0x01 });
@@ -359,6 +473,14 @@ test "a SETTINGS payload cut mid-pair is truncated" {
     try testing.expectError(error.Truncated, iterator.next());
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9114#section-7.1
+//# Each frame's payload MUST contain exactly the fields identified in
+//# its description.  A frame payload that contains additional bytes
+//# after the identified fields or a frame payload that terminates before
+//# the end of the identified fields MUST be treated as a connection
+//# error of type H3_FRAME_ERROR.  In particular, redundant length
+//# encodings MUST be verified to be self-consistent; see Section 10.8.
+//= type=test
 test "the single-integer frames refuse a payload of any other length" {
     try testing.expectEqual(@as(u64, 7), try parseSingleVarint(&.{0x07}));
     try testing.expectError(error.Invalid, parseSingleVarint(&.{ 0x07, 0x00 }));
