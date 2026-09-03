@@ -40,6 +40,10 @@ const packet_number = @import("packet_number.zig");
 const Space = packet_number.Space;
 
 /// Section 6.1.1: packets this far before an acknowledged one are lost.
+//= https://www.rfc-editor.org/rfc/rfc9002#section-6.1.1
+//# In order to remain similar to TCP,
+//# implementations SHOULD NOT use a packet threshold less than 3; see
+//# [RFC5681].
 pub const packet_threshold: u64 = 3;
 
 /// Section 6.1.2: reordering tolerated in time, as an RTT multiplier of 9/8.
@@ -50,6 +54,9 @@ pub const time_threshold_denominator: u64 = 8;
 pub const granularity_ns: u64 = std.time.ns_per_ms;
 
 /// Section 6.2.2: the RTT assumed before a sample exists.
+//= https://www.rfc-editor.org/rfc/rfc9002#section-6.2.2
+//# When no previous RTT is available, the initial RTT
+//# SHOULD be set to 333 milliseconds.
 pub const initial_rtt_ns: u64 = 333 * std.time.ns_per_ms;
 
 /// Section 7.6: consecutive PTO periods without a delivery that mean the path
@@ -162,6 +169,19 @@ pub fn Recovery(comptime config: Config) type {
         latest_rtt: u64 = 0,
         smoothed_rtt: u64 = initial_rtt_ns,
         rttvar: u64 = initial_rtt_ns / 2,
+        /// Section 5.2's minimum, and it only ever falls: nothing here raises
+        /// it again, which is the shape of both citations below.
+        //= https://www.rfc-editor.org/rfc/rfc9002#section-5.2
+        //# Endpoints SHOULD set the min_rtt to the newest RTT sample after
+        //# persistent congestion is established.
+        //= type=todo
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9002#section-5.2
+        //# Implementations SHOULD
+        //# NOT refresh the min_rtt value too often since the actual minimum RTT
+        //# of the path is not frequently observable.
+        //= type=exception
+        //= reason=section 5.2's optional reestablishment is not implemented, so there is no refresh whose frequency could be wrong
         min_rtt: u64 = 0,
         has_rtt_sample: bool = false,
         pto_count: u32 = 0,
@@ -194,6 +214,26 @@ pub fn Recovery(comptime config: Config) type {
         };
 
         /// Section A.5.
+        ///
+        /// The PTO is not stored, it is derived: `ptoTimeAndSpace` recomputes
+        /// it from `time_of_last_ack_eliciting` on every `timeoutAt`, so
+        /// recording the send time here *is* the restart section 6.2.1 asks
+        /// for. `onAckReceived` and `discardSpace` restart it the same way, by
+        /// moving what the derivation reads.
+        //= https://www.rfc-editor.org/rfc/rfc9002#section-6.2.1
+        //# A sender SHOULD restart its PTO timer every time an ack-eliciting
+        //# packet is sent or acknowledged, or when Initial or Handshake keys are
+        //# discarded (Section 4.9 of [QUIC-TLS]).
+        //
+        // Section 7.5: a probe is counted in flight like anything else. There
+        // is no probe flag on `Sent` precisely because the RFC does not want
+        // one here — the exemption is on the *send* decision, not on the
+        // accounting.
+        //= https://www.rfc-editor.org/rfc/rfc9002#section-7.5
+        //# A
+        //# sender MUST however count these packets as being additionally in
+        //# flight, since these packets add network load without establishing
+        //# packet loss.
         pub fn onPacketSent(self: *Self, space: Space, sent: Sent) SentError!void {
             const state = &self.spaces[@intFromEnum(space)];
             if (state.count == config.sent_max) return error.TooManyOutstanding;
@@ -256,6 +296,18 @@ pub fn Recovery(comptime config: Config) type {
             // acknowledged, and only when that packet was ack-eliciting —
             // otherwise the peer was under no obligation to answer promptly and
             // the sample is not one.
+            //
+            // `newly` is null when the frame acknowledged nothing this endpoint
+            // still tracked, which is the early return above; `largest.number
+            // == ack.largest` is the rest of it.
+            //= https://www.rfc-editor.org/rfc/rfc9002#section-5.1
+            //# To avoid generating multiple RTT samples for a single packet, an ACK
+            //# frame SHOULD NOT be used to update RTT estimates if it does not newly
+            //# acknowledge the largest acknowledged packet.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9002#section-5.1
+            //# An RTT sample MUST NOT be generated on receiving an ACK frame that
+            //# does not newly acknowledge at least one ack-eliciting packet.
             if (largest.number == ack.largest and largest.ack_eliciting) {
                 self.updateRtt(now_ns - largest.time_sent, ack_delay_ns);
                 result.rtt_sampled = true;
@@ -334,12 +386,24 @@ pub fn Recovery(comptime config: Config) type {
         }
 
         /// Section 5.3.
+        //= https://www.rfc-editor.org/rfc/rfc9002#section-5.3
+        //# In such
+        //# cases, an endpoint SHOULD subtract such local delays from its RTT
+        //# sample until the handshake is confirmed.
+        //= type=exception
+        //= reason=a packet whose keys are not yet installed is discarded rather than buffered, so no local delay of the kind section 5.3 describes is ever accumulated to subtract
         fn updateRtt(self: *Self, sample: u64, ack_delay_ns: u64) void {
             // A sample is an elapsed time computed by the caller from two of
             // its own timestamps, so a zero is a clock that did not move rather
             // than a packet that arrived before it left.
             assert(sample < std.math.maxInt(u64) / 8);
             self.latest_rtt = sample;
+            // The two branches below are the two halves of one requirement:
+            // the first sample *sets* the minimum, every later one lowers it.
+            //= https://www.rfc-editor.org/rfc/rfc9002#section-5.2
+            //# min_rtt MUST be set to the latest_rtt on the first RTT sample.
+            //# min_rtt MUST be set to the lesser of min_rtt and latest_rtt
+            //# (Section 5.1) on all other samples.
             if (!self.has_rtt_sample) {
                 self.min_rtt = sample;
                 self.smoothed_rtt = sample;
@@ -360,6 +424,14 @@ pub fn Recovery(comptime config: Config) type {
             // parameters and before that this endpoint is comparing against its
             // own default rather than against anything the peer promised.
             // Clamping earlier shrank the subtrahend and biased the estimate up.
+            //= https://www.rfc-editor.org/rfc/rfc9002#section-5.3
+            //# To account for this, the endpoint SHOULD ignore
+            //# max_ack_delay until the handshake is confirmed, as defined in
+            //# Section 4.1.2 of [QUIC-TLS].
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9002#section-5.3
+            //# *  MUST use the lesser of the acknowledgment delay and the peer's
+            //# max_ack_delay after the handshake is confirmed; and
             const delay = if (self.handshake_confirmed)
                 @min(ack_delay_ns, self.max_ack_delay_ns)
             else
@@ -369,6 +441,9 @@ pub fn Recovery(comptime config: Config) type {
             // beside it: both terms come from the peer, and section 5.3 is
             // explicit that a peer inflating its reported delay must not be
             // able to shrink our estimate below what we measured.
+            //= https://www.rfc-editor.org/rfc/rfc9002#section-5.3
+            //# *  MUST NOT subtract the acknowledgment delay from the RTT sample if
+            //# the resulting value is smaller than the min_rtt.
             const adjusted = if (sample >= self.min_rtt + delay) sample - delay else sample;
             assert(adjusted <= sample);
 
@@ -391,6 +466,11 @@ pub fn Recovery(comptime config: Config) type {
         /// floored here and in `ptoTimeAndSpace`, which is why nothing needs to
         /// special-case it. A fuzz oracle that asserted `smoothed_rtt > 0`
         /// found this and was wrong; the tests below pin the behaviour instead.
+        //= https://www.rfc-editor.org/rfc/rfc9002#section-6.1.2
+        //# To avoid declaring
+        //# packets as lost too early, this time threshold MUST be set to at
+        //# least the local timer granularity, as indicated by the kGranularity
+        //# constant.
         pub fn lossDelay(self: *const Self) u64 {
             const rtt = @max(self.latest_rtt, self.smoothed_rtt);
             assert(rtt >= self.latest_rtt);
@@ -402,6 +482,14 @@ pub fn Recovery(comptime config: Config) type {
         }
 
         /// Section A.10.
+        ///
+        /// Every packet below the largest acknowledged is examined on every
+        /// pass, so there is no class of loss this declines to notice — which
+        /// is what section 7.4 asks of a sender that has no key-availability
+        /// heuristic to apply.
+        //= https://www.rfc-editor.org/rfc/rfc9002#section-7.4
+        //# Endpoints MUST NOT ignore the loss of packets that were sent after
+        //# the earliest acknowledged packet in a given packet number space.
         fn detectAndRemoveLostPackets(self: *Self, space: Space, now_ns: u64, lost: []Context) u32 {
             const state = &self.spaces[@intFromEnum(space)];
             const largest_acked = state.largest_acked orelse return 0;
@@ -434,10 +522,17 @@ pub fn Recovery(comptime config: Config) type {
                 // clamps the threshold to zero — declaring every packet sent at
                 // time zero lost, on the first acknowledgement, forever. The
                 // tests below found it.
+                //= https://www.rfc-editor.org/rfc/rfc9002#section-6.1.2
+                //# Once a later packet within the same packet number space has been
+                //# acknowledged, an endpoint SHOULD declare an earlier packet lost if it
+                //# was sent a threshold amount of time in the past.
                 const by_time = packet.time_sent + delay <= now_ns;
                 const by_order = largest_acked >= packet.number + packet_threshold;
                 if (!by_time and !by_order) {
                     // Still in doubt: the timer that would settle it.
+                    //= https://www.rfc-editor.org/rfc/rfc9002#section-6.1.2
+                    //# If packets sent prior to the largest acknowledged packet cannot yet
+                    //# be declared lost, then a timer SHOULD be set for the remaining time.
                     const at = packet.time_sent + delay;
                     state.loss_time = if (state.loss_time) |current| @min(current, at) else at;
                     index += 1;
@@ -568,7 +663,26 @@ pub fn Recovery(comptime config: Config) type {
         const PtoTime = struct { at: u64, space: Space };
 
         /// Section A.6: the PTO, and the space it belongs to.
+        ///
+        /// A client with nothing ack-eliciting outstanding gets no PTO here:
+        /// every space without an ack-eliciting packet is skipped. Section
+        /// 6.2.2.1 wants one anyway before the handshake is confirmed, so that
+        /// a client keeps unblocking a server held under its anti-amplification
+        /// limit. See the `todo` below.
+        //= https://www.rfc-editor.org/rfc/rfc9002#section-6.2.2.1
+        //# That is,
+        //# the client MUST set the PTO timer if the client has not received an
+        //# acknowledgment for any of its Handshake packets and the handshake is
+        //# not confirmed (see Section 4.1.2 of [QUIC-TLS]), even if there are no
+        //# packets in flight.
+        //= type=todo
         fn ptoTimeAndSpace(self: *const Self) ?PtoTime {
+            // Section 6.2.1: the floor is inside the base rather than applied
+            // to the sum, which is the RFC's own arrangement — `max(4*rttvar,
+            // kGranularity)` cannot be zero, so neither can the period.
+            //= https://www.rfc-editor.org/rfc/rfc9002#section-6.2.1
+            //# The PTO period MUST be at least kGranularity to avoid the timer
+            //# expiring immediately.
             var duration = self.smoothed_rtt + @max(4 * self.rttvar, granularity_ns);
             duration <<= @intCast(@min(self.pto_count, @as(u32, pto_backoff_shift_max)));
 
@@ -580,11 +694,21 @@ pub fn Recovery(comptime config: Config) type {
                 // Section 6.2.1: an application-data PTO waits for the
                 // handshake, because 1-RTT keys may not exist on both sides.
                 var at = state.time_of_last_ack_eliciting orelse continue;
+                //= https://www.rfc-editor.org/rfc/rfc9002#section-6.2.1
+                //# An endpoint MUST NOT set its PTO timer for the Application Data
+                //# packet number space until the handshake is confirmed.
                 if (space == .application) {
                     if (!self.handshake_confirmed) continue;
                     at += (self.max_ack_delay_ns << @intCast(@min(self.pto_count, @as(u32, pto_backoff_shift_max))));
                 }
                 at += duration;
+                // The earliest across every armed space, which subsumes the
+                // Initial-and-Handshake case the RFC calls out: those two are
+                // the only spaces armed before the handshake is confirmed.
+                //= https://www.rfc-editor.org/rfc/rfc9002#section-6.2.1
+                //# When ack-eliciting packets in multiple packet number spaces are in
+                //# flight, the timer MUST be set to the earlier value of the Initial and
+                //# Handshake packet number spaces.
                 if (earliest == null or at < earliest.?.at) earliest = .{ .at = at, .space = space };
             }
             return earliest;
@@ -608,6 +732,12 @@ pub fn Recovery(comptime config: Config) type {
                 const at = state.loss_time orelse continue;
                 earliest = if (earliest) |current| @min(current, at) else at;
             }
+            // A loss time short-circuits the PTO rather than being compared
+            // with it: the timer this returns is the only one the caller arms,
+            // so returning the loss time *is* declining to set the PTO.
+            //= https://www.rfc-editor.org/rfc/rfc9002#section-6.2.1
+            //# The PTO timer MUST NOT be set if a timer is set for time threshold
+            //# loss detection; see Section 6.1.2.
             if (earliest) |at| return at;
             const pto = self.ptoTimeAndSpace() orelse return null;
             return pto.at;
@@ -620,6 +750,23 @@ pub fn Recovery(comptime config: Config) type {
             /// Nothing is known to be lost, but the peer has gone quiet.
             /// Section 6.2.4: send ack-eliciting packets in this space to make
             /// it say something. Two, because one may be lost as well.
+            //= https://www.rfc-editor.org/rfc/rfc9002#section-6.2.4
+            //# When a PTO timer expires, a sender MUST send at least one ack-
+            //# eliciting packet in the packet number space as a probe.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9002#section-6.2.4
+            //# All probe packets sent on a PTO MUST be ack-eliciting.
+            //
+            // One space, not several: a caller told to probe `.initial` is
+            // told nothing about the Handshake data it may also have in
+            // flight, so the coalescing section 6.2.4 asks for cannot be
+            // driven from this answer.
+            //= https://www.rfc-editor.org/rfc/rfc9002#section-6.2.4
+            //# In addition to sending data in the packet number space for which the
+            //# timer expired, the sender SHOULD send ack-eliciting packets from
+            //# other packet number spaces with in-flight data, coalescing packets if
+            //# possible.
+            //= type=todo
             probe: struct { space: Space, packets: u8 },
             /// Nothing to do.
             idle,
@@ -645,6 +792,17 @@ pub fn Recovery(comptime config: Config) type {
             // Section 6.2.1: the backoff is exponential, and it is reset by a
             // delivery rather than by a probe being sent — a probe that is also
             // lost must not shorten the next wait.
+            //
+            // Nothing is removed from `sent` on this path, which is the whole
+            // of section 6.2's requirement: a PTO answers `.probe`, and only
+            // `detectAndRemoveLostPackets` ever answers `.lost`.
+            //= https://www.rfc-editor.org/rfc/rfc9002#section-6.2
+            //# A PTO timer expiration event does not indicate packet loss and MUST
+            //# NOT cause prior unacknowledged packets to be marked as lost.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9002#section-6.2.1
+            //# When a PTO timer expires, the PTO backoff MUST be increased,
+            //# resulting in the PTO period being set to twice its current value.
             self.pto_count += 1;
             return .{ .probe = .{ .space = pto.space, .packets = 2 } };
         }
@@ -652,6 +810,20 @@ pub fn Recovery(comptime config: Config) type {
         /// Section 6.2.3: the connection has just discarded a packet number
         /// space, so everything outstanding in it is neither lost nor
         /// acknowledged — it is gone.
+        //= https://www.rfc-editor.org/rfc/rfc9002#section-6.4
+        //# The sender MUST discard all recovery state
+        //# associated with those packets and MUST remove them from the count of
+        //# bytes in flight.
+        //
+        // `state.* = .{}` clears `loss_time` and `time_of_last_ack_eliciting`
+        // together, and both timers are derived from those on the next
+        // `timeoutAt` — which is what resetting them means here.
+        //= https://www.rfc-editor.org/rfc/rfc9002#section-6.2.2
+        //# When
+        //# Initial or Handshake keys are discarded, the PTO and loss detection
+        //# timers MUST be reset, because discarding keys indicates forward
+        //# progress and the loss detection timer might have been set for a now-
+        //# discarded packet number space.
         pub fn discardSpace(self: *Self, space: Space) void {
             const state = &self.spaces[@intFromEnum(space)];
             for (state.sent[0..state.count]) |packet| {
@@ -711,6 +883,11 @@ fn ackOf(largest: u64, first_range: u64) frame.Ack {
     };
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9002#section-5.2
+//# min_rtt MUST be set to the latest_rtt on the first RTT sample.
+//# min_rtt MUST be set to the lesser of min_rtt and latest_rtt
+//# (Section 5.1) on all other samples.
+//= type=test
 test "the first sample sets the estimate rather than smoothing into it" {
     var recovery: TestRecovery = .{};
     // Before a sample, section 6.2.2's 333ms stands in.
@@ -741,6 +918,10 @@ test "a later sample moves the estimate by an eighth" {
     try testing.expectEqual(@as(u64, 100 * ms), recovery.min_rtt);
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9002#section-5.3
+//# *  MUST NOT subtract the acknowledgment delay from the RTT sample if
+//# the resulting value is smaller than the min_rtt.
+//= type=test
 test "an inflated ack delay cannot shrink the estimate below the minimum" {
     var recovery: TestRecovery = .{};
     var lost: [8]u64 = undefined;
@@ -755,6 +936,11 @@ test "an inflated ack delay cannot shrink the estimate below the minimum" {
     try testing.expect(recovery.smoothed_rtt >= recovery.min_rtt);
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9002#section-6.1.1
+//# In order to remain similar to TCP,
+//# implementations SHOULD NOT use a packet threshold less than 3; see
+//# [RFC5681].
+//= type=test
 test "section 6.1.1: three packets past a delivery is lost" {
     var recovery: TestRecovery = .{};
     var lost: [8]u64 = undefined;
@@ -772,6 +958,11 @@ test "section 6.1.1: three packets past a delivery is lost" {
     try testing.expectEqual(@as(u32, 2), recovery.outstanding(.initial));
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9002#section-6.1.2
+//# Once a later packet within the same packet number space has been
+//# acknowledged, an endpoint SHOULD declare an earlier packet lost if it
+//# was sent a threshold amount of time in the past.
+//= type=test
 test "section 6.1.2: a packet old enough is lost even without three behind it" {
     var recovery: TestRecovery = .{};
     var lost: [8]u64 = undefined;
@@ -791,6 +982,11 @@ test "section 6.1.2: a packet old enough is lost even without three behind it" {
     try testing.expectEqual(@as(u64, 0), lost[0]);
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9002#section-5.1
+//# To avoid generating multiple RTT samples for a single packet, an ACK
+//# frame SHOULD NOT be used to update RTT estimates if it does not newly
+//# acknowledge the largest acknowledged packet.
+//= type=test
 test "an ACK that acknowledges nothing new does nothing" {
     var recovery: TestRecovery = .{};
     var lost: [8]u64 = undefined;
@@ -808,6 +1004,10 @@ test "an ACK that acknowledges nothing new does nothing" {
     try testing.expectEqual(smoothed, recovery.smoothed_rtt);
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9002#section-6.1.2
+//# If packets sent prior to the largest acknowledged packet cannot yet
+//# be declared lost, then a timer SHOULD be set for the remaining time.
+//= type=test
 test "a packet still in doubt arms the timer rather than being declared lost" {
     var recovery: TestRecovery = .{};
     var lost: [8]u64 = undefined;
@@ -886,6 +1086,20 @@ test "a full window stops the sender" {
     try testing.expect(recovery.bytes_in_flight + 1200 > recovery.congestion_window);
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9002#section-6.2.4
+//# When a PTO timer expires, a sender MUST send at least one ack-
+//# eliciting packet in the packet number space as a probe.
+//= type=test
+//
+//= https://www.rfc-editor.org/rfc/rfc9002#section-6.2.1
+//# When a PTO timer expires, the PTO backoff MUST be increased,
+//# resulting in the PTO period being set to twice its current value.
+//= type=test
+//
+//= https://www.rfc-editor.org/rfc/rfc9002#section-6.2
+//# A PTO timer expiration event does not indicate packet loss and MUST
+//# NOT cause prior unacknowledged packets to be marked as lost.
+//= type=test
 test "a silent peer produces a probe, and the backoff is exponential" {
     var recovery: TestRecovery = .{};
     var lost: [8]u64 = undefined;
@@ -908,6 +1122,17 @@ test "a silent peer produces a probe, and the backoff is exponential" {
     try testing.expectEqual(@as(u32, 0), recovery.pto_count);
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9002#section-6.1.2
+//# To avoid declaring
+//# packets as lost too early, this time threshold MUST be set to at
+//# least the local timer granularity, as indicated by the kGranularity
+//# constant.
+//= type=test
+//
+//= https://www.rfc-editor.org/rfc/rfc9002#section-6.2.1
+//# The PTO period MUST be at least kGranularity to avoid the timer
+//# expiring immediately.
+//= type=test
 test "a zero RTT sample is degenerate, not dangerous" {
     var recovery: TestRecovery = .{};
     var lost: [8]u64 = undefined;
@@ -927,6 +1152,10 @@ test "a zero RTT sample is degenerate, not dangerous" {
     try testing.expect(at >= granularity_ns);
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9002#section-6.2.1
+//# An endpoint MUST NOT set its PTO timer for the Application Data
+//# packet number space until the handshake is confirmed.
+//= type=test
 test "an application-data PTO waits for the handshake" {
     var recovery: TestRecovery = .{};
     try recovery.onPacketSent(.application, sentPacket(0, 0));
@@ -938,6 +1167,11 @@ test "an application-data PTO waits for the handshake" {
     try testing.expect(recovery.timeoutAt() != null);
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9002#section-6.4
+//# The sender MUST discard all recovery state
+//# associated with those packets and MUST remove them from the count of
+//# bytes in flight.
+//= type=test
 test "discarding a space forgets what was in flight there" {
     var recovery: TestRecovery = .{};
     try recovery.onPacketSent(.initial, sentPacket(0, 0));
