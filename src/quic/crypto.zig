@@ -42,6 +42,18 @@ pub const retry = @import("crypto/retry.zig");
 pub const Keys = protect.Keys;
 pub const Secret = secrets.Secret;
 
+// The rule below is implemented in two places and neither half is it alone:
+// keys are chosen by level here, and `Connection.onPacketsLost` rewinds the
+// *level's* CRYPTO cursor, so data lost at one level is framed again at that
+// level and therefore sealed with that level's keys.
+//= https://www.rfc-editor.org/rfc/rfc9001#section-4
+//# Each chunk of data that is produced by TLS is associated with the set of
+//# keys that TLS is currently using. If QUIC needs to retransmit that data,
+//# it MUST use the same keys even if TLS has already updated to newer keys.
+//
+//= https://www.rfc-editor.org/rfc/rfc9001#section-4.9
+//# If packets from a lower encryption level contain CRYPTO frames, frames
+//# that retransmit that data MUST be sent at the same encryption level.
 /// RFC 9001 section 4.1.1: the four encryption levels.
 ///
 /// Not the same thing as a packet number space, and the difference is the bug
@@ -54,6 +66,8 @@ pub const Level = enum(u2) {
     handshake,
     one_rtt,
 
+    //= https://www.rfc-editor.org/rfc/rfc9001#section-4
+    //# Each encryption level corresponds to a packet number space.
     /// The packet number space this level draws from (section 12.3).
     pub fn space(level: Level) @import("packet_number.zig").Space {
         return switch (level) {
@@ -92,6 +106,19 @@ pub const Side = enum(u1) {
     }
 };
 
+//= https://www.rfc-editor.org/rfc/rfc9001#section-5.3
+//# QUIC can use any of the cipher suites defined in [TLS13] with the
+//# exception of TLS_AES_128_CCM_8_SHA256. A cipher suite MUST NOT be
+//# negotiated unless a header protection scheme is defined for the cipher
+//# suite. This document defines a header protection scheme for all cipher
+//# suites defined in [TLS13] aside from TLS_AES_128_CCM_8_SHA256.
+//
+//= https://www.rfc-editor.org/rfc/rfc9001#section-5.3
+//# An endpoint MUST NOT reject a ClientHello that offers a cipher suite
+//# that it does not support, or it would be impossible to deploy a new
+//# cipher suite.
+//= type=exception
+//= reason=the ClientHello is the consumer's TLS engine's and this package never sees one: `installSecret` is told which suite was negotiated, after the fact. A suite absent from this enum is one no key can be derived for, which is a different refusal from rejecting the offer. See docs/DESIGN.md section 4.
 /// The AEAD and hash pairing a level's keys were derived under.
 ///
 /// RFC 9001 section 5.3 admits every TLS 1.3 cipher suite except
@@ -129,6 +156,10 @@ pub const Suite = enum {
         };
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc9001#section-5.4.1
+    //# Before a TLS cipher suite can be used with QUIC, a header protection
+    //# algorithm MUST be specified for the AEAD used with that cipher
+    //# suite.
     /// Which header protection construction section 5.4 pairs with the suite.
     pub fn headerProtection(suite: Suite) HeaderProtection {
         return switch (suite) {
@@ -141,15 +172,38 @@ pub const Suite = enum {
 /// Section 5.4.3 and 5.4.4: the two ways a header protection mask is produced.
 pub const HeaderProtection = enum { aes, chacha20 };
 
+//= https://www.rfc-editor.org/rfc/rfc9001#section-5.3
+//# These cipher suites have a 16-byte authentication tag and produce an
+//# output 16 bytes larger than their input.
 /// Section 5.3: every AEAD QUIC admits produces a 16-octet tag, and the format
 /// depends on that — the tag is what makes a packet's length known before its
 /// contents are, and section 5.4.2's sampling relies on there being 16 octets
 /// after the packet number that are not header.
 pub const tag_octets: u8 = 16;
 
+//= https://www.rfc-editor.org/rfc/rfc9001#section-5.1
+//# The Length provided with "quic iv" is the minimum length of the AEAD
+//# nonce or 8 bytes if that is larger; see [AEAD].
 /// Section 5.3: the nonce is the write IV, so it is the AEAD's nonce length.
 pub const iv_octets: u8 = 12;
 
+//= https://www.rfc-editor.org/rfc/rfc9001#section-6.6
+//# Endpoints MUST count the number of encrypted packets for each set of
+//# keys. If the total number of encrypted packets with the same key exceeds
+//# the confidentiality limit for the selected AEAD, the endpoint MUST stop
+//# using those keys. Endpoints MUST initiate a key update before sending
+//# more protected packets than the confidentiality limit for the selected
+//# AEAD permits.
+//
+//= https://www.rfc-editor.org/rfc/rfc9001#section-6.6
+//# For AEAD_AES_128_GCM and AEAD_AES_256_GCM, the confidentiality limit is
+//# 2^23 encrypted packets; see Appendix B.1. For AEAD_CHACHA20_POLY1305,
+//# the confidentiality limit is greater than the number of possible packets
+//# (2^62) and so can be disregarded.
+//
+//= https://www.rfc-editor.org/rfc/rfc9001#section-5.3
+//# An endpoint MUST initiate a key update (Section 6) prior to exceeding
+//# any limit set for the AEAD that is in use.
 /// RFC 9001 section 6.6: how many packets one key may seal.
 ///
 /// "Endpoints MUST count the number of encrypted packets for each set of keys.
@@ -169,6 +223,28 @@ pub fn confidentialityLimit(suite: Suite) u64 {
     };
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9001#section-6.6
+//# In addition to counting packets sent, endpoints MUST count the number of
+//# received packets that fail authentication during the lifetime of a
+//# connection. If the total number of received packets that fail
+//# authentication within the connection, across all keys, exceeds the
+//# integrity limit for the selected AEAD, the endpoint MUST immediately
+//# close the connection with a connection error of type AEAD_LIMIT_REACHED
+//# and not process any more packets.
+//
+//= https://www.rfc-editor.org/rfc/rfc9001#section-6.6
+//# For AEAD_AES_128_GCM and AEAD_AES_256_GCM, the integrity limit is 2^52
+//# invalid packets; see Appendix B.1. For AEAD_CHACHA20_POLY1305, the
+//# integrity limit is 2^36 invalid packets; see [AEBounds].
+//
+//= https://www.rfc-editor.org/rfc/rfc9001#section-6.6
+//# Any TLS cipher suite that is specified for use with QUIC MUST define
+//# limits on the use of the associated AEAD function that preserves margins
+//# for confidentiality and integrity. That is, limits MUST be specified for
+//# the number of packets that can be authenticated and for the number of
+//# packets that can fail authentication.
+//= type=exception
+//= reason=a requirement on the specification of a cipher suite rather than on an implementation of one. RFC 9001 specifies the limits for the three suites `Suite` admits and they are the two functions here; a future suite that arrived without them could not be added to `Suite` at all.
 /// RFC 9001 section 6.6: how many forgeries a connection may survive.
 ///
 /// "If the total number of received packets that fail authentication within the
