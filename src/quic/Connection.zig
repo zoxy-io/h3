@@ -686,6 +686,29 @@ pub fn Connection(comptime config: Config) type {
         //# "fatal" level.
         //= type=exception
         //= reason=the TLS handshake is the consumer's engine and not this package's: docs/DESIGN.md section 4 puts ztls and zssl on the other side of the seam, and what crosses it is handshake bytes and traffic secrets. Nothing here sees a TLS version, a certificate, an alert or a handshake message, so none of these rules has a place to be checked. See docs/DESIGN.md section 2 and section 6.
+        //
+        // RFC 9000 section 7 states what the handshake has to deliver before any of
+        // this matters, and every item on its list is delivered on the other side of
+        // the seam: authentication, the transport parameter exchange's
+        // confidentiality, and the application protocol.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-7
+        //# The cryptographic handshake MUST provide the following properties: *
+        //# authenticated key exchange, where - a server is always
+        //# authenticated, - a client is optionally authenticated, - every
+        //# connection produces distinct and unrelated keys, and - keying
+        //# material is usable for packet protection for both 0-RTT and 1-RTT
+        //# packets. * authenticated exchange of values for transport parameters
+        //# of both endpoints, and confidentiality protection for server
+        //# transport parameters (see Section 7.4). * authenticated negotiation
+        //# of an application protocol (TLS uses Application-Layer Protocol
+        //# Negotiation (ALPN) [ALPN] for this purpose).
+        //= type=exception
+        //= reason=the TLS handshake is the consumer's engine and not this package's: docs/DESIGN.md section 4 puts ztls and zssl on the other side of the seam, so what a handshake authenticated, and whether it negotiated an application protocol at all, is never visible here. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-7
+        //# Endpoints MUST explicitly negotiate an application protocol.
+        //= type=exception
+        //= reason=the TLS handshake is the consumer's engine and not this package's: docs/DESIGN.md section 4 puts ztls and zssl on the other side of the seam, so what a handshake authenticated, and whether it negotiated an application protocol at all, is never visible here. See docs/DESIGN.md section 2 and section 6.
         pub const SecretError = error{
             /// A secret of the wrong length for the suite, or one installed at
             /// a level whose keys are already gone.
@@ -892,6 +915,86 @@ pub fn Connection(comptime config: Config) type {
             return self.peer_parameters[0..self.peer_parameters_len];
         }
 
+        // The receive half of the rule, which is the half this package can enforce:
+        // the extension this endpoint *sends* is built by the consumer's TLS engine,
+        // and `transport_parameters.parse` refuses a repeated identifier with
+        // `error.Malformed` before any of it is kept.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-7.4
+        //# An endpoint MUST NOT send a parameter more than once in a given
+        //# transport parameters extension.
+        //
+        // And the other side of the same loop: an identifier outside the set section
+        // 18.2 defines is skipped rather than refused, which is what lets a peer
+        // carrying an extension's parameter still talk to this one.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-7.4.2
+        //# An endpoint MUST ignore transport parameters that it does not
+        //# support.
+        //
+        // Section 7.4.1 is entirely about what a client remembers from one connection
+        // to the next, and this package remembers nothing: a `Connection` starts from
+        // `Options` and holds the peer's parameters only as the octets that arrived.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-7.4.1
+        //# The definition of a new transport parameter (Section 7.4.2) MUST
+        //# specify whether storing the transport parameter for 0-RTT is
+        //# mandatory, optional, or prohibited.
+        //= type=exception
+        //= reason=a requirement on the document that defines a new transport parameter rather than on code; `transport_parameters.zig` implements the parameters RFC 9000 section 18.2 defines and adds none of its own.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-7.4.1
+        //# A client MUST NOT use remembered values for the following
+        //# parameters: ack_delay_exponent, max_ack_delay,
+        //# initial_source_connection_id, original_destination_connection_id,
+        //# preferred_address, retry_source_connection_id, and
+        //# stateless_reset_token.
+        //= type=exception
+        //= reason=0-RTT is out of scope: this package remembers nothing between connections — a `Connection` is initialised from `Options` and holds the peer's parameters only as the octets that arrived — and no early-data key is ever installed. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-7.4.1
+        //# The client MUST use the server's new values in the handshake
+        //# instead; if the server does not provide new values, the default
+        //# values are used.
+        //= type=exception
+        //= reason=0-RTT is out of scope: this package remembers nothing between connections — a `Connection` is initialised from `Options` and holds the peer's parameters only as the octets that arrived — and no early-data key is ever installed. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-7.4.1
+        //# A client that attempts to send 0-RTT data MUST remember all other
+        //# transport parameters used by the server that it is able to process.
+        //= type=exception
+        //= reason=0-RTT is out of scope: this package remembers nothing between connections — a `Connection` is initialised from `Options` and holds the peer's parameters only as the octets that arrived — and no early-data key is ever installed. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-7.4.1
+        //# If 0-RTT data is accepted by the server, the server MUST NOT reduce
+        //# any limits or alter any values that might be violated by the client
+        //# with its 0-RTT data.
+        //= type=exception
+        //= reason=0-RTT is out of scope: this package remembers nothing between connections — a `Connection` is initialised from `Options` and holds the peer's parameters only as the octets that arrived — and no early-data key is ever installed. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-7.4.1
+        //# In particular, a server that accepts 0-RTT data MUST NOT set values
+        //# for the following parameters (Section 18.2) that are smaller than
+        //# the remembered values of the parameters. *
+        //# active_connection_id_limit * initial_max_data *
+        //# initial_max_stream_data_bidi_local *
+        //# initial_max_stream_data_bidi_remote * initial_max_stream_data_uni *
+        //# initial_max_streams_bidi * initial_max_streams_uni Omitting or
+        //# setting a zero value for certain transport parameters can result in
+        //# 0-RTT data being enabled but not usable.
+        //= type=exception
+        //= reason=0-RTT is out of scope: this package remembers nothing between connections — a `Connection` is initialised from `Options` and holds the peer's parameters only as the octets that arrived — and no early-data key is ever installed. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-7.4.1
+        //# A server MUST reject 0-RTT data if the restored values for transport
+        //# parameters cannot be supported.
+        //= type=exception
+        //= reason=0-RTT is out of scope: this package remembers nothing between connections — a `Connection` is initialised from `Options` and holds the peer's parameters only as the octets that arrived — and no early-data key is ever installed. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-7.4.1
+        //# When sending frames in 0-RTT packets, a client MUST only use
+        //# remembered transport parameters; importantly, it MUST NOT use
+        //# updated values that it learns from the server's updated transport
+        //# parameters or from frames received in 1-RTT packets.
+        //= type=exception
+        //= reason=0-RTT is out of scope: this package remembers nothing between connections — a `Connection` is initialised from `Options` and holds the peer's parameters only as the octets that arrived — and no early-data key is ever installed. See docs/DESIGN.md section 2 and section 6.
         /// Hand over the peer's transport parameters extension.
         pub fn transportParametersIn(
             self: *Self,
@@ -1346,6 +1449,25 @@ pub fn Connection(comptime config: Config) type {
             //# packet, with the following two exceptions.
             //= type=exception
             //= reason=version negotiation is out of scope for this slice; a connection here speaks one version. See docs/DESIGN.md section 2, which puts the QUIC connection state machine in this package and leaves the packet types that begin a *different* connection to the consumer.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-6.1
+            //# An endpoint MUST NOT send a Version Negotiation packet in
+            //# response to receiving a Version Negotiation packet.
+            //= type=exception
+            //= reason=version negotiation is out of scope; a connection here speaks QUIC version 1, and a Version Negotiation packet has no encryption level, so it leaves `receivePacket` discarded. Deciding to try another version means beginning a different connection, which is the consumer's, per docs/DESIGN.md section 2 and section 6.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-6.2
+            //# A client MUST discard any Version Negotiation packet if it has
+            //# received and successfully processed any other packet, including
+            //# an earlier Version Negotiation packet.
+            //= type=exception
+            //= reason=version negotiation is out of scope; a connection here speaks QUIC version 1, and a Version Negotiation packet has no encryption level, so it leaves `receivePacket` discarded. Deciding to try another version means beginning a different connection, which is the consumer's, per docs/DESIGN.md section 2 and section 6.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-6.2
+            //# A client MUST discard a Version Negotiation packet that lists
+            //# the QUIC version selected by the client.
+            //= type=exception
+            //= reason=version negotiation is out of scope; a connection here speaks QUIC version 1, and a Version Negotiation packet has no encryption level, so it leaves `receivePacket` discarded. Deciding to try another version means beginning a different connection, which is the consumer's, per docs/DESIGN.md section 2 and section 6.
             //
             // Retry is refused here for the same reason and is not excused: the
             // integrity tag and the key re-derivation it implies are written
@@ -2274,6 +2396,13 @@ pub fn Connection(comptime config: Config) type {
             //# is from a new encryption level, it is saved for later processing
             //# by TLS.
             //= type=todo
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-7.5
+            //# Packets containing discarded CRYPTO frames MUST be acknowledged
+            //# because the packet has been received and processed by the
+            //# transport even though the CRYPTO frame was discarded.
+            //= type=exception
+            //= reason=this package never discards a CRYPTO frame, so there is no discarded frame to acknowledge: `Reassembler` buffers out-of-order handshake data up to `crypto_octets`, and a flow that outgrows it closes the connection with section 7.5's CRYPTO_BUFFER_EXCEEDED rather than dropping anything. The rule governs the other choice section 7.5 offers, which this package does not make.
             stream.received.push(value.offset, value.data) catch |err| return switch (err) {
                 // A CRYPTO stream that outruns its buffer is a resource limit
                 // rather than a peer breaking a rule, and section 7.5 gives it
