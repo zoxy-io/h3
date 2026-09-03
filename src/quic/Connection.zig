@@ -305,6 +305,47 @@ pub fn Connection(comptime config: Config) type {
         const Self = @This();
 
         pub const datagram_octets: u32 = config.datagram_octets;
+        // What `datagram_octets` is and is not. It is a comptime bound on what this
+        // package will build; it is not a discovered path MTU, and nothing here can
+        // discover one.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-14
+        //# UDP datagrams MUST NOT be fragmented at the IP layer.
+        //= type=exception
+        //= reason=path MTU discovery is the consumer's: it needs the socket, its options and the ICMP messages the kernel delivers beside it, and none of the three crosses the seam of docs/DESIGN.md section 3. This package takes `datagram_octets` as a comptime constant that a comptime assert holds at or above section 14's 1200-octet floor. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-14
+        //# In IPv4 [IPv4], the Don't Fragment (DF) bit MUST be set if possible,
+        //# to prevent fragmentation on the path.
+        //= type=exception
+        //= reason=path MTU discovery is the consumer's: it needs the socket, its options and the ICMP messages the kernel delivers beside it, and none of the three crosses the seam of docs/DESIGN.md section 3. This package takes `datagram_octets` as a comptime constant that a comptime assert holds at or above section 14's 1200-octet floor. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-14.2
+        //# If a QUIC endpoint determines that the PMTU between any pair of
+        //# local and remote IP addresses cannot support the smallest allowed
+        //# maximum datagram size of 1200 bytes, it MUST immediately cease
+        //# sending QUIC packets, except for those in PMTU probes or those
+        //# containing CONNECTION_CLOSE frames, on the affected path.
+        //= type=exception
+        //= reason=path MTU discovery is the consumer's: it needs the socket, its options and the ICMP messages the kernel delivers beside it, and none of the three crosses the seam of docs/DESIGN.md section 3. This package takes `datagram_octets` as a comptime constant that a comptime assert holds at or above section 14's 1200-octet floor. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-14.2.1
+        //# An endpoint MUST ignore an ICMP message that claims the PMTU has
+        //# decreased below QUIC's smallest allowed maximum datagram size.
+        //= type=exception
+        //= reason=path MTU discovery is the consumer's: it needs the socket, its options and the ICMP messages the kernel delivers beside it, and none of the three crosses the seam of docs/DESIGN.md section 3. This package takes `datagram_octets` as a comptime constant that a comptime assert holds at or above section 14's 1200-octet floor. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-14.2.1
+        //# ICMP message validation MUST include matching IP addresses and UDP
+        //# ports [RFC8085] and, when possible, connection IDs to an active QUIC
+        //# session.
+        //= type=exception
+        //= reason=path MTU discovery is the consumer's: it needs the socket, its options and the ICMP messages the kernel delivers beside it, and none of the three crosses the seam of docs/DESIGN.md section 3. This package takes `datagram_octets` as a comptime constant that a comptime assert holds at or above section 14's 1200-octet floor. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-14.2.1
+        //# An endpoint MUST NOT increase the PMTU based on ICMP messages; see
+        //# Item 6 in Section 3 of [DPLPMTUD].
+        //= type=exception
+        //= reason=path MTU discovery is the consumer's: it needs the socket, its options and the ICMP messages the kernel delivers beside it, and none of the three crosses the seam of docs/DESIGN.md section 3. This package takes `datagram_octets` as a comptime constant that a comptime assert holds at or above section 14's 1200-octet floor. See docs/DESIGN.md section 2 and section 6.
 
         /// What one connection costs, in octets.
         ///
@@ -316,6 +357,68 @@ pub fn Connection(comptime config: Config) type {
         side: Side,
         state: State = .handshaking,
 
+        // Section 5.1: a connection here carries one identifier in each direction and
+        // never a second. The four fields below are the whole set — what this endpoint
+        // answers to, what it addresses the peer as, the identifier the Initial keys
+        // came from, and the peer's — so every rule about *issuing* more of them, and
+        // about the unlinkability that having more is for, is somebody else's.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-5.1
+        //# Connection IDs MUST NOT contain any information that can be used by
+        //# an external observer (that is, one that does not cooperate with the
+        //# issuer) to correlate them with other connection IDs for the same
+        //# connection.
+        //= type=exception
+        //= reason=the identifiers are the consumer's: a client draws its own and a server takes the client's off the wire, so whether one correlates with another is decided where they are chosen. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-5.1
+        //# As a trivial example, this means the same connection ID MUST NOT be
+        //# issued more than once on the same connection.
+        //= type=exception
+        //= reason=connection-ID issuance beyond Options.source is out of scope: this endpoint issues exactly one identifier and generates no NEW_CONNECTION_ID or RETIRE_CONNECTION_ID frame, so there is no second identifier to number, retire or count. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-5.1
+        //# An endpoint MUST NOT use the same IP address and port for multiple
+        //# concurrent connections with zero-length connection IDs, unless it is
+        //# certain that those protocol features are not in use.
+        //= type=exception
+        //= reason=this package opens no socket and never sees an address: the seam of docs/DESIGN.md section 3 hands over a datagram, so which IP and port carry a connection is the consumer's choice and not this slice's. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-5.1.1
+        //# The sequence number on each newly issued connection ID MUST increase
+        //# by 1.
+        //= type=exception
+        //= reason=connection-ID issuance beyond Options.source is out of scope: this endpoint issues exactly one identifier and generates no NEW_CONNECTION_ID or RETIRE_CONNECTION_ID frame, so there is no second identifier to number, retire or count. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-5.1.1
+        //# An endpoint MUST NOT provide more connection IDs than the peer's
+        //# limit.
+        //= type=exception
+        //= reason=connection-ID issuance beyond Options.source is out of scope: this endpoint issues exactly one identifier and generates no NEW_CONNECTION_ID or RETIRE_CONNECTION_ID frame, so there is no second identifier to number, retire or count. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-5.1.1
+        //# After processing a NEW_CONNECTION_ID frame and adding and retiring
+        //# active connection IDs, if the number of active connection IDs
+        //# exceeds the value advertised in its active_connection_id_limit
+        //# transport parameter, an endpoint MUST close the connection with an
+        //# error of type CONNECTION_ID_LIMIT_ERROR.
+        //= type=exception
+        //= reason=connection-ID issuance beyond Options.source is out of scope: this endpoint issues exactly one identifier and generates no NEW_CONNECTION_ID or RETIRE_CONNECTION_ID frame, so there is no second identifier to number, retire or count. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-5.1.2
+        //# Upon receipt of an increased Retire Prior To field, the peer MUST
+        //# stop using the corresponding connection IDs and retire them with
+        //# RETIRE_CONNECTION_ID frames before adding the newly provided
+        //# connection ID to the set of active connection IDs.
+        //= type=exception
+        //= reason=connection-ID issuance beyond Options.source is out of scope: this endpoint issues exactly one identifier and generates no NEW_CONNECTION_ID or RETIRE_CONNECTION_ID frame, so there is no second identifier to number, retire or count. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-5.1.2
+        //# An endpoint MUST NOT forget a connection ID without retiring it,
+        //# though it MAY choose to treat having connection IDs in need of
+        //# retirement that exceed this limit as a connection error of type
+        //# CONNECTION_ID_LIMIT_ERROR.
+        //= type=exception
+        //= reason=connection-ID issuance beyond Options.source is out of scope: this endpoint issues exactly one identifier and generates no NEW_CONNECTION_ID or RETIRE_CONNECTION_ID frame, so there is no second identifier to number, retire or count. See docs/DESIGN.md section 2 and section 6.
         /// What this endpoint puts in the Destination field of what it sends.
         /// A server replaces it with the client's source identifier; a client
         /// replaces it when the server's first packet names a new one.
@@ -344,6 +447,92 @@ pub fn Connection(comptime config: Config) type {
         levels: [Level.count]CryptoLevel = @splat(.{}),
         spaces: [Space.count]PacketSpace = @splat(.{}),
 
+        // Section 9 in full. There is no field below for a path, and that is the
+        // whole of the argument: an address never crosses the seam, so this endpoint
+        // cannot observe a change of one, cannot initiate a move to another, and has
+        // no "last validated peer address" to revert to.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-9
+        //# An endpoint MUST NOT initiate connection migration before the
+        //# handshake is confirmed, as defined in Section 4.1.2 of [QUIC-TLS].
+        //= type=exception
+        //= reason=connection migration is out of scope: a connection here has exactly one path and never learns an address, because the seam of docs/DESIGN.md section 3 hands over a datagram rather than a peer. There is no second path to probe, revert to or reset a controller for. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-9
+        //# If the peer sent the disable_active_migration transport parameter,
+        //# an endpoint also MUST NOT send packets (including probing packets;
+        //# see Section 9.1) from a different local address to the address the
+        //# peer used during the handshake, unless the endpoint has acted on a
+        //# preferred_address transport parameter from the peer.
+        //= type=exception
+        //= reason=connection migration is out of scope: a connection here has exactly one path and never learns an address, because the seam of docs/DESIGN.md section 3 hands over a datagram rather than a peer. There is no second path to probe, revert to or reset a controller for. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-9
+        //# If the peer violates this requirement, the endpoint MUST either drop
+        //# the incoming packets on that path without generating a Stateless
+        //# Reset or proceed with path validation and allow the peer to migrate.
+        //= type=exception
+        //= reason=connection migration is out of scope: a connection here has exactly one path and never learns an address, because the seam of docs/DESIGN.md section 3 hands over a datagram rather than a peer. There is no second path to probe, revert to or reset a controller for. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-9
+        //# If a client receives packets from an unknown server address, the
+        //# client MUST discard these packets.
+        //= type=exception
+        //= reason=connection migration is out of scope: a connection here has exactly one path and never learns an address, because the seam of docs/DESIGN.md section 3 hands over a datagram rather than a peer. There is no second path to probe, revert to or reset a controller for. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-9.3
+        //# If the recipient permits the migration, it MUST send subsequent
+        //# packets to the new peer address and MUST initiate path validation
+        //# (Section 8.2) to verify the peer's ownership of the address if
+        //# validation is not already underway.
+        //= type=exception
+        //= reason=connection migration is out of scope: a connection here has exactly one path and never learns an address, because the seam of docs/DESIGN.md section 3 hands over a datagram rather than a peer. There is no second path to probe, revert to or reset a controller for. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-9.3
+        //# An endpoint MAY send data to an unvalidated peer address, but it
+        //# MUST protect against potential attacks as described in Sections
+        //# 9.3.1 and 9.3.2. An endpoint MAY skip validation of a peer address
+        //# if that address has been seen recently.
+        //= type=exception
+        //= reason=connection migration is out of scope: a connection here has exactly one path and never learns an address, because the seam of docs/DESIGN.md section 3 hands over a datagram rather than a peer. There is no second path to probe, revert to or reset a controller for. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-9.3.2
+        //# To protect the connection from failing due to such a spurious
+        //# migration, an endpoint MUST revert to using the last validated peer
+        //# address when validation of a new peer address fails.
+        //= type=exception
+        //= reason=connection migration is out of scope: a connection here has exactly one path and never learns an address, because the seam of docs/DESIGN.md section 3 hands over a datagram rather than a peer. There is no second path to probe, revert to or reset a controller for. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-9.3.2
+        //# If an endpoint has no state about the last validated peer address,
+        //# it MUST close the connection silently by discarding all connection
+        //# state.
+        //= type=exception
+        //= reason=connection migration is out of scope: a connection here has exactly one path and never learns an address, because the seam of docs/DESIGN.md section 3 hands over a datagram rather than a peer. There is no second path to probe, revert to or reset a controller for. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-9.3.3
+        //# In response to an apparent migration, endpoints MUST validate the
+        //# previously active path using a PATH_CHALLENGE frame.
+        //= type=exception
+        //= reason=connection migration is out of scope: a connection here has exactly one path and never learns an address, because the seam of docs/DESIGN.md section 3 hands over a datagram rather than a peer. There is no second path to probe, revert to or reset a controller for. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-9.5
+        //# An endpoint MUST NOT reuse a connection ID when sending from more
+        //# than one local address -- for example, when initiating connection
+        //# migration as described in Section 9.2 or when probing a new network
+        //# path as described in Section 9.1. Similarly, an endpoint MUST NOT
+        //# reuse a connection ID when sending to more than one destination
+        //# address.
+        //= type=exception
+        //= reason=connection migration is out of scope: a connection here has exactly one path and never learns an address, because the seam of docs/DESIGN.md section 3 hands over a datagram rather than a peer. There is no second path to probe, revert to or reset a controller for. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-9.7
+        //# The flow label generation MUST be designed to minimize the chances
+        //# of linkability with a previously used flow label, as a stable flow
+        //# label would enable correlating activity on multiple paths; see
+        //# Section 9.5. [RFC6437] suggests deriving values using a pseudorandom
+        //# function to generate flow labels.
+        //= type=exception
+        //= reason=an IPv6 flow label is a field of an IP header, and this package writes no IP header and opens no socket: the seam of docs/DESIGN.md section 3 is a UDP payload. See docs/DESIGN.md section 2 and section 6.
         /// Section 8.1's accounting. A client validates its peer by construction
         /// — it chose the address — so this only ever restrains a server.
         address_validated: bool,
@@ -356,6 +545,29 @@ pub fn Connection(comptime config: Config) type {
         peer_parameters: [config.transport_parameters_octets]u8 = @splat(0),
         peer_parameters_len: u32 = 0,
 
+        // Section 9.4 is what a migration would owe the controller below, and the
+        // reason `Recovery` holds one window and one round-trip estimate rather than
+        // one per path: there is only ever one path to hold them for.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-9.4
+        //# Packets sent on the old path MUST NOT contribute to congestion
+        //# control or RTT estimation for the new path.
+        //= type=exception
+        //= reason=connection migration is out of scope: a connection here has exactly one path and never learns an address, because the seam of docs/DESIGN.md section 3 hands over a datagram rather than a peer. There is no second path to probe, revert to or reset a controller for. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-9.4
+        //# On confirming a peer's ownership of its new address, an endpoint
+        //# MUST immediately reset the congestion controller and round-trip time
+        //# estimator for the new path to initial values (see Appendices A.3 and
+        //# B.3 of [QUIC-RECOVERY]) unless the only change in the peer's address
+        //# is its port number.
+        //= type=exception
+        //= reason=connection migration is out of scope: a connection here has exactly one path and never learns an address, because the seam of docs/DESIGN.md section 3 hands over a datagram rather than a peer. There is no second path to probe, revert to or reset a controller for. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-9.4
+        //# This timer SHOULD be set as described in Section 6.2.1 of
+        //# [QUIC-RECOVERY] and MUST NOT be more aggressive.
+        //= type=exception
+        //= reason=connection migration is out of scope: a connection here has exactly one path and never learns an address, because the seam of docs/DESIGN.md section 3 hands over a datagram rather than a peer. There is no second path to probe, revert to or reset a controller for. See docs/DESIGN.md section 2 and section 6.
         /// RFC 9002: what decides that a packet was lost, and when to probe.
         recovery: Recovery = .{},
 
@@ -390,6 +602,13 @@ pub fn Connection(comptime config: Config) type {
         close_is_application: bool = false,
         close_pending: bool = false,
 
+        // The client's first Destination Connection ID arrives here already chosen,
+        // and its length is never checked against section 7.2's floor: an eight-octet
+        // minimum is what makes the identifier hard to guess for an off-path attacker
+        // who wants to forge an Initial, and `ConnectionId.octets_min` is zero.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-7.2
+        //# This Destination Connection ID MUST be at least 8 bytes in length.
+        //= type=todo
         pub const Options = struct {
             side: Side,
             /// The Destination Connection ID of the client's first Initial.
@@ -424,6 +643,72 @@ pub fn Connection(comptime config: Config) type {
 
         // ---------------------------------------------------------------- TLS
 
+        // Section 4's rules about the handshake itself, gathered at the entry point
+        // that is the whole of this package's view of TLS: a secret, a level and a
+        // direction. What negotiated the secret, whether it authenticated anybody,
+        // and what it would do about an alert are all on the other side.
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-4.2
+        //# Clients MUST NOT offer TLS versions older than 1.3.
+        //= type=exception
+        //= reason=the TLS handshake is the consumer's engine and not this package's: docs/DESIGN.md section 4 puts ztls and zssl on the other side of the seam, and what crosses it is handshake bytes and traffic secrets. Nothing here sees a TLS version, a certificate, an alert or a handshake message, so none of these rules has a place to be checked. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-4.2
+        //# An endpoint MUST terminate the connection if a version of TLS older
+        //# than 1.3 is negotiated.
+        //= type=exception
+        //= reason=the TLS handshake is the consumer's engine and not this package's: docs/DESIGN.md section 4 puts ztls and zssl on the other side of the seam, and what crosses it is handshake bytes and traffic secrets. Nothing here sees a TLS version, a certificate, an alert or a handshake message, so none of these rules has a place to be checked. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-4.4
+        //# A client MUST authenticate the identity of the server.
+        //= type=exception
+        //= reason=the TLS handshake is the consumer's engine and not this package's: docs/DESIGN.md section 4 puts ztls and zssl on the other side of the seam, and what crosses it is handshake bytes and traffic secrets. Nothing here sees a TLS version, a certificate, an alert or a handshake message, so none of these rules has a place to be checked. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-4.4
+        //# A server MUST NOT use post-handshake client authentication (as
+        //# defined in Section 4.6.2 of [TLS13]) because the multiplexing
+        //# offered by QUIC prevents clients from correlating the certificate
+        //# request with the application-level event that triggered it (see
+        //# [HTTP2-TLS13]).
+        //= type=exception
+        //= reason=the TLS handshake is the consumer's engine and not this package's: docs/DESIGN.md section 4 puts ztls and zssl on the other side of the seam, and what crosses it is handshake bytes and traffic secrets. Nothing here sees a TLS version, a certificate, an alert or a handshake message, so none of these rules has a place to be checked. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-4.4
+        //# More specifically, servers MUST NOT send post- handshake TLS
+        //# CertificateRequest messages, and clients MUST treat receipt of such
+        //# messages as a connection error of type PROTOCOL_VIOLATION.
+        //= type=exception
+        //= reason=the TLS handshake is the consumer's engine and not this package's: docs/DESIGN.md section 4 puts ztls and zssl on the other side of the seam, and what crosses it is handshake bytes and traffic secrets. Nothing here sees a TLS version, a certificate, an alert or a handshake message, so none of these rules has a place to be checked. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-4.8
+        //# As QUIC provides alternative mechanisms for connection termination
+        //# and the TLS connection is only closed if an error is encountered, a
+        //# QUIC endpoint MUST treat any alert from TLS as if it were at the
+        //# "fatal" level.
+        //= type=exception
+        //= reason=the TLS handshake is the consumer's engine and not this package's: docs/DESIGN.md section 4 puts ztls and zssl on the other side of the seam, and what crosses it is handshake bytes and traffic secrets. Nothing here sees a TLS version, a certificate, an alert or a handshake message, so none of these rules has a place to be checked. See docs/DESIGN.md section 2 and section 6.
+        //
+        // RFC 9000 section 7 states what the handshake has to deliver before any of
+        // this matters, and every item on its list is delivered on the other side of
+        // the seam: authentication, the transport parameter exchange's
+        // confidentiality, and the application protocol.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-7
+        //# The cryptographic handshake MUST provide the following properties: *
+        //# authenticated key exchange, where - a server is always
+        //# authenticated, - a client is optionally authenticated, - every
+        //# connection produces distinct and unrelated keys, and - keying
+        //# material is usable for packet protection for both 0-RTT and 1-RTT
+        //# packets. * authenticated exchange of values for transport parameters
+        //# of both endpoints, and confidentiality protection for server
+        //# transport parameters (see Section 7.4). * authenticated negotiation
+        //# of an application protocol (TLS uses Application-Layer Protocol
+        //# Negotiation (ALPN) [ALPN] for this purpose).
+        //= type=exception
+        //= reason=the TLS handshake is the consumer's engine and not this package's: docs/DESIGN.md section 4 puts ztls and zssl on the other side of the seam, so what a handshake authenticated, and whether it negotiated an application protocol at all, is never visible here. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-7
+        //# Endpoints MUST explicitly negotiate an application protocol.
+        //= type=exception
+        //= reason=the TLS handshake is the consumer's engine and not this package's: docs/DESIGN.md section 4 puts ztls and zssl on the other side of the seam, so what a handshake authenticated, and whether it negotiated an application protocol at all, is never visible here. See docs/DESIGN.md section 2 and section 6.
         pub const SecretError = error{
             /// A secret of the wrong length for the suite, or one installed at
             /// a level whose keys are already gone.
@@ -441,6 +726,17 @@ pub fn Connection(comptime config: Config) type {
         ) SecretError!void {
             if (secret.length != suite.hashOctets()) return error.Rejected;
             const keys: crypto.Keys = .fromSecret(suite, secret);
+
+            // Nothing checks the level below before installing this one. A peer that
+            // sends a CRYPTO frame at Initial, then hands over Handshake keys before the
+            // consumer has read those octets back out through `cryptoOut`, gets the new
+            // level installed and the old flow's remainder silently stranded.
+            //= https://www.rfc-editor.org/rfc/rfc9001#section-4.1.3
+            //# When TLS provides keys for a higher encryption level, if there
+            //# is data from a previous encryption level that TLS has not
+            //# consumed, this MUST be treated as a connection error of type
+            //# PROTOCOL_VIOLATION.
+            //= type=todo
             switch (direction) {
                 .send => self.send_keys[@intFromEnum(level)] = keys,
                 .receive => self.receive_keys[@intFromEnum(level)] = keys,
@@ -503,6 +799,55 @@ pub fn Connection(comptime config: Config) type {
             }
         }
 
+        // Section 8.1's application protocol negotiation, in full. The handshake
+        // crosses here as octets and leaves as octets; which protocol they agreed on,
+        // and whether they agreed at all, is a fact only the consumer's TLS engine
+        // ever holds.
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-8.1
+        //# Unless another mechanism is used for agreeing on an application
+        //# protocol, endpoints MUST use ALPN for this purpose.
+        //= type=exception
+        //= reason=ALPN is negotiated inside the TLS handshake, which docs/DESIGN.md section 4 puts in the consumer's engine: `cryptoIn` and `cryptoOut` carry the handshake as opaque octets, so nothing here can read a protocol list, select from one, or raise no_application_protocol. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-8.1
+        //# When using ALPN, endpoints MUST immediately close a connection (see
+        //# Section 10.2 of [QUIC-TRANSPORT]) with a no_application_protocol TLS
+        //# alert (QUIC error code 0x0178; see Section 4.8) if an application
+        //# protocol is not negotiated.
+        //= type=exception
+        //= reason=ALPN is negotiated inside the TLS handshake, which docs/DESIGN.md section 4 puts in the consumer's engine: `cryptoIn` and `cryptoOut` carry the handshake as opaque octets, so nothing here can read a protocol list, select from one, or raise no_application_protocol. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-8.1
+        //# While [ALPN] only specifies that servers use this alert, QUIC
+        //# clients MUST use error 0x0178 to terminate a connection when ALPN
+        //# negotiation fails.
+        //= type=exception
+        //= reason=ALPN is negotiated inside the TLS handshake, which docs/DESIGN.md section 4 puts in the consumer's engine: `cryptoIn` and `cryptoOut` carry the handshake as opaque octets, so nothing here can read a protocol list, select from one, or raise no_application_protocol. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-8.1
+        //# Servers MUST select an application protocol compatible with the QUIC
+        //# version that the client has selected.
+        //= type=exception
+        //= reason=ALPN is negotiated inside the TLS handshake, which docs/DESIGN.md section 4 puts in the consumer's engine: `cryptoIn` and `cryptoOut` carry the handshake as opaque octets, so nothing here can read a protocol list, select from one, or raise no_application_protocol. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-8.1
+        //# The server MUST treat the inability to select a compatible
+        //# application protocol as a connection error of type 0x0178
+        //# (no_application_protocol).
+        //= type=exception
+        //= reason=ALPN is negotiated inside the TLS handshake, which docs/DESIGN.md section 4 puts in the consumer's engine: `cryptoIn` and `cryptoOut` carry the handshake as opaque octets, so nothing here can read a protocol list, select from one, or raise no_application_protocol. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-8.1
+        //# Similarly, a client MUST treat the selection of an incompatible
+        //# application protocol by a server as a connection error of type
+        //# 0x0178.
+        //= type=exception
+        //= reason=ALPN is negotiated inside the TLS handshake, which docs/DESIGN.md section 4 puts in the consumer's engine: `cryptoIn` and `cryptoOut` carry the handshake as opaque octets, so nothing here can read a protocol list, select from one, or raise no_application_protocol. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-8.4
+        //# A client MUST NOT request the use of the TLS 1.3 compatibility mode.
+        //= type=exception
+        //= reason=the TLS handshake is the consumer's engine and not this package's: docs/DESIGN.md section 4 puts ztls and zssl on the other side of the seam, and what crosses it is handshake bytes and traffic secrets. Nothing here builds a TLS extension, chooses a transport for one, or sends an alert. See docs/DESIGN.md section 2 and section 6.
         /// Queue handshake bytes for sending at `level`.
         pub fn cryptoIn(self: *Self, level: Level, data: []const u8) error{CryptoBufferExceeded}!void {
             assert(@intFromEnum(level) < self.levels.len);
@@ -539,17 +884,122 @@ pub fn Connection(comptime config: Config) type {
             self.levels[@intFromEnum(level)].received.consume(octets);
         }
 
+        // The extension crosses this seam as octets in both directions, and its
+        // *absence* is what nobody notices: a peer whose ClientHello or
+        // EncryptedExtensions carried no quic_transport_parameters simply never
+        // reaches `transportParametersIn`, `peer_parameters_len` stays zero, and the
+        // connection proceeds on defaults rather than closing with 0x016d.
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-8.2
+        //# Endpoints MUST send the quic_transport_parameters extension;
+        //# endpoints that receive ClientHello or EncryptedExtensions messages
+        //# without the quic_transport_parameters extension MUST close the
+        //# connection with an error of type 0x016d (equivalent to a fatal TLS
+        //# missing_extension alert, see Section 4.8).
+        //= type=todo
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-8.2
+        //# Endpoints MUST NOT send this extension in a TLS connection that does
+        //# not use QUIC (such as the use of TLS with TCP defined in [TLS13]).
+        //= type=exception
+        //= reason=the TLS handshake is the consumer's engine and not this package's: docs/DESIGN.md section 4 puts ztls and zssl on the other side of the seam, and what crosses it is handshake bytes and traffic secrets. Nothing here builds a TLS extension, chooses a transport for one, or sends an alert. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-8.2
+        //# A fatal unsupported_extension alert MUST be sent by an
+        //# implementation that supports this extension if the extension is
+        //# received when the transport is not QUIC.
+        //= type=exception
+        //= reason=the TLS handshake is the consumer's engine and not this package's: docs/DESIGN.md section 4 puts ztls and zssl on the other side of the seam, and what crosses it is handshake bytes and traffic secrets. Nothing here builds a TLS extension, chooses a transport for one, or sends an alert. See docs/DESIGN.md section 2 and section 6.
         /// The peer's transport parameters, as the extension's octets, or an
         /// empty slice before they arrive.
         pub fn transportParametersOut(self: *const Self) []const u8 {
             return self.peer_parameters[0..self.peer_parameters_len];
         }
 
+        // The receive half of the rule, which is the half this package can enforce:
+        // the extension this endpoint *sends* is built by the consumer's TLS engine,
+        // and `transport_parameters.parse` refuses a repeated identifier with
+        // `error.Malformed` before any of it is kept.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-7.4
+        //# An endpoint MUST NOT send a parameter more than once in a given
+        //# transport parameters extension.
+        //
+        // And the other side of the same loop: an identifier outside the set section
+        // 18.2 defines is skipped rather than refused, which is what lets a peer
+        // carrying an extension's parameter still talk to this one.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-7.4.2
+        //# An endpoint MUST ignore transport parameters that it does not
+        //# support.
+        //
+        // Section 7.4.1 is entirely about what a client remembers from one connection
+        // to the next, and this package remembers nothing: a `Connection` starts from
+        // `Options` and holds the peer's parameters only as the octets that arrived.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-7.4.1
+        //# The definition of a new transport parameter (Section 7.4.2) MUST
+        //# specify whether storing the transport parameter for 0-RTT is
+        //# mandatory, optional, or prohibited.
+        //= type=exception
+        //= reason=a requirement on the document that defines a new transport parameter rather than on code; `transport_parameters.zig` implements the parameters RFC 9000 section 18.2 defines and adds none of its own.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-7.4.1
+        //# A client MUST NOT use remembered values for the following
+        //# parameters: ack_delay_exponent, max_ack_delay,
+        //# initial_source_connection_id, original_destination_connection_id,
+        //# preferred_address, retry_source_connection_id, and
+        //# stateless_reset_token.
+        //= type=exception
+        //= reason=0-RTT is out of scope: this package remembers nothing between connections — a `Connection` is initialised from `Options` and holds the peer's parameters only as the octets that arrived — and no early-data key is ever installed. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-7.4.1
+        //# The client MUST use the server's new values in the handshake
+        //# instead; if the server does not provide new values, the default
+        //# values are used.
+        //= type=exception
+        //= reason=0-RTT is out of scope: this package remembers nothing between connections — a `Connection` is initialised from `Options` and holds the peer's parameters only as the octets that arrived — and no early-data key is ever installed. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-7.4.1
+        //# A client that attempts to send 0-RTT data MUST remember all other
+        //# transport parameters used by the server that it is able to process.
+        //= type=exception
+        //= reason=0-RTT is out of scope: this package remembers nothing between connections — a `Connection` is initialised from `Options` and holds the peer's parameters only as the octets that arrived — and no early-data key is ever installed. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-7.4.1
+        //# If 0-RTT data is accepted by the server, the server MUST NOT reduce
+        //# any limits or alter any values that might be violated by the client
+        //# with its 0-RTT data.
+        //= type=exception
+        //= reason=0-RTT is out of scope: this package remembers nothing between connections — a `Connection` is initialised from `Options` and holds the peer's parameters only as the octets that arrived — and no early-data key is ever installed. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-7.4.1
+        //# In particular, a server that accepts 0-RTT data MUST NOT set values
+        //# for the following parameters (Section 18.2) that are smaller than
+        //# the remembered values of the parameters. *
+        //# active_connection_id_limit * initial_max_data *
+        //# initial_max_stream_data_bidi_local *
+        //# initial_max_stream_data_bidi_remote * initial_max_stream_data_uni *
+        //# initial_max_streams_bidi * initial_max_streams_uni Omitting or
+        //# setting a zero value for certain transport parameters can result in
+        //# 0-RTT data being enabled but not usable.
+        //= type=exception
+        //= reason=0-RTT is out of scope: this package remembers nothing between connections — a `Connection` is initialised from `Options` and holds the peer's parameters only as the octets that arrived — and no early-data key is ever installed. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-7.4.1
+        //# A server MUST reject 0-RTT data if the restored values for transport
+        //# parameters cannot be supported.
+        //= type=exception
+        //= reason=0-RTT is out of scope: this package remembers nothing between connections — a `Connection` is initialised from `Options` and holds the peer's parameters only as the octets that arrived — and no early-data key is ever installed. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-7.4.1
+        //# When sending frames in 0-RTT packets, a client MUST only use
+        //# remembered transport parameters; importantly, it MUST NOT use
+        //# updated values that it learns from the server's updated transport
+        //# parameters or from frames received in 1-RTT packets.
+        //= type=exception
+        //= reason=0-RTT is out of scope: this package remembers nothing between connections — a `Connection` is initialised from `Options` and holds the peer's parameters only as the octets that arrived — and no early-data key is ever installed. See docs/DESIGN.md section 2 and section 6.
         /// Hand over the peer's transport parameters extension.
         pub fn transportParametersIn(
             self: *Self,
             octets: []const u8,
-        ) (error{TooLarge} || transport_parameters.ParseError)!void {
+        ) (error{TooLarge} || transport_parameters.ParseError || transport_parameters.ValidateError)!void {
             if (octets.len > config.transport_parameters_octets) return error.TooLarge;
             // Parsed before it is kept, so a malformed extension is refused
             // rather than stored and handed back to a consumer as if it were a
@@ -560,12 +1010,131 @@ pub fn Connection(comptime config: Config) type {
             //# invalid value as a connection error of type
             //# TRANSPORT_PARAMETER_ERROR.
             const parsed = try transport_parameters.parse(octets);
+            // Section 18.2's server-only parameters and section 7.3's presence
+            // rules. `transport_parameters.validate` implemented exactly this
+            // and had no caller anywhere in the tree — tested, and never
+            // wired in, which docs/VERIFICATION.md section 1 lists twice as the
+            // shape half these findings take. The peer's side is what decides
+            // which half applies, because the rule is about what the *sender*
+            // was allowed to include.
+            try transport_parameters.validate(&parsed, self.side.peer());
+            // Section 7.3's other half — matching `initial_source_connection_id`
+            // against the identifier the handshake actually carried — needs the
+            // peer's Source Connection ID, which a server learns from the first
+            // Initial and a client from the server's first long header.
+            if (parsed.initial_source_connection_id) |declared| {
+                if (self.peer_source) |carried| {
+                    if (!declared.eql(&carried)) return error.Malformed;
+                }
+            }
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-7.3
+            //# Endpoints MUST validate that received transport parameters match
+            //# received connection ID values.
+            //= type=todo
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-7.3
+            //# The values provided by a peer for these transport parameters
+            //# MUST match the values that an endpoint used in the Destination
+            //# and Source Connection ID fields of Initial packets that it sent
+            //# (and received, for servers).
+            //= type=todo
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-7.3
+            //# An endpoint MUST treat the absence of the
+            //# initial_source_connection_id transport parameter from either
+            //# endpoint or the absence of the
+            //# original_destination_connection_id transport parameter from the
+            //# server as a connection error of type TRANSPORT_PARAMETER_ERROR.
+            //= type=todo
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-7.3
+            //# An endpoint MUST treat the following as a connection error of
+            //# type TRANSPORT_PARAMETER_ERROR or PROTOCOL_VIOLATION: * absence
+            //# of the retry_source_connection_id transport parameter from the
+            //# server after receiving a Retry packet, * presence of the
+            //# retry_source_connection_id transport parameter when no Retry
+            //# packet was received, or * a mismatch between values received
+            //# from a peer in these transport parameters and the value sent in
+            //# the corresponding Destination or Source Connection ID fields of
+            //# Initial packets.
+            //= type=todo
 
             // Section 4.6: the peer's initial stream limits are limits on *us*,
             // and until this they were parsed by nobody. The data limits are
             // deliberately not applied here — `setConnectionSendLimit` and
             // `setSendLimit` are the consumer's seam for those and are already
             // driven by MAX_DATA and MAX_STREAM_DATA on the same path.
+            //
+            // `preferred_address` is one of the parameters parsed above and one of the
+            // four a client may not send, and nothing reads it: section 9.6's whole
+            // exchange is a migration the consumer would have to route, and routing is
+            // on the other side of the seam.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-9.6.1
+            //# If path validation fails, the client MUST continue sending all
+            //# future packets to the server's original IP address.
+            //= type=exception
+            //= reason=a server's preferred address is migration by another name and is out of scope: this package never sends the preferred_address transport parameter and never acts on one, and the address it would name is outside the seam of docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-9.6.2
+            //# A client that migrates to a preferred address MUST validate the
+            //# address it chooses before migrating; see Section 21.5.3. A
+            //# server might receive a packet addressed to its preferred IP
+            //# address at any time after it accepts a connection.
+            //= type=exception
+            //= reason=a server's preferred address is migration by another name and is out of scope: this package never sends the preferred_address transport parameter and never acts on one, and the address it would name is outside the seam of docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-9.6.2
+            //# If this packet contains a PATH_CHALLENGE frame, the server sends
+            //# a packet containing a PATH_RESPONSE frame as per Section 8.2.
+            //# The server MUST send non- probing packets from its original
+            //# address until it receives a non- probing packet from the client
+            //# at its preferred address and until the server has validated the
+            //# new path.
+            //= type=exception
+            //= reason=a server's preferred address is migration by another name and is out of scope: this package never sends the preferred_address transport parameter and never acts on one, and the address it would name is outside the seam of docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-9.6.2
+            //# The server MUST probe on the path toward the client from its
+            //# preferred address.
+            //= type=exception
+            //= reason=a server's preferred address is migration by another name and is out of scope: this package never sends the preferred_address transport parameter and never acts on one, and the address it would name is outside the seam of docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-9.6.2
+            //# A client MUST NOT use these for other connections, including
+            //# connections that are resumed from the current connection.
+            //= type=exception
+            //= reason=a server's preferred address is migration by another name and is out of scope: this package never sends the preferred_address transport parameter and never acts on one, and the address it would name is outside the seam of docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-9.6.3
+            //# If path validation of the server's preferred address succeeds,
+            //# the client MUST abandon validation of the original address and
+            //# migrate to using the server's preferred address.
+            //= type=exception
+            //= reason=a server's preferred address is migration by another name and is out of scope: this package never sends the preferred_address transport parameter and never acts on one, and the address it would name is outside the seam of docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-9.6.3
+            //# If packets received at the server's preferred address have a
+            //# different source address than observed from the client during
+            //# the handshake, the server MUST protect against potential attacks
+            //# as described in Sections 9.3.1 and 9.3.2. In addition to
+            //# intentional simultaneous migration, this might also occur
+            //# because the client's access network used a different NAT binding
+            //# for the server's preferred address.
+            //= type=exception
+            //= reason=a server's preferred address is migration by another name and is out of scope: this package never sends the preferred_address transport parameter and never acts on one, and the address it would name is outside the seam of docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-21.5
+            //# Any future extension that allows server migration MUST also
+            //# define countermeasures for forgery attacks.
+            //= type=exception
+            //= reason=connection migration and a server's preferred address are out of scope: a connection here has one path, never learns an address, and never sends preferred_address. See docs/DESIGN.md section 2 and section 6.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-21.5.3
+            //# A client MUST NOT send non-probing frames to a preferred address
+            //# prior to validating that address; see Section 8. This greatly
+            //# reduces the options that a server has to control the encrypted
+            //# portion of datagrams.
+            //= type=exception
+            //= reason=connection migration and a server's preferred address are out of scope: a connection here has one path, never learns an address, and never sends preferred_address. See docs/DESIGN.md section 2 and section 6.
             self.streams.setPeerStreamLimit(true, parsed.initial_max_streams_bidi);
             self.streams.setPeerStreamLimit(false, parsed.initial_max_streams_uni);
 
@@ -608,6 +1177,23 @@ pub fn Connection(comptime config: Config) type {
             assert(self.spaces[@intFromEnum(Space.handshake)].discarded);
         }
 
+        // QUIC's key update is this function and nothing else. The TLS message of
+        // the same name never appears on either side of the seam: `cryptoIn` and
+        // `cryptoOut` carry opaque octets, and only the consumer's engine can tell
+        // one handshake message from another.
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-6
+        //# Endpoints MUST NOT send a TLS KeyUpdate message.
+        //= type=exception
+        //= reason=the TLS handshake is the consumer's engine and not this package's: docs/DESIGN.md section 4 puts ztls and zssl on the other side of the seam, and what crosses it is handshake bytes and traffic secrets. Nothing here sees a TLS version, a certificate, an alert or a handshake message, so none of these rules has a place to be checked. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-6
+        //# Endpoints MUST treat the receipt of a TLS KeyUpdate message as a
+        //# connection error of type 0x010a, equivalent to a fatal TLS alert of
+        //# unexpected_message; see Section 4.8. Figure 9 shows a key update
+        //# process, where the initial set of keys used (identified with @M) are
+        //# replaced by updated keys (identified with @N).
+        //= type=exception
+        //= reason=the TLS handshake is the consumer's engine and not this package's: docs/DESIGN.md section 4 puts ztls and zssl on the other side of the seam, and what crosses it is handshake bytes and traffic secrets. Nothing here sees a TLS version, a certificate, an alert or a handshake message, so none of these rules has a place to be checked. See docs/DESIGN.md section 2 and section 6.
         pub fn updateKeys(self: *Self) void {
             const one = &self.one_rtt;
             const send_secret = one.send_secret orelse return;
@@ -706,6 +1292,102 @@ pub fn Connection(comptime config: Config) type {
         /// is the attack. So a decryption failure ends the datagram quietly and
         /// only a protocol violation by the authenticated peer returns an error.
         pub fn receive(self: *Self, datagram: []u8, now_ns: u64) ReceiveError!void {
+            // Section 10.3's detection would happen here, on the first packet of a
+            // datagram that cannot be opened, and it does not: this endpoint holds no
+            // reset token, advertises none, and would have nothing to compare against.
+            // The generating half is the same argument from the other side.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-10.3.1
+            //# However, the comparison MUST be performed when the first packet
+            //# in an incoming datagram either cannot be associated with a
+            //# connection or cannot be decrypted.
+            //= type=exception
+            //= reason=stateless reset is out of scope: it needs a static key and a token this package neither holds nor advertises, and detecting one means recognising a datagram that belongs to no connection — a decision made by whatever routes datagrams to a Connection, which is the consumer's, per docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-10.3.1
+            //# An endpoint MUST NOT check for any stateless reset tokens
+            //# associated with connection IDs it has not used or for connection
+            //# IDs that have been retired.
+            //= type=exception
+            //= reason=stateless reset is out of scope: it needs a static key and a token this package neither holds nor advertises, and detecting one means recognising a datagram that belongs to no connection — a decision made by whatever routes datagrams to a Connection, which is the consumer's, per docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-10.3.1
+            //# When comparing a datagram to stateless reset token values,
+            //# endpoints MUST perform the comparison without leaking
+            //# information about the value of the token.
+            //= type=exception
+            //= reason=stateless reset is out of scope: it needs a static key and a token this package neither holds nor advertises, and detecting one means recognising a datagram that belongs to no connection — a decision made by whatever routes datagrams to a Connection, which is the consumer's, per docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-10.3.1
+            //# If the last 16 bytes of the datagram are identical in value to a
+            //# stateless reset token, the endpoint MUST enter the draining
+            //# period and not send any further packets on this connection.
+            //= type=exception
+            //= reason=stateless reset is out of scope: it needs a static key and a token this package neither holds nor advertises, and detecting one means recognising a datagram that belongs to no connection — a decision made by whatever routes datagrams to a Connection, which is the consumer's, per docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-10.3
+            //# An endpoint MUST NOT send a Stateless Reset that is three times
+            //# or more larger than the packet it receives to avoid being used
+            //# for amplification.
+            //= type=exception
+            //= reason=stateless reset is out of scope: it needs a static key and a token this package neither holds nor advertises, and detecting one means recognising a datagram that belongs to no connection — a decision made by whatever routes datagrams to a Connection, which is the consumer's, per docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-10.3.2
+            //# The stateless reset token MUST be difficult to guess.
+            //= type=exception
+            //= reason=stateless reset is out of scope: it needs a static key and a token this package neither holds nor advertises, and detecting one means recognising a datagram that belongs to no connection — a decision made by whatever routes datagrams to a Connection, which is the consumer's, per docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-10.3.2
+            //# An endpoint that uses this design MUST either use the same
+            //# connection ID length for all connections or encode the length of
+            //# the connection ID such that it can be recovered without state.
+            //= type=exception
+            //= reason=stateless reset is out of scope: it needs a static key and a token this package neither holds nor advertises, and detecting one means recognising a datagram that belongs to no connection — a decision made by whatever routes datagrams to a Connection, which is the consumer's, per docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-10.3.2
+            //# This method for choosing the stateless reset token means that
+            //# the combination of connection ID and static key MUST NOT be used
+            //# for another connection.
+            //= type=exception
+            //= reason=stateless reset is out of scope: it needs a static key and a token this package neither holds nor advertises, and detecting one means recognising a datagram that belongs to no connection — a decision made by whatever routes datagrams to a Connection, which is the consumer's, per docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-10.3.2
+            //# A denial-of-service attack is possible if the same connection ID
+            //# is used by instances that share a static key or if an attacker
+            //# can cause a packet to be routed to an instance that has no state
+            //# but the same static key; see Section 21.11. A connection ID from
+            //# a connection that is reset by revealing the stateless reset
+            //# token MUST NOT be reused for new connections at nodes that share
+            //# a static key.
+            //= type=exception
+            //= reason=stateless reset is out of scope: it needs a static key and a token this package neither holds nor advertises, and detecting one means recognising a datagram that belongs to no connection — a decision made by whatever routes datagrams to a Connection, which is the consumer's, per docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-10.3.2
+            //# The same stateless reset token MUST NOT be used for multiple
+            //# connection IDs.
+            //= type=exception
+            //= reason=stateless reset is out of scope: it needs a static key and a token this package neither holds nor advertises, and detecting one means recognising a datagram that belongs to no connection — a decision made by whatever routes datagrams to a Connection, which is the consumer's, per docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-10.3.3
+            //# An endpoint MUST ensure that every Stateless Reset that it sends
+            //# is smaller than the packet that triggered it, unless it
+            //# maintains state sufficient to prevent looping.
+            //= type=exception
+            //= reason=stateless reset is out of scope: it needs a static key and a token this package neither holds nor advertises, and detecting one means recognising a datagram that belongs to no connection — a decision made by whatever routes datagrams to a Connection, which is the consumer's, per docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-21.11
+            //# To defend against this style of denial of service, endpoints
+            //# that share a static key for stateless resets (see Section
+            //# 10.3.2) MUST be arranged so that packets with a given connection
+            //# ID always arrive at an instance that has connection state,
+            //# unless that connection is no longer active.
+            //= type=exception
+            //= reason=stateless reset is out of scope: this endpoint holds no static key and no reset token, advertises none, and generates no reset — so it cannot be the oracle this section describes. How instances share connection state behind a load balancer is a deployment's question and outside the seam of docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-21.11
+            //# More generally, servers MUST NOT generate a stateless reset if a
+            //# connection with the corresponding connection ID could be active
+            //# on any endpoint using the same static key.
+            //= type=exception
+            //= reason=stateless reset is out of scope: this endpoint holds no static key and no reset token, advertises none, and generates no reset — so it cannot be the oracle this section describes. How instances share connection state behind a load balancer is a deployment's question and outside the seam of docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
             if (self.state == .draining) return;
 
             // Section 14.1: "A server MUST discard an Initial packet that is
@@ -758,6 +1440,11 @@ pub fn Connection(comptime config: Config) type {
             var packets: u32 = 0;
             while (offset < datagram.len) : (packets += 1) {
                 assert(packets <= datagram.len);
+                // `packet.parse` refuses anything shorter than a header, and a refusal ends
+                // the datagram rather than the connection.
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-10.3
+                //# Endpoints MUST discard packets that are too small to be
+                //# valid QUIC packets.
                 const parsed = packet.parse(datagram[offset..], self.source.length) catch return;
                 const consumed = parsed.octets;
                 assert(consumed >= 1);
@@ -774,6 +1461,25 @@ pub fn Connection(comptime config: Config) type {
             //= type=exception
             //= reason=version negotiation is out of scope for this slice; a connection here speaks one version. See docs/DESIGN.md section 2, which puts the QUIC connection state machine in this package and leaves the packet types that begin a *different* connection to the consumer.
             //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-6.1
+            //# An endpoint MUST NOT send a Version Negotiation packet in
+            //# response to receiving a Version Negotiation packet.
+            //= type=exception
+            //= reason=version negotiation is out of scope; a connection here speaks QUIC version 1, and a Version Negotiation packet has no encryption level, so it leaves `receivePacket` discarded. Deciding to try another version means beginning a different connection, which is the consumer's, per docs/DESIGN.md section 2 and section 6.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-6.2
+            //# A client MUST discard any Version Negotiation packet if it has
+            //# received and successfully processed any other packet, including
+            //# an earlier Version Negotiation packet.
+            //= type=exception
+            //= reason=version negotiation is out of scope; a connection here speaks QUIC version 1, and a Version Negotiation packet has no encryption level, so it leaves `receivePacket` discarded. Deciding to try another version means beginning a different connection, which is the consumer's, per docs/DESIGN.md section 2 and section 6.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-6.2
+            //# A client MUST discard a Version Negotiation packet that lists
+            //# the QUIC version selected by the client.
+            //= type=exception
+            //= reason=version negotiation is out of scope; a connection here speaks QUIC version 1, and a Version Negotiation packet has no encryption level, so it leaves `receivePacket` discarded. Deciding to try another version means beginning a different connection, which is the consumer's, per docs/DESIGN.md section 2 and section 6.
+            //
             // Retry is refused here for the same reason and is not excused: the
             // integrity tag and the key re-derivation it implies are written
             // (`original_destination` exists for it) and nothing calls them.
@@ -781,6 +1487,38 @@ pub fn Connection(comptime config: Config) type {
             //# A client MUST accept and process at most one Retry packet for each
             //# connection attempt.
             //= type=todo
+            //
+            // A long header in a version this package does not implement parses to
+            // `unsupported_version`, which has no encryption level, so it leaves here
+            // discarded rather than processed. Section 5.2.2's Version Negotiation reply
+            // is the consumer's, and is excused at the top of `receivePacket`.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-5.2.1
+            //# If a client receives a packet that uses a different version than
+            //# it initially selected, it MUST discard that packet.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-5.2.2
+            //# Servers MUST drop smaller packets that specify unsupported
+            //# versions.
+            //
+            // The sweep of the same rule: every path below that cannot proceed returns
+            // rather than closing, so a packet this connection cannot account for is
+            // dropped and the connection survives it.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-5.2.2
+            //# Servers MUST drop incoming packets under all other
+            //# circumstances.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-5.2.3
+            //# Server deployments that use this simple form of load balancing
+            //# MUST avoid the creation of a stateless reset oracle; see Section
+            //# 21.11.
+            //= type=exception
+            //= reason=stateless reset is out of scope; nothing here holds a reset token or recognises one, and a load balancer's addressing is outside the seam of docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-21.12
+            //# Future versions of QUIC that use Version Negotiation packets
+            //# MUST define a mechanism that is robust against version downgrade
+            //# attacks.
+            //= type=exception
+            //= reason=version negotiation is out of scope; a connection here speaks QUIC version 1 and the packet types that would begin a different one are the consumer's, per docs/DESIGN.md section 2. The rule is in any case addressed to a future version of QUIC rather than to an implementation of this one.
             const level = header.level() orelse return; // Retry, Version Negotiation: not this slice.
             const offset = header.packetNumberOffset() orelse return;
             const index = @intFromEnum(level);
@@ -791,6 +1529,46 @@ pub fn Connection(comptime config: Config) type {
             //= https://www.rfc-editor.org/rfc/rfc9001#section-5.7
             //# Endpoints in either role MUST NOT decrypt 1-RTT packets from
             //# their peer prior to completing the handshake.
+            //
+            // Both roles, and both by the same mechanism as the rule already cited above:
+            // a 1-RTT read key exists only once the consumer's engine has handed one
+            // over, and it does that when the handshake completes.
+            //= https://www.rfc-editor.org/rfc/rfc9001#section-5.7
+            //# A server MUST NOT process incoming 1-RTT protected packets
+            //# before the TLS handshake is complete.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9001#section-5.7
+            //# Even if it has 1-RTT secrets, a client MUST NOT process incoming
+            //# 1-RTT protected packets before the TLS handshake is complete.
+            //
+            // The same line answers section 5.6: no 0-RTT key is ever installed in
+            // either direction, so a 0-RTT packet reaching a client has nothing to open
+            // it and leaves here discarded.
+            //= https://www.rfc-editor.org/rfc/rfc9001#section-5.6
+            //# A client MUST NOT attempt to decrypt 0-RTT packets it receives
+            //# and instead MUST discard them.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9001#section-5.6
+            //# A server MUST NOT use 0-RTT keys to protect packets; it uses
+            //# 1-RTT keys to protect acknowledgments of 0-RTT packets.
+            //= type=exception
+            //= reason=0-RTT is out of scope: no early-data key is ever installed in either direction, so this endpoint can neither protect a packet with one nor open a packet that was. See docs/DESIGN.md section 2 and section 6.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9001#section-5.6
+            //# Once a client has installed 1-RTT keys, it MUST NOT send any
+            //# more 0-RTT packets. | Note: 0-RTT data can be acknowledged by
+            //# the server as it | receives it, but any packets containing
+            //# acknowledgments of | 0-RTT data cannot have packet protection
+            //# removed by the client | until the TLS handshake is complete.
+            //= type=exception
+            //= reason=0-RTT is out of scope: no early-data key is ever installed in either direction, so this endpoint can neither protect a packet with one nor open a packet that was. See docs/DESIGN.md section 2 and section 6.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9001#section-5.6
+            //# An application protocol that uses QUIC MUST include a profile
+            //# that defines acceptable use of 0-RTT; otherwise, 0-RTT can only
+            //# be used to carry QUIC frames that do not carry application data.
+            //= type=exception
+            //= reason=0-RTT is out of scope: no early-data key is ever installed in either direction, so this endpoint can neither protect a packet with one nor open a packet that was. See docs/DESIGN.md section 2 and section 6.
             const keys = self.receive_keys[index] orelse return; // No keys yet: discard.
 
             const space = &self.spaces[@intFromEnum(level.space())];
@@ -824,6 +1602,15 @@ pub fn Connection(comptime config: Config) type {
             //# A packet MUST NOT be acknowledged until packet protection has been
             //# successfully removed and all frames contained in the packet have been
             //# processed.
+            //
+            // Section 5.2's other half: an Initial packet's contents are processed before
+            // anything about the peer is proven, so a frame this endpoint refuses has to
+            // raise a connection error rather than leave the connection half-changed.
+            // `receiveFrames` returns the error and `record` below never runs.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-5.2
+            //# An endpoint MUST generate a connection error if processing the
+            //# contents of these packets prior to discovering an error, or
+            //# fully revert any changes made during that processing.
             const eliciting = try self.receiveFrames(level, opened.payload, now_ns);
             space.received.record(opened.number, now_ns, eliciting);
 
@@ -895,6 +1682,18 @@ pub fn Connection(comptime config: Config) type {
                 .handshake, .zero_rtt => |value| value.source,
                 else => null,
             };
+            // The client half of the same rule, from the other side: `destination` moves
+            // exactly once, when the first long header this client can open names a
+            // Source Connection ID, and never again.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-7.2
+            //# Until a packet is received from the server, the client MUST use
+            //# the same Destination Connection ID value on all packets in this
+            //# connection.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-7.2
+            //# A client MUST change the Destination Connection ID it uses for
+            //# sending packets in response to only the first received Initial
+            //# or Retry packet.
             if (carried_source) |source| {
                 if (self.peer_source) |known| {
                     if (!known.eql(&source)) return;
@@ -911,6 +1710,24 @@ pub fn Connection(comptime config: Config) type {
             }
         }
 
+        // The three steps section 9.5 names are this function and nothing else:
+        // header protection is removed, the packet number is recovered from what it
+        // reveals, and the payload is opened, all before anything is reported. The
+        // branch on the Key Phase bit is the one place the timing could differ, and
+        // section 6.3's answer is why `next_receive` is derived in advance rather
+        // than inside this path.
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-9.5
+        //# For authentication to be free from side channels, the entire process
+        //# of header protection removal, packet number recovery, and packet
+        //# protection removal MUST be applied together without timing and other
+        //# side channels.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-9.4
+        //# Future header protection variants based on this construction MUST
+        //# use a PRF to ensure equivalent security guarantees.
+        //= type=exception
+        //= reason=a requirement on a future specification that defines another header protection variant, not on an implementation of the one in section 5.4. This package implements exactly the AES and ChaCha20 constructions RFC 9001 defines and adds no variant of its own.
+        //
         /// Remove protection, choosing the 1-RTT generation the Key Phase bit
         /// names, and count a failure against section 6.6's integrity limit.
         fn openPacket(
@@ -1036,6 +1853,13 @@ pub fn Connection(comptime config: Config) type {
                 //# receipt of a frame in a packet type that is not permitted as a
                 //# connection error of type PROTOCOL_VIOLATION.
                 if (!value.frameType().allowedIn(level)) return error.Protocol;
+
+                // Section 12.4's table carries RFC 9001 section 8.3's rule too: `allowedIn`
+                // answers false for CRYPTO at 0-RTT, so the check above is the one this
+                // requirement asks for.
+                //= https://www.rfc-editor.org/rfc/rfc9001#section-8.3
+                //# A server MUST treat receipt of a CRYPTO frame in a 0-RTT
+                //# packet as a connection error of type PROTOCOL_VIOLATION.
                 if (value.ackEliciting()) eliciting = true;
                 frames += 1;
                 try self.receiveFrame(level, value, now_ns);
@@ -1091,6 +1915,83 @@ pub fn Connection(comptime config: Config) type {
                 //# these packets.
                 //= type=exception
                 //= reason=a server's preferred address is migration by another name and is out of scope; nothing here sees a source address at all, because the seam of docs/DESIGN.md section 3 hands over a datagram and not a peer. See docs/DESIGN.md section 2 and section 6.
+                //
+                // Section 8.2's whole mechanism, both halves. Nothing here initiates a path
+                // validation and nothing answers one; the frames parse so that a conforming
+                // peer's datagram is not refused, and they end here.
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-8.2.1
+                //# The endpoint MUST use unpredictable data in every
+                //# PATH_CHALLENGE frame so that it can associate the peer's
+                //# response with the corresponding PATH_CHALLENGE.
+                //= type=exception
+                //= reason=path validation belongs to connection migration, which is out of scope: a connection here has one path, never learns an address because the seam of docs/DESIGN.md section 3 hands over a datagram rather than a peer, and generates no PATH_CHALLENGE — whose payload would need randomness that same seam does not carry. See docs/DESIGN.md section 2 and section 6.
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-8.2.1
+                //# An endpoint MUST expand datagrams that contain a
+                //# PATH_CHALLENGE frame to at least the smallest allowed
+                //# maximum datagram size of 1200 bytes, unless the
+                //# anti-amplification limit for the path does not permit
+                //# sending a datagram of this size.
+                //= type=exception
+                //= reason=path validation belongs to connection migration, which is out of scope: a connection here has one path, never learns an address because the seam of docs/DESIGN.md section 3 hands over a datagram rather than a peer, and generates no PATH_CHALLENGE — whose payload would need randomness that same seam does not carry. See docs/DESIGN.md section 2 and section 6.
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-8.2.1
+                //# To ensure that the path MTU is large enough, the endpoint
+                //# MUST perform a second path validation by sending a
+                //# PATH_CHALLENGE frame in a datagram of at least 1200 bytes.
+                //= type=exception
+                //= reason=path validation belongs to connection migration, which is out of scope: a connection here has one path, never learns an address because the seam of docs/DESIGN.md section 3 hands over a datagram rather than a peer, and generates no PATH_CHALLENGE — whose payload would need randomness that same seam does not carry. See docs/DESIGN.md section 2 and section 6.
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-8.2.1
+                //# Unlike other cases where datagrams are expanded, endpoints
+                //# MUST NOT discard datagrams that appear to be too small when
+                //# they contain PATH_CHALLENGE or PATH_RESPONSE.
+                //= type=exception
+                //= reason=path validation belongs to connection migration, which is out of scope: a connection here has one path, never learns an address because the seam of docs/DESIGN.md section 3 hands over a datagram rather than a peer, and generates no PATH_CHALLENGE — whose payload would need randomness that same seam does not carry. See docs/DESIGN.md section 2 and section 6.
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-8.2.2
+                //# An endpoint MUST NOT delay transmission of a packet
+                //# containing a PATH_RESPONSE frame unless constrained by
+                //# congestion control.
+                //= type=exception
+                //= reason=path validation belongs to connection migration, which is out of scope: a connection here has one path, never learns an address because the seam of docs/DESIGN.md section 3 hands over a datagram rather than a peer, and generates no PATH_CHALLENGE — whose payload would need randomness that same seam does not carry. See docs/DESIGN.md section 2 and section 6.
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-8.2.2
+                //# A PATH_RESPONSE frame MUST be sent on the network path where
+                //# the PATH_CHALLENGE frame was received.
+                //= type=exception
+                //= reason=path validation belongs to connection migration, which is out of scope: a connection here has one path, never learns an address because the seam of docs/DESIGN.md section 3 hands over a datagram rather than a peer, and generates no PATH_CHALLENGE — whose payload would need randomness that same seam does not carry. See docs/DESIGN.md section 2 and section 6.
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-8.2.2
+                //# This requirement MUST NOT be enforced by the endpoint that
+                //# initiates path validation, as that would enable an attack on
+                //# migration; see Section 9.3.3. An endpoint MUST expand
+                //# datagrams that contain a PATH_RESPONSE frame to at least the
+                //# smallest allowed maximum datagram size of 1200 bytes.
+                //= type=exception
+                //= reason=path validation belongs to connection migration, which is out of scope: a connection here has one path, never learns an address because the seam of docs/DESIGN.md section 3 hands over a datagram rather than a peer, and generates no PATH_CHALLENGE — whose payload would need randomness that same seam does not carry. See docs/DESIGN.md section 2 and section 6.
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-8.2.2
+                //# However, an endpoint MUST NOT expand the datagram containing
+                //# the PATH_RESPONSE if the resulting data exceeds the
+                //# anti-amplification limit.
+                //= type=exception
+                //= reason=path validation belongs to connection migration, which is out of scope: a connection here has one path, never learns an address because the seam of docs/DESIGN.md section 3 hands over a datagram rather than a peer, and generates no PATH_CHALLENGE — whose payload would need randomness that same seam does not carry. See docs/DESIGN.md section 2 and section 6.
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-8.2.2
+                //# An endpoint MUST NOT send more than one PATH_RESPONSE frame
+                //# in response to one PATH_CHALLENGE frame; see Section 13.3.
+                //# The peer is expected to send more PATH_CHALLENGE frames as
+                //# necessary to evoke additional PATH_RESPONSE frames.
+                //= type=exception
+                //= reason=path validation belongs to connection migration, which is out of scope: a connection here has one path, never learns an address because the seam of docs/DESIGN.md section 3 hands over a datagram rather than a peer, and generates no PATH_CHALLENGE — whose payload would need randomness that same seam does not carry. See docs/DESIGN.md section 2 and section 6.
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-8.2.3
+                //# However, the endpoint MUST initiate another path validation
+                //# with an expanded datagram to verify that the path supports
+                //# the required MTU.
+                //= type=exception
+                //= reason=path validation belongs to connection migration, which is out of scope: a connection here has one path, never learns an address because the seam of docs/DESIGN.md section 3 hands over a datagram rather than a peer, and generates no PATH_CHALLENGE — whose payload would need randomness that same seam does not carry. See docs/DESIGN.md section 2 and section 6.
                 .new_connection_id, .retire_connection_id, .path_challenge, .path_response => {
                     // Migration is not this slice; the frames parse and are
                     // ignored rather than refused, because they are legal and a
@@ -1119,6 +2020,101 @@ pub fn Connection(comptime config: Config) type {
                 // the frame either — this package requests no token and stores
                 // none — but only the server's half is a rule, so only the
                 // server's half is enforced.
+                //
+                // Sections 8.1.1 through 8.1.4 are the token's whole lifecycle — how a server
+                // builds one, how a client carries it, and what integrity it has to have —
+                // and none of it happens here. The frame is refused at a server and ignored
+                // at a client, which is the entirety of this package's relationship with a
+                // token.
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.1
+                //# A token sent in a NEW_TOKEN frame or a Retry packet MUST be
+                //# constructed in a way that allows the server to identify how
+                //# it was provided to a client.
+                //= type=exception
+                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.2
+                //# This token MUST be repeated by the client in all Initial
+                //# packets it sends for that connection after it receives the
+                //# Retry packet.
+                //= type=exception
+                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.3
+                //# The client MUST include the token in all Initial packets it
+                //# sends, unless a Retry replaces the token with a newer one.
+                //= type=exception
+                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.3
+                //# The client MUST NOT use the token provided in a Retry for
+                //# future connections.
+                //= type=exception
+                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.3
+                //# A token issued with NEW_TOKEN MUST NOT include information
+                //# that would allow values to be linked by an observer to the
+                //# connection on which it was issued.
+                //= type=exception
+                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.3
+                //# A client MUST NOT include a token that is not applicable to
+                //# the server that it is connecting to, unless the client has
+                //# the knowledge that the server that issued the token and the
+                //# server the client is connecting to are jointly managing the
+                //# tokens.
+                //= type=exception
+                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.3
+                //# In comparison, a token obtained in a Retry packet MUST be
+                //# used immediately during the connection attempt and cannot be
+                //# used in subsequent connection attempts.
+                //= type=exception
+                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.3
+                //# When a server receives an Initial packet with an address
+                //# validation token, it MUST attempt to validate the token,
+                //# unless it has already completed address validation.
+                //= type=exception
+                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.4
+                //# An address validation token MUST be difficult to guess.
+                //= type=exception
+                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.4
+                //# For this design to work, the token MUST be covered by
+                //# integrity protection against modification or falsification
+                //# by clients.
+                //= type=exception
+                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.4
+                //# Tokens sent in NEW_TOKEN frames MUST include information
+                //# that allows the server to verify that the client IP address
+                //# has not changed from when the token was issued.
+                //= type=exception
+                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.4
+                //# If the client IP address has changed, the server MUST adhere
+                //# to the anti-amplification limit; see Section 8. Note that in
+                //# the presence of NAT, this requirement might be insufficient
+                //# to protect other hosts that share the NAT from amplification
+                //# attacks.
+                //= type=exception
+                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.4
+                //# To protect against such attacks, servers MUST ensure that
+                //# replay of tokens is prevented or limited.
+                //= type=exception
+                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
                 //= https://www.rfc-editor.org/rfc/rfc9000#section-19.7
                 //# The token MUST NOT be empty.  A client MUST treat receipt
                 //# of a NEW_TOKEN frame with an empty Token field as a connection
@@ -1136,6 +2132,13 @@ pub fn Connection(comptime config: Config) type {
                 //= https://www.rfc-editor.org/rfc/rfc9000#section-4.1
                 //# A sender MUST ignore any MAX_STREAM_DATA or MAX_DATA frames that do
                 //# not increase flow control limits.
+                // Accepted rather than refused, which is the other half of taking `@max`: an
+                // outdated limit is a legal retransmission and closing on one would end a
+                // connection over reordering.
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-13.3
+                //# A receiver MUST accept packets containing an outdated frame,
+                //# such as a MAX_DATA frame carrying a smaller maximum data
+                //# value than one found in an older packet.
                 .max_data => |value| self.streams.setConnectionSendLimit(value.maximum),
                 .max_stream_data => |value| self.streams.setSendLimit(value.stream, value.maximum) catch |err| {
                     return streamError(err);
@@ -1181,6 +2184,88 @@ pub fn Connection(comptime config: Config) type {
                 //# initiated stream that has not yet been created, or for a send-only
                 //# stream.
                 .stream => |value| {
+                    // `Level.zero_rtt` exists because section 12.4's table has a column for it
+                    // and a frame has to be told whether it is permitted there. It is not a
+                    // claim that 0-RTT works: no early-data key is ever installed, so this
+                    // arm is unreachable at that level and section 4.6's rules have nothing
+                    // here to govern.
+                    //= https://www.rfc-editor.org/rfc/rfc9001#section-4.6.1
+                    //# Servers MUST NOT send the early_data extension with a
+                    //# max_early_data_size field set to any value other than
+                    //# 0xffffffff.
+                    //= type=exception
+                    //= reason=0-RTT is out of scope: no early-data key is ever installed, and the session ticket, the early_data extension and the decision to accept or reject early data all live in the consumer's TLS engine, per docs/DESIGN.md section 4. See docs/DESIGN.md section 2 and section 6.
+                    //
+                    //= https://www.rfc-editor.org/rfc/rfc9001#section-4.6.1
+                    //# A client MUST treat receipt of a NewSessionTicket that
+                    //# contains an early_data extension with any other value as
+                    //# a connection error of type PROTOCOL_VIOLATION.
+                    //= type=exception
+                    //= reason=0-RTT is out of scope: no early-data key is ever installed, and the session ticket, the early_data extension and the decision to accept or reject early data all live in the consumer's TLS engine, per docs/DESIGN.md section 4. See docs/DESIGN.md section 2 and section 6.
+                    //
+                    //= https://www.rfc-editor.org/rfc/rfc9001#section-4.6.2
+                    //# When rejecting 0-RTT, a server MUST NOT process any
+                    //# 0-RTT packets, even if it could.
+                    //= type=exception
+                    //= reason=0-RTT is out of scope: no early-data key is ever installed, and the session ticket, the early_data extension and the decision to accept or reject early data all live in the consumer's TLS engine, per docs/DESIGN.md section 4. See docs/DESIGN.md section 2 and section 6.
+                    //
+                    //= https://www.rfc-editor.org/rfc/rfc9001#section-4.6.2
+                    //# The client therefore MUST reset the state of all
+                    //# streams, including application state bound to those
+                    //# streams.
+                    //= type=exception
+                    //= reason=0-RTT is out of scope: no early-data key is ever installed, and the session ticket, the early_data extension and the decision to accept or reject early data all live in the consumer's TLS engine, per docs/DESIGN.md section 4. See docs/DESIGN.md section 2 and section 6.
+                    //
+                    //= https://www.rfc-editor.org/rfc/rfc9001#section-4.9.3
+                    //# After receiving a 1-RTT packet, servers MUST discard
+                    //# 0-RTT keys within a short time; the RECOMMENDED time
+                    //# period is three times the Probe Timeout (PTO, see
+                    //# [QUIC-RECOVERY]).
+                    //= type=exception
+                    //= reason=0-RTT is out of scope: no early-data key is ever installed, and the session ticket, the early_data extension and the decision to accept or reject early data all live in the consumer's TLS engine, per docs/DESIGN.md section 4. See docs/DESIGN.md section 2 and section 6.
+                    //
+                    // The replay surface 0-RTT opens, and the reason its absence is a smaller
+                    // decision than it looks: what can be replayed is the application's data,
+                    // and there is no early-data key here to carry any.
+                    //= https://www.rfc-editor.org/rfc/rfc9001#section-8.3
+                    //# Clients MUST NOT send the EndOfEarlyData message.
+                    //= type=exception
+                    //= reason=0-RTT is out of scope: no early-data key is ever installed, and the session ticket, the early_data extension and the decision to accept or reject early data all live in the consumer's TLS engine, per docs/DESIGN.md section 4. See docs/DESIGN.md section 2 and section 6.
+                    //
+                    //= https://www.rfc-editor.org/rfc/rfc9001#section-9.2
+                    //# Endpoints MUST implement and use the replay protections
+                    //# described in [TLS13], however it is recognized that
+                    //# these protections are imperfect.
+                    //= type=exception
+                    //= reason=0-RTT is out of scope: no early-data key is ever installed, and the session ticket, the early_data extension and the decision to accept or reject early data all live in the consumer's TLS engine, per docs/DESIGN.md section 4. See docs/DESIGN.md section 2 and section 6.
+                    //
+                    //= https://www.rfc-editor.org/rfc/rfc9001#section-9.2
+                    //# An application protocol that uses QUIC MUST describe how
+                    //# the protocol uses 0-RTT and the measures that are
+                    //# employed to protect against replay attack.
+                    //= type=exception
+                    //= reason=0-RTT is out of scope: no early-data key is ever installed, and the session ticket, the early_data extension and the decision to accept or reject early data all live in the consumer's TLS engine, per docs/DESIGN.md section 4. See docs/DESIGN.md section 2 and section 6.
+                    //
+                    //= https://www.rfc-editor.org/rfc/rfc9001#section-9.2
+                    //# QUIC extensions MUST either describe how replay attacks
+                    //# affect their operation or prohibit the use of the
+                    //# extension in 0-RTT.
+                    //= type=exception
+                    //= reason=0-RTT is out of scope: no early-data key is ever installed, and the session ticket, the early_data extension and the decision to accept or reject early data all live in the consumer's TLS engine, per docs/DESIGN.md section 4. See docs/DESIGN.md section 2 and section 6.
+                    //
+                    //= https://www.rfc-editor.org/rfc/rfc9001#section-9.2
+                    //# Application protocols MUST either prohibit the use of
+                    //# extensions that carry application semantics in 0-RTT or
+                    //# provide replay mitigation strategies.
+                    //= type=exception
+                    //= reason=0-RTT is out of scope: no early-data key is ever installed, and the session ticket, the early_data extension and the decision to accept or reject early data all live in the consumer's TLS engine, per docs/DESIGN.md section 4. See docs/DESIGN.md section 2 and section 6.
+                    //
+                    //= https://www.rfc-editor.org/rfc/rfc9001#section-9.2
+                    //# These MUST NOT be used to communicate application
+                    //# semantics between endpoints; clients MUST treat them as
+                    //# opaque values.
+                    //= type=exception
+                    //= reason=session tickets and address validation tokens are out of scope: this package sends no Retry, issues no NEW_TOKEN and resumes no session, so it neither writes nor reads either kind of token. See docs/DESIGN.md section 2 and section 6.
                     if (level != .one_rtt and level != .zero_rtt) return error.Protocol;
                     self.streams.receive(value.stream, value.offset, value.data, value.fin) catch |err| {
                         return streamError(err);
@@ -1239,9 +2324,41 @@ pub fn Connection(comptime config: Config) type {
 
         /// Section 13.2 and RFC 9002 section 5: what an acknowledgement moves.
         fn receiveAck(self: *Self, level: Level, value: frame.Ack, now_ns: u64) ReceiveError!void {
+            // Section 13.4's ECN, in full. `frame.Ack.ecn` holds the counts an ACK_ECN
+            // frame carried and nothing below reads it.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-13.4.1
+            //# Even if an endpoint does not set an ECT field in packets it sends,
+            //# the endpoint MUST provide feedback about ECN markings it receives,
+            //# if these are accessible.
+            //= type=exception
+            //= reason=ECN is parsed and not acted on, which docs/DESIGN.md section 6 states rather than hides: an ACK_ECN frame's counts reach `frame.Ack.ecn` and go no further, so there is no validation to fail and nothing to disable. Marking the field is also a socket option, and the socket is the consumer's, per docs/DESIGN.md section 3.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-13.4.2.1
+            //# An endpoint MUST NOT fail ECN validation as a result of processing
+            //# an ACK frame that does not increase the largest acknowledged packet
+            //# number.
+            //= type=exception
+            //= reason=ECN is parsed and not acted on, which docs/DESIGN.md section 6 states rather than hides: an ACK_ECN frame's counts reach `frame.Ack.ecn` and go no further, so there is no validation to fail and nothing to disable. Marking the field is also a socket option, and the socket is the consumer's, per docs/DESIGN.md section 3.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-13.4.2.2
+            //# If validation fails, then the endpoint MUST disable ECN.
+            //= type=exception
+            //= reason=ECN is parsed and not acted on, which docs/DESIGN.md section 6 states rather than hides: an ACK_ECN frame's counts reach `frame.Ack.ecn` and go no further, so there is no validation to fail and nothing to disable. Marking the field is also a socket option, and the socket is the consumer's, per docs/DESIGN.md section 3.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-13.4.2.2
+            //# Network routing and path elements can change mid-connection; an
+            //# endpoint MUST disable ECN if validation later fails.
+            //= type=exception
+            //= reason=ECN is parsed and not acted on, which docs/DESIGN.md section 6 states rather than hides: an ACK_ECN frame's counts reach `frame.Ack.ecn` and go no further, so there is no validation to fail and nothing to disable. Marking the field is also a socket option, and the socket is the consumer's, per docs/DESIGN.md section 3.
+            //
             // The caller applied section 12.4's Table 3 before dispatching, so
             // an ACK cannot arrive at a level that forbids one.
             assert(frame.Type.ack.allowedIn(level));
+            // The space is chosen from the level the packet arrived at, so an ACK can
+            // only ever move packets this endpoint sent in that same space.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-12.5
+            //# ACK frames MAY appear in any packet number space but can only
+            //# acknowledge packets that appeared in that packet number space.
             const space = &self.spaces[@intFromEnum(level.space())];
 
             // A peer cannot acknowledge a number we never sent; doing so would
@@ -1304,6 +2421,32 @@ pub fn Connection(comptime config: Config) type {
             //# data length -- cannot exceed 2^62-1.  Receipt of a frame that exceeds
             //# this limit MUST be treated as a connection error of type
             //# FRAME_ENCODING_ERROR or CRYPTO_BUFFER_EXCEEDED.
+            //
+            // `Reassembler.push` refuses data that contradicts an offset it already
+            // holds, which is section 2.2's rule and not this one: a retransmission at a
+            // level whose keys are already superseded may still *extend* that level's
+            // flow here, and section 4.1.3 says it may not.
+            //= https://www.rfc-editor.org/rfc/rfc9001#section-4.1.3
+            //# If the result of this process is that new data is available,
+            //# then it is delivered to TLS in order. * If the packet is from a
+            //# previously installed encryption level, it MUST NOT contain data
+            //# that extends past the end of previously received data in that
+            //# flow.
+            //= type=todo
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9001#section-4.1.3
+            //# Implementations MUST treat any violations of this requirement as
+            //# a connection error of type PROTOCOL_VIOLATION. * If the packet
+            //# is from a new encryption level, it is saved for later processing
+            //# by TLS.
+            //= type=todo
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-7.5
+            //# Packets containing discarded CRYPTO frames MUST be acknowledged
+            //# because the packet has been received and processed by the
+            //# transport even though the CRYPTO frame was discarded.
+            //= type=exception
+            //= reason=this package never discards a CRYPTO frame, so there is no discarded frame to acknowledge: `Reassembler` buffers out-of-order handshake data up to `crypto_octets`, and a flow that outgrows it closes the connection with section 7.5's CRYPTO_BUFFER_EXCEEDED rather than dropping anything. The rule governs the other choice section 7.5 offers, which this package does not make.
             stream.received.push(value.offset, value.data) catch |err| return switch (err) {
                 // A CRYPTO stream that outruns its buffer is a resource limit
                 // rather than a peer breaking a rule, and section 7.5 gives it
@@ -1410,6 +2553,19 @@ pub fn Connection(comptime config: Config) type {
             self.recovery.discardSpace(level.space());
         }
 
+        // The level travels with the packet. `PacketContext.level` is what a lost
+        // packet hands back, and rewinding a level's send cursor re-frames the same
+        // octets at that same level — which is what keeps a retransmission under the
+        // keys the original went out with, even after a later level's arrived.
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-4
+        //# If QUIC needs to retransmit that data, it MUST use the same keys
+        //# even if TLS has already updated to newer keys.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-4.9
+        //# If packets from a lower encryption level contain CRYPTO frames,
+        //# frames that retransmit that data MUST be sent at the same encryption
+        //# level.
+        //
         /// Undo the sending of packets RFC 9002 declared lost.
         ///
         /// Rewinding the level's send cursor to where the lost packet began is
@@ -1421,6 +2577,23 @@ pub fn Connection(comptime config: Config) type {
         /// it would be a second reassembler on the send side, and a handshake is
         /// a few kilobytes.
         fn onPacketsLost(self: *Self, contexts: []const PacketContext) void {
+            // The congestion action is `Recovery`'s and happens before this is called:
+            // this function only rebuilds what the lost packets carried. Section 13.3's
+            // list of what is re-sent and what is not is the switch below, and the
+            // close is deliberately not on it.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-13.3
+            //# Upon detecting losses, a sender MUST take appropriate congestion
+            //# control action.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-13.3
+            //# The content of a RESET_STREAM frame MUST NOT change when it is sent
+            //# again. * Similarly, a request to cancel stream transmission, as
+            //# encoded in a STOP_SENDING frame, is sent until the receiving part of
+            //# the stream enters either a "Data Recvd" or "Reset Recvd" state; see
+            //# Section 3.5. * Connection close signals, including packets that
+            //# contain CONNECTION_CLOSE frames, are not sent again when packet loss
+            //# is detected.
+            //
             // Bounded by the caller's array rather than by anything the peer
             // chose; `receiveAck` clamps the count to it before calling here.
             assert(contexts.len <= lost_report_max);
@@ -1459,6 +2632,17 @@ pub fn Connection(comptime config: Config) type {
             //= https://www.rfc-editor.org/rfc/rfc9000#section-10.2
             //# These states SHOULD persist for at least three
             //# times the current PTO interval as defined in [QUIC-RECOVERY].
+            //= type=todo
+            //
+            // There is no idle timer at all, so section 10.1's floor on one has nothing
+            // to raise. `max_idle_timeout` is parsed out of the peer's transport
+            // parameters and read by nobody, and a connection that stops hearing from
+            // its peer stays in `handshaking` or `established` until the consumer
+            // decides otherwise.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-10.1
+            //# To avoid excessively small idle timeout periods, endpoints MUST
+            //# increase the idle timeout period to be at least three times the
+            //# current Probe Timeout (PTO).
             //= type=todo
             if (self.state == .draining) return null;
             return self.recovery.timeoutAt();
@@ -1567,6 +2751,21 @@ pub fn Connection(comptime config: Config) type {
             // Padding past `limit` is not possible and that is correct: for an
             // unvalidated server `limit` is section 8.1's three-times budget,
             // and section 14.1 does not license exceeding it.
+            //
+            // Section 8.1 states the client's half of the floor as an obligation on the
+            // datagram rather than on the packet, which is the same padding read from
+            // the other end: this is the only place a datagram's length is decided.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1
+            //# Clients MUST ensure that UDP datagrams containing Initial
+            //# packets have UDP payloads of at least 1200 bytes, adding PADDING
+            //# frames as necessary.
+            //
+            // RFC 9001 section 9.3 states the same floor as a reflection defence rather
+            // than as a path check, and it is the same padding: a client's Initial is
+            // expanded to 1200 octets whatever it carries.
+            //= https://www.rfc-editor.org/rfc/rfc9001#section-9.3
+            //# First, the packet containing a ClientHello MUST be padded to a
+            //# minimum size.
             const owes_padding = (self.side == .client and
                 self.send_keys[@intFromEnum(Level.initial)] != null) or
                 initial_ack_eliciting;
@@ -1580,6 +2779,23 @@ pub fn Connection(comptime config: Config) type {
             return offset;
         }
 
+        // Section 6.6's first two sentences are addressed to whoever writes a cipher
+        // suite's specification. What they require of *this* code is the counting
+        // below and the integrity limit in `countForgery`, both already cited.
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-6.6
+        //# Any TLS cipher suite that is specified for use with QUIC MUST define
+        //# limits on the use of the associated AEAD function that preserves
+        //# margins for confidentiality and integrity.
+        //= type=exception
+        //= reason=a requirement on the document that specifies a cipher suite for use with QUIC rather than on an implementation of one. The limits section 6.6 states for the suites this package supports are the constants `countSealed` and `countForgery` compare against, and those are cited where they are enforced.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-6.6
+        //# That is, limits MUST be specified for the number of packets that can
+        //# be authenticated and for the number of packets that can fail
+        //# authentication.
+        //= type=exception
+        //= reason=a requirement on the document that specifies a cipher suite for use with QUIC rather than on an implementation of one. The limits section 6.6 states for the suites this package supports are the constants `countSealed` and `countForgery` compare against, and those are cited where they are enforced.
+        //
         /// Section 6.6: count a packet sealed under the current key, and act
         /// before the confidentiality limit is passed rather than after.
         ///
@@ -1660,6 +2876,20 @@ pub fn Connection(comptime config: Config) type {
         //# packets received from an unvalidated address or limit the cumulative
         //# size of packets it sends to an unvalidated address to three times the
         //# size of packets it receives from that address.
+        //
+        // The one budget, applied in every state. A closing endpoint runs through
+        // here too, which is what section 10.2.1 asks for: the close is a packet like
+        // any other and cannot buy an attacker amplification the handshake would
+        // have refused.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-14.1
+        //# The server MUST also limit the number of bytes it sends before
+        //# validating the address of the client; see Section 8.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-10.2.1
+        //# To avoid being used for an amplification attack, such endpoints MUST
+        //# limit the cumulative size of packets it sends to three times the
+        //# cumulative size of the packets that are received and attributed to
+        //# the connection.
         fn sendRoom(self: *const Self) u64 {
             if (self.address_validated) return config.datagram_octets;
             const allowance = self.received_octets * amplification_factor;
@@ -1887,6 +3117,14 @@ pub fn Connection(comptime config: Config) type {
             return total;
         }
 
+        // The send-side half of section 9.5. The packet number's encoded width is
+        // chosen in `sendPacket` from `largest_acked`, which the peer already knows,
+        // and never from the number's own value; the header is then written and
+        // protected the same way for every width.
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-9.5
+        //# For the sending of packets, construction and protection of packet
+        //# payloads and packet numbers MUST be free from side channels that
+        //# would reveal the packet number or its encoded size.
         fn writeHeader(self: *const Self, buffer: []u8, level: Level, number: u64, number_octets: u8) !packet.Written {
             // A number wider than four octets has no encoding, and one at the
             // varint ceiling has no successor — either would make the next
@@ -2009,6 +3247,26 @@ pub fn Connection(comptime config: Config) type {
             //# 0x1c) MAY appear in any packet number space.  CONNECTION_CLOSE
             //# frames signaling application errors (type 0x1d) MUST only appear
             //# in the application data packet number space.
+            //
+            // All three of section 10.2.3's rules hold by construction rather than by a
+            // check. `close` is the only way into `closing` and it always writes a
+            // transport code, so the 0x1d form is never built; the reason phrase is
+            // always empty; and after confirmation the Initial and Handshake spaces are
+            // discarded, so 1-RTT is the only level left to write at.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-10.2.3
+            //# A CONNECTION_CLOSE of type 0x1d MUST be replaced by a
+            //# CONNECTION_CLOSE of type 0x1c when sending the frame in Initial
+            //# or Handshake packets.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-10.2.3
+            //# Endpoints MUST clear the value of the Reason Phrase field and
+            //# SHOULD use the APPLICATION_ERROR code when converting to a
+            //# CONNECTION_CLOSE of type 0x1c.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-10.2.3
+            //# After the handshake is confirmed (see Section 4.1.2 of
+            //# [QUIC-TLS]), an endpoint MUST send any CONNECTION_CLOSE frames
+            //# in a 1-RTT packet.
             const written = frame.encode(payload, .{ .connection_close = .{
                 .application = self.close_is_application,
                 .code = self.close_code,
@@ -2037,6 +3295,55 @@ pub fn Connection(comptime config: Config) type {
             // connection that is over.
             if (self.state == .closing) return self.writeClose(payload, &result);
 
+            // Acknowledged as soon as there is a datagram to carry it, at every level:
+            // `wantsSend` answers true while this flag is set, so a consumer that polls
+            // it sends the ACK on the next turn of its loop. That is stricter than
+            // `max_ack_delay` asks for and needs no timer to be, which is what lets
+            // this package own no clock.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-13.2.1
+            //# An endpoint MUST acknowledge all ack-eliciting Initial and
+            //# Handshake packets immediately and all ack-eliciting 0-RTT and
+            //# 1-RTT packets within its advertised max_ack_delay, with the
+            //# following exception.
+            //
+            // The flag is the whole of the rate limit. It is set by an ack-eliciting
+            // packet and cleared by the write below, so one ACK goes out per
+            // ack-eliciting packet received and none at all for a packet that elicits
+            // nothing.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-13.2.1
+            //# Since packets containing only ACK frames are not congestion
+            //# controlled, an endpoint MUST NOT send more than one such packet
+            //# in response to receiving an ack-eliciting packet.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-13.2.1
+            //# An endpoint MUST NOT send a non-ack-eliciting packet in response
+            //# to a non-ack-eliciting packet, even if there are packet gaps
+            //# that precede the received packet.
+            //
+            // Nothing here ever adds a PING to make an ACK-only packet ack-eliciting.
+            // The only PING this package writes is section 6.2.4's probe, below, and a
+            // probe is owed by the timer rather than by a packet that arrived.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-13.2.1
+            //# An endpoint that is only sending non-ack-eliciting packets might
+            //# choose to occasionally add an ack-eliciting frame to those
+            //# packets to ensure that it receives an acknowledgment; see
+            //# Section 13.2.4. In that case, an endpoint MUST NOT send an
+            //# ack-eliciting frame in all packets that would otherwise be
+            //# non-ack-eliciting, to avoid an infinite feedback loop of
+            //# acknowledgments.
+            //
+            // `space` came from the level this packet is being built at, so the ranges
+            // written below can only ever be the ones recorded in that same space.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-13.2.6
+            //# ACK frames MUST only be carried in a packet that has the same
+            //# packet number space as the packet being acknowledged; see
+            //# Section 12.1. For instance, packets that are protected with
+            //# 1-RTT keys MUST be acknowledged in packets that are also
+            //# protected with 1-RTT keys.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-13.2.6
+            //# Packets that a client sends with 0-RTT packet protection MUST be
+            //# acknowledged by the server in packets protected by 1-RTT keys.
             if (space.received.ack_eliciting_pending) {
                 // Section 13.2.5's delay exponent is the peer's transport
                 // parameter; until this package decodes them it uses the
@@ -2241,6 +3548,25 @@ pub fn Connection(comptime config: Config) type {
         //# versions might allow the use of a long header.
         //= type=exception
         //= reason=stateless reset is out of scope; it is the answer of an endpoint that has *lost* the connection state, which is the consumer's lookup table rather than this type, and its token needs randomness that docs/DESIGN.md section 3 keeps outside the package. See docs/DESIGN.md section 2 and section 6.
+        //
+        // The single entry point for section 11.1's connection error, and the only
+        // thing that sets `closing`. Every `ReceiveError` the caller sees is meant to
+        // arrive back here as the code to send.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-11.1
+        //# Errors that result in the connection being unusable, such as an
+        //# obvious violation of protocol semantics or corruption of state that
+        //# affects an entire connection, MUST be signaled using a
+        //# CONNECTION_CLOSE frame (Section 19.19).
+        //
+        // Section 11.2's stream error has no counterpart: there is no entry point
+        // for an application to reset a stream, and `writePayload` never encodes a
+        // RESET_STREAM or a STOP_SENDING. Both are handled on receipt and neither is
+        // ever sent, so a consumer that wants to abandon one stream has to close the
+        // whole connection.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-11.2
+        //# RESET_STREAM MUST only be instigated by the application protocol
+        //# that uses QUIC.
+        //= type=todo
         //
         /// Begin closing (section 10.2). The close frame goes out on the next
         /// `send`.
@@ -2655,7 +3981,12 @@ test "transport parameters cross as opaque octets" {
     var encoded: [256]u8 = @splat(0);
     const written = try transport_parameters.encode(&encoded, &.{
         .initial_max_data = 1 << 20,
+        // Section 7.3 requires both of these from a server, and
+        // `transport_parameters.validate` now runs on the way in — so a
+        // fixture that omits one is refused. It used to be accepted because
+        // nothing called the function that checks.
         .initial_source_connection_id = try ConnectionId.init(&server_source),
+        .original_destination_connection_id = try ConnectionId.init(&client_cid),
     });
     try client.transportParametersIn(encoded[0..written]);
 
@@ -3705,4 +5036,54 @@ test "section 19.7: a client refuses a NEW_TOKEN with an empty token" {
     const written = try frame.encode(&payload, .{ .new_token = .{ .token = "tok" } });
     _ = try client.receiveFrames(.one_rtt, payload[0..written], 1000);
     _ = &server;
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9000#section-18.2
+//# A server MUST treat receipt of any of these transport parameters as
+//# a connection error of type TRANSPORT_PARAMETER_ERROR.
+//= type=test
+test "section 18.2: a client may not send a server-only transport parameter" {
+    // `transport_parameters.validate` implemented this and had no caller
+    // anywhere in the tree — tested, and never wired in. A client could hand a
+    // server a stateless reset token for a connection it does not own and the
+    // server would keep it.
+    var server = testServer();
+    var encoded: [256]u8 = @splat(0);
+    const written = try transport_parameters.encode(&encoded, &.{
+        .initial_source_connection_id = try ConnectionId.init(&client_source),
+        .stateless_reset_token = @splat(0xab),
+    });
+    try testing.expectError(
+        error.ServerOnlyParameter,
+        server.transportParametersIn(encoded[0..written]),
+    );
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9000#section-7.3
+//# Endpoints MUST validate that received transport parameters match
+//# received connection ID values.
+//= type=test
+test "section 7.3: a declared source connection id must match the one that carried the handshake" {
+    var client = testClient();
+    var server = testServer();
+    try client.cryptoIn(.initial, "ClientHello");
+    _ = try deliver(&client, &server, 0);
+    // The server now knows the client's Source Connection ID from the wire.
+    try testing.expectEqualSlices(u8, &client_source, server.peer_source.?.bytes());
+
+    // Parameters declaring a different one are a tampered handshake.
+    var encoded: [256]u8 = @splat(0);
+    const written = try transport_parameters.encode(&encoded, &.{
+        .initial_source_connection_id = try ConnectionId.init(&.{ 0xde, 0xad, 0xbe, 0xef }),
+    });
+    try testing.expectError(
+        error.Malformed,
+        server.transportParametersIn(encoded[0..written]),
+    );
+
+    // And the honest ones are accepted.
+    const honest = try transport_parameters.encode(&encoded, &.{
+        .initial_source_connection_id = try ConnectionId.init(&client_source),
+    });
+    try server.transportParametersIn(encoded[0..honest]);
 }

@@ -344,7 +344,13 @@ fn driveHandshake(world: *World) void {
 /// and it is where section 4.6's stream limits are applied — a simulation that
 /// set the limits by hand would never exercise it.
 fn exchangeTransportParameters(world: *World) void {
+    // Section 7.3's identifiers are required of both roles, and a server must
+    // also echo the client's original Destination Connection ID. The exchange
+    // is symmetric here because the fake handshake is, so the encoding carries
+    // both and each side validates the other's.
     const parameters: quic.transport_parameters.Parameters = .{
+        .initial_source_connection_id = ConnectionId.init(&.{ 0xf0, 0x67, 0xa5, 0x50, 0x2a, 0x42, 0x62, 0xb5 }) catch unreachable, // Eight octets.
+        .original_destination_connection_id = ConnectionId.init(&.{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 }) catch unreachable, // As above.
         .initial_max_data = 1 << 20,
         .initial_max_stream_data_bidi_local = 1 << 18,
         .initial_max_stream_data_bidi_remote = 1 << 18,

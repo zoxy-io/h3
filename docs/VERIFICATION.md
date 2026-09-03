@@ -208,9 +208,22 @@ states, and the ledger is where the oracles come from.
 
 **Status.** `specs/` holds RFC 9000, 9001, 9002, 9110, 9112, 9114 and 9204.
 `scripts/requirements.zig` runs as `zig build requirements` and is part of
-`zig build ci`. It reads 849 sections and finds **1206 normative sentences, 849
-of them mandatory**. **241 are cited: 87 with a test, 60 an exception with a
-stated reason, 25 a todo.**
+`zig build ci`. It reads 849 sections across seven RFCs and finds **1206
+normative sentences, 849 of them mandatory**.
+
+**In the five documents this package implements: 547 of 571 mandatory
+requirements cited.** RFC 9114 and RFC 9204 are complete; RFC 9001 has one
+left, RFC 9002 two, RFC 9000 twenty-one. RFC 9110 and RFC 9112 are
+*referenced* rather than implemented and are cited only where a rule is
+borrowed — see specs/SCOPE.md, and note that the aggregate hid this until the
+report was split per RFC.
+
+Of those citations, 123 carry a test and 329 an exception with a stated reason.
+**The exceptions are the product as much as the citations are**: migration,
+0-RTT, version negotiation, Retry, stateless reset, address-validation tokens,
+preferred address, PMTU discovery, server push, the QPACK dynamic table, ECN
+and pacing are each now marked out of scope with a mechanism named. Before this
+work every one of them was indistinguishable from an oversight.
 
 The annotation was done by three agents working on disjoint files, and the
 method is worth keeping. Every one of them generated its `//#` blocks by
