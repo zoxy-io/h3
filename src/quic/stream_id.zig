@@ -42,6 +42,19 @@ pub const Kind = enum(u2) {
 /// The largest number of streams of one kind. Section 19.11: a limit above this
 /// is a `FRAME_ENCODING_ERROR`, because the identifier it implies would not fit
 /// a variable-length integer.
+///
+/// `frame.streamsLimit` is what enforces this on the wire, for both frames that
+/// carry a streams count; this constant is the same bound stated where the
+/// identifier arithmetic that produces it lives.
+//= https://www.rfc-editor.org/rfc/rfc9000#section-19.11
+//# Receipt of a frame that permits opening of a stream larger than this
+//# limit MUST be treated as a connection error of type
+//# FRAME_ENCODING_ERROR.
+//
+//= https://www.rfc-editor.org/rfc/rfc9000#section-19.14
+//# Receipt of a frame that encodes a larger stream ID MUST be treated
+//# as a connection error of type STREAM_LIMIT_ERROR or
+//# FRAME_ENCODING_ERROR.
 pub const count_max: u64 = 1 << 60;
 
 comptime {
@@ -62,6 +75,13 @@ pub fn index(id: u64) u64 {
 }
 
 /// The identifier of the `position`-th stream of `stream_kind`.
+///
+/// A pure function of the kind and the position, which is what makes the rule
+/// below structural rather than something a caller has to remember: two calls
+/// with the same arguments name the same stream, and the callers that open
+/// streams count `position` upward and never downward.
+//= https://www.rfc-editor.org/rfc/rfc9000#section-2.1
+//# A QUIC endpoint MUST NOT reuse a stream ID within a connection.
 pub fn make(stream_kind: Kind, position: u64) u64 {
     assert(position < count_max);
     const id = (position << 2) | @intFromEnum(stream_kind);

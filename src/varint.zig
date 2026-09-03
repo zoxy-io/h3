@@ -102,6 +102,9 @@ pub fn decode(source: []const u8) DecodeError!Decoded {
 /// This is what reads a frame type (RFC 9000 section 12.4, RFC 9114 section
 /// 7.1) and a transport parameter identifier: those are dispatched on, and a
 /// type with four legal spellings is four ways past a `switch`.
+//= https://www.rfc-editor.org/rfc/rfc9000#section-12.4
+//# To ensure simple and efficient implementations of frame parsing, a
+//# frame type MUST use the shortest possible encoding.
 pub fn decodeMinimal(source: []const u8) DecodeError!Decoded {
     const decoded = try decode(source);
     if (decoded.octets != encodedLength(decoded.value)) return error.NotMinimal;
@@ -241,6 +244,10 @@ test "RFC 9000 appendix A.1: the sample encodings" {
     }
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9000#section-12.4
+//# To ensure simple and efficient implementations of frame parsing, a
+//# frame type MUST use the shortest possible encoding.
+//= type=test
 test "RFC 9000 appendix A.1: 0x4025 is also 37" {
     // The appendix's fifth case, and the whole reason `decodeMinimal` exists.
     const decoded = try decode(&.{ 0x40, 0x25 });

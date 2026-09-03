@@ -35,11 +35,77 @@ const assert = @import("../assert.zig").assert;
 
 /// Section 17.2: the longest identifier a QUIC version 1 endpoint may use, and
 /// the reason the storage below is a fixed array.
+//= https://www.rfc-editor.org/rfc/rfc9000#section-17.2
+//# In QUIC version 1, this value MUST NOT exceed 20 bytes. Endpoints
+//# that receive a version 1 long header with a value larger than 20
+//# MUST drop the packet.
 pub const octets_max: u8 = 20;
 
 /// Section 5.1.1: an endpoint that issues a zero-length identifier is saying it
 /// will route by four-tuple alone. Legal, and a real deployment choice — but it
 /// forfeits migration, so the two are worth being able to name apart.
+///
+/// The rules below are what an endpoint that *issues* identifiers owes its
+/// peer. This package issues exactly one — the `Options.source` its consumer
+/// hands it — and never a second, so each of them is an exception naming that
+/// rather than a gap.
+//= https://www.rfc-editor.org/rfc/rfc9000#section-5.1
+//# Connection IDs MUST NOT contain any information that can be used by
+//# an external observer (that is, one that does not cooperate with the
+//# issuer) to correlate them with other connection IDs for the same
+//# connection.
+//= type=exception
+//= reason=this package chooses no connection identifier; it draws no randomness at all, so the one identifier it uses is the octets its consumer supplied. See docs/DESIGN.md section 3 for why entropy stays outside the seam, and section 2 for what this package owns.
+//
+//= https://www.rfc-editor.org/rfc/rfc9000#section-5.1
+//# As a trivial example, this means the same connection ID MUST NOT be
+//# issued more than once on the same connection.
+//= type=exception
+//= reason=only one identifier is ever issued, so there is no second issuance to collide with; issuing more belongs to migration, which is out of scope per docs/DESIGN.md section 2 and section 6.
+//
+//= https://www.rfc-editor.org/rfc/rfc9000#section-5.1
+//# An endpoint MUST NOT use the same IP address and port for multiple
+//# concurrent connections with zero-length connection IDs, unless it is
+//# certain that those protocol features are not in use.
+//= type=exception
+//= reason=nothing here sees an address or a port; the seam of docs/DESIGN.md section 3 takes a datagram rather than a socket, so demultiplexing connections onto a four-tuple is the consumer's table and not this type's.
+//
+//= https://www.rfc-editor.org/rfc/rfc9000#section-5.1.1
+//# The sequence number on each newly issued connection ID MUST increase
+//# by 1.
+//= type=exception
+//= reason=no connection identifier is ever issued after the first, which carries sequence number zero by definition, so no sequence number is ever assigned. NEW_CONNECTION_ID belongs to migration; see docs/DESIGN.md section 2 and section 6.
+//
+//= https://www.rfc-editor.org/rfc/rfc9000#section-5.1.1
+//# An endpoint MUST NOT provide more connection IDs than the peer's
+//# limit.
+//= type=exception
+//= reason=this endpoint provides none beyond the first, so the peer's active_connection_id_limit can never be exceeded. See docs/DESIGN.md section 2 and section 6 for migration's place on the not-built list.
+//
+//= https://www.rfc-editor.org/rfc/rfc9000#section-5.1.1
+//# After processing a NEW_CONNECTION_ID frame and adding and retiring
+//# active connection IDs, if the number of active connection IDs
+//# exceeds the value advertised in its active_connection_id_limit
+//# transport parameter, an endpoint MUST close the connection with an
+//# error of type CONNECTION_ID_LIMIT_ERROR.
+//= type=exception
+//= reason=NEW_CONNECTION_ID frames are parsed and ignored rather than tracked, because migration is out of scope and this endpoint keeps no set of active identifiers to overflow. See docs/DESIGN.md section 2 and section 6.
+//
+//= https://www.rfc-editor.org/rfc/rfc9000#section-5.1.2
+//# Upon receipt of an increased Retire Prior To field, the peer MUST
+//# stop using the corresponding connection IDs and retire them with
+//# RETIRE_CONNECTION_ID frames before adding the newly provided
+//# connection ID to the set of active connection IDs.
+//= type=exception
+//= reason=retirement is migration's bookkeeping and is out of scope; this endpoint uses one destination identifier for the life of the connection and never rotates it. See docs/DESIGN.md section 2 and section 6.
+//
+//= https://www.rfc-editor.org/rfc/rfc9000#section-5.1.2
+//# An endpoint MUST NOT forget a connection ID without retiring it,
+//# though it MAY choose to treat having connection IDs in need of
+//# retirement that exceed this limit as a connection error of type
+//# CONNECTION_ID_LIMIT_ERROR.
+//= type=exception
+//= reason=no identifier is ever forgotten because none is ever stored beyond the single one in use; the retirement bookkeeping this rule governs belongs to migration, which docs/DESIGN.md section 2 and section 6 place out of scope.
 pub const octets_min: u8 = 0;
 
 comptime {
@@ -105,6 +171,11 @@ test "the empty identifier is a choice, not an error" {
     try std.testing.expectEqual(@as(usize, 0), id.bytes().len);
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9000#section-17.2
+//# In QUIC version 1, this value MUST NOT exceed 20 bytes. Endpoints
+//# that receive a version 1 long header with a value larger than 20
+//# MUST drop the packet.
+//= type=test
 test "twenty octets fit and twenty-one do not" {
     const twenty: [octets_max]u8 = @splat(0xab);
     const id = try init(&twenty);
