@@ -1316,6 +1316,9 @@ pub fn Connection(comptime config: Config) type {
                     assert(@min(level.framed, context.crypto_start) <= level.framed);
                     level.framed = @min(level.framed, context.crypto_start);
                 }
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-13.3
+                //# The HANDSHAKE_DONE frame MUST be retransmitted until it is
+                //# acknowledged.
                 if (context.handshake_done) self.handshake_done_framed = false;
                 if (context.stream_end > context.stream_start or context.stream_fin) {
                     self.streams.rewind(context.stream, context.stream_start, context.stream_fin);
@@ -2175,6 +2178,12 @@ fn deliver(from: *TestConnection, to: *TestConnection, now_ns: u64) !usize {
     return octets;
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9000#section-14.1
+//# A client MUST expand the payload of all UDP datagrams carrying
+//# Initial packets to at least the smallest allowed maximum datagram
+//# size of 1200 bytes by adding PADDING frames to the Initial packet or
+//# by coalescing the Initial packet; see Section 12.2.
+//= type=test
 test "a client's first flight is a padded Initial carrying its CRYPTO bytes" {
     var client = testClient();
     var server = testServer();
@@ -2214,6 +2223,12 @@ test "the server's reply completes the Initial exchange in both directions" {
     try testing.expectEqual(@as(?u64, 0), client.spaces[@intFromEnum(Space.initial)].largest_acked);
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9001#section-4.9.1
+//# Thus, a client MUST discard Initial keys when it first sends a
+//# Handshake packet and a server MUST discard Initial keys when it first
+//# successfully processes a Handshake packet.  Endpoints MUST NOT send
+//# Initial packets after this point.
+//= type=test
 test "a handshake reaches 1-RTT through all three levels" {
     var client = testClient();
     var server = testServer();
@@ -2252,6 +2267,11 @@ test "a handshake reaches 1-RTT through all three levels" {
     try testing.expectEqual(State.established, client.state);
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9000#section-8.1
+//# Prior to validating the client address, servers MUST NOT send more
+//# than three times as many bytes as the number of bytes they have
+//# received.
+//= type=test
 test "section 8.1: a server may not amplify before the address is validated" {
     var server = testServer();
     // Nothing received, so nothing may be sent: an unvalidated address gets
@@ -2272,6 +2292,12 @@ test "section 8.1: a server may not amplify before the address is validated" {
     try testing.expectEqual(@as(usize, 0), try server.send(&datagram, 0));
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9000#section-8.1
+//# For the purposes of
+//# avoiding amplification prior to address validation, servers MUST
+//# count all of the payload bytes received in datagrams that are
+//# uniquely attributed to a single connection.
+//= type=test
 test "a Handshake packet validates the address and lifts the limit" {
     var client = testClient();
     var server = testServer();
@@ -2291,6 +2317,11 @@ test "a Handshake packet validates the address and lifts the limit" {
     try testing.expectEqual(@as(u64, TestConnection.datagram_octets), server.sendRoom());
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9000#section-12.4
+//# An endpoint MUST treat
+//# receipt of a frame in a packet type that is not permitted as a
+//# connection error of type PROTOCOL_VIOLATION.
+//= type=test
 test "section 12.4: a frame the level does not permit is a protocol violation" {
     var client = testClient();
     var server = testServer();
@@ -2311,6 +2342,11 @@ test "section 12.4: a frame the level does not permit is a protocol violation" {
     try client.receiveFrame(.one_rtt, (try frame.parse(payload[0..done])).frame, 0);
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9000#section-13.1
+//# An endpoint SHOULD treat receipt of an acknowledgment for a packet it
+//# did not send as a connection error of type PROTOCOL_VIOLATION, if it
+//# is able to detect the condition.
+//= type=test
 test "an ACK for a packet never sent is refused" {
     var client = testClient();
     var payload: [64]u8 = @splat(0);
@@ -2328,6 +2364,12 @@ test "an ACK for a packet never sent is refused" {
     try testing.expectError(error.Protocol, client.receiveFrames(.initial, payload[0..written], 0));
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9000#section-12.2
+//# For example, if decryption fails (because the keys are
+//# not available or for any other reason), the receiver MAY either
+//# discard or buffer the packet for later processing and MUST attempt to
+//# process the remaining packets.
+//= type=test
 test "a datagram that cannot be decrypted is discarded, not fatal" {
     var server = testServer();
     var datagram: [initial_datagram_min]u8 = @splat(0);
@@ -2346,6 +2388,13 @@ test "a datagram that cannot be decrypted is discarded, not fatal" {
     try testing.expectEqual(@as(u32, 0), server.spaces[@intFromEnum(Space.initial)].received.count);
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9000#section-12.3
+//# A receiver MUST discard a newly unprotected packet unless it is
+//# certain that it has not processed another packet with the same packet
+//# number from the same packet number space.  Duplicate suppression MUST
+//# happen after removing packet protection for the reasons described in
+//# Section 9.5 of [QUIC-TLS].
+//= type=test
 test "a duplicate packet is not processed twice" {
     var client = testClient();
     var server = testServer();
@@ -2365,6 +2414,10 @@ test "a duplicate packet is not processed twice" {
     try testing.expectEqualStrings("ClientHello", server.cryptoOut(.initial));
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9000#section-10.2.2
+//# While otherwise identical to the closing state, an
+//# endpoint in the draining state MUST NOT send any packets.
+//= type=test
 test "a CONNECTION_CLOSE puts the receiver in draining" {
     var client = testClient();
     var server = testServer();
@@ -2404,6 +2457,10 @@ test "handshake bytes larger than one packet span several" {
     try testing.expectEqualSlices(u8, &chain, client.cryptoOut(.handshake));
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9000#section-7.5
+//# If an endpoint does not expand its buffer, it MUST close
+//# the connection with a CRYPTO_BUFFER_EXCEEDED error code.
+//= type=test
 test "more handshake data than the buffer holds is refused rather than overrun" {
     var client = testClient();
     const oversized: [5000]u8 = @splat(0);
@@ -2603,6 +2660,11 @@ test "a response larger than one packet arrives in order" {
     try testing.expectEqualSlices(u8, &body, received[0..body.len]);
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9000#section-4.1
+//# A receiver MUST close the connection with an error of type
+//# FLOW_CONTROL_ERROR if the sender violates the advertised connection
+//# or stream data limits; see Section 11 for details on error handling.
+//= type=test
 test "section 4.1: a peer that sends past its limit is refused" {
     var server = testServer();
     var payload: [256]u8 = @splat(0);
@@ -2666,6 +2728,11 @@ test "a lost stream packet is sent again" {
     try testing.expectEqualStrings("the body", server.readable(0));
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9000#section-4.5
+//# The receiver MUST use the final size of the stream to
+//# account for all bytes sent on the stream in its connection-level flow
+//# controller.
+//= type=test
 test "a RESET_STREAM ends the receive half and keeps its accounting" {
     var client = testClient();
     var server = testServer();
@@ -2903,6 +2970,12 @@ test "a lost FIN is sent again even though it carries no octets" {
     try testing.expect(server.findStream(0).?.receive_state != .receiving);
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9001#section-6.2
+//# If a packet is successfully processed using the next key and IV, then
+//# the peer has initiated a key update.  The endpoint MUST update its
+//# send keys to the corresponding key phase in response, as described in
+//# Section 6.1.
+//= type=test
 test "RFC 9001 section 6: a key update crosses the wire and the peer follows" {
     var client = testClient();
     var server = testServer();
@@ -2934,6 +3007,10 @@ test "RFC 9001 section 6: a key update crosses the wire and the peer follows" {
     try testing.expect(server.one_rtt.phase);
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9001#section-6.1
+//# An endpoint MUST retain old keys until it has successfully
+//# unprotected a packet sent using the new keys.
+//= type=test
 test "section 6.3: a packet reordered from before an update still opens" {
     var client = testClient();
     var server = testServer();
@@ -2955,6 +3032,12 @@ test "section 6.3: a packet reordered from before an update still opens" {
     try testing.expect(!server.one_rtt.phase);
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9001#section-6.1
+//# An endpoint MUST NOT initiate a key update prior to having confirmed
+//# the handshake (Section 4.1.2).  An endpoint MUST NOT initiate a
+//# subsequent key update unless it has received an acknowledgment for a
+//# packet that was sent protected with keys from the current key phase.
+//= type=test
 test "section 6.1: no second update until the first is acknowledged" {
     var client = testClient();
     var server = testServer();
@@ -2973,6 +3056,16 @@ test "section 6.1: no second update until the first is acknowledged" {
     try testing.expect(client.canUpdateKeys());
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9001#section-6.6
+//# Endpoints MUST initiate a key update
+//# before sending more protected packets than the confidentiality limit
+//# for the selected AEAD permits.
+//= type=test
+//
+//= https://www.rfc-editor.org/rfc/rfc9001#section-6.6
+//# Endpoints MUST count the number of encrypted packets for each set of
+//# keys.
+//= type=test
 test "section 6.6: the confidentiality limit updates keys rather than closing" {
     var client = testClient();
     var server = testServer();
@@ -2994,6 +3087,14 @@ test "section 6.6: the confidentiality limit updates keys rather than closing" {
     try testing.expectEqual(State.established, client.state);
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9001#section-6.6
+//# If a key update is not possible or
+//# integrity limits are reached, the endpoint MUST stop using the
+//# connection and only send stateless resets in response to receiving
+//# packets.  It is RECOMMENDED that endpoints immediately close the
+//# connection with a connection error of type AEAD_LIMIT_REACHED before
+//# reaching a state where key updates are not possible.
+//= type=test
 test "section 6.6: the confidentiality limit closes when no update is possible" {
     var client = testClient();
     var server = testServer();
@@ -3011,6 +3112,15 @@ test "section 6.6: the confidentiality limit closes when no update is possible" 
     try testing.expectEqual(@intFromEnum(error_code.Transport.aead_limit_reached), client.close_code);
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9001#section-6.6
+//# In addition to counting packets sent, endpoints MUST count the number
+//# of received packets that fail authentication during the lifetime of a
+//# connection.  If the total number of received packets that fail
+//# authentication within the connection, across all keys, exceeds the
+//# integrity limit for the selected AEAD, the endpoint MUST immediately
+//# close the connection with a connection error of type
+//# AEAD_LIMIT_REACHED and not process any more packets.
+//= type=test
 test "section 6.6: forgeries past the integrity limit close the connection" {
     var client = testClient();
     var server = testServer();
@@ -3042,6 +3152,10 @@ test "section 6.6: forgeries past the integrity limit close the connection" {
     try testing.expectEqual(@intFromEnum(error_code.Transport.aead_limit_reached), server.close_code);
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9000#section-7.2
+//# A server MUST set the Destination Connection ID it
+//# uses for sending packets based on the first received Initial packet.
+//= type=test
 test "section 7.2: a client's source connection id is fixed for the connection" {
     var client = testClient();
     var server = testServer();
@@ -3067,6 +3181,17 @@ test "section 7.2: a client's source connection id is fixed for the connection" 
     try testing.expectEqualSlices(u8, &client_source, server.destination.bytes());
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9000#section-14.1
+//# A server MUST discard an Initial packet that is carried in a UDP
+//# datagram with a payload that is smaller than the smallest allowed
+//# maximum datagram size of 1200 bytes.
+//= type=test
+//
+//= https://www.rfc-editor.org/rfc/rfc9000#section-14
+//# Therefore, an endpoint MUST NOT close a connection
+//# when it receives a datagram that does not meet size constraints; the
+//# endpoint MAY discard such datagrams.
+//= type=test
 test "section 14.1: an undersized Initial is discarded and buys no allowance" {
     var server = testServer();
     var client = testClient();
@@ -3141,6 +3266,12 @@ test "a full window does not throttle acknowledgements" {
     try testing.expect(!server.spaces[@intFromEnum(Space.application)].received.ack_eliciting_pending);
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9000#section-10.2.2
+//# An endpoint that receives a CONNECTION_CLOSE frame MAY send a single
+//# packet containing a CONNECTION_CLOSE frame before entering the
+//# draining state, using a NO_ERROR code if appropriate.  An endpoint
+//# MUST NOT send further packets.
+//= type=test
 test "section 10.2: a closing endpoint sends only CONNECTION_CLOSE" {
     var client = testClient();
     var server = testServer();
@@ -3196,6 +3327,10 @@ test "RFC 9001 section 4.1.2: the server sends HANDSHAKE_DONE" {
     try testing.expect(client.recovery.handshake_confirmed);
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9000#section-13.3
+//# The HANDSHAKE_DONE frame MUST be retransmitted until it is
+//# acknowledged.
+//= type=test
 test "a lost HANDSHAKE_DONE is sent again" {
     // It carries no byte range, so like a FIN it needs its own re-owing: a
     // client that missed it never confirms, and RFC 9002 section 6.2.1 then
