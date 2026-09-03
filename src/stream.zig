@@ -41,6 +41,12 @@
 // authoritative for an origin all sit on the consumer's side of the seam, per
 // docs/DESIGN.md sections 3 and 4.
 //= https://www.rfc-editor.org/rfc/rfc9114#section-3.1
+//# Connectivity problems (e.g., blocking UDP) can result in a failure to
+//# establish a QUIC connection; clients SHOULD attempt to use TCP-based
+//# versions of HTTP in this case.
+//= type=exception
+//= reason=falling back to a TCP-based HTTP version means opening a TCP connection and speaking HTTP/1.1 or HTTP/2, neither of which exists here: docs/DESIGN.md section 3's seam takes datagrams and the no-I/O rule forbids a socket outright. The consumer is the party that chose QUIC and is the only one that can choose otherwise
+//= https://www.rfc-editor.org/rfc/rfc9114#section-3.1
 //# Upon receiving a
 //# server certificate in the TLS handshake, the client MUST verify that
 //# the certificate is an acceptable match for the URI's origin server
@@ -76,6 +82,26 @@
 //# connection SHOULD be established for the new origin.
 //= type=exception
 //= reason=choosing which connection carries a request for which origin is the consumer's, and the certificate that decision rests on never crosses the seam of docs/DESIGN.md section 4
+//= https://www.rfc-editor.org/rfc/rfc9114#section-3.3
+//# If the reason the certificate cannot be verified might apply to other
+//# origins already associated with the connection, the client SHOULD
+//# revalidate the server certificate for those origins.
+//= type=exception
+//= reason=revalidating a certificate is the TLS engine's, and this package links neither of the two consumers use: docs/DESIGN.md section 4 puts the engine on their side of the seam, so no certificate and no list of associated origins exists here to revalidate
+//= https://www.rfc-editor.org/rfc/rfc9114#section-3.3
+//# Clients SHOULD NOT open more than one HTTP/3 connection to a given IP
+//# address and UDP port, where the IP address and port might be derived
+//# from a URI, a selected alternative service ([ALTSVC]), a configured
+//# proxy, or name resolution of any of these.
+//= type=exception
+//= reason=this package opens no connection and knows no address: docs/DESIGN.md section 3's seam takes datagrams a consumer has already read off a socket, and the no-I/O rule keeps std.net out of src/ entirely. Pooling one connection per address is the consumer's bookkeeping
+//= https://www.rfc-editor.org/rfc/rfc9114#section-3.3
+//# A client MAY open multiple HTTP/3 connections to the same IP address
+//# and UDP port using different transport or TLS configurations but
+//# SHOULD avoid creating multiple connections with the same
+//# configuration.
+//= type=exception
+//= reason=the transport and TLS configurations this rule compares are the consumer's — quic/Connection is parameterised with its limits and its TLS engine is its own, per docs/DESIGN.md sections 4 and 5 — so nothing here can tell one configuration from another, or open a second connection under either
 
 const std = @import("std");
 
@@ -97,6 +123,29 @@ const varint = @import("varint.zig");
 //# unidirectional streams.
 //= type=exception
 //= reason=the value advertised for initial_max_streams_uni comes from the limits a consumer parameterises quic/Connection with (docs/DESIGN.md section 5), and quic/transport_parameters.zig is what encodes it; this file classifies the type on a stream that already exists and opens none
+//= https://www.rfc-editor.org/rfc/rfc9114#section-6.1
+//# In order to permit these streams to open, an HTTP/3 server SHOULD
+//# configure non- zero minimum values for the number of permitted streams
+//# and the initial stream flow-control window.
+//= type=exception
+//= reason=a limit that is not comptime is a bug here (docs/DESIGN.md section 5): quic/Connection is parameterised by the consumer's limits, so what a server configures is chosen one level up and encoded by quic/transport_parameters.zig. This file opens no stream and advertises nothing
+//= https://www.rfc-editor.org/rfc/rfc9114#section-6.1
+//# So as to not unnecessarily limit parallelism, at least 100 request
+//# streams SHOULD be permitted at a time.
+//= type=exception
+//= reason=initial_max_streams_bidi is one of the comptime limits a consumer parameterises quic/Connection with, per docs/DESIGN.md section 5; a hundred is a deployment's number rather than a codec's, and this file neither holds it nor counts streams against it
+//= https://www.rfc-editor.org/rfc/rfc9114#section-6.2
+//# These transport parameters SHOULD also provide at least 1,024 bytes of
+//# flow-control credit to each unidirectional stream.
+//= type=exception
+//= reason=initial_max_stream_data_uni is a comptime limit the consumer parameterises quic/Connection with (docs/DESIGN.md section 5) and quic/transport_parameters.zig encodes; this file reads the first octets of a stream and grants no credit
+//= https://www.rfc-editor.org/rfc/rfc9114#section-6.2
+//# Endpoints SHOULD create the HTTP control stream as well as the
+//# unidirectional streams required by mandatory extensions (such as the
+//# QPACK encoder and decoder streams) first, and then create additional
+//# streams as allowed by their peer.
+//= type=exception
+//= reason=the control stream and the two QPACK streams are not built — docs/DESIGN.md section 6 lists the control stream as next and the QPACK dynamic table with it — so there is no ordering here to get right; write() encodes a type into a caller's buffer and opens nothing
 //= https://www.rfc-editor.org/rfc/rfc9114#section-11.2.4
 //# In addition to common fields as described in Section 11.2, permanent
 //# registrations in this registry MUST include the following fields:
@@ -120,6 +169,13 @@ pub const Type = enum(u64) {
     //# H3_MISSING_SETTINGS.
     //= type=exception
     //= reason=initiating the control stream and sequencing SETTINGS onto it is the HTTP/3 connection layer's, which docs/DESIGN.md section 6 lists as next rather than built; Type.control is the number it will write first
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.1
+    //# Because the contents of the control stream are used to manage the
+    //# behavior of other streams, endpoints SHOULD provide enough flow-
+    //# control credit to keep the peer's control stream from becoming
+    //# blocked.
+    //= type=exception
+    //= reason=flow-control credit for a stream is granted by quic/Connection out of a comptime limit the consumer parameterises it with (docs/DESIGN.md section 5), and the control stream that would need it is not built (section 6). Type.control is the number by which the connection layer will recognise the stream to credit
     control = 0x00,
     //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.2
     //# Only servers can push; if a server receives a client-initiated push
@@ -173,6 +229,18 @@ pub const Type = enum(u64) {
     //# HTTP cache.
     //= type=exception
     //= reason=server push is not implemented and this package has no cache; cacheability is decided from response fields by the consumer that would store them
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.2
+    //# A client SHOULD NOT abort reading on a push stream prior to reading
+    //# the push stream header, as this could lead to disagreement between
+    //# client and server on which push IDs have already been consumed.
+    //= type=exception
+    //= reason=server push is not implemented, so no push stream header is ever read and no push ID is ever consumed; aborting a read is the consumer's action on a QUIC stream in any case, per docs/DESIGN.md section 3
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-4.6
+    //# Clients SHOULD abort reading and discard data already read from push
+    //# streams if no corresponding PUSH_PROMISE frame is processed in a
+    //# reasonable amount of time.
+    //= type=exception
+    //= reason=server push is not implemented, and pairing a push stream with the PUSH_PROMISE that announced it is connection state nothing here holds; "a reasonable amount of time" would also need a clock, and docs/DESIGN.md's seam takes now_ns as a parameter rather than reading one
     //= https://www.rfc-editor.org/rfc/rfc9114#section-10.4
     //# Where multiple tenants share space on the same server, that server
     //# MUST ensure that tenants are not able to push representations of
@@ -213,6 +281,12 @@ pub const Type = enum(u64) {
     //# unsupported types.
     //= type=exception
     //= reason=discarding a stream's data or aborting its read is an action on a QUIC stream, which docs/DESIGN.md section 3 puts on the consumer's side of the seam; Type.known is the classification it asks
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2
+    //# If reading is aborted, the recipient SHOULD use the
+    //# H3_STREAM_CREATION_ERROR error code or a reserved error code (Section
+    //# 8.1).
+    //= type=exception
+    //= reason=aborting a read is a QUIC STOP_SENDING and choosing the code on it is that frame's field, both of which are the consumer's per docs/DESIGN.md section 3; this file answers which types are unknown and never resets anything
     pub fn known(stream_type: Type) bool {
         return switch (stream_type) {
             .control, .push, .qpack_encoder, .qpack_decoder => true,
@@ -236,6 +310,11 @@ pub const Type = enum(u64) {
     //# assigned values.
     //= type=exception
     //= reason=an instruction to IANA rather than to an implementation; isReserved is what this package does with the family IANA is told to leave unassigned, and the test below walks it
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.3
+    //# When resetting the stream, either the H3_NO_ERROR error code or a
+    //# reserved error code (Section 8.1) SHOULD be used.
+    //= type=exception
+    //= reason=resetting a stream is a QUIC RESET_STREAM and the code on it is that frame's field, both the consumer's per docs/DESIGN.md section 3; isReserved is what tells it that the stream it is resetting is one of the reserved family this sentence is about
     pub fn isReserved(stream_type: Type) bool {
         const value = @intFromEnum(stream_type);
         if (value < 0x21) return false;
@@ -283,6 +362,12 @@ pub const Parsed = struct {
 //# A receiver MUST tolerate unidirectional streams being
 //# closed or reset prior to the reception of the unidirectional stream
 //# header.
+//= https://www.rfc-editor.org/rfc/rfc9114#section-6.2
+//# As certain stream types can affect connection state, a recipient
+//# SHOULD NOT discard data from incoming unidirectional streams prior to
+//# reading the stream type.
+//= type=exception
+//= reason=discarding a stream's data is the recipient's action and docs/DESIGN.md section 3 puts the QUIC stream on the consumer's side of the seam. What this file owes that recipient is the reason it need not discard early, and parse gives it: a type split across packets answers Incomplete rather than an error, so a caller that follows the contract keeps the octets and retries
 pub fn parse(source: []const u8) ParseError!Parsed {
     const decoded = varint.decodeMinimal(source) catch |err| return switch (err) {
         error.Incomplete => error.Incomplete,
