@@ -677,10 +677,18 @@ pub const MessageValidator = struct {
     }
 
     /// RFC 9110 section 8.6: `Content-Length = 1*DIGIT`. A second field line
-    /// with a different value is the response-splitting pair, and section 8.6
-    /// permits refusing even the repeated-identical form — which this does,
-    /// because "a sender MUST NOT forward a message with a Content-Length
-    /// header field value that does not match the ABNF above".
+    /// with a different value is the response-splitting pair — whichever the next
+    /// hop believes, the other half of the stream is a message it did not see
+    /// coming — and that is what this refuses.
+    ///
+    /// Two field lines carrying the *same* value are accepted. Section 8.6 offers
+    /// both answers for that case ("MAY either reject the message as invalid or
+    /// replace that invalid field value with a single instance"), and taking the
+    /// second is conformant. What is refused is the comma-joined spelling
+    /// `10, 10`, which fails the ABNF outright.
+    ///
+    /// This comment used to claim the repeated-identical form was refused too,
+    /// "which this does" — it does not, and the test below states the real rule.
     fn checkContentLength(self: *MessageValidator, value: []const u8) Error!void {
         const length = parseContentLength(value) orelse return error.ContentLengthInvalid;
         if (self.content_length_seen and self.content_length != length) {
