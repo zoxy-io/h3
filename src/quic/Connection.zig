@@ -643,6 +643,49 @@ pub fn Connection(comptime config: Config) type {
 
         // ---------------------------------------------------------------- TLS
 
+        // Section 4's rules about the handshake itself, gathered at the entry point
+        // that is the whole of this package's view of TLS: a secret, a level and a
+        // direction. What negotiated the secret, whether it authenticated anybody,
+        // and what it would do about an alert are all on the other side.
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-4.2
+        //# Clients MUST NOT offer TLS versions older than 1.3.
+        //= type=exception
+        //= reason=the TLS handshake is the consumer's engine and not this package's: docs/DESIGN.md section 4 puts ztls and zssl on the other side of the seam, and what crosses it is handshake bytes and traffic secrets. Nothing here sees a TLS version, a certificate, an alert or a handshake message, so none of these rules has a place to be checked. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-4.2
+        //# An endpoint MUST terminate the connection if a version of TLS older
+        //# than 1.3 is negotiated.
+        //= type=exception
+        //= reason=the TLS handshake is the consumer's engine and not this package's: docs/DESIGN.md section 4 puts ztls and zssl on the other side of the seam, and what crosses it is handshake bytes and traffic secrets. Nothing here sees a TLS version, a certificate, an alert or a handshake message, so none of these rules has a place to be checked. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-4.4
+        //# A client MUST authenticate the identity of the server.
+        //= type=exception
+        //= reason=the TLS handshake is the consumer's engine and not this package's: docs/DESIGN.md section 4 puts ztls and zssl on the other side of the seam, and what crosses it is handshake bytes and traffic secrets. Nothing here sees a TLS version, a certificate, an alert or a handshake message, so none of these rules has a place to be checked. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-4.4
+        //# A server MUST NOT use post-handshake client authentication (as
+        //# defined in Section 4.6.2 of [TLS13]) because the multiplexing
+        //# offered by QUIC prevents clients from correlating the certificate
+        //# request with the application-level event that triggered it (see
+        //# [HTTP2-TLS13]).
+        //= type=exception
+        //= reason=the TLS handshake is the consumer's engine and not this package's: docs/DESIGN.md section 4 puts ztls and zssl on the other side of the seam, and what crosses it is handshake bytes and traffic secrets. Nothing here sees a TLS version, a certificate, an alert or a handshake message, so none of these rules has a place to be checked. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-4.4
+        //# More specifically, servers MUST NOT send post- handshake TLS
+        //# CertificateRequest messages, and clients MUST treat receipt of such
+        //# messages as a connection error of type PROTOCOL_VIOLATION.
+        //= type=exception
+        //= reason=the TLS handshake is the consumer's engine and not this package's: docs/DESIGN.md section 4 puts ztls and zssl on the other side of the seam, and what crosses it is handshake bytes and traffic secrets. Nothing here sees a TLS version, a certificate, an alert or a handshake message, so none of these rules has a place to be checked. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-4.8
+        //# As QUIC provides alternative mechanisms for connection termination
+        //# and the TLS connection is only closed if an error is encountered, a
+        //# QUIC endpoint MUST treat any alert from TLS as if it were at the
+        //# "fatal" level.
+        //= type=exception
+        //= reason=the TLS handshake is the consumer's engine and not this package's: docs/DESIGN.md section 4 puts ztls and zssl on the other side of the seam, and what crosses it is handshake bytes and traffic secrets. Nothing here sees a TLS version, a certificate, an alert or a handshake message, so none of these rules has a place to be checked. See docs/DESIGN.md section 2 and section 6.
         pub const SecretError = error{
             /// A secret of the wrong length for the suite, or one installed at
             /// a level whose keys are already gone.
@@ -660,6 +703,17 @@ pub fn Connection(comptime config: Config) type {
         ) SecretError!void {
             if (secret.length != suite.hashOctets()) return error.Rejected;
             const keys: crypto.Keys = .fromSecret(suite, secret);
+
+            // Nothing checks the level below before installing this one. A peer that
+            // sends a CRYPTO frame at Initial, then hands over Handshake keys before the
+            // consumer has read those octets back out through `cryptoOut`, gets the new
+            // level installed and the old flow's remainder silently stranded.
+            //= https://www.rfc-editor.org/rfc/rfc9001#section-4.1.3
+            //# When TLS provides keys for a higher encryption level, if there
+            //# is data from a previous encryption level that TLS has not
+            //# consumed, this MUST be treated as a connection error of type
+            //# PROTOCOL_VIOLATION.
+            //= type=todo
             switch (direction) {
                 .send => self.send_keys[@intFromEnum(level)] = keys,
                 .receive => self.receive_keys[@intFromEnum(level)] = keys,
@@ -922,6 +976,23 @@ pub fn Connection(comptime config: Config) type {
             assert(self.spaces[@intFromEnum(Space.handshake)].discarded);
         }
 
+        // QUIC's key update is this function and nothing else. The TLS message of
+        // the same name never appears on either side of the seam: `cryptoIn` and
+        // `cryptoOut` carry opaque octets, and only the consumer's engine can tell
+        // one handshake message from another.
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-6
+        //# Endpoints MUST NOT send a TLS KeyUpdate message.
+        //= type=exception
+        //= reason=the TLS handshake is the consumer's engine and not this package's: docs/DESIGN.md section 4 puts ztls and zssl on the other side of the seam, and what crosses it is handshake bytes and traffic secrets. Nothing here sees a TLS version, a certificate, an alert or a handshake message, so none of these rules has a place to be checked. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-6
+        //# Endpoints MUST treat the receipt of a TLS KeyUpdate message as a
+        //# connection error of type 0x010a, equivalent to a fatal TLS alert of
+        //# unexpected_message; see Section 4.8. Figure 9 shows a key update
+        //# process, where the initial set of keys used (identified with @M) are
+        //# replaced by updated keys (identified with @N).
+        //= type=exception
+        //= reason=the TLS handshake is the consumer's engine and not this package's: docs/DESIGN.md section 4 puts ztls and zssl on the other side of the seam, and what crosses it is handshake bytes and traffic secrets. Nothing here sees a TLS version, a certificate, an alert or a handshake message, so none of these rules has a place to be checked. See docs/DESIGN.md section 2 and section 6.
         pub fn updateKeys(self: *Self) void {
             const one = &self.one_rtt;
             const send_secret = one.send_secret orelse return;
@@ -1767,6 +1838,45 @@ pub fn Connection(comptime config: Config) type {
                 //# initiated stream that has not yet been created, or for a send-only
                 //# stream.
                 .stream => |value| {
+                    // `Level.zero_rtt` exists because section 12.4's table has a column for it
+                    // and a frame has to be told whether it is permitted there. It is not a
+                    // claim that 0-RTT works: no early-data key is ever installed, so this
+                    // arm is unreachable at that level and section 4.6's rules have nothing
+                    // here to govern.
+                    //= https://www.rfc-editor.org/rfc/rfc9001#section-4.6.1
+                    //# Servers MUST NOT send the early_data extension with a
+                    //# max_early_data_size field set to any value other than
+                    //# 0xffffffff.
+                    //= type=exception
+                    //= reason=0-RTT is out of scope: no early-data key is ever installed, and the session ticket, the early_data extension and the decision to accept or reject early data all live in the consumer's TLS engine, per docs/DESIGN.md section 4. See docs/DESIGN.md section 2 and section 6.
+                    //
+                    //= https://www.rfc-editor.org/rfc/rfc9001#section-4.6.1
+                    //# A client MUST treat receipt of a NewSessionTicket that
+                    //# contains an early_data extension with any other value as
+                    //# a connection error of type PROTOCOL_VIOLATION.
+                    //= type=exception
+                    //= reason=0-RTT is out of scope: no early-data key is ever installed, and the session ticket, the early_data extension and the decision to accept or reject early data all live in the consumer's TLS engine, per docs/DESIGN.md section 4. See docs/DESIGN.md section 2 and section 6.
+                    //
+                    //= https://www.rfc-editor.org/rfc/rfc9001#section-4.6.2
+                    //# When rejecting 0-RTT, a server MUST NOT process any
+                    //# 0-RTT packets, even if it could.
+                    //= type=exception
+                    //= reason=0-RTT is out of scope: no early-data key is ever installed, and the session ticket, the early_data extension and the decision to accept or reject early data all live in the consumer's TLS engine, per docs/DESIGN.md section 4. See docs/DESIGN.md section 2 and section 6.
+                    //
+                    //= https://www.rfc-editor.org/rfc/rfc9001#section-4.6.2
+                    //# The client therefore MUST reset the state of all
+                    //# streams, including application state bound to those
+                    //# streams.
+                    //= type=exception
+                    //= reason=0-RTT is out of scope: no early-data key is ever installed, and the session ticket, the early_data extension and the decision to accept or reject early data all live in the consumer's TLS engine, per docs/DESIGN.md section 4. See docs/DESIGN.md section 2 and section 6.
+                    //
+                    //= https://www.rfc-editor.org/rfc/rfc9001#section-4.9.3
+                    //# After receiving a 1-RTT packet, servers MUST discard
+                    //# 0-RTT keys within a short time; the RECOMMENDED time
+                    //# period is three times the Probe Timeout (PTO, see
+                    //# [QUIC-RECOVERY]).
+                    //= type=exception
+                    //= reason=0-RTT is out of scope: no early-data key is ever installed, and the session ticket, the early_data extension and the decision to accept or reject early data all live in the consumer's TLS engine, per docs/DESIGN.md section 4. See docs/DESIGN.md section 2 and section 6.
                     if (level != .one_rtt and level != .zero_rtt) return error.Protocol;
                     self.streams.receive(value.stream, value.offset, value.data, value.fin) catch |err| {
                         return streamError(err);
@@ -1895,6 +2005,25 @@ pub fn Connection(comptime config: Config) type {
             //# data length -- cannot exceed 2^62-1.  Receipt of a frame that exceeds
             //# this limit MUST be treated as a connection error of type
             //# FRAME_ENCODING_ERROR or CRYPTO_BUFFER_EXCEEDED.
+            //
+            // `Reassembler.push` refuses data that contradicts an offset it already
+            // holds, which is section 2.2's rule and not this one: a retransmission at a
+            // level whose keys are already superseded may still *extend* that level's
+            // flow here, and section 4.1.3 says it may not.
+            //= https://www.rfc-editor.org/rfc/rfc9001#section-4.1.3
+            //# If the result of this process is that new data is available,
+            //# then it is delivered to TLS in order. * If the packet is from a
+            //# previously installed encryption level, it MUST NOT contain data
+            //# that extends past the end of previously received data in that
+            //# flow.
+            //= type=todo
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9001#section-4.1.3
+            //# Implementations MUST treat any violations of this requirement as
+            //# a connection error of type PROTOCOL_VIOLATION. * If the packet
+            //# is from a new encryption level, it is saved for later processing
+            //# by TLS.
+            //= type=todo
             stream.received.push(value.offset, value.data) catch |err| return switch (err) {
                 // A CRYPTO stream that outruns its buffer is a resource limit
                 // rather than a peer breaking a rule, and section 7.5 gives it
@@ -2001,6 +2130,19 @@ pub fn Connection(comptime config: Config) type {
             self.recovery.discardSpace(level.space());
         }
 
+        // The level travels with the packet. `PacketContext.level` is what a lost
+        // packet hands back, and rewinding a level's send cursor re-frames the same
+        // octets at that same level — which is what keeps a retransmission under the
+        // keys the original went out with, even after a later level's arrived.
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-4
+        //# If QUIC needs to retransmit that data, it MUST use the same keys
+        //# even if TLS has already updated to newer keys.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-4.9
+        //# If packets from a lower encryption level contain CRYPTO frames,
+        //# frames that retransmit that data MUST be sent at the same encryption
+        //# level.
+        //
         /// Undo the sending of packets RFC 9002 declared lost.
         ///
         /// Rewinding the level's send cursor to where the lost packet began is
@@ -2190,6 +2332,23 @@ pub fn Connection(comptime config: Config) type {
             return offset;
         }
 
+        // Section 6.6's first two sentences are addressed to whoever writes a cipher
+        // suite's specification. What they require of *this* code is the counting
+        // below and the integrity limit in `countForgery`, both already cited.
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-6.6
+        //# Any TLS cipher suite that is specified for use with QUIC MUST define
+        //# limits on the use of the associated AEAD function that preserves
+        //# margins for confidentiality and integrity.
+        //= type=exception
+        //= reason=a requirement on the document that specifies a cipher suite for use with QUIC rather than on an implementation of one. The limits section 6.6 states for the suites this package supports are the constants `countSealed` and `countForgery` compare against, and those are cited where they are enforced.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-6.6
+        //# That is, limits MUST be specified for the number of packets that can
+        //# be authenticated and for the number of packets that can fail
+        //# authentication.
+        //= type=exception
+        //= reason=a requirement on the document that specifies a cipher suite for use with QUIC rather than on an implementation of one. The limits section 6.6 states for the suites this package supports are the constants `countSealed` and `countForgery` compare against, and those are cited where they are enforced.
+        //
         /// Section 6.6: count a packet sealed under the current key, and act
         /// before the confidentiality limit is passed rather than after.
         ///
