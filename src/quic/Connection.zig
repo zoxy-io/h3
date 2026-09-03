@@ -133,12 +133,22 @@ comptime {
     assert(ack_delay_ns_max < std.math.maxInt(u64));
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9000#section-8.1
+//# Prior to validating the client address, servers MUST NOT send more
+//# than three times as many bytes as the number of bytes they have
+//# received.
+//
 /// RFC 9000 section 8.1: before a peer's address is validated, a server may
 /// send no more than this multiple of what it has received. Without it a server
 /// is a reflector for anyone who can spoof a source address.
 pub const amplification_factor: u32 = 3;
 
 pub const Config = struct {
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-7.5
+    //# Implementations MUST support buffering at least 4096 bytes of data
+    //# received in out-of-order CRYPTO frames.
+    //= type=todo
+    //
     /// Handshake octets buffered per encryption level, each way. A TLS
     /// handshake with a certificate chain is a few kilobytes; this bounds what
     /// a peer can make us hold before the handshake completes, which is RFC
@@ -187,6 +197,9 @@ pub fn Connection(comptime config: Config) type {
         assert(config.ack_ranges_max >= 1);
         // A datagram smaller than section 14.1's floor could not carry a client
         // Initial, so the connection could never start.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-14
+        //# QUIC MUST NOT be used if the network path cannot support a
+        //# maximum datagram size of at least 1200 bytes.
         assert(config.datagram_octets >= initial_datagram_min);
         assert(config.datagram_octets <= udp_payload_octets_max);
     }
@@ -434,6 +447,11 @@ pub fn Connection(comptime config: Config) type {
             // Section 4.9.1: Initial keys are discarded as soon as a Handshake
             // packet can be sent. Holding them longer is holding keys anyone who
             // saw the first packet can compute.
+            //= https://www.rfc-editor.org/rfc/rfc9001#section-4.9.1
+            //# Thus, a client MUST discard Initial keys when it first sends a
+            //# Handshake packet and a server MUST discard Initial keys when it first
+            //# successfully processes a Handshake packet.  Endpoints MUST NOT send
+            //# Initial packets after this point.
             if (level == .handshake) self.discard(.initial);
 
             // RFC 9001 section 4.1.2: the handshake is confirmed at the *server*
@@ -443,6 +461,13 @@ pub fn Connection(comptime config: Config) type {
             // application-data PTO before it, because 1-RTT keys may not exist
             // on both sides yet, and a connection that never confirms is a
             // connection whose 1-RTT packets are never retransmitted.
+            //
+            // The Handshake keys are *not* dropped here, and by section 4.9.2
+            // they should be: for a server, "confirmed" is this line.
+            //= https://www.rfc-editor.org/rfc/rfc9001#section-4.9.2
+            //# An endpoint MUST discard its Handshake keys when the TLS handshake is
+            //# confirmed (Section 4.1.2).
+            //= type=todo
             if (level == .one_rtt and direction == .send and self.side == .server) {
                 self.state = .established;
                 self.recovery.handshake_confirmed = true;
@@ -462,6 +487,14 @@ pub fn Connection(comptime config: Config) type {
                         // see the note on `next_receive`. Through
                         // `nextGeneration`, which keeps the header protection
                         // key — section 6.1 does not update it.
+                        //= https://www.rfc-editor.org/rfc/rfc9001#section-6.3
+                        //# For this reason, endpoints MUST be able to retain two sets of packet
+                        //# protection keys for receiving packets: the current and the next.
+                        //
+                        //= https://www.rfc-editor.org/rfc/rfc9001#section-6.3
+                        //# Endpoints responding to an apparent key update MUST NOT generate a
+                        //# timing side-channel signal that might indicate that the Key Phase bit
+                        //# was invalid (see Section 9.5).
                         const next = crypto.secrets.update(suite, secret);
                         self.one_rtt.next_receive = keys.nextGeneration(suite, &next);
                     },
@@ -521,6 +554,10 @@ pub fn Connection(comptime config: Config) type {
             // rather than stored and handed back to a consumer as if it were a
             // peer's settings. Section 18 makes either failure a
             // `TRANSPORT_PARAMETER_ERROR`.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-7.4
+            //# An endpoint MUST treat receipt of a transport parameter with an
+            //# invalid value as a connection error of type
+            //# TRANSPORT_PARAMETER_ERROR.
             const parsed = try transport_parameters.parse(octets);
 
             // Section 4.6: the peer's initial stream limits are limits on *us*,
@@ -554,6 +591,19 @@ pub fn Connection(comptime config: Config) type {
             // The outgoing generation is kept for reading, not for writing:
             // section 6.3 expects reordered packets from the old phase for up
             // to a PTO after the update.
+            //= https://www.rfc-editor.org/rfc/rfc9001#section-6.1
+            //# An endpoint MUST retain old keys until it has successfully
+            //# unprotected a packet sent using the new keys.
+            //
+            // Retained without a clock, and so retained until the *next*
+            // update rather than for three times the PTO. Nothing here reads
+            // `now_ns`, so the expiry below has no timer to hang off.
+            //= https://www.rfc-editor.org/rfc/rfc9001#section-6.5
+            //# An endpoint SHOULD retain old read keys for no more than three times
+            //# the PTO after having received a packet protected using the new keys.
+            //# After this period, old read keys and their corresponding secrets
+            //# SHOULD be discarded.
+            //= type=todo
             const current_send = self.send_keys[@intFromEnum(Level.one_rtt)] orelse return;
             const current_receive = self.receive_keys[@intFromEnum(Level.one_rtt)] orelse return;
 
@@ -576,6 +626,12 @@ pub fn Connection(comptime config: Config) type {
             one.phase_acknowledged = false;
         }
 
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-6.1
+        //# An endpoint MUST NOT initiate a key update prior to having confirmed
+        //# the handshake (Section 4.1.2).  An endpoint MUST NOT initiate a
+        //# subsequent key update unless it has received an acknowledgment for a
+        //# packet that was sent protected with keys from the current key phase.
+        //
         /// Whether section 6.1 permits this endpoint to start an update.
         pub fn canUpdateKeys(self: *const Self) bool {
             if (self.state != .established) return false; // Section 6.1: not before the handshake is confirmed.
@@ -638,13 +694,38 @@ pub fn Connection(comptime config: Config) type {
             //# A server MUST discard an Initial packet that is carried in a UDP
             //# datagram with a payload that is smaller than the smallest allowed
             //# maximum datagram size of 1200 bytes.
+            //
+            // Discarded rather than closed on, which is the other half of the
+            // rule: a datagram's size is not authenticated, so treating an
+            // undersized one as a connection error would hand anyone who can
+            // spoof a source address a way to kill the connection.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-14
+            //# Therefore, an endpoint MUST NOT close a connection
+            //# when it receives a datagram that does not meet size constraints; the
+            //# endpoint MAY discard such datagrams.
             if (self.side == .server and datagram.len < initial_datagram_min) {
                 const first = packet.parse(datagram, self.source.length) catch return;
                 if (first.header == .initial) return;
             }
 
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1
+            //# For the purposes of
+            //# avoiding amplification prior to address validation, servers MUST
+            //# count all of the payload bytes received in datagrams that are
+            //# uniquely attributed to a single connection.  This includes datagrams
+            //# that contain packets that are successfully processed and datagrams
+            //# that contain packets that are all discarded.
             self.received_octets += datagram.len;
 
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-12.2
+            //# Receivers MUST be able to
+            //# process coalesced packets.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-12.2
+            //# The receiver of coalesced QUIC packets MUST
+            //# individually process each QUIC packet and separately acknowledge
+            //# them, as if they were received as the payload of different UDP
+            //# datagrams.
             var offset: usize = 0;
             var packets: u32 = 0;
             while (offset < datagram.len) : (packets += 1) {
@@ -658,10 +739,30 @@ pub fn Connection(comptime config: Config) type {
         }
 
         fn receivePacket(self: *Self, bytes: []u8, header: packet.Header, now_ns: u64) ReceiveError!void {
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-6.2
+            //# A client that supports only this version of QUIC MUST abandon the
+            //# current connection attempt if it receives a Version Negotiation
+            //# packet, with the following two exceptions.
+            //= type=exception
+            //= reason=version negotiation is out of scope for this slice; a connection here speaks one version. See docs/DESIGN.md section 2, which puts the QUIC connection state machine in this package and leaves the packet types that begin a *different* connection to the consumer.
+            //
+            // Retry is refused here for the same reason and is not excused: the
+            // integrity tag and the key re-derivation it implies are written
+            // (`original_destination` exists for it) and nothing calls them.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.5.2
+            //# A client MUST accept and process at most one Retry packet for each
+            //# connection attempt.
+            //= type=todo
             const level = header.level() orelse return; // Retry, Version Negotiation: not this slice.
             const offset = header.packetNumberOffset() orelse return;
             const index = @intFromEnum(level);
             if (self.spaces[@intFromEnum(level.space())].discarded) return;
+            // The TLS engine is the gate: 1-RTT read keys reach `installSecret`
+            // only when the handshake is complete, so a packet that arrives
+            // before then has no key to open it and is discarded here.
+            //= https://www.rfc-editor.org/rfc/rfc9001#section-5.7
+            //# Endpoints in either role MUST NOT decrypt 1-RTT packets from
+            //# their peer prior to completing the handshake.
             const keys = self.receive_keys[index] orelse return; // No keys yet: discard.
 
             const space = &self.spaces[@intFromEnum(level.space())];
@@ -676,13 +777,25 @@ pub fn Connection(comptime config: Config) type {
 
             // Section 12.3: a duplicate is discarded rather than reprocessed,
             // which is what stops a replayed packet from counting twice toward
-            // anything.
+            // anything. After `openPacket`, never before it.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-12.3
+            //# A receiver MUST discard a newly unprotected packet unless it is
+            //# certain that it has not processed another packet with the same packet
+            //# number from the same packet number space.  Duplicate suppression MUST
+            //# happen after removing packet protection for the reasons described in
+            //# Section 9.5 of [QUIC-TLS].
             if (space.received.contains(opened.number)) return;
 
             // Section 8.1: receiving a Handshake packet proves the peer holds
             // keys only the real one could have, which validates the address.
             if (level == .handshake) self.address_validated = true;
 
+            // The ACK debt is recorded only after every frame has been applied,
+            // so a payload that fails halfway is never acknowledged.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-13.1
+            //# A packet MUST NOT be acknowledged until packet protection has been
+            //# successfully removed and all frames contained in the packet have been
+            //# processed.
             const eliciting = try self.receiveFrames(level, opened.payload, now_ns);
             space.received.record(opened.number, now_ns, eliciting);
 
@@ -697,6 +810,30 @@ pub fn Connection(comptime config: Config) type {
             // of anything. An off-path observer could therefore point all of a
             // server's subsequent packets at an identifier the real client
             // discards, and the connection dies with neither endpoint at fault.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-7.2
+            //# A server MUST set the Destination Connection ID it
+            //# uses for sending packets based on the first received Initial packet.
+            //
+            // The second Initial with a different Source Connection ID is a
+            // *connection error* here, and section 7.2 asks for it to be
+            // discarded instead. Left as it stands rather than changed under a
+            // ledger pass, because the two readings differ in what an off-path
+            // forgery costs and that is a decision rather than an edit.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-7.2
+            //# Any further changes to the Destination Connection ID are only
+            //# permitted if the values are taken from NEW_CONNECTION_ID frames; if
+            //# subsequent Initial packets include a different Source Connection ID,
+            //# they MUST be discarded.
+            //= type=todo
+            //
+            // And the client half of the same rule is absent: only a server
+            // pins its peer's Source Connection ID below.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-7.2
+            //# Once a
+            //# client has received a valid Initial packet from the server, it MUST
+            //# discard any subsequent packet it receives on that connection with a
+            //# different Source Connection ID.
+            //= type=todo
             if (self.side == .server) {
                 switch (header) {
                     .initial => |value| {
@@ -750,6 +887,12 @@ pub fn Connection(comptime config: Config) type {
             // a packet reordered from before ours. Both carry the opposite bit,
             // so there is nothing to tell them apart but trying: the next
             // generation first, then the previous.
+            //= https://www.rfc-editor.org/rfc/rfc9001#section-6.2
+            //# If a packet is successfully processed using the next key and IV, then
+            //# the peer has initiated a key update.  The endpoint MUST update its
+            //# send keys to the corresponding key phase in response, as described in
+            //# Section 6.1.  Sending keys MUST be updated before sending an
+            //# acknowledgment for the packet that was received with updated keys.
             if (one.next_receive) |next| {
                 if (next.decrypt(bytes, header)) |opened| {
                     // Section 6.2: a packet that opens under the next generation
@@ -758,9 +901,23 @@ pub fn Connection(comptime config: Config) type {
                     return opened;
                 } else |_| {}
             }
+            // The old generation is tried without comparing packet numbers, so
+            // a peer that goes *backwards* — old keys on a higher number than
+            // one the new keys covered — is accepted rather than reported.
+            //= https://www.rfc-editor.org/rfc/rfc9001#section-6.4
+            //# Packets with higher packet numbers MUST be protected with either the
+            //# same or newer packet protection keys than packets with lower packet
+            //# numbers.  An endpoint that successfully removes protection with old
+            //# keys when newer keys were used for packets with lower packet numbers
+            //# MUST treat this as a connection error of type KEY_UPDATE_ERROR.
+            //= type=todo
             if (one.previous_receive) |previous| {
                 if (previous.decrypt(bytes, header)) |opened| return opened else |_| {}
             }
+            //= https://www.rfc-editor.org/rfc/rfc9001#section-5.5
+            //# Similarly, a packet
+            //# that appears to trigger a key update but cannot be unprotected
+            //# successfully MUST be discarded.
             return self.countForgery();
         }
 
@@ -770,6 +927,14 @@ pub fn Connection(comptime config: Config) type {
             // RFC 9001 section 6.6 counts every failure, not every packet: an
             // off-path attacker injects at will, so this is the only number
             // that bounds how long a key stays in use under attack.
+            //= https://www.rfc-editor.org/rfc/rfc9001#section-6.6
+            //# In addition to counting packets sent, endpoints MUST count the number
+            //# of received packets that fail authentication during the lifetime of a
+            //# connection.  If the total number of received packets that fail
+            //# authentication within the connection, across all keys, exceeds the
+            //# integrity limit for the selected AEAD, the endpoint MUST immediately
+            //# close the connection with a connection error of type
+            //# AEAD_LIMIT_REACHED and not process any more packets.
             assert(self.forgeries < std.math.maxInt(u64));
             self.forgeries += 1;
             assert(self.forgeries >= 1);
@@ -787,10 +952,17 @@ pub fn Connection(comptime config: Config) type {
             var eliciting = false;
             var count: u32 = 0;
             while (count <= payload.len) : (count += 1) {
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-12.4
+                //# An endpoint MUST treat the receipt of a frame of unknown type as a
+                //# connection error of type FRAME_ENCODING_ERROR.
                 const one = iterator.next() catch return error.Protocol;
                 const value = one orelse break;
                 // Section 12.4, Table 3. A STREAM frame in an Initial packet is
                 // application data accepted before anyone is authenticated.
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-12.4
+                //# An endpoint MUST treat
+                //# receipt of a frame in a packet type that is not permitted as a
+                //# connection error of type PROTOCOL_VIOLATION.
                 if (!value.frameType().allowedIn(level)) return error.Protocol;
                 if (value.ackEliciting()) eliciting = true;
                 try self.receiveFrame(level, value, now_ns);
