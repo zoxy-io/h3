@@ -211,12 +211,25 @@ states, and the ledger is where the oracles come from.
 `zig build ci`. It reads 849 sections across seven RFCs and finds **1206
 normative sentences, 849 of them mandatory**.
 
-**In the five documents this package implements: 547 of 571 mandatory
-requirements cited.** RFC 9114 and RFC 9204 are complete; RFC 9001 has one
-left, RFC 9002 two, RFC 9000 twenty-one. RFC 9110 and RFC 9112 are
-*referenced* rather than implemented and are cited only where a rule is
-borrowed — see specs/SCOPE.md, and note that the aggregate hid this until the
-report was split per RFC.
+**Every mandatory requirement in the five documents this package implements is
+cited: 566 of 566.** RFC 9110 and RFC 9112 are *referenced* rather than
+implemented and are cited only where a rule is borrowed — see specs/SCOPE.md,
+and note that the aggregate hid this distinction until the report was split per
+RFC.
+
+`--uncited` lists what is left rather than counting it, which is what finished
+the sweep: the last twenty-four were invisible in a total, and three of them
+turned out to be RFC 8174's keyword boilerplate — a sentence that names every
+keyword while defining its own vocabulary. That is a defect in the extractor
+rather than a gap in the code, and it is excluded there. Ten more were RFC
+9000 section 22, which instructs IANA and the authors of future extensions and
+has no counterpart in an implementation.
+
+**"Cited" is not "correct".** 566 of 566 means every mandatory sentence has
+something in the tree pointing at it and quoting it accurately; 124 of those
+carry a test, 343 an exception with a stated reason, and the rest are an
+implementation a reader can check. The ledger's value is that the third
+category is now visible and finite.
 
 Of those citations, 123 carry a test and 329 an exception with a stated reason.
 **The exceptions are the product as much as the citations are**: migration,

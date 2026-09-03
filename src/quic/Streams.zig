@@ -327,7 +327,7 @@ pub fn Streams(comptime config: Config) type {
         /// receive-only for the peer, so a STREAM, RESET_STREAM or FIN arriving
         /// on one is the peer writing where it cannot. Section 19.8 makes that
         /// a `STREAM_STATE_ERROR` rather than something to ignore.
-        fn peerMaySend(self: *const Self, id: u64) bool {
+        pub fn peerMaySend(self: *const Self, id: u64) bool {
             const kind = stream_id.kindOf(id);
             // The low two bits are the type tag, so every identifier has a
             // kind; there is no such thing as an unrecognised one to reject.
@@ -445,6 +445,9 @@ pub fn Streams(comptime config: Config) type {
         /// lower-numbered streams are implicitly created — which this package
         /// does not do. So a peer sending on index 10 000 while sixty-four were
         /// advertised used to get a stream, because it was only the first one.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-19.11
+        //# An endpoint MUST terminate a connection with an error of type
+        //# STREAM_LIMIT_ERROR if a peer opens more streams than was permitted.
         fn checkAdvertisedStreamLimit(self: *const Self, id: u64) Error!void {
             const kind = stream_id.kindOf(id);
             if (kind.initiator() == self.side) return;
@@ -486,6 +489,21 @@ pub fn Streams(comptime config: Config) type {
         /// The charge is the *delta* of the stream's highest offset, so a
         /// retransmission of data already counted costs nothing and a peer
         /// cannot consume the connection window twice with the same octets.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-19.9
+        //# An endpoint MUST terminate a connection with an error of type
+        //# FLOW_CONTROL_ERROR if it receives more data than the maximum data
+        //# value that it has sent.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-19.10
+        //# An endpoint MUST terminate a connection with an error of type
+        //# FLOW_CONTROL_ERROR if it receives more data than the largest maximum
+        //# stream data that it has sent for the affected stream.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-19.9
+        //# The sum of the final sizes on all streams -- including streams in
+        //# terminal states -- MUST NOT exceed the value advertised by a
+        //# receiver.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-19.10
+        //# The data sent on a stream MUST NOT exceed the largest maximum stream
+        //# data value advertised by the receiver.
         fn admit(self: *Self, stream: *Stream, end: u64) Error!void {
             if (end <= stream.received_highest) return;
             if (end > stream.receiveLimit()) return error.FlowControl;
@@ -562,6 +580,9 @@ pub fn Streams(comptime config: Config) type {
         //# the final size for the stream, an endpoint SHOULD respond with an
         //# error of type FINAL_SIZE_ERROR; see Section 11 for details on error
         //# handling.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-19.4
+        //# An endpoint that receives a RESET_STREAM frame for a send-only
+        //# stream MUST terminate the connection with error STREAM_STATE_ERROR.
         pub fn reset(self: *Self, id: u64, code: u64, final_size: u64) Error!void {
             if (!self.peerMaySend(id)) return error.StreamState;
             if (final_size > varint.max) return error.FinalSize;
@@ -670,6 +691,9 @@ pub fn Streams(comptime config: Config) type {
         }
 
         /// Section 19.10 and 19.9: raise a peer's limits.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-19.10
+        //# An endpoint that receives a MAX_STREAM_DATA frame for a receive-only
+        //# stream MUST terminate the connection with error STREAM_STATE_ERROR.
         pub fn setSendLimit(self: *Self, id: u64, limit: u64) Error!void {
             // Section 19.10: MAX_STREAM_DATA for a stream this endpoint cannot
             // send on is the peer raising a limit that could never apply.

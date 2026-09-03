@@ -259,6 +259,17 @@ pub fn Recovery(comptime config: Config) type {
         /// `PeerCompletedAddressValidation` answers differently for each, and
         /// nothing else here needs to know — see that function.
         side: Side = .client,
+        /// Whether Handshake keys exist. Appendix A.8 chooses the space an
+        /// anti-deadlock probe goes out in by asking exactly this, and it is
+        /// not the same question as "the Handshake space is not discarded" —
+        /// before the keys arrive that space is undiscarded and unusable.
+        /// `Connection.installSecret` sets it.
+        handshake_keys: bool = false,
+        /// The instant an anti-deadlock probe is measured from. Appendix A.8
+        /// says "the anti-deadlock PTO starts from the current time", and this
+        /// function takes no `now_ns` — so the caller stamps it, and
+        /// `timeoutAt` is where that happens.
+        anti_deadlock_from_ns: u64 = 0,
 
         /// Section 18.2's `max_ack_delay`, from the peer's transport
         /// parameters. Held rather than read from them, because the connection
@@ -296,6 +307,12 @@ pub fn Recovery(comptime config: Config) type {
         //# packet loss.
         pub fn onPacketSent(self: *Self, space: Space, sent: Sent) SentError!void {
             const state = &self.spaces[@intFromEnum(space)];
+            // Appendix A.8's "the anti-deadlock PTO starts from the current
+            // time". `ptoTimeAndSpace` is `*const` and takes no clock, so every
+            // entry point that carries one stamps it here instead — the probe
+            // is then measured from the last thing that happened, which is what
+            // re-arming a timer on each send and each acknowledgement means.
+            self.anti_deadlock_from_ns = @max(self.anti_deadlock_from_ns, sent.time_sent);
             if (state.count == config.sent_max) return error.TooManyOutstanding;
             // Ascending by number, which every walk below relies on.
             if (state.count > 0) assert(sent.number > state.sent[state.count - 1].number);
@@ -360,6 +377,7 @@ pub fn Recovery(comptime config: Config) type {
 
             var result: AckResult = .{};
             var acked: [config.sent_max]AckedPacket = undefined;
+            self.anti_deadlock_from_ns = @max(self.anti_deadlock_from_ns, now_ns);
             const newly = try self.removeAcked(space, ack, &result, &acked);
             if (newly == null) return result;
             const largest = newly.?;
@@ -965,6 +983,40 @@ pub fn Recovery(comptime config: Config) type {
             var duration = self.smoothed_rtt + @max(4 * self.rttvar, granularity_ns);
             duration <<= @intCast(@min(self.pto_count, @as(u32, pto_backoff_shift_max)));
 
+            //= https://www.rfc-editor.org/rfc/rfc9002#section-6.2.2.1
+            //# That is, the client MUST set the PTO timer if the client has not
+            //# received an acknowledgment for any of its Handshake packets and the
+            //# handshake is not confirmed (see Section 4.1.2 of [QUIC-TLS]), even
+            //# if there are no packets in flight. When the PTO fires, the client
+            //# MUST send a Handshake packet if it has Handshake keys, otherwise it
+            //# MUST send an Initial packet in a UDP datagram with a payload of at
+            //# least 1200 bytes.
+            //
+            // The anti-deadlock probe, and the reason it cannot fall out of the
+            // loop below: that loop arms a space only when something
+            // ack-eliciting is outstanding there, and this rule is about the
+            // case where *nothing* is. A client whose Initial flight was
+            // answered by an ACK-only packet has no ack-eliciting packet in
+            // flight, so it armed no timer, so it never probed — and the server
+            // is blocked behind the amplification limit waiting for exactly
+            // that probe. Both sides then wait.
+            //
+            // Appendix A.8 puts the assertion below in the pseudocode rather
+            // than the condition, because a server never reaches it: its own
+            // `peerCompletedAddressValidation` is always true.
+            if (!self.peerCompletedAddressValidation()) {
+                var any_in_flight = false;
+                for (0..Space.count) |index| {
+                    const space: Space = @enumFromInt(index);
+                    if (self.hasAckEliciting(space)) any_in_flight = true;
+                }
+                if (!any_in_flight) {
+                    assert(self.side == .client);
+                    const space: Space = if (self.handshake_keys) .handshake else .initial;
+                    return .{ .at = self.anti_deadlock_from_ns + duration, .space = space };
+                }
+            }
+
             var earliest: ?PtoTime = null;
             for (0..Space.count) |index| {
                 const space: Space = @enumFromInt(index);
@@ -1053,6 +1105,7 @@ pub fn Recovery(comptime config: Config) type {
 
         /// Section A.9.
         pub fn onLossDetectionTimeout(self: *Self, now_ns: u64, lost: []Context) Timeout {
+            self.anti_deadlock_from_ns = @max(self.anti_deadlock_from_ns, now_ns);
             var earliest_space: ?Space = null;
             var earliest: ?u64 = null;
             for (self.spaces, 0..) |state, index| {

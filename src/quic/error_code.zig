@@ -125,3 +125,75 @@ test "the reserved pattern matches what section 22.5 describes" {
     try std.testing.expect(!isReserved(0));
     try std.testing.expect(!isReserved(0x0a));
 }
+
+// RFC 9000 section 22 is the IANA considerations, and none of it is a
+// requirement on an implementation. It tells IANA how to run four registries
+// and tells the authors of future extensions what a registration must contain.
+// The one part with a counterpart in code is the codepoints themselves, which
+// this file and its neighbours transcribe, and the reserved pattern that
+// `isReserved` refuses — cited as implementations where they live.
+//
+// Grouped here rather than scattered, because scattering them would put ten
+// procedural rules among the frame rules that actually bind this parser, and
+// the point of an exception is to be legible.
+
+//= https://www.rfc-editor.org/rfc/rfc9000#section-22.1.2
+//# IANA MUST allocate the selected codepoint if the codepoint is
+//# unassigned and the requirements of the registration policy are met.
+//= type=exception
+//= reason=section 22 instructs IANA and the authors of future specifications, not this code. A registry's allocation policy, its expert-review process and the fields a permanent registration must carry are procedural requirements on the registry itself; the only part with a counterpart here is the codepoint values, which src/quic/frame.zig, src/quic/transport_parameters.zig and src/quic/error_code.zig transcribe and isReserved acts on. See specs/SCOPE.md
+//
+//= https://www.rfc-editor.org/rfc/rfc9000#section-22.1.3
+//# A request to remove a codepoint MUST be reviewed by the designated
+//# experts.
+//= type=exception
+//= reason=section 22 instructs IANA and the authors of future specifications, not this code. A registry's allocation policy, its expert-review process and the fields a permanent registration must carry are procedural requirements on the registry itself; the only part with a counterpart here is the codepoint values, which src/quic/frame.zig, src/quic/transport_parameters.zig and src/quic/error_code.zig transcribe and isReserved acts on. See specs/SCOPE.md
+//
+//= https://www.rfc-editor.org/rfc/rfc9000#section-22.1.3
+//# The experts MUST attempt to determine whether the codepoint is still
+//# in use.
+//= type=exception
+//= reason=section 22 instructs IANA and the authors of future specifications, not this code. A registry's allocation policy, its expert-review process and the fields a permanent registration must carry are procedural requirements on the registry itself; the only part with a counterpart here is the codepoint values, which src/quic/frame.zig, src/quic/transport_parameters.zig and src/quic/error_code.zig transcribe and isReserved acts on. See specs/SCOPE.md
+//
+//= https://www.rfc-editor.org/rfc/rfc9000#section-22.1.3
+//# If any use of the codepoints is identified by this search or a
+//# request to update the registration is made, the codepoint MUST NOT
+//# be reclaimed.
+//= type=exception
+//= reason=section 22 instructs IANA and the authors of future specifications, not this code. A registry's allocation policy, its expert-review process and the fields a permanent registration must carry are procedural requirements on the registry itself; the only part with a counterpart here is the codepoint values, which src/quic/frame.zig, src/quic/transport_parameters.zig and src/quic/error_code.zig transcribe and isReserved acts on. See specs/SCOPE.md
+//
+//= https://www.rfc-editor.org/rfc/rfc9000#section-22.1.4
+//# All registrations made by Standards Track publications MUST be
+//# permanent.
+//= type=exception
+//= reason=section 22 instructs IANA and the authors of future specifications, not this code. A registry's allocation policy, its expert-review process and the fields a permanent registration must carry are procedural requirements on the registry itself; the only part with a counterpart here is the codepoint values, which src/quic/frame.zig, src/quic/transport_parameters.zig and src/quic/error_code.zig transcribe and isReserved acts on. See specs/SCOPE.md
+//
+//= https://www.rfc-editor.org/rfc/rfc9000#section-22.2
+//# All codepoints that follow the pattern 0x?a?a?a?a are reserved, MUST
+//# NOT be assigned by IANA, and MUST NOT appear in the listing of
+//# assigned values.
+//= type=exception
+//= reason=section 22 instructs IANA and the authors of future specifications, not this code. A registry's allocation policy, its expert-review process and the fields a permanent registration must carry are procedural requirements on the registry itself; the only part with a counterpart here is the codepoint values, which src/quic/frame.zig, src/quic/transport_parameters.zig and src/quic/error_code.zig transcribe and isReserved acts on. See specs/SCOPE.md
+//
+//= https://www.rfc-editor.org/rfc/rfc9000#section-22.3
+//# In addition to the fields listed in Section 22.1.1, permanent
+//# registrations in this registry MUST include the following field:
+//= type=exception
+//= reason=section 22 instructs IANA and the authors of future specifications, not this code. A registry's allocation policy, its expert-review process and the fields a permanent registration must carry are procedural requirements on the registry itself; the only part with a counterpart here is the codepoint values, which src/quic/frame.zig, src/quic/transport_parameters.zig and src/quic/error_code.zig transcribe and isReserved acts on. See specs/SCOPE.md
+//
+//= https://www.rfc-editor.org/rfc/rfc9000#section-22.3
+//# The initial contents of this registry are shown in Table 6.
+//= type=exception
+//= reason=section 22 instructs IANA and the authors of future specifications, not this code. A registry's allocation policy, its expert-review process and the fields a permanent registration must carry are procedural requirements on the registry itself; the only part with a counterpart here is the codepoint values, which src/quic/frame.zig, src/quic/transport_parameters.zig and src/quic/error_code.zig transcribe and isReserved acts on. See specs/SCOPE.md
+//
+//= https://www.rfc-editor.org/rfc/rfc9000#section-22.4
+//# In addition to the fields listed in Section 22.1.1, permanent
+//# registrations in this registry MUST include the following field:
+//= type=exception
+//= reason=section 22 instructs IANA and the authors of future specifications, not this code. A registry's allocation policy, its expert-review process and the fields a permanent registration must carry are procedural requirements on the registry itself; the only part with a counterpart here is the codepoint values, which src/quic/frame.zig, src/quic/transport_parameters.zig and src/quic/error_code.zig transcribe and isReserved acts on. See specs/SCOPE.md
+//
+//= https://www.rfc-editor.org/rfc/rfc9000#section-22.5
+//# In addition to the fields listed in Section 22.1.1, permanent
+//# registrations in this registry MUST include the following fields:
+//= type=exception
+//= reason=section 22 instructs IANA and the authors of future specifications, not this code. A registry's allocation policy, its expert-review process and the fields a permanent registration must carry are procedural requirements on the registry itself; the only part with a counterpart here is the codepoint values, which src/quic/frame.zig, src/quic/transport_parameters.zig and src/quic/error_code.zig transcribe and isReserved acts on. See specs/SCOPE.md

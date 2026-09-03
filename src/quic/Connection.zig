@@ -749,6 +749,10 @@ pub fn Connection(comptime config: Config) type {
             //# Handshake packet and a server MUST discard Initial keys when it first
             //# successfully processes a Handshake packet.  Endpoints MUST NOT send
             //# Initial packets after this point.
+            // Appendix A.8 of RFC 9002 chooses the space an anti-deadlock probe
+            // goes out in by asking whether Handshake keys exist, which is not
+            // the same as asking whether the Handshake space was discarded.
+            if (level == .handshake) self.recovery.handshake_keys = true;
             if (level == .handshake) self.discard(.initial);
 
             // RFC 9001 section 4.1.2: the handshake is confirmed at the *server*
@@ -2140,8 +2144,28 @@ pub fn Connection(comptime config: Config) type {
                 //# such as a MAX_DATA frame carrying a smaller maximum data
                 //# value than one found in an older packet.
                 .max_data => |value| self.streams.setConnectionSendLimit(value.maximum),
-                .max_stream_data => |value| self.streams.setSendLimit(value.stream, value.maximum) catch |err| {
-                    return streamError(err);
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-19.10
+                //# Receiving a MAX_STREAM_DATA frame for a locally initiated stream
+                //# that has not yet been created MUST be treated as a connection error
+                //# of type STREAM_STATE_ERROR.
+                //
+                // The same shape as STOP_SENDING two arms down, and it was open
+                // for the same reason: `setSendLimit` calls `open`, so a peer
+                // naming a locally-initiated stream this endpoint has not
+                // opened *created* it, filling the table with identifiers the
+                // application never asked for. Checked here rather than in
+                // `setSendLimit`, because a consumer applying the peer's
+                // transport parameters legitimately raises a limit on a stream
+                // that does not exist yet.
+                .max_stream_data => |value| {
+                    if (self.streams.find(value.stream) == null and
+                        stream_id.kindOf(value.stream).initiator() == self.side)
+                    {
+                        return error.StreamState;
+                    }
+                    self.streams.setSendLimit(value.stream, value.maximum) catch |err| {
+                        return streamError(err);
+                    };
                 },
                 // Section 4.6: the peer telling us how many streams we may
                 // open. The claim that stood here — that "this package opens
@@ -2177,7 +2201,22 @@ pub fn Connection(comptime config: Config) type {
                 //# it wishes to open a stream but is unable to do so due to the maximum
                 //# stream limit set by its peer; see Section 19.11.
                 //= type=todo
-                .data_blocked, .stream_data_blocked, .streams_blocked => {},
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-19.13
+                //# An endpoint that receives a STREAM_DATA_BLOCKED frame for a
+                //# send-only stream MUST terminate the connection with error
+                //# STREAM_STATE_ERROR.
+                //
+                // The three blocked frames were ignored wholesale, which is
+                // right for their *content* — they say the peer is stuck behind
+                // a limit this endpoint already raises as the application reads
+                // — and wrong for their *addressing*. A STREAM_DATA_BLOCKED
+                // naming a stream the peer cannot send on is not information,
+                // it is a claim about a stream that does not exist in that
+                // direction, and section 19.13 makes it a connection error.
+                .stream_data_blocked => |value| {
+                    if (!self.streams.peerMaySend(value.stream)) return error.StreamState;
+                },
+                .data_blocked, .streams_blocked => {},
                 //= https://www.rfc-editor.org/rfc/rfc9000#section-19.8
                 //# An endpoint MUST terminate the connection with error
                 //# STREAM_STATE_ERROR if it receives a STREAM frame for a locally
@@ -2309,6 +2348,10 @@ pub fn Connection(comptime config: Config) type {
                 // the table with identifiers this endpoint never opened, up to
                 // `streams_max`, using a frame that names them.
                 .stop_sending => |value| {
+                    //= https://www.rfc-editor.org/rfc/rfc9000#section-19.5
+                    //# Receiving a STOP_SENDING frame for a locally initiated stream that
+                    //# has not yet been created MUST be treated as a connection error of
+                    //# type STREAM_STATE_ERROR.
                     if (!self.streams.weMaySend(value.stream)) return error.StreamState;
                     if (self.streams.find(value.stream) == null and
                         stream_id.kindOf(value.stream).initiator() == self.side)
@@ -4065,15 +4108,35 @@ test "a packet carrying only an ACK is not in flight" {
     try testing.expectEqual(before, server.recovery.bytes_in_flight);
 }
 
-test "the timer is only about what is outstanding" {
+test "the timer is only about what is outstanding, except when it is not" {
+    // A *server* has nothing to wait for until it has sent something: its own
+    // `peerCompletedAddressValidation` is always true, so RFC 9002 section
+    // 6.2.2.1's anti-deadlock rule never applies to it.
+    var server = testServer();
+    try testing.expectEqual(@as(?u64, null), server.timeout());
+
+    // A client is the exception, and this assertion used to read `null` for it
+    // too. Section 6.2.2.1: "the client MUST set the PTO timer if the client
+    // has not received an acknowledgment for any of its Handshake packets and
+    // the handshake is not confirmed … even if there are no packets in
+    // flight." The server may be blocked behind the amplification limit
+    // waiting for a probe that only the client can send, and a client that
+    // arms nothing because nothing is outstanding is the other half of that
+    // deadlock.
     var client = testClient();
-    // Nothing sent, nothing to wait for.
-    try testing.expectEqual(@as(?u64, null), client.timeout());
+    try testing.expect(client.timeout() != null);
 
     try client.cryptoIn(.initial, "ClientHello");
     var datagram: [TestConnection.datagram_octets]u8 = @splat(0);
     _ = try client.send(&datagram, 0);
     try testing.expect(client.timeout() != null);
+
+    // And once the handshake is confirmed there is nothing left to unblock.
+    client.confirmHandshake();
+    client.recovery.spaces[@intFromEnum(Space.initial)].count = 0;
+    client.recovery.spaces[@intFromEnum(Space.handshake)].count = 0;
+    client.recovery.spaces[@intFromEnum(Space.application)].count = 0;
+    try testing.expectEqual(@as(?u64, null), client.timeout());
 }
 
 /// Bring two connections to the point where 1-RTT keys are installed both ways,
@@ -5086,4 +5149,64 @@ test "section 7.3: a declared source connection id must match the one that carri
         .initial_source_connection_id = try ConnectionId.init(&client_source),
     });
     try server.transportParametersIn(encoded[0..honest]);
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9000#section-19.10
+//# Receiving a MAX_STREAM_DATA frame for a locally
+//# initiated stream that has not yet been created MUST be treated as a
+//# connection error of type STREAM_STATE_ERROR.
+//= type=test
+test "section 19.10: MAX_STREAM_DATA may not create a locally-initiated stream" {
+    // The same shape as STOP_SENDING: `setSendLimit` calls `open`, so a peer
+    // naming a stream this endpoint has not opened brought it into existence
+    // and spent one of `streams_max`.
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+    const uncreated = stream_id.make(.client_bidirectional, 3);
+    try testing.expect(client.findStream(uncreated) == null);
+
+    var payload: [32]u8 = @splat(0);
+    const written = try frame.encode(&payload, .{ .max_stream_data = .{
+        .stream = uncreated,
+        .maximum = 1000,
+    } });
+    try testing.expectError(
+        error.StreamState,
+        client.receiveFrames(.one_rtt, payload[0..written], 1000),
+    );
+    try testing.expect(client.findStream(uncreated) == null);
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9000#section-19.13
+//# An endpoint that receives a STREAM_DATA_BLOCKED frame for a
+//# send-only stream MUST terminate the connection with error
+//# STREAM_STATE_ERROR.
+//= type=test
+test "section 19.13: STREAM_DATA_BLOCKED may not name a stream the peer cannot send on" {
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+
+    // A unidirectional stream the client initiated: the client sends, the peer
+    // only receives, so the peer claiming to be blocked *sending* on it is a
+    // claim about a direction that does not exist.
+    const ours = stream_id.make(.client_unidirectional, 0);
+    var payload: [32]u8 = @splat(0);
+    var written = try frame.encode(&payload, .{ .stream_data_blocked = .{
+        .stream = ours,
+        .limit = 100,
+    } });
+    try testing.expectError(
+        error.StreamState,
+        client.receiveFrames(.one_rtt, payload[0..written], 1000),
+    );
+
+    // On a stream the peer may send on it is still merely informational.
+    const theirs = stream_id.make(.server_unidirectional, 0);
+    written = try frame.encode(&payload, .{ .stream_data_blocked = .{
+        .stream = theirs,
+        .limit = 100,
+    } });
+    _ = try client.receiveFrames(.one_rtt, payload[0..written], 1000);
 }

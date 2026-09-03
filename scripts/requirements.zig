@@ -236,11 +236,20 @@ pub fn main(init: std.process.Init) !u8 {
     assert(requirements.items.len > 0);
 
     var citations: std.ArrayList(Citation) = .empty;
+    var list_uncited = false;
     for (args[2..]) |root_path| {
+        // `--uncited` lists what is left rather than counting it. Counting is
+        // what a gate needs; a listing is what the next person to do the work
+        // needs, and hunting them by hand out of seven RFCs is how a sweep
+        // stops halfway.
+        if (std.mem.eql(u8, root_path, "--uncited")) {
+            list_uncited = true;
+            continue;
+        }
         try collectCitations(arena, io, root_path, &citations);
     }
 
-    return report(arena, sections.items, requirements.items, citations.items);
+    return report(arena, sections.items, requirements.items, citations.items, list_uncited);
 }
 
 fn loadSpecs(
@@ -331,12 +340,29 @@ fn flushSection(
 
     for (try splitSentences(arena, normalized)) |sentence| {
         const keyword = keywordIn(sentence) orelse continue;
+        // RFC 8174's boilerplate names every keyword in one sentence, so the
+        // extractor sees a requirement where the document is only saying what
+        // its own words mean. Three of these were the last uncited "mandatory
+        // requirements" in the ledger, and citing them would have been the
+        // heuristic teaching everyone to satisfy the heuristic.
+        if (isKeywordBoilerplate(sentence)) continue;
         try requirements.append(arena, .{
             .section = index,
             .keyword = keyword,
             .text = sentence,
         });
     }
+}
+
+/// RFC 8174 section 2's sentence, which every one of these documents quotes
+/// verbatim. Recognised by the shape rather than by section number, because the
+/// section it sits in differs per RFC.
+fn isKeywordBoilerplate(sentence: []const u8) bool {
+    if (std.mem.indexOf(u8, sentence, "NOT RECOMMENDED") == null) return false;
+    if (std.mem.indexOf(u8, sentence, "OPTIONAL") == null) return false;
+    return std.mem.indexOf(u8, sentence, "BCP 14") != null or
+        std.mem.indexOf(u8, sentence, "RFC2119") != null or
+        std.mem.indexOf(u8, sentence, "RFC8174") != null;
 }
 
 /// The strongest keyword a sentence carries, so "MUST NOT" is not reported as
@@ -464,6 +490,7 @@ fn report(
     sections: []const Section,
     requirements: []Requirement,
     citations: []const Citation,
+    list_uncited: bool,
 ) !u8 {
     _ = arena;
     var violations: u32 = 0;
@@ -507,6 +534,7 @@ fn report(
     }
 
     printCoverage(sections, requirements);
+    if (list_uncited) printUncited(sections, requirements);
 
     if (violations > 0) {
         std.debug.print("\nrequirements: {d} violation(s)\n", .{violations});
@@ -544,6 +572,29 @@ fn markCited(
         // implementation citation on the same requirement.
         if (requirement.kind == .none or citation.kind == .test_) requirement.kind = citation.kind;
     }
+}
+
+/// Every mandatory requirement in an implemented document that nothing cites,
+/// with enough of the sentence to find it.
+fn printUncited(sections: []const Section, requirements: []const Requirement) void {
+    std.debug.print("\nuncited mandatory requirements, implemented documents only\n\n", .{});
+    var count: u32 = 0;
+    for (requirements) |requirement| {
+        if (requirement.cited) continue;
+        if (!isMandatory(requirement.keyword)) continue;
+        const section = sections[requirement.section];
+        if (!isImplemented(section.rfc)) continue;
+        count += 1;
+        const shown = if (requirement.text.len > 150) requirement.text[0..150] else requirement.text;
+        std.debug.print("  rfc{s} section {s} [{s}]\n    {s}{s}\n", .{
+            section.rfc,
+            section.number,
+            requirement.keyword,
+            shown,
+            if (requirement.text.len > 150) "…" else "",
+        });
+    }
+    std.debug.print("\n  {d} remaining\n", .{count});
 }
 
 fn printCoverage(sections: []const Section, requirements: []const Requirement) void {
@@ -736,4 +787,23 @@ test "sentences split on a full stop and not on a section number" {
     try testing.expectEqual(@as(usize, 2), parts.len);
     try testing.expectEqualStrings("See Section 4.1. An endpoint MUST stop.", parts[0]);
     try testing.expectEqualStrings("It then closes.", parts[1]);
+}
+
+test "RFC 8174's keyword boilerplate is not a requirement" {
+    // It names every keyword in one sentence, so the extractor sees a MUST NOT
+    // where the document is only defining its own vocabulary. Three of these
+    // were the last uncited mandatory requirements in the ledger.
+    try testing.expect(isKeywordBoilerplate(
+        "The key words \"MUST\", \"MUST NOT\", \"REQUIRED\", \"SHALL\", \"SHALL NOT\", " ++
+            "\"SHOULD\", \"SHOULD NOT\", \"RECOMMENDED\", \"NOT RECOMMENDED\", \"MAY\", and " ++
+            "\"OPTIONAL\" in this document are to be interpreted as described in BCP 14 " ++
+            "[RFC2119] [RFC8174] when, and only when, they appear in all capitals, as shown here.",
+    ));
+    // And a real requirement that happens to mention a keyword is not.
+    try testing.expect(!isKeywordBoilerplate(
+        "An endpoint MUST NOT send a packet if it would cause bytes_in_flight to be larger than the congestion window.",
+    ));
+    try testing.expect(!isKeywordBoilerplate(
+        "This is OPTIONAL and NOT RECOMMENDED for a sender.",
+    ));
 }
