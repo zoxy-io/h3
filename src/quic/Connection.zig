@@ -305,6 +305,47 @@ pub fn Connection(comptime config: Config) type {
         const Self = @This();
 
         pub const datagram_octets: u32 = config.datagram_octets;
+        // What `datagram_octets` is and is not. It is a comptime bound on what this
+        // package will build; it is not a discovered path MTU, and nothing here can
+        // discover one.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-14
+        //# UDP datagrams MUST NOT be fragmented at the IP layer.
+        //= type=exception
+        //= reason=path MTU discovery is the consumer's: it needs the socket, its options and the ICMP messages the kernel delivers beside it, and none of the three crosses the seam of docs/DESIGN.md section 3. This package takes `datagram_octets` as a comptime constant that a comptime assert holds at or above section 14's 1200-octet floor. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-14
+        //# In IPv4 [IPv4], the Don't Fragment (DF) bit MUST be set if possible,
+        //# to prevent fragmentation on the path.
+        //= type=exception
+        //= reason=path MTU discovery is the consumer's: it needs the socket, its options and the ICMP messages the kernel delivers beside it, and none of the three crosses the seam of docs/DESIGN.md section 3. This package takes `datagram_octets` as a comptime constant that a comptime assert holds at or above section 14's 1200-octet floor. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-14.2
+        //# If a QUIC endpoint determines that the PMTU between any pair of
+        //# local and remote IP addresses cannot support the smallest allowed
+        //# maximum datagram size of 1200 bytes, it MUST immediately cease
+        //# sending QUIC packets, except for those in PMTU probes or those
+        //# containing CONNECTION_CLOSE frames, on the affected path.
+        //= type=exception
+        //= reason=path MTU discovery is the consumer's: it needs the socket, its options and the ICMP messages the kernel delivers beside it, and none of the three crosses the seam of docs/DESIGN.md section 3. This package takes `datagram_octets` as a comptime constant that a comptime assert holds at or above section 14's 1200-octet floor. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-14.2.1
+        //# An endpoint MUST ignore an ICMP message that claims the PMTU has
+        //# decreased below QUIC's smallest allowed maximum datagram size.
+        //= type=exception
+        //= reason=path MTU discovery is the consumer's: it needs the socket, its options and the ICMP messages the kernel delivers beside it, and none of the three crosses the seam of docs/DESIGN.md section 3. This package takes `datagram_octets` as a comptime constant that a comptime assert holds at or above section 14's 1200-octet floor. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-14.2.1
+        //# ICMP message validation MUST include matching IP addresses and UDP
+        //# ports [RFC8085] and, when possible, connection IDs to an active QUIC
+        //# session.
+        //= type=exception
+        //= reason=path MTU discovery is the consumer's: it needs the socket, its options and the ICMP messages the kernel delivers beside it, and none of the three crosses the seam of docs/DESIGN.md section 3. This package takes `datagram_octets` as a comptime constant that a comptime assert holds at or above section 14's 1200-octet floor. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-14.2.1
+        //# An endpoint MUST NOT increase the PMTU based on ICMP messages; see
+        //# Item 6 in Section 3 of [DPLPMTUD].
+        //= type=exception
+        //= reason=path MTU discovery is the consumer's: it needs the socket, its options and the ICMP messages the kernel delivers beside it, and none of the three crosses the seam of docs/DESIGN.md section 3. This package takes `datagram_octets` as a comptime constant that a comptime assert holds at or above section 14's 1200-octet floor. See docs/DESIGN.md section 2 and section 6.
 
         /// What one connection costs, in octets.
         ///
@@ -979,6 +1020,87 @@ pub fn Connection(comptime config: Config) type {
         /// is the attack. So a decryption failure ends the datagram quietly and
         /// only a protocol violation by the authenticated peer returns an error.
         pub fn receive(self: *Self, datagram: []u8, now_ns: u64) ReceiveError!void {
+            // Section 10.3's detection would happen here, on the first packet of a
+            // datagram that cannot be opened, and it does not: this endpoint holds no
+            // reset token, advertises none, and would have nothing to compare against.
+            // The generating half is the same argument from the other side.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-10.3.1
+            //# However, the comparison MUST be performed when the first packet
+            //# in an incoming datagram either cannot be associated with a
+            //# connection or cannot be decrypted.
+            //= type=exception
+            //= reason=stateless reset is out of scope: it needs a static key and a token this package neither holds nor advertises, and detecting one means recognising a datagram that belongs to no connection — a decision made by whatever routes datagrams to a Connection, which is the consumer's, per docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-10.3.1
+            //# An endpoint MUST NOT check for any stateless reset tokens
+            //# associated with connection IDs it has not used or for connection
+            //# IDs that have been retired.
+            //= type=exception
+            //= reason=stateless reset is out of scope: it needs a static key and a token this package neither holds nor advertises, and detecting one means recognising a datagram that belongs to no connection — a decision made by whatever routes datagrams to a Connection, which is the consumer's, per docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-10.3.1
+            //# When comparing a datagram to stateless reset token values,
+            //# endpoints MUST perform the comparison without leaking
+            //# information about the value of the token.
+            //= type=exception
+            //= reason=stateless reset is out of scope: it needs a static key and a token this package neither holds nor advertises, and detecting one means recognising a datagram that belongs to no connection — a decision made by whatever routes datagrams to a Connection, which is the consumer's, per docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-10.3.1
+            //# If the last 16 bytes of the datagram are identical in value to a
+            //# stateless reset token, the endpoint MUST enter the draining
+            //# period and not send any further packets on this connection.
+            //= type=exception
+            //= reason=stateless reset is out of scope: it needs a static key and a token this package neither holds nor advertises, and detecting one means recognising a datagram that belongs to no connection — a decision made by whatever routes datagrams to a Connection, which is the consumer's, per docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-10.3
+            //# An endpoint MUST NOT send a Stateless Reset that is three times
+            //# or more larger than the packet it receives to avoid being used
+            //# for amplification.
+            //= type=exception
+            //= reason=stateless reset is out of scope: it needs a static key and a token this package neither holds nor advertises, and detecting one means recognising a datagram that belongs to no connection — a decision made by whatever routes datagrams to a Connection, which is the consumer's, per docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-10.3.2
+            //# The stateless reset token MUST be difficult to guess.
+            //= type=exception
+            //= reason=stateless reset is out of scope: it needs a static key and a token this package neither holds nor advertises, and detecting one means recognising a datagram that belongs to no connection — a decision made by whatever routes datagrams to a Connection, which is the consumer's, per docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-10.3.2
+            //# An endpoint that uses this design MUST either use the same
+            //# connection ID length for all connections or encode the length of
+            //# the connection ID such that it can be recovered without state.
+            //= type=exception
+            //= reason=stateless reset is out of scope: it needs a static key and a token this package neither holds nor advertises, and detecting one means recognising a datagram that belongs to no connection — a decision made by whatever routes datagrams to a Connection, which is the consumer's, per docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-10.3.2
+            //# This method for choosing the stateless reset token means that
+            //# the combination of connection ID and static key MUST NOT be used
+            //# for another connection.
+            //= type=exception
+            //= reason=stateless reset is out of scope: it needs a static key and a token this package neither holds nor advertises, and detecting one means recognising a datagram that belongs to no connection — a decision made by whatever routes datagrams to a Connection, which is the consumer's, per docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-10.3.2
+            //# A denial-of-service attack is possible if the same connection ID
+            //# is used by instances that share a static key or if an attacker
+            //# can cause a packet to be routed to an instance that has no state
+            //# but the same static key; see Section 21.11. A connection ID from
+            //# a connection that is reset by revealing the stateless reset
+            //# token MUST NOT be reused for new connections at nodes that share
+            //# a static key.
+            //= type=exception
+            //= reason=stateless reset is out of scope: it needs a static key and a token this package neither holds nor advertises, and detecting one means recognising a datagram that belongs to no connection — a decision made by whatever routes datagrams to a Connection, which is the consumer's, per docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-10.3.2
+            //# The same stateless reset token MUST NOT be used for multiple
+            //# connection IDs.
+            //= type=exception
+            //= reason=stateless reset is out of scope: it needs a static key and a token this package neither holds nor advertises, and detecting one means recognising a datagram that belongs to no connection — a decision made by whatever routes datagrams to a Connection, which is the consumer's, per docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-10.3.3
+            //# An endpoint MUST ensure that every Stateless Reset that it sends
+            //# is smaller than the packet that triggered it, unless it
+            //# maintains state sufficient to prevent looping.
+            //= type=exception
+            //= reason=stateless reset is out of scope: it needs a static key and a token this package neither holds nor advertises, and detecting one means recognising a datagram that belongs to no connection — a decision made by whatever routes datagrams to a Connection, which is the consumer's, per docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
             if (self.state == .draining) return;
 
             // Section 14.1: "A server MUST discard an Initial packet that is
@@ -1031,6 +1153,11 @@ pub fn Connection(comptime config: Config) type {
             var packets: u32 = 0;
             while (offset < datagram.len) : (packets += 1) {
                 assert(packets <= datagram.len);
+                // `packet.parse` refuses anything shorter than a header, and a refusal ends
+                // the datagram rather than the connection.
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-10.3
+                //# Endpoints MUST discard packets that are too small to be
+                //# valid QUIC packets.
                 const parsed = packet.parse(datagram[offset..], self.source.length) catch return;
                 const consumed = parsed.octets;
                 assert(consumed >= 1);
@@ -1313,6 +1440,13 @@ pub fn Connection(comptime config: Config) type {
         /// Walk the frames of one payload, returning whether any was
         /// ack-eliciting.
         fn receiveFrames(self: *Self, level: Level, payload: []const u8, now_ns: u64) ReceiveError!bool {
+            // An empty payload leaves the loop below on its first iteration and returns
+            // `false`, so a packet carrying no frames is acknowledged rather than
+            // refused.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-12.4
+            //# An endpoint MUST treat receipt of a packet containing no frames
+            //# as a connection error of type PROTOCOL_VIOLATION.
+            //= type=todo
             var iterator: frame.Iterator = .init(payload);
             var eliciting = false;
             var count: u32 = 0;
@@ -1694,6 +1828,11 @@ pub fn Connection(comptime config: Config) type {
             // The caller applied section 12.4's Table 3 before dispatching, so
             // an ACK cannot arrive at a level that forbids one.
             assert(frame.Type.ack.allowedIn(level));
+            // The space is chosen from the level the packet arrived at, so an ACK can
+            // only ever move packets this endpoint sent in that same space.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-12.5
+            //# ACK frames MAY appear in any packet number space but can only
+            //# acknowledge packets that appeared in that packet number space.
             const space = &self.spaces[@intFromEnum(level.space())];
 
             // A peer cannot acknowledge a number we never sent; doing so would
@@ -1912,6 +2051,17 @@ pub fn Connection(comptime config: Config) type {
             //# These states SHOULD persist for at least three
             //# times the current PTO interval as defined in [QUIC-RECOVERY].
             //= type=todo
+            //
+            // There is no idle timer at all, so section 10.1's floor on one has nothing
+            // to raise. `max_idle_timeout` is parsed out of the peer's transport
+            // parameters and read by nobody, and a connection that stops hearing from
+            // its peer stays in `handshaking` or `established` until the consumer
+            // decides otherwise.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-10.1
+            //# To avoid excessively small idle timeout periods, endpoints MUST
+            //# increase the idle timeout period to be at least three times the
+            //# current Probe Timeout (PTO).
+            //= type=todo
             if (self.state == .draining) return null;
             return self.recovery.timeoutAt();
         }
@@ -2120,6 +2270,20 @@ pub fn Connection(comptime config: Config) type {
         //# packets received from an unvalidated address or limit the cumulative
         //# size of packets it sends to an unvalidated address to three times the
         //# size of packets it receives from that address.
+        //
+        // The one budget, applied in every state. A closing endpoint runs through
+        // here too, which is what section 10.2.1 asks for: the close is a packet like
+        // any other and cannot buy an attacker amplification the handshake would
+        // have refused.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-14.1
+        //# The server MUST also limit the number of bytes it sends before
+        //# validating the address of the client; see Section 8.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-10.2.1
+        //# To avoid being used for an amplification attack, such endpoints MUST
+        //# limit the cumulative size of packets it sends to three times the
+        //# cumulative size of the packets that are received and attributed to
+        //# the connection.
         fn sendRoom(self: *const Self) u64 {
             if (self.address_validated) return config.datagram_octets;
             const allowance = self.received_octets * amplification_factor;
@@ -2469,6 +2633,26 @@ pub fn Connection(comptime config: Config) type {
             //# 0x1c) MAY appear in any packet number space.  CONNECTION_CLOSE
             //# frames signaling application errors (type 0x1d) MUST only appear
             //# in the application data packet number space.
+            //
+            // All three of section 10.2.3's rules hold by construction rather than by a
+            // check. `close` is the only way into `closing` and it always writes a
+            // transport code, so the 0x1d form is never built; the reason phrase is
+            // always empty; and after confirmation the Initial and Handshake spaces are
+            // discarded, so 1-RTT is the only level left to write at.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-10.2.3
+            //# A CONNECTION_CLOSE of type 0x1d MUST be replaced by a
+            //# CONNECTION_CLOSE of type 0x1c when sending the frame in Initial
+            //# or Handshake packets.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-10.2.3
+            //# Endpoints MUST clear the value of the Reason Phrase field and
+            //# SHOULD use the APPLICATION_ERROR code when converting to a
+            //# CONNECTION_CLOSE of type 0x1c.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-10.2.3
+            //# After the handshake is confirmed (see Section 4.1.2 of
+            //# [QUIC-TLS]), an endpoint MUST send any CONNECTION_CLOSE frames
+            //# in a 1-RTT packet.
             const written = frame.encode(payload, .{ .connection_close = .{
                 .application = self.close_is_application,
                 .code = self.close_code,
@@ -2691,6 +2875,25 @@ pub fn Connection(comptime config: Config) type {
         //# versions might allow the use of a long header.
         //= type=exception
         //= reason=stateless reset is out of scope; it is the answer of an endpoint that has *lost* the connection state, which is the consumer's lookup table rather than this type, and its token needs randomness that docs/DESIGN.md section 3 keeps outside the package. See docs/DESIGN.md section 2 and section 6.
+        //
+        // The single entry point for section 11.1's connection error, and the only
+        // thing that sets `closing`. Every `ReceiveError` the caller sees is meant to
+        // arrive back here as the code to send.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-11.1
+        //# Errors that result in the connection being unusable, such as an
+        //# obvious violation of protocol semantics or corruption of state that
+        //# affects an entire connection, MUST be signaled using a
+        //# CONNECTION_CLOSE frame (Section 19.19).
+        //
+        // Section 11.2's stream error has no counterpart: there is no entry point
+        // for an application to reset a stream, and `writePayload` never encodes a
+        // RESET_STREAM or a STOP_SENDING. Both are handled on receipt and neither is
+        // ever sent, so a consumer that wants to abandon one stream has to close the
+        // whole connection.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-11.2
+        //# RESET_STREAM MUST only be instigated by the application protocol
+        //# that uses QUIC.
+        //= type=todo
         //
         /// Begin closing (section 10.2). The close frame goes out on the next
         /// `send`.
