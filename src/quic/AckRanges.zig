@@ -81,6 +81,18 @@ pub const Config = struct {
     /// limiting this is allowed, and section 19.3 bounds an ACK frame's size in
     /// the same breath — a frame has to fit a packet, and every range costs two
     /// variable-length integers.
+    //
+    // A fixed bound is the whole of the eviction policy: nothing here watches
+    // for an ACK *of* an ACK, so a range survives until the count is full and
+    // the low end is pushed out, rather than until the peer confirms it saw
+    // it. That is section 13.2.4's algorithm, and it needs state this
+    // structure does not keep — which Largest Acknowledged each sent ACK
+    // frame carried, and which of those packets were acknowledged.
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-13.2.3
+    //# After receiving
+    //# acknowledgments for an ACK frame, the receiver SHOULD stop tracking
+    //# those acknowledged ACK Ranges.
+    //= type=todo
     ranges_max: u32 = 32,
 };
 
@@ -105,16 +117,51 @@ pub fn AckRanges(comptime config: Config) type {
         largest_received_at: u64 = 0,
         /// Whether anything ack-eliciting has arrived since the last ACK was
         /// written. Section 13.2.1: an ACK frame is owed only for those.
+        //
+        // The debt, not the deadline: this flag says an ACK is owed and
+        // `write` clears it. Whether the connection pays it inside
+        // `max_ack_delay` is the connection's, because that needs a timer and
+        // the transport parameter this structure does not hold.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-13.2.1
+        //# Every packet SHOULD be acknowledged at least once, and ack-eliciting
+        //# packets MUST be acknowledged at least once within the maximum delay
+        //# an endpoint communicated using the max_ack_delay transport parameter;
+        //# see Section 18.2.
+        //
+        // Section 13.2.1 also wants a CE-marked packet acknowledged at once.
+        // The codepoint is in the IP header, and this package's seam takes a
+        // datagram without one — see docs/DESIGN.md section 3 for why no
+        // socket-level information crosses it, and section 6 for ECN as a
+        // named gap.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-13.2.1
+        //# Similarly, packets marked with the ECN Congestion Experienced (CE)
+        //# codepoint in the IP header SHOULD be acknowledged immediately, to
+        //# reduce the peer's response time to congestion events.
+        //= type=exception
+        //= reason=the seam takes datagrams without their IP-level ECN codepoints, so a CE mark is not observable here; ECN is a documented gap in docs/DESIGN.md section 6
         ack_eliciting_pending: bool = false,
         /// Section 13.2.3's minimum packet number: everything below this is
         /// treated as already seen, whether or not a range still records it.
         /// Rises when eviction forgets a range, and never falls.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-13.2.3
+        //# A receiver MUST retain an ACK Range unless it can ensure that it will
+        //# not subsequently accept packets with numbers in that range.
         minimum: u64 = 0,
 
         /// Note that `number` arrived at `now_ns`.
         ///
         /// Idempotent: a duplicate changes nothing, which matters because a
         /// duplicate is exactly what a retransmitted packet looks like.
+        //
+        // Recording a number is what makes it acknowledgeable, so the ordering
+        // below is a requirement rather than a convenience.
+        // `Connection.receiveDatagram` calls this only after `openPacket` has
+        // removed the protection and `receiveFrames` has returned — a frame
+        // that fails to process closes the connection instead of landing here.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-13.1
+        //# A packet MUST NOT be acknowledged until packet protection has been
+        //# successfully removed and all frames contained in the packet have been
+        //# processed.
         pub fn record(self: *Self, number: u64, now_ns: u64, ack_eliciting: bool) void {
             assert(number <= packet_number.max);
             if (ack_eliciting) self.ack_eliciting_pending = true;
@@ -181,6 +228,18 @@ pub fn AckRanges(comptime config: Config) type {
         /// the lowest if the set is full. See the module comment for why the
         /// low end is the end that goes, and why forgetting one obliges this to
         /// raise `minimum`.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-13.2.3
+        //# A receiver MUST retain an ACK Range unless it can ensure that it will
+        //# not subsequently accept packets with numbers in that range.
+        //
+        // Eviction takes `ranges[count - 1]`, the lowest, and index 0 holds
+        // the largest — so the number section 13.2.3 requires be kept is the
+        // one this can never drop.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-13.2.3
+        //# Receivers can discard all ACK Ranges, but they MUST retain the
+        //# largest packet number that has been successfully processed, as that
+        //# is used to recover packet numbers from subsequent packets; see
+        //# Section 17.1.
         fn open(self: *Self, index: u32, number: u64) void {
             assert(index <= self.count);
             const floor_before = self.minimum;
@@ -241,6 +300,21 @@ pub fn AckRanges(comptime config: Config) type {
         /// `now_ns` and `ack_delay_exponent` come from the caller: the delay is
         /// measured against a clock this structure does not read, and scaled by
         /// a transport parameter it does not hold.
+        //
+        // `ranges[0]` is the largest received and is always written first, and
+        // `writeRanges` drops from the low end when the target runs out — so
+        // the two requirements below hold no matter how little room the caller
+        // gives this.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-13.2.3
+        //# ACK frames SHOULD always acknowledge the most recently received
+        //# packets, and the more out of order the packets are, the more
+        //# important it is to send an updated ACK frame quickly, to prevent the
+        //# peer from declaring a packet as lost and spuriously retransmitting
+        //# the frames it contains.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-13.2.3
+        //# A receiver SHOULD include an ACK Range containing the largest
+        //# received packet number in every ACK frame.
         pub fn write(self: *Self, target: []u8, now_ns: u64, ack_delay_exponent: u6) WriteError!Written {
             if (self.count == 0) return error.Empty;
             self.assertInvariants();
@@ -254,6 +328,26 @@ pub fn AckRanges(comptime config: Config) type {
             // below the receive time — and with assertions compiled out a bare
             // subtraction there is unsigned overflow. A stale `now_ns` producing a
             // zero delay is a correct answer; undefined behaviour is not.
+            //
+            // Both terms are the caller's clock: `largest_received_at` was
+            // stamped in `record` and `now_ns` is passed here, so the interval
+            // is the one this endpoint held the acknowledgement for and
+            // nothing else. It is reported whatever its size, with no clamp to
+            // `max_ack_delay` — the peer is told what happened.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-13.2.5
+            //# An endpoint MUST NOT include delays that it
+            //# does not control when populating the ACK Delay field in an ACK frame.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-13.2.5
+            //# When the measured acknowledgment delay is larger than its
+            //# max_ack_delay, an endpoint SHOULD report the measured delay.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-13.2.5
+            //# However, endpoints SHOULD include buffering delays caused by
+            //# unavailability of decryption keys, since these delays can be large
+            //# and are likely to be non-repeating.
+            //= type=exception
+            //= reason=a packet arriving before its keys is discarded rather than buffered, so no key-unavailability delay is ever accumulated to report
             assert(now_ns >= self.largest_received_at);
             const delay_us = (now_ns -| self.largest_received_at) / std.time.ns_per_us;
             const delay = delay_us >> ack_delay_exponent;
@@ -402,6 +496,12 @@ test "a duplicate changes nothing" {
     try testing.expectEqual(@as(u64, 100), set.largest_received_at);
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9000#section-13.2.3
+//# Receivers can discard all ACK Ranges, but they MUST retain the
+//# largest packet number that has been successfully processed, as that
+//# is used to recover packet numbers from subsequent packets; see
+//# Section 17.1.
+//= type=test
 test "the lowest range is what a full set forgets" {
     var set: Set = .{};
     // Every other number: one range each, which is the shape a peer chooses
@@ -473,6 +573,10 @@ test "the delay is scaled by the exponent the peer advertised" {
     try testing.expectEqual(@as(u64, 1024), ack.delay);
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9000#section-13.2.3
+//# A receiver SHOULD include an ACK Range containing the largest
+//# received packet number in every ACK frame.
+//= type=test
 test "a target too small carries the largest and drops the rest" {
     var set: Set = .{};
     for ([_]u64{ 100, 98, 96, 94 }) |number| set.record(number, 0, true);
@@ -502,6 +606,12 @@ test "an empty set has nothing to say" {
     try testing.expect(!set.contains(0));
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9000#section-13.2.1
+//# Every packet SHOULD be acknowledged at least once, and ack-eliciting
+//# packets MUST be acknowledged at least once within the maximum delay
+//# an endpoint communicated using the max_ack_delay transport parameter;
+//# see Section 18.2.
+//= type=test
 test "writing an ACK clears the debt an ack-eliciting packet created" {
     var set: Set = .{};
     set.record(1, 0, false);
@@ -514,6 +624,10 @@ test "writing an ACK clears the debt an ack-eliciting packet created" {
     try testing.expect(!set.ack_eliciting_pending);
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9000#section-13.2.3
+//# A receiver MUST retain an ACK Range unless it can ensure that it will
+//# not subsequently accept packets with numbers in that range.
+//= type=test
 test "section 13.2.3: forgetting a range means refusing it forever" {
     var set: Set = .{};
     // Every other number, which is the shape that costs one range each.
