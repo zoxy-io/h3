@@ -208,6 +208,17 @@ pub const Error = error{
 //# of type QPACK_DECOMPRESSION_FAILED; see Section 2.2.3.
 //= type=exception
 //= reason=comparing a Required Insert Count against the expected one needs the decoder's own Insert Count, which is dynamic table state this package does not keep (docs/DESIGN.md section 6); any non-zero count is refused instead
+//= https://www.rfc-editor.org/rfc/rfc9204#section-2.1.3
+//# To avoid these deadlocks, an encoder SHOULD NOT write an instruction
+//# unless sufficient stream and connection flow-control credit is
+//# available for the entire instruction.
+//= type=exception
+//= reason=the instruction this rule is about is an encoder-stream instruction, and this endpoint sends none: it advertises SETTINGS_QPACK_MAX_TABLE_CAPACITY = 0 and section 3.2.3 then forbids the encoder stream entirely, per docs/DESIGN.md section 6. Flow-control credit is the QUIC layer's in any case, and encode writes into a caller-owned buffer rather than onto a stream
+//= https://www.rfc-editor.org/rfc/rfc9204#section-2.2.1
+//# While blocked, encoded field section data SHOULD remain in the blocked
+//# stream's flow-control window.
+//= type=exception
+//= reason=no stream can block here: a section that references the dynamic table is the only thing that blocks one, and iterate refuses any Required Insert Count that is not zero. Holding data in a flow-control window is the QUIC layer's doing regardless, per docs/DESIGN.md section 3
 pub const Prefix = struct {
     /// How much of the dynamic table this section depends on. Always zero from
     /// a peer that has been told the table's capacity is zero, and a non-zero
