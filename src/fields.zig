@@ -349,6 +349,14 @@ comptime {
 /// Nothing here retains a caller's slice: where a later rule needs an earlier
 /// field's value, either a bit is derived while the value is in hand, or the
 /// octets are copied into this struct's own storage.
+///
+/// Section 4.1's "begin processing partial HTTP messages" is why it is an
+/// iterator rather than a function over a list: a field section can be checked
+/// as it streams past, so a consumer never has to hold a whole one.
+//= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
+//# Because some messages are large or unbounded, endpoints SHOULD begin
+//# processing partial HTTP messages once enough of the message has been
+//# received to make progress.
 //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
 //# A
 //# client MUST send only a single request on a given stream.
@@ -374,6 +382,60 @@ comptime {
 //# can always discard responses at their discretion for other reasons.
 //= type=exception
 //= reason=what to do with a response that arrived is the consumer's decision, as this file's header says: zoxy must reject a malformed one and zrk may want to record what it got, and neither is a rule about a field section
+//= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
+//# If a client-initiated stream terminates without enough of the HTTP
+//# message to provide a complete response, the server SHOULD abort its
+//# response stream with the error code H3_REQUEST_INCOMPLETE.
+//= type=exception
+//= reason=aborting a response stream is an action on a QUIC stream, which docs/DESIGN.md section 3 puts on the consumer's side of the seam; nothing here sees a stream end, so "terminates without enough of the message" is not a fact a field-section validator can observe
+//= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
+//# The error code H3_NO_ERROR SHOULD be used when requesting that the
+//# client stop sending on the request stream.
+//= type=exception
+//= reason=requesting that a peer stop sending is a QUIC STOP_SENDING frame, which this package never sends on any consumer's behalf; docs/DESIGN.md section 3 leaves the stream and its error code to the consumer
+//= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
+//# If the server sends a partial or complete response but does not abort
+//# reading the request, clients SHOULD continue sending the content of
+//# the request and close the stream normally.
+//= type=exception
+//= reason=this package sends no content and closes no stream; whether a server aborted reading is per-stream state the consumer holds, per docs/DESIGN.md section 3
+// RFC 9114 section 4.1.1: how a request is cancelled and what may be done
+// afterwards. None of it is a rule about a field section — every one names an
+// action on a QUIC stream, or a decision about a request this package does not
+// hold. The error codes themselves are named in frame.zig's section 8 block.
+//= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.1
+//# Implementations SHOULD cancel requests by abruptly terminating any
+//# directions of a stream that are still open.
+//= type=exception
+//= reason=abruptly terminating a direction of a stream is a QUIC RESET_STREAM or STOP_SENDING, and docs/DESIGN.md section 3 puts the stream on the consumer's side of the seam; this validator is handed a decoded field section and cancels nothing
+//= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.1
+//# The server SHOULD abort its response stream with the error code
+//# H3_REQUEST_REJECTED.
+//= type=exception
+//= reason=this package resets no stream, so it chooses no error code for one; the matching MUST NOT — that H3_REQUEST_REJECTED not be used for a request that was processed — is cited in frame.zig for the same reason
+//= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.1
+//# When a server abandons a response after partial processing, it SHOULD
+//# abort its response stream with the error code H3_REQUEST_CANCELLED.
+//= type=exception
+//= reason=whether a response was abandoned after partial processing is the consumer's knowledge — it is what runs the request — and aborting the stream is its action, per docs/DESIGN.md section 3
+//= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.1
+//# Client SHOULD use the error code H3_REQUEST_CANCELLED to cancel
+//# requests.
+//= type=exception
+//= reason=this package issues no request and therefore cancels none; docs/DESIGN.md section 3 leaves the request/response state machine and the stream it rides on to the consumer
+//= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.1
+//# However, if a stream is cancelled after receiving a partial response,
+//# the response SHOULD NOT be used.
+//= type=exception
+//= reason=using a response is the consumer's decision, as this file's header says: it reports and never acts, and it retains no field of any message it has checked
+//= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.1
+//# Only idempotent actions such as GET, PUT, or DELETE can be safely
+//# retried; a client SHOULD NOT automatically retry a request with a
+//# non-idempotent method unless it has some means to know that the
+//# request semantics are idempotent independent of the method or some
+//# means to detect that the original request was never applied.
+//= type=exception
+//= reason=retrying a request is the consumer's, and this package deliberately knows nothing about method semantics: its header says whether a method is one that exists is not checked here, so idempotence is not a property it could read
 //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2.1
 //# If a decompressed field
 //# section contains multiple cookie field lines, these MUST be
@@ -717,6 +779,31 @@ pub const MessageValidator = struct {
     //# the stream, it MUST close the TCP connection.
     //= type=exception
     //= reason=the TCP connection a CONNECT tunnel carries is the proxy's, and this package opens no socket at all: docs/DESIGN.md section 3's seam takes datagrams, so finishConnect checks the request's shape and owns nothing to close
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-4.4
+    //# TCP connections that remain half closed in a single direction are not
+    //# invalid, but are often handled poorly by servers, so clients SHOULD
+    //# NOT close a stream for sending while they still expect to receive data
+    //# from the target of the CONNECT.
+    //= type=exception
+    //= reason=closing a stream for sending is an action on a QUIC stream, which docs/DESIGN.md section 3 puts on the consumer's side of the seam; finishConnect decides whether a CONNECT request is well-formed and never drives the tunnel it opens
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-4.4
+    //# If the stream is reset or reading is aborted by the client, a proxy
+    //# SHOULD perform the same operation on the other direction in order to
+    //# ensure that both directions of the stream are cancelled.
+    //= type=exception
+    //= reason=this package is not a proxy: it holds neither the QUIC stream nor the TCP connection a tunnel joins, so there is no other direction for it to mirror a reset onto. zoxy is the proxy, per docs/DESIGN.md section 3
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-4.4
+    //# In all these cases, if the underlying TCP implementation permits it,
+    //# the proxy SHOULD send a TCP segment with the RST bit set.
+    //= type=exception
+    //= reason=there is no underlying TCP implementation here — the package's no-I/O rule forbids std.posix and std.net outright, per docs/DESIGN.md section 3 — so no segment of any kind is this file's to send
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-4.4
+    //# Since CONNECT creates a tunnel to an arbitrary server, proxies that
+    //# support CONNECT SHOULD restrict its use to a set of known ports or a
+    //# list of safe request targets; see Section 9.3.6 of [HTTP] for more
+    //# details.
+    //= type=exception
+    //= reason=which destinations a deployment permits is policy rather than syntax, and it belongs where the socket is: zoxy holds the port allowlist. finishConnect gives that policy the shape it needs — an :authority that is present, non-empty and unaccompanied by :scheme or :path — and the consumer already holds the value, because it is the party feeding each decoded field in
     fn finishConnect(self: *const MessageValidator) Error!void {
         assert(self.method_is_connect);
         assert(!self.seen.contains(.protocol));
