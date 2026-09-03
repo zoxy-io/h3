@@ -1386,6 +1386,9 @@ pub fn Connection(comptime config: Config) type {
         /// package deciding how fast to send.
         pub fn send(self: *Self, buffer: []u8, now_ns: u64) SendError!usize {
             if (buffer.len < config.datagram_octets) return error.BufferTooSmall;
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-10.2.2
+            //# While otherwise identical to the closing state, an
+            //# endpoint in the draining state MUST NOT send any packets.
             if (self.state == .draining) return 0;
 
             const room = self.sendRoom();
@@ -1395,6 +1398,18 @@ pub fn Connection(comptime config: Config) type {
             var offset: usize = 0;
             // Section 12.2: levels are coalesced oldest first, so a peer that
             // has not yet installed later keys still gets the earlier packet.
+            //
+            // Every packet in the datagram is addressed to `self.destination`,
+            // which is one value for the connection, so the coalescing rule
+            // below holds by construction rather than by a check.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-12.2
+            //# Senders MUST NOT coalesce QUIC packets
+            //# with different connection IDs into a single UDP datagram.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-12.2
+            //# An endpoint SHOULD include multiple frames in a single packet if they
+            //# are to be sent at the same encryption level, instead of coalescing
+            //# multiple packets at the same encryption level.
             for ([_]Level{ .initial, .handshake, .one_rtt }) |level| {
                 offset += self.sendPacket(buffer[offset..limit], level, now_ns) catch 0;
             }
@@ -1405,6 +1420,23 @@ pub fn Connection(comptime config: Config) type {
             // but it goes outside the packet rather than inside it — this
             // endpoint has already sealed by now, and section 12.2 allows a
             // datagram to be longer than the packets it carries.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-14.1
+            //# A client MUST expand the payload of all UDP datagrams carrying
+            //# Initial packets to at least the smallest allowed maximum datagram
+            //# size of 1200 bytes by adding PADDING frames to the Initial packet or
+            //# by coalescing the Initial packet; see Section 12.2.
+            //
+            // Only the client half. A server's Initial carrying CRYPTO is
+            // ack-eliciting and is sent short, and the test below
+            // ("the server's reply completes the Initial exchange in both
+            // directions") asserts that it is — so the assertion is the
+            // requirement's opposite, which is the shape section 1 of
+            // docs/VERIFICATION.md calls a test that asserts the bug.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-14.1
+            //# Similarly, a server MUST expand the payload of all UDP
+            //# datagrams carrying ack-eliciting Initial packets to at least the
+            //# smallest allowed maximum datagram size of 1200 bytes.
+            //= type=todo
             if (self.side == .client and self.send_keys[@intFromEnum(Level.initial)] != null) {
                 if (offset < initial_datagram_min and limit >= initial_datagram_min) {
                     @memset(buffer[offset..initial_datagram_min], 0);
@@ -1448,11 +1480,33 @@ pub fn Connection(comptime config: Config) type {
             assert(self.one_rtt.sealed < std.math.maxInt(u64));
             self.one_rtt.sealed += 1;
             assert(self.one_rtt.sealed >= 1);
+            //= https://www.rfc-editor.org/rfc/rfc9001#section-6.6
+            //# If the total number of encrypted packets with the same key
+            //# exceeds the confidentiality limit for the selected AEAD, the endpoint
+            //# MUST stop using those keys.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9001#section-5.3
+            //# An endpoint MUST initiate a key update
+            //# (Section 6) prior to exceeding any limit set for the AEAD that is in
+            //# use.
             if (self.one_rtt.sealed < crypto.confidentialityLimit(self.one_rtt.suite)) return;
+            //= https://www.rfc-editor.org/rfc/rfc9001#section-6.6
+            //# Endpoints MUST initiate a key update
+            //# before sending more protected packets than the confidentiality limit
+            //# for the selected AEAD permits.
             if (self.canUpdateKeys()) {
                 self.updateKeys();
                 return;
             }
+            // No stateless reset follows, which is the RECOMMENDED close taken
+            // in its place rather than the sentence's whole content.
+            //= https://www.rfc-editor.org/rfc/rfc9001#section-6.6
+            //# If a key update is not possible or
+            //# integrity limits are reached, the endpoint MUST stop using the
+            //# connection and only send stateless resets in response to receiving
+            //# packets.  It is RECOMMENDED that endpoints immediately close the
+            //# connection with a connection error of type AEAD_LIMIT_REACHED before
+            //# reaching a state where key updates are not possible.
             self.close(.aead_limit_reached);
         }
 
@@ -1464,6 +1518,15 @@ pub fn Connection(comptime config: Config) type {
         //# validated, an endpoint MUST limit the amount of data it sends to the
         //# unvalidated address to three times the amount of data received from
         //# that address.
+        //
+        // The closing state is not exempt: `send` consults this before it
+        // frames a CONNECTION_CLOSE, so a close to an unvalidated address is
+        // held to the same three times.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-10.2.1
+        //# An endpoint in the closing state MUST either discard
+        //# packets received from an unvalidated address or limit the cumulative
+        //# size of packets it sends to an unvalidated address to three times the
+        //# size of packets it receives from that address.
         fn sendRoom(self: *const Self) u64 {
             if (self.address_validated) return config.datagram_octets;
             const allowance = self.received_octets * amplification_factor;
@@ -1487,6 +1550,16 @@ pub fn Connection(comptime config: Config) type {
             if (space.discarded) return error.Empty;
 
             const number = space.next;
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-17.1
+            //# Prior to receiving an acknowledgment for a packet number space, the
+            //# full packet number MUST be included; it is not to be truncated, as
+            //# described below.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-17.1
+            //# After an acknowledgment is received for a packet number space, the
+            //# sender MUST use a packet number size able to represent more than
+            //# twice as large a range as the difference between the largest
+            //# acknowledged packet number and the packet number being sent.
             const number_octets = packet_number.encodedLength(number, space.largest_acked);
             const header = try self.writeHeader(buffer, level, number, number_octets);
 
@@ -1535,6 +1608,11 @@ pub fn Connection(comptime config: Config) type {
                 self.recovery.canSend(config.datagram_octets);
             const written = self.writePayload(buffer[header.header_octets..][0..payload_room], level, now_ns, window_open);
             const payload_octets = written.octets;
+            // An empty payload is not a packet: the header is abandoned rather
+            // than sealed over nothing.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-12.4
+            //# The payload of a packet that contains frames MUST contain at least
+            //# one frame, and MAY contain multiple frames and multiple frame types.
             if (payload_octets == 0) {
                 self.rollback(level, undo, written);
                 return error.Empty;
@@ -1585,6 +1663,28 @@ pub fn Connection(comptime config: Config) type {
                 self.rollback(level, undo, written);
                 return error.Empty;
             };
+            // Advanced only after a successful seal, and never rewound: the
+            // packet number is the AEAD nonce, so a number used twice under one
+            // key is a nonce used twice.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-12.3
+            //# Packet numbers in each space start
+            //# at packet number 0.  Subsequent packets sent in the same packet
+            //# number space MUST increase the packet number by at least one.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-12.3
+            //# A QUIC endpoint MUST NOT reuse a packet number within the same packet
+            //# number space in one connection.
+            //
+            // The ceiling has no handling: `writeHeader` asserts the number is
+            // encodable, so at 2^62-1 a safe build panics and an
+            // assertions-off build encodes a number it cannot represent.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-12.3
+            //# If the packet number for sending
+            //# reaches 2^62-1, the sender MUST close the connection without sending
+            //# a CONNECTION_CLOSE frame or any further packets; an endpoint MAY send
+            //# a Stateless Reset (Section 10.3) in response to further packets that
+            //# it receives.
+            //= type=todo
             space.next += 1;
             self.countSealed(level);
 
@@ -1681,6 +1781,18 @@ pub fn Connection(comptime config: Config) type {
                     .number_octets = number_octets,
                     .length_octets = length_field_octets,
                 }),
+                //= https://www.rfc-editor.org/rfc/rfc9001#section-5.6
+                //# A client
+                //# therefore MUST NOT use 0-RTT for application data unless specifically
+                //# requested by the application that is in use.
+                //= type=exception
+                //= reason=0-RTT is out of scope; no header is ever written at this level, so no 0-RTT packet leaves this endpoint. See docs/DESIGN.md section 2 for what this package owns and section 6 for the list this sits on.
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9001#section-4.9.3
+                //# Therefore, a client SHOULD discard 0-RTT keys as soon as it installs
+                //# 1-RTT keys as they have no use after that moment.
+                //= type=exception
+                //= reason=0-RTT keys are never installed, so there are none to discard; 0-RTT is out of scope per docs/DESIGN.md section 2 and section 6.
                 .zero_rtt => error.Empty,
             };
         }
@@ -1740,6 +1852,15 @@ pub fn Connection(comptime config: Config) type {
         /// STREAM paths at all.
         fn writeClose(self: *Self, payload: []u8, result: *Payload) Payload {
             assert(self.state == .closing);
+            // One close and then silence: `close_pending` is cleared below and
+            // is never set again, so a closing endpoint does not answer every
+            // incoming packet with a fresh CONNECTION_CLOSE. That is quieter
+            // than the rate limit asks for and coarser than it: the peer that
+            // loses the one close hears nothing until its own idle timeout.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-10.2.1
+            //# An endpoint SHOULD limit the rate at which it generates packets in
+            //# the closing state.
+            //= type=todo
             if (!self.close_pending) return result.*;
             // Section 19.19: a transport close carries the frame type that
             // triggered it and an application close does not. Writing `null`
@@ -1932,6 +2053,29 @@ pub fn Connection(comptime config: Config) type {
             return written;
         }
 
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-11
+        //# An endpoint that detects an error SHOULD signal the existence of that
+        //# error to its peer.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-10.3
+        //# An endpoint that wishes to communicate a fatal
+        //# connection error MUST use a CONNECTION_CLOSE frame if it is able.
+        //
+        // A connection here always has the state to frame one, and never sends
+        // a Stateless Reset, so the rule below holds by having no other path.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-11
+        //# A
+        //# stateless reset MUST NOT be used by an endpoint that has the state
+        //# necessary to send a frame on the connection.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-10.3
+        //# Endpoints MUST send Stateless Resets formatted as a packet with a
+        //# short header.  However, endpoints MUST treat any packet ending in a
+        //# valid stateless reset token as a Stateless Reset, as other QUIC
+        //# versions might allow the use of a long header.
+        //= type=exception
+        //= reason=stateless reset is out of scope; it is the answer of an endpoint that has *lost* the connection state, which is the consumer's lookup table rather than this type, and its token needs randomness that docs/DESIGN.md section 3 keeps outside the package. See docs/DESIGN.md section 2 and section 6.
+        //
         /// Begin closing (section 10.2). The close frame goes out on the next
         /// `send`.
         pub fn close(self: *Self, code: error_code.Transport) void {
