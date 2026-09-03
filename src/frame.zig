@@ -46,6 +46,12 @@ const varint = @import("varint.zig");
 //# conditionally present.
 //= type=exception
 //= reason=a requirement on the specification that registers a frame type, not on code; this package implements the layouts RFC 9114 section 7.2 already gives
+//= https://www.rfc-editor.org/rfc/rfc9114#section-11.2.1
+//# If an entry is present in only one registry, every effort SHOULD be
+//# made to avoid assigning the corresponding value to an unrelated
+//# operation.
+//= type=exception
+//= reason=an instruction to IANA about keeping the HTTP/2 and HTTP/3 frame type registries aligned; what an implementation does with the result is refuse the four values HTTP/2 used and HTTP/3 does not, which is isHttp2Reserved
 //= https://www.rfc-editor.org/rfc/rfc9114#section-9
 //# Extensions that could change the semantics of existing protocol
 //# components MUST be negotiated before being used.
@@ -67,6 +73,32 @@ pub const Type = enum(u64) {
     //# be treated as a connection error of type H3_ID_ERROR.
     //= type=exception
     //= reason=server push is not implemented; which push IDs a PUSH_PROMISE has mentioned is connection state the HTTP/3 layer docs/DESIGN.md section 6 lists as next would hold
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.3
+    //# The server SHOULD abort sending the resource, but the mechanism to do
+    //# so depends on the state of the corresponding push stream.
+    //= type=exception
+    //= reason=server push is not implemented, so no resource is ever pushed and no push stream ever opened; whether one is open is connection state the HTTP/3 layer docs/DESIGN.md section 6 lists as next would hold
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.3
+    //# If the push stream is open, the server SHOULD abruptly terminate that
+    //# stream.
+    //= type=exception
+    //= reason=server push is not implemented, and terminating a stream is a QUIC RESET_STREAM on the consumer's side of the seam per docs/DESIGN.md section 3
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.3
+    //# Regardless of whether a push stream has been opened, a server SHOULD
+    //# send a CANCEL_PUSH frame when it determines that promise will not be
+    //# fulfilled.
+    //= type=exception
+    //= reason=server push is not implemented, so this endpoint makes no promise it could fail to fulfil; Type.cancel_push is the number the connection layer would write if it did, and writeHeader is what would frame it
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.3
+    //# A client SHOULD NOT send a CANCEL_PUSH frame when it has already
+    //# received a corresponding push stream.
+    //= type=exception
+    //= reason=server push is not implemented, and remembering which push streams have arrived is connection state the HTTP/3 layer docs/DESIGN.md section 6 lists as next would hold
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.3
+    //# The client SHOULD abort reading the stream with an error code of
+    //# H3_REQUEST_CANCELLED.
+    //= type=exception
+    //= reason=server push is not implemented; aborting a read is a QUIC STOP_SENDING and the code on it is that frame's field, both the consumer's per docs/DESIGN.md section 3
     cancel_push = 0x03,
     settings = 0x04,
     //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.5
@@ -103,6 +135,32 @@ pub const Type = enum(u64) {
     //# as a connection error of type H3_FRAME_UNEXPECTED.
     //= type=exception
     //= reason=server push is not implemented, so no push stream is ever read; allowedOnRequestStream is the per-stream-kind answer this file can give, and a push stream is not one of its two kinds
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-4.6
+    //# A server SHOULD use push IDs sequentially, beginning from zero.
+    //= type=exception
+    //= reason=server push is not implemented, so this endpoint issues no push ID; the counter that would run sequentially is connection state the HTTP/3 layer docs/DESIGN.md section 6 lists as next would hold
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-4.6
+    //# The server SHOULD send PUSH_PROMISE frames prior to sending HEADERS or
+    //# DATA frames that reference the promised responses.
+    //= type=exception
+    //= reason=server push is not implemented, and the ordering of frames on a stream is the HTTP/3 connection layer's; this file writes one frame header at a time and sequences nothing
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-4.6
+    //# Clients SHOULD send a CANCEL_PUSH frame upon receipt of a PUSH_PROMISE
+    //# frame carrying a request that is not cacheable, is not known to be
+    //# safe, that indicates the presence of request content, or for which it
+    //# does not consider the server authoritative.
+    //= type=exception
+    //= reason=server push is not implemented, and each of the four conditions is knowledge this package refuses on purpose: cacheability and method safety are response and method semantics fields.zig's header says it does not read, and authoritativeness rests on a certificate that never crosses the seam of docs/DESIGN.md section 4
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.5
+    //# If the decompressed field sections match exactly, the client SHOULD
+    //# associate the pushed content with each stream on which a PUSH_PROMISE
+    //# frame was received.
+    //= type=exception
+    //= reason=server push is not implemented, and the comparison this depends on is the one the MUST above already declines: matching two promises means retaining a decoded field section, which neither this file nor fields.zig does
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.5
+    //# A server SHOULD avoid reusing a push ID over a long period.
+    //= type=exception
+    //= reason=server push is not implemented, so no push ID is issued and none can be reused; "a long period" would also need a clock, and docs/DESIGN.md's seam takes now_ns as a parameter rather than reading one
     push_promise = 0x05,
     //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.6
     //# A client MUST treat receipt of a GOAWAY frame containing a stream ID
@@ -129,6 +187,50 @@ pub const Type = enum(u64) {
     //# might have been processed.
     //= type=exception
     //= reason=what a client assumes about a request it already sent is a decision about requests, and this package holds none: docs/DESIGN.md section 3 leaves the request/response state machine to the consumer
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-3.3
+    //# When either endpoint chooses to close the HTTP/3 connection, the
+    //# terminating endpoint SHOULD first send a GOAWAY frame (Section 5.2) so
+    //# that both endpoints can reliably determine whether previously sent
+    //# frames have been processed and gracefully complete or terminate any
+    //# necessary remaining tasks.
+    //= type=exception
+    //= reason=deciding to close a connection and sequencing a frame onto the control stream before doing so are both the HTTP/3 connection layer's, which docs/DESIGN.md section 6 lists as next rather than built; writeHeader and parseSingleVarint are the codec for the frame it will send
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-5.2
+    //# Servers SHOULD send a GOAWAY frame when the closing of a connection is
+    //# known in advance, even if the advance notice is small, so that the
+    //# remote peer can know whether or not a request has been partially
+    //# processed.
+    //= type=exception
+    //= reason=knowing a close is coming is the consumer's — it owns the socket and the shutdown that prompts one — and the control stream a GOAWAY rides on is docs/DESIGN.md section 6's next slice rather than a built one
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-5.2
+    //# Upon sending a GOAWAY frame, the endpoint SHOULD explicitly cancel
+    //# (see Sections 4.1.1 and 7.2.3) any requests or pushes that have
+    //# identifiers greater than or equal to the one indicated, in order to
+    //# clean up transport state for the affected streams.
+    //= type=exception
+    //= reason=which requests are outstanding is connection state the HTTP/3 layer docs/DESIGN.md section 6 lists as next would hold, and cancelling one is a QUIC RESET_STREAM on the consumer's side of the seam; this file writes the identifier and reads it back
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-5.2
+    //# The endpoint SHOULD continue to do so as more requests or pushes
+    //# arrive.
+    //= type=exception
+    //= reason=the same reason as the sentence it continues: cancelling a request that arrives after a GOAWAY needs the outstanding-request set the connection layer would hold, and server push is not implemented at all
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-5.2
+    //# An endpoint that completes a graceful shutdown SHOULD use the
+    //# H3_NO_ERROR error code when closing the connection.
+    //= type=exception
+    //= reason=closing a connection is a QUIC CONNECTION_CLOSE and the code on it is that frame's field, both the consumer's per docs/DESIGN.md section 3; nothing in this file closes anything or chooses a code
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-5.1
+    //# HTTP/3 implementations will need to open a new HTTP/3 connection for
+    //# new requests if the existing connection has been idle for longer than
+    //# the idle timeout negotiated during the QUIC handshake, and they SHOULD
+    //# do so if approaching the idle timeout; see Section 10.1 of
+    //# [QUIC-TRANSPORT].
+    //= type=exception
+    //= reason=opening a connection is the consumer's and the idle timeout is quic/Connection's, which takes now_ns as a parameter rather than reading a clock (docs/DESIGN.md section 3); this file has no notion of time and no connection to replace
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-5.1
+    //# Servers SHOULD NOT actively keep connections open.
+    //= type=exception
+    //= reason=keeping a connection open means sending something to defer the idle timeout, which is a decision about when to send; docs/DESIGN.md section 3's seam leaves that to the consumer driving quic/Connection, and this file encodes frames rather than scheduling them
     goaway = 0x07,
     //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.7
     //# A MAX_PUSH_ID frame cannot reduce the maximum push
@@ -143,6 +245,11 @@ pub const Type = enum(u64) {
     //# H3_FRAME_UNEXPECTED.
     //= type=exception
     //= reason=which endpoint this is decides both halves of the rule, and this file encodes and decodes frames without knowing; server push is not implemented in either direction
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-10.5
+    //# A client that accepts server push SHOULD limit the number of push IDs
+    //# it issues at a time.
+    //= type=exception
+    //= reason=this endpoint accepts no server push, so the limit MAX_PUSH_ID carries is never raised above its absent default; the count of outstanding push IDs is connection state the HTTP/3 layer docs/DESIGN.md section 6 lists as next would hold
     max_push_id = 0x0d,
     _,
 
@@ -177,6 +284,11 @@ pub const Type = enum(u64) {
     //# assigned values.
     //= type=exception
     //= reason=an instruction to IANA rather than to an implementation; isReserved is what this package does with the family IANA is told to leave unassigned, and the test below walks it
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-10.5
+    //# Implementations SHOULD track the use of these features and set limits
+    //# on their use.
+    //= type=exception
+    //= reason=the features section 10.5 names are server push, which is not implemented, unknown protocol elements, and field compression. Counting how many unknown frame types, settings or stream types a peer has sent is per-connection accounting the HTTP/3 layer docs/DESIGN.md section 6 lists as next would keep; isReserved and known are the classification it would count with. Field compression's limit is the one this package does enforce — qpack.field_line.iterate refuses a section past the advertised SETTINGS_MAX_FIELD_SECTION_SIZE
     pub fn isReserved(frame_type: Type) bool {
         const value = @intFromEnum(frame_type);
         if (value < 0x21) return false;
@@ -204,6 +316,13 @@ pub const Type = enum(u64) {
     //# HEADERS frames can only be sent on request streams or push streams.
     //# If a HEADERS frame is received on a control stream, the recipient
     //# MUST respond with a connection error of type H3_FRAME_UNEXPECTED.
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-9
+    //# However, where a known frame type is required to be in a specific
+    //# location, such as the SETTINGS frame as the first frame of the control
+    //# stream (see Section 6.2.1), an unknown frame type does not satisfy
+    //# that requirement and SHOULD be treated as an error.
+    //= type=exception
+    //= reason=the one location RFC 9114 fixes is the first frame of the control stream, and the control stream is docs/DESIGN.md section 6's next slice rather than a built one. Position on a stream is not something a per-frame classifier can see: allowedOnControlStream answers `true` for an unknown type because it is right everywhere except the first position, and it is the connection layer holding "have I seen SETTINGS yet" that turns that into H3_MISSING_SETTINGS
     pub fn allowedOnControlStream(frame_type: Type) bool {
         return switch (frame_type) {
             .cancel_push, .settings, .goaway, .max_push_id => true,
@@ -272,6 +391,11 @@ pub const Header = struct {
 //# H3_NO_ERROR.
 //= type=exception
 //= reason=an error code arrives on a QUIC RESET_STREAM or CONNECTION_CLOSE, which this file never sees; ParseError names what a frame header can be wrong about and the consumer maps it onto section 8.1's codes
+//= https://www.rfc-editor.org/rfc/rfc9114#section-8.1
+//# Implementations SHOULD select an error code from this space with some
+//# probability when they would have sent H3_NO_ERROR.
+//= type=exception
+//= reason=this is greasing, and it needs two things this package does not have: an occasion to send an error code — it resets no stream and closes no connection, per docs/DESIGN.md section 3 — and randomness, which CLAUDE.md's policy makes a parameter rather than something src/ draws. The reserved family the rule draws from is the one section 11.2.3 keeps unassigned, cited above
 //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.1
 //# Servers MUST NOT use the H3_REQUEST_REJECTED error code for requests
 //# that were partially or fully processed.
@@ -379,6 +503,26 @@ pub fn writeHeader(target: []u8, frame_type: Type, length: u64) EncodeError!u8 {
 //= type=exception
 //= reason=the peer's settings are connection state, and docs/DESIGN.md section 3 puts connection state on the consumer's side of the seam; SettingsIterator hands every pair it decodes to that consumer and holds none
 //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4.2
+//# Each endpoint SHOULD use these initial values to send messages before
+//# the peer's SETTINGS frame has arrived, as packets carrying the
+//# settings can be lost or delayed.
+//= type=exception
+//= reason=the initial values are the defaults an endpoint assumes until SETTINGS arrives, and holding them is connection state the HTTP/3 layer docs/DESIGN.md section 6 lists as next would keep; SettingsIterator decodes the frame that replaces them and remembers nothing between calls
+//= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4.2
+//# Clients SHOULD NOT wait indefinitely for SETTINGS to arrive before
+//# sending requests, but they SHOULD process received datagrams in order
+//# to increase the likelihood of processing SETTINGS before sending the
+//# first request.
+//= type=exception
+//= reason=waiting, and reading datagrams while waiting, are both about when to act; docs/DESIGN.md section 3's seam takes datagrams from the consumer and this file decides no moment. The SETTINGS exchange itself needs the control stream, which section 6 lists as next rather than built
+//= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4.2
+//# Clients SHOULD store the settings the server provided in the HTTP/3
+//# connection where resumption information was provided, but they MAY opt
+//# not to store settings in certain cases (e.g., if the session ticket is
+//# received before the SETTINGS frame).
+//= type=exception
+//= reason=remembering settings alongside a session ticket is 0-RTT bookkeeping, and 0-RTT is out of scope: docs/DESIGN.md section 4 puts the TLS engine and its tickets in the consumer, so there is nothing here to attach a stored setting to
+//= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4.2
 //# Endpoints MUST NOT require any data to be received from
 //# the peer prior to sending the SETTINGS frame; settings MUST be sent
 //# as soon as the transport is ready to send data.
@@ -422,6 +566,16 @@ pub fn writeHeader(target: []u8, frame_type: Type, length: u64) EncodeError!u8 {
 //# Setting Name:  A symbolic name for the setting.
 //= type=exception
 //= reason=an instruction to IANA and to the author of a registration rather than to an implementation; Setting transcribes what Table 3 registers plus RFC 9220's 0x08
+//= https://www.rfc-editor.org/rfc/rfc9114#section-11.2.2
+//# If an entry is present in only one registry, every effort SHOULD be
+//# made to avoid assigning the corresponding value to an unrelated
+//# operation.
+//= type=exception
+//= reason=an instruction to IANA about keeping the HTTP/2 and HTTP/3 settings registries aligned; what an implementation does with the result is refuse the four identifiers HTTP/2 used and HTTP/3 does not, which is isHttp2Reserved below
+//= https://www.rfc-editor.org/rfc/rfc9114#section-11.2.2
+//# A default SHOULD be the most restrictive possible value.
+//= type=exception
+//= reason=an instruction to the author of a future settings registration about the default it declares, not to code; the two defaults this package relies on are RFC 9204's, and it advertises the most restrictive of them — SETTINGS_QPACK_MAX_TABLE_CAPACITY = 0 — per docs/DESIGN.md section 6
 pub const Setting = enum(u64) {
     qpack_max_table_capacity = 0x01,
     max_field_section_size = 0x06,
@@ -458,6 +612,11 @@ pub const Setting = enum(u64) {
     //# assigned values.
     //= type=exception
     //= reason=an instruction to IANA rather than to an implementation; isReserved is what this package does with the family IANA is told to leave unassigned, so that a peer can send one to prove unknown settings are ignored
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4.1
+    //# Endpoints SHOULD include at least one such setting in their SETTINGS
+    //# frame.
+    //= type=exception
+    //= reason=greasing a SETTINGS frame means choosing a reserved identifier and putting it in a frame this package does not assemble: the SETTINGS exchange needs the control stream, which docs/DESIGN.md section 6 lists as next rather than built. isReserved is how a connection layer would pick one, and writeSetting is what would encode it
     pub fn isReserved(setting: Setting) bool {
         const value = @intFromEnum(setting);
         if (value < 0x21) return false;
