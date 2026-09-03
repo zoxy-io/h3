@@ -79,6 +79,38 @@ pub const initial_datagram_min: u32 = 1200;
 /// nothing.
 const lost_report_max: u32 = 32;
 
+/// Octets of a Retry token this endpoint will hold.
+///
+/// RFC 9000 puts no bound on the field — a Retry packet's token runs to sixteen
+/// octets short of the end of the datagram — so this is a choice, and the
+/// consequence of choosing it is that a Retry carrying a longer token is
+/// discarded. The connection attempt then fails rather than continuing under a
+/// token that was silently cut in half, which is the only other option and is
+/// worse. 512 is four times the largest token the three implementations in
+/// `interop/` issue, and the comptime assert below is what keeps it a fraction
+/// of the Initial packet it has to share with the ClientHello.
+const retry_token_octets_max: u16 = 512;
+
+comptime {
+    // A token has to fit in the same Initial packet as the handshake message it
+    // travels with, and section 14.1 requires that datagram to reach 1200
+    // octets in any case. A token past half of that leaves a client re-sending
+    // a ClientHello it can no longer fit.
+    assert(retry_token_octets_max < initial_datagram_min / 2);
+}
+
+/// The largest Retry packet whose integrity tag this endpoint will compute: a
+/// first octet, a version, two length-prefixed identifiers, the token, and the
+/// tag. Derived from the token bound rather than chosen, so that raising one
+/// raises the other.
+const retry_octets_max: usize = 1 + 4 +
+    2 * (1 + @as(usize, ConnectionId.octets_max)) +
+    retry_token_octets_max + crypto.tag_octets;
+
+/// RFC 9001 section 5.8's pseudo-packet: a one-octet length, the original
+/// Destination Connection ID, and the Retry packet up to its tag.
+const retry_pseudo_packet_octets_max: usize = 1 + @as(usize, ConnectionId.octets_max) + retry_octets_max;
+
 /// Events held between polls. Sized so that one datagram's worth of frames
 /// cannot overflow it: a datagram carries at most `lost_report_max` losses plus
 /// a bounded number of stream events, and a consumer polls between datagrams.
@@ -443,6 +475,23 @@ pub fn Connection(comptime config: Config) type {
 
         side: Side,
         state: State = .handshaking,
+
+        // Section 17.2.5: a Retry restarts the connection attempt under an
+        // identifier and a token the server chose. All four of these exist so
+        // that it can happen exactly once and be checked afterwards.
+        /// The token to copy into every subsequent Initial packet.
+        retry_token: [retry_token_octets_max]u8 = @splat(0),
+        retry_token_len: u16 = 0,
+        /// Whether a Retry has been accepted. Section 17.2.5.2 permits one.
+        retry_seen: bool = false,
+        /// The Source Connection ID the Retry carried, which section 7.3 has
+        /// the server repeat in `retry_source_connection_id`.
+        retry_source: ?ConnectionId = null,
+        /// Whether an Initial packet from the peer has been opened. Section
+        /// 17.2.5.2 closes the window for a Retry at this point, and it is a
+        /// separate question from `peer_source` being pinned: a packet that
+        /// failed to decrypt was received and not *processed*.
+        peer_initial_processed: bool = false,
 
         // Section 5.1: a connection here carries one identifier in each direction and
         // never a second. The four fields below are the whole set — what this endpoint
@@ -1356,22 +1405,29 @@ pub fn Connection(comptime config: Config) type {
             //= https://www.rfc-editor.org/rfc/rfc9000#section-7.3
             //# Endpoints MUST validate that received transport parameters match
             //# received connection ID values.
-            //= type=todo
+            //= type=test
             //
             //= https://www.rfc-editor.org/rfc/rfc9000#section-7.3
             //# The values provided by a peer for these transport parameters
             //# MUST match the values that an endpoint used in the Destination
             //# and Source Connection ID fields of Initial packets that it sent
             //# (and received, for servers).
-            //= type=todo
+            //= type=test
             //
+            // `validate` above is the absence half; this is the mismatch half,
+            // and it is the half a Retry makes interesting. Section 7.3 is what
+            // stops an attacker who can inject packets during the handshake
+            // from choosing either endpoint's connection identifier: the
+            // identifiers travel twice, once in the clear on the wire and once
+            // inside the handshake the peer authenticates, and this compares
+            // them.
             //= https://www.rfc-editor.org/rfc/rfc9000#section-7.3
             //# An endpoint MUST treat the absence of the
             //# initial_source_connection_id transport parameter from either
             //# endpoint or the absence of the
             //# original_destination_connection_id transport parameter from the
             //# server as a connection error of type TRANSPORT_PARAMETER_ERROR.
-            //= type=todo
+            //= type=test
             //
             //= https://www.rfc-editor.org/rfc/rfc9000#section-7.3
             //# An endpoint MUST treat the following as a connection error of
@@ -1383,7 +1439,26 @@ pub fn Connection(comptime config: Config) type {
             //# from a peer in these transport parameters and the value sent in
             //# the corresponding Destination or Source Connection ID fields of
             //# Initial packets.
-            //= type=todo
+            //= type=test
+            if (self.side == .client) {
+                // The server repeats the identifier the client drew for its
+                // first Initial. A mismatch means the handshake authenticated a
+                // connection attempt other than this one.
+                if (parsed.original_destination_connection_id) |declared| {
+                    if (!declared.eql(&self.original_destination)) return error.Malformed;
+                }
+                // And the Retry triple. `retry_source` is set with `retry_seen`
+                // and read only here, which is the whole reason a Retry's
+                // Source Connection ID is kept after `destination` has moved on
+                // to whatever the server's first Initial named.
+                if (self.retry_source) |carried| {
+                    const declared = parsed.retry_source_connection_id orelse
+                        return error.MissingConnectionId;
+                    if (!declared.eql(&carried)) return error.Malformed;
+                } else if (parsed.retry_source_connection_id != null) {
+                    return error.Malformed;
+                }
+            }
 
             // Section 4.6: the peer's initial stream limits are limits on *us*,
             // and until this they were parsed by nobody. The data limits are
@@ -2018,7 +2093,15 @@ pub fn Connection(comptime config: Config) type {
             //# Clients are not able to send Handshake packets prior to
             //# receiving a server response, so servers SHOULD ignore any
             //# such packets.
-            const level = header.level() orelse return; // Retry, Version Negotiation: not this slice.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.5.2
+            //# A Retry packet does not include a packet number and cannot be
+            //# explicitly acknowledged by a client.
+            //
+            // Which is why this is handled before the packet number space is
+            // reached rather than inside it: a Retry has no number to record,
+            // nothing to acknowledge it with, and no payload to open.
+            if (header == .retry) return self.receiveRetry(bytes, header.retry);
+            const level = header.level() orelse return; // Version Negotiation: not this slice.
             const offset = header.packetNumberOffset() orelse return;
             const index = @intFromEnum(level);
             if (self.spaces[@intFromEnum(level.space())].discarded) return;
@@ -2121,6 +2204,11 @@ pub fn Connection(comptime config: Config) type {
             // Section 8.1: receiving a Handshake packet proves the peer holds
             // keys only the real one could have, which validates the address.
             if (level == .handshake) self.address_validated = true;
+            // Section 17.2.5.2's other closing condition for the Retry window,
+            // recorded where "processed" actually happens: after the packet
+            // opened, so a Retry is not shut out by a datagram that failed to
+            // authenticate.
+            if (level == .initial) self.peer_initial_processed = true;
             // The server's half of section 4.9.1, at the point it names: a
             // Handshake packet that opened is one that was successfully
             // processed.
@@ -2246,6 +2334,141 @@ pub fn Connection(comptime config: Config) type {
                     }
                 }
             }
+        }
+
+        /// RFC 9000 section 17.2.5.2: the one packet a client acts on without
+        /// opening it.
+        ///
+        /// **Every failure below is a discard, not a connection error**, and
+        /// the section says so three times. A Retry is unauthenticated until
+        /// its integrity tag is checked, and an endpoint that closed on a bad
+        /// one would be an endpoint that anyone able to send a datagram could
+        /// close. The tag is the only thing that makes a Retry credible, and
+        /// only an entity that saw the client's Initial can compute it.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.5.2
+        //# A client MUST accept and process at most one Retry packet for each
+        //# connection attempt.
+        //= type=test
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.5.2
+        //# After the client has received and processed an Initial or Retry
+        //# packet from the server, it MUST discard any subsequent Retry packets
+        //# that it receives.
+        //= type=test
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.5.2
+        //# Clients MUST discard Retry packets that have a Retry Integrity Tag
+        //# that cannot be validated; see Section 5.8 of [QUIC-TLS].
+        //= type=test
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.5.2
+        //# A client MUST discard a Retry packet with a zero-length Retry Token
+        //# field.
+        //= type=test
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.5.1
+        //# A client MUST discard a Retry packet that contains a Source
+        //# Connection ID field that is identical to the Destination Connection
+        //# ID field of its Initial packet.
+        //= type=test
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.5.1
+        //# The client MUST use the value from the Source Connection ID field of
+        //# the Retry packet in the Destination Connection ID field of
+        //# subsequent packets that it sends.
+        //= type=test
+        //
+        // The two rules this function keeps by *not* doing something. The
+        // Source Connection ID is written from `self.source`, which nothing
+        // here touches; and the packet number is `space.next`, which nothing
+        // here rewinds — the counter goes on from where the discarded first
+        // flight left it, so the new Initial is number one rather than a second
+        // number zero under a different key.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.5.2
+        //# The client MUST NOT change the Source Connection ID because the
+        //# server could include the connection ID as part of its token
+        //# validation logic; see Section 8.1.4.
+        //= type=test
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.5.3
+        //# A client MUST NOT reset the packet number for any packet number
+        //# space after processing a Retry packet.
+        //= type=test
+        //
+        // And the one it keeps by rewinding a cursor rather than a buffer:
+        // `levels[initial].pending` still holds the handshake message the
+        // consumer's TLS engine produced, and only `framed` — how much of it
+        // has been put in a packet — goes back to zero.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.5.3
+        //# A client MUST use the same cryptographic handshake message it
+        //# included in this packet.
+        //= type=test
+        fn receiveRetry(self: *Self, bytes: []const u8, header: @FieldType(packet.Header, "retry")) void {
+            // A server acts on no Retry: it is the endpoint that would send
+            // one, and this package sends none.
+            if (self.side != .client) return;
+            if (self.retry_seen) return;
+            if (self.peer_initial_processed) return;
+            if (header.token.len == 0) return;
+            if (header.token.len > retry_token_octets_max) return;
+            // Section 17.2.5.1: a Retry whose Source Connection ID is the one
+            // the client already addressed would ask the client to change
+            // nothing, which is either a bug or a reflection.
+            if (header.source.eql(&self.destination)) return;
+
+            // Section 5.8 of RFC 9001. The pseudo-packet is the *original*
+            // Destination Connection ID — the one the client drew for its first
+            // Initial — in front of the Retry packet without its tag, which is
+            // what makes the tag unforgeable by anyone who did not see that
+            // Initial.
+            var scratch: [retry_pseudo_packet_octets_max]u8 = undefined;
+            const needed = crypto.retry.pseudoPacketOctets(
+                self.original_destination.bytes().len,
+                bytes.len,
+            );
+            if (needed > scratch.len) return;
+            crypto.retry.verify(
+                scratch[0..needed],
+                self.original_destination.bytes(),
+                bytes,
+            ) catch return;
+
+            // Accepted. From here the connection attempt restarts under the
+            // server's identifier and token, and nothing else about it moves.
+            self.retry_seen = true;
+            self.retry_source = header.source;
+            self.destination = header.source;
+            @memcpy(self.retry_token[0..header.token.len], header.token);
+            self.retry_token_len = @intCast(header.token.len);
+
+            // Section 5.2 of RFC 9001: the Initial secrets come from the
+            // Destination Connection ID of the client's Initial, and that
+            // identifier has just changed — so both halves are recomputed. A
+            // client that kept the old keys would send a packet the server
+            // cannot open and could not open the server's reply.
+            //= https://www.rfc-editor.org/rfc/rfc9001#section-5.2
+            //# The connection ID used with HKDF-Expand-Label is the Destination
+            //# Connection ID in the Initial packet sent by the client.  This will be
+            //# a randomly selected value unless the client creates the Initial
+            //# packet after receiving a Retry packet, where the Destination
+            //# Connection ID is selected by the server.
+            //= type=test
+            const identifier = header.source.bytes();
+            self.send_keys[@intFromEnum(Level.initial)] = .initial(identifier, .client);
+            self.receive_keys[@intFromEnum(Level.initial)] = .initial(identifier, .server);
+
+            // The first flight goes again, from the same octets.
+            self.levels[@intFromEnum(Level.initial)].framed = 0;
+
+            // RFC 9002 section 6.3: a Retry says the Initial was received and
+            // not processed, so the packet it acknowledges nothing about is
+            // gone and so is everything measured from it. Rebuilt rather than
+            // adjusted, because "reset congestion control and loss recovery
+            // state, including resetting any pending timers" is every field
+            // `Recovery` has except which side it is on — and a partial reset
+            // here is how a connection ends up with a timer armed for a packet
+            // that no longer exists.
+            self.recovery = .{ .side = self.side };
         }
 
         // The three steps section 9.5 names are this function and nothing else:
@@ -3968,6 +4191,12 @@ pub fn Connection(comptime config: Config) type {
                     .long_type = if (level == .initial) .initial else .handshake,
                     .destination = self.destination,
                     .source = self.source,
+                    // Section 17.2.5.3: the token goes in *every* subsequent
+                    // Initial, not only the first one after the Retry — a
+                    // retransmission without it is a packet the server has no
+                    // reason to answer. Empty until a Retry is accepted, and
+                    // `writeLong` ignores the field at any other level.
+                    .token = self.retry_token[0..self.retry_token_len],
                     // A placeholder: the field is pinned to `length_field_octets`
                     // and back-filled once the payload exists.
                     .payload_octets = 0,
@@ -6415,4 +6644,332 @@ test "section 14.1: a datagram carrying no Initial packet is not padded" {
     try testing.expect(octets < initial_datagram_min);
     try server.receive(datagram[0..octets], 1000);
     try testing.expectEqualStrings("a 1-RTT packet", server.readable(0));
+}
+
+/// Build a Retry packet the way a server would, tag included.
+///
+/// `original` is the Destination Connection ID of the client's first Initial,
+/// which is what RFC 9001 section 5.8 puts in front of the pseudo-packet — and
+/// what makes a Retry unforgeable by anyone who did not see that Initial.
+fn writeRetry(
+    buffer: []u8,
+    destination: ConnectionId,
+    source: ConnectionId,
+    token: []const u8,
+    original: []const u8,
+) ![]u8 {
+    var cursor: usize = 0;
+    // Long header, fixed bit, type Retry, and four Unused bits a client ignores.
+    buffer[cursor] = 0xf5;
+    cursor += 1;
+    std.mem.writeInt(u32, buffer[cursor..][0..4], packet.version_1, .big);
+    cursor += 4;
+    for ([_]ConnectionId{ destination, source }) |one| {
+        const octets = one.bytes();
+        buffer[cursor] = @intCast(octets.len);
+        cursor += 1;
+        @memcpy(buffer[cursor..][0..octets.len], octets);
+        cursor += octets.len;
+    }
+    @memcpy(buffer[cursor..][0..token.len], token);
+    cursor += token.len;
+
+    const total = cursor + crypto.tag_octets;
+    var scratch: [1024]u8 = undefined;
+    const computed = try crypto.retry.tag(&scratch, original, buffer[0..total]);
+    @memcpy(buffer[cursor..][0..crypto.tag_octets], &computed);
+    return buffer[0..total];
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.5.3
+//# Subsequent Initial packets from the client include the connection ID
+//# and token values from the Retry packet.
+//= type=test
+test "section 17.2.5: a Retry restarts the attempt under the server's identifier and token" {
+    var client = testClient();
+    var datagram: [TestConnection.datagram_octets]u8 = @splat(0);
+
+    // The first flight, so that there is a packet number to not reset and a
+    // handshake message to send again.
+    try client.cryptoIn(.initial, "ClientHello");
+    const first = try client.send(&datagram, 0);
+    try testing.expect(first > 0);
+    try testing.expectEqual(@as(u64, 1), client.spaces[@intFromEnum(Space.initial)].next);
+    const before = client.send_keys[@intFromEnum(Level.initial)].?;
+
+    var buffer: [256]u8 = @splat(0);
+    const retry = try writeRetry(
+        &buffer,
+        ConnectionId.init(&client_source) catch unreachable, // Four octets.
+        ConnectionId.init(&server_source) catch unreachable, // Eight octets.
+        "a token",
+        &client_cid,
+    );
+    try client.receive(retry, 1000);
+
+    // The identifier, the token and the keys all moved together. RFC 9001
+    // section 5.2 derives the Initial secrets from the Destination Connection
+    // ID, so a client that adopted one without the other would be sending
+    // packets nobody can open.
+    try testing.expect(client.retry_seen);
+    try testing.expectEqualSlices(u8, &server_source, client.destination.bytes());
+    try testing.expectEqualStrings("a token", client.retry_token[0..client.retry_token_len]);
+    try testing.expect(!std.mem.eql(
+        u8,
+        &before.key_storage,
+        &client.send_keys[@intFromEnum(Level.initial)].?.key_storage,
+    ));
+
+    // The next Initial carries both, at the *next* packet number: section
+    // 17.2.5.3 forbids resetting it, because a second packet number zero under
+    // a different key is a reused nonce.
+    const second = try client.send(&datagram, 2000);
+    try testing.expect(second > 0);
+    const parsed = try packet.parse(datagram[0..second], @intCast(client_source.len));
+    const initial = parsed.header.initial;
+    try testing.expectEqualStrings("a token", initial.token);
+    try testing.expectEqualSlices(u8, &server_source, initial.destination.bytes());
+    // The Source Connection ID did not change, which section 17.2.5.2 requires
+    // because a server may have built its token out of it.
+    try testing.expectEqualSlices(u8, &client_source, initial.source.bytes());
+    try testing.expectEqual(@as(u64, 2), client.spaces[@intFromEnum(Space.initial)].next);
+
+    // And the same handshake message went out again: `framed` rewound, the
+    // buffer did not.
+    try testing.expectEqualStrings("ClientHello", client.levels[@intFromEnum(Level.initial)].pending[0.."ClientHello".len]);
+}
+
+test "a Retry that does not authenticate is discarded rather than fatal" {
+    var client = testClient();
+    try client.cryptoIn(.initial, "ClientHello");
+    var datagram: [TestConnection.datagram_octets]u8 = @splat(0);
+    _ = try client.send(&datagram, 0);
+
+    var buffer: [256]u8 = @splat(0);
+    const retry = try writeRetry(
+        &buffer,
+        ConnectionId.init(&client_source) catch unreachable, // Four octets.
+        ConnectionId.init(&server_source) catch unreachable, // Eight octets.
+        "a token",
+        &client_cid,
+    );
+    // One octet of the tag, which is the whole point of the tag.
+    retry[retry.len - 1] ^= 0x01;
+    try client.receive(retry, 1000);
+    try testing.expect(!client.retry_seen);
+    try testing.expectEqualSlices(u8, &client_cid, client.destination.bytes());
+
+    // A tag computed against a different original identifier is the same
+    // failure seen from the other side: only an endpoint that saw the client's
+    // Initial can produce one that verifies.
+    const wrong_original = [_]u8{ 0xde, 0xad, 0xbe, 0xef, 0xde, 0xad, 0xbe, 0xef };
+    const other = try writeRetry(
+        &buffer,
+        ConnectionId.init(&client_source) catch unreachable, // As above.
+        ConnectionId.init(&server_source) catch unreachable, // As above.
+        "a token",
+        &wrong_original,
+    );
+    try client.receive(other, 2000);
+    try testing.expect(!client.retry_seen);
+}
+
+test "a Retry is refused when it is empty, repeated, or too late" {
+    var buffer: [256]u8 = @splat(0);
+    const client_id = ConnectionId.init(&client_source) catch unreachable; // Four octets.
+    const server_id = ConnectionId.init(&server_source) catch unreachable; // Eight octets.
+
+    // A zero-length token: section 17.2.5.2 makes it a discard, because a Retry
+    // that asks the client to send nothing new is a Retry that only costs it a
+    // round trip.
+    {
+        var client = testClient();
+        const retry = try writeRetry(&buffer, client_id, server_id, "", &client_cid);
+        try client.receive(retry, 0);
+        try testing.expect(!client.retry_seen);
+    }
+
+    // A Source Connection ID identical to the one the client is already
+    // addressing. `testClient`'s destination is `client_cid` until a Retry
+    // moves it.
+    {
+        var client = testClient();
+        const retry = try writeRetry(
+            &buffer,
+            client_id,
+            ConnectionId.init(&client_cid) catch unreachable, // Eight octets.
+            "a token",
+            &client_cid,
+        );
+        try client.receive(retry, 0);
+        try testing.expect(!client.retry_seen);
+    }
+
+    // A second Retry. One per connection attempt, so the second one leaves the
+    // first one's token and identifier in place.
+    {
+        var client = testClient();
+        var first: [256]u8 = @splat(0);
+        const one = try writeRetry(&first, client_id, server_id, "first", &client_cid);
+        try client.receive(one, 0);
+        try testing.expect(client.retry_seen);
+
+        const other = [_]u8{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88 };
+        const two = try writeRetry(
+            &buffer,
+            client_id,
+            ConnectionId.init(&other) catch unreachable, // Eight octets.
+            "second",
+            &client_cid,
+        );
+        try client.receive(two, 1000);
+        try testing.expectEqualStrings("first", client.retry_token[0..client.retry_token_len]);
+        try testing.expectEqualSlices(u8, &server_source, client.destination.bytes());
+    }
+}
+
+test "a Retry after the server's first Initial has been processed is discarded" {
+    var client = testClient();
+    var server = testServer();
+
+    // A real Initial from the server, opened. That is what closes the window:
+    // the handshake has moved past the point where a Retry means anything.
+    try client.cryptoIn(.initial, "ClientHello");
+    _ = try deliver(&client, &server, 0);
+    try server.cryptoIn(.initial, "ServerHello");
+    _ = try deliver(&server, &client, 1000);
+    try testing.expect(client.peer_initial_processed);
+
+    // A Source Connection ID this client is *not* already addressing, so that
+    // the only rule that can refuse this Retry is the one under test. Reusing
+    // `server_source` here made the test pass for the wrong reason — by then
+    // the client's destination is `server_source`, and section 17.2.5.1's
+    // identical-identifier rule rejected it before section 17.2.5.2's window
+    // was ever consulted.
+    const other = [_]u8{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88 };
+    try testing.expect(!std.mem.eql(u8, &other, client.destination.bytes()));
+
+    var buffer: [256]u8 = @splat(0);
+    const retry = try writeRetry(
+        &buffer,
+        ConnectionId.init(&client_source) catch unreachable, // Four octets.
+        ConnectionId.init(&other) catch unreachable, // Eight octets.
+        "a token",
+        &client_cid,
+    );
+    try client.receive(retry, 2000);
+    try testing.expect(!client.retry_seen);
+    try testing.expectEqual(@as(u16, 0), client.retry_token_len);
+}
+
+/// The server's transport parameters, as a client would receive them.
+fn serverParameters(
+    buffer: []u8,
+    original: ?ConnectionId,
+    retry_source: ?ConnectionId,
+) ![]const u8 {
+    const written = try transport_parameters.encode(buffer, &.{
+        .original_destination_connection_id = original,
+        .retry_source_connection_id = retry_source,
+        .initial_source_connection_id = ConnectionId.init(&server_source) catch unreachable, // Eight octets.
+        .initial_max_streams_bidi = 4,
+    });
+    return buffer[0..written];
+}
+
+test "section 7.3: the Retry's identifier is authenticated by the handshake" {
+    const original = ConnectionId.init(&client_cid) catch unreachable; // Eight octets.
+    const server_id = ConnectionId.init(&server_source) catch unreachable; // As above.
+    const other = ConnectionId.init(&[_]u8{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88 }) catch unreachable; // As above.
+    var buffer: [256]u8 = @splat(0);
+
+    // A client that received a Retry and a server that does not admit to
+    // sending one. Section 7.3: an attacker who injected the Retry would
+    // otherwise have chosen the connection identifier for a handshake the
+    // server authenticated without it.
+    {
+        var client = testClient();
+        var retry_buffer: [256]u8 = @splat(0);
+        const retry = try writeRetry(
+            &retry_buffer,
+            ConnectionId.init(&client_source) catch unreachable, // Four octets.
+            server_id,
+            "a token",
+            &client_cid,
+        );
+        try client.receive(retry, 0);
+        try testing.expect(client.retry_seen);
+
+        try testing.expectError(
+            error.MissingConnectionId,
+            client.transportParametersIn(try serverParameters(&buffer, original, null)),
+        );
+        // And one that admits to a different Retry.
+        try testing.expectError(
+            error.Malformed,
+            client.transportParametersIn(try serverParameters(&buffer, original, other)),
+        );
+        // The matching one is accepted.
+        try client.transportParametersIn(try serverParameters(&buffer, original, server_id));
+    }
+
+    // The other direction: a server claiming a Retry that never happened.
+    {
+        var client = testClient();
+        try testing.expectError(
+            error.Malformed,
+            client.transportParametersIn(try serverParameters(&buffer, original, server_id)),
+        );
+    }
+
+    // And `original_destination_connection_id` naming an identifier this client
+    // never used.
+    {
+        var client = testClient();
+        try testing.expectError(
+            error.Malformed,
+            client.transportParametersIn(try serverParameters(&buffer, other, null)),
+        );
+        try client.transportParametersIn(try serverParameters(&buffer, original, null));
+    }
+}
+
+test "a Retry resets loss recovery and congestion control" {
+    // RFC 9002 section 6.3: "Clients that receive a Retry packet reset
+    // congestion control and loss recovery state, including resetting any
+    // pending timers." The Initial that provoked the Retry was received and
+    // not processed, so nothing about it can ever be acknowledged — and a timer
+    // still armed for it is a timer that will fire for a packet the connection
+    // no longer knows how to retransmit.
+    var client = testClient();
+    var datagram: [TestConnection.datagram_octets]u8 = @splat(0);
+    try client.cryptoIn(.initial, "ClientHello");
+    _ = try client.send(&datagram, 0);
+    try testing.expect(client.recovery.bytes_in_flight > 0);
+    // A probe timeout that has already fired twice, so that the backoff is
+    // visible in `pto_count` and a reset is distinguishable from a connection
+    // that never had one.
+    client.onTimeout(1_000_000_000);
+    client.onTimeout(4_000_000_000);
+    try testing.expect(client.recovery.pto_count > 0);
+
+    var buffer: [256]u8 = @splat(0);
+    const retry = try writeRetry(
+        &buffer,
+        ConnectionId.init(&client_source) catch unreachable, // Four octets.
+        ConnectionId.init(&server_source) catch unreachable, // Eight octets.
+        "a token",
+        &client_cid,
+    );
+    try client.receive(retry, 1000);
+
+    try testing.expect(client.retry_seen);
+    try testing.expectEqual(@as(u64, 0), client.recovery.bytes_in_flight);
+    try testing.expectEqual(@as(u32, 0), client.recovery.pto_count);
+    // A timer is still armed, and that is not a leftover: a client with nothing
+    // in flight and an unfinished handshake owes the anti-deadlock probe of
+    // RFC 9002 appendix A.8. What matters is that it was armed from the reset
+    // state rather than from the discarded flight — which is what `pto_count`
+    // going back to zero says.
+    try testing.expect(client.timeout() != null);
 }

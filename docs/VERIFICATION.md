@@ -576,14 +576,30 @@ afterwards, and it is the one that asserts a datagram carrying no Initial
 packet stays under 1200 octets.
 
 Verified against three independent implementations — quic-go, ngtcp2 and
-aioquic — at five test cases each, transferring a megabyte byte for byte, with
-all four TLS secrets matching each server's own key log exactly.
+aioquic — at six test cases each, twice over: once against servers in their
+normal mode and once against servers configured to answer every connection with
+a Retry, so that all six run the Retry path as well. A megabyte byte for byte
+each time, with all four TLS secrets matching each server's own key log
+exactly.
+
+**`retry` is now covered too**, and closing it was the first thing the shim's
+existence paid for a second time. RFC 9000 section 17.2.5 was nine `type=todo`
+and `type=exception` citations in `packet.zig` saying Retry was out of scope;
+it is now `Connection.receiveRetry`, and with it section 7.3's connection-ID
+authentication — which had been four `type=todo`s of its own, and which is the
+rule that stops an attacker who can inject a packet during the handshake from
+choosing either endpoint's connection identifier.
+
+Twelve reverts of that work were checked and twelve failed a test. One of them
+failed for the wrong reason first: the test for "a Retry arriving after the
+server's Initial is discarded" reused the server's Source Connection ID, which
+by that point is the identifier the client is already addressing — so section
+17.2.5.1's identical-identifier rule refused the packet before the rule under
+test was ever consulted. It passed, it proved nothing, and only the revert
+showed it.
 
 What is left here:
 
-- **`retry`**, which needs client-side Retry handling in `src/`: re-sending the
-  Initial under the new Destination Connection ID, carrying the token, and
-  checking `retry_source_connection_id`.
 - **`http3`**, which needs the control stream and the settings exchange, and
   then h3spec pointed at the same binary.
 - **A server role**, which needs a certificate, a Retry token and address

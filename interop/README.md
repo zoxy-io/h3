@@ -11,9 +11,13 @@ that "the `AckRanges` tests asserted the bug". `corpus/qifs.zig` was the cheap
 half of the answer and reaches only QPACK's representation choices. This is the
 other half.
 
-It found four defects on the first connection it completed. They are described
-in the commit that added this directory and summarised in
-docs/VERIFICATION.md §5.5.
+It found four defects on the first connection it completed, and paid for itself
+a second time by closing `retry` — nine RFC 9000 §17.2.5 rules that `packet.zig`
+had recorded as out of scope, plus §7.3's connection-ID authentication. All of
+it is summarised in docs/VERIFICATION.md §5.5.
+
+Set `TESTCASE=retry` on a server container and every case in the table below
+runs the Retry path as well, which is the cheapest way to exercise it.
 
 ## What it is not
 
@@ -43,17 +47,12 @@ stream and the response until the FIN:
 | `chacha20` | ChaCha20-Poly1305 packet protection, offered alone |
 | `keyupdate` | RFC 9001 §6's key update, initiated by this client |
 | `multiconnect` | one connection per request, sequentially |
+| `retry` | the server's Retry: a new identifier, new Initial keys, a token |
 | `handshakeloss`, `transferloss` | the same, through the runner's lossy path |
 
-Two are refused with **exit 127**, which is the runner's "unsupported" and the
-reason the code is not 1:
-
-- **`retry`.** `packet.zig` parses a Retry packet and `Connection` discards it:
-  a client here never re-sends its Initial under the new Destination Connection
-  ID, never carries the token, and never checks `retry_source_connection_id`.
-  A real gap in `src/`.
-- **`http3`.** The control stream and the settings exchange are not built, so
-  `h3` as an ALPN would be a lie told to a server.
+**`http3` is refused with exit 127**, which is the runner's "unsupported" and
+the reason the code is not 1: the control stream and the settings exchange are
+not built, so `h3` as an ALPN would be a lie told to a server.
 
 A test case this binary has never heard of is also 127. Reporting 1 for an
 unimplemented feature is how an implementation ends up with a red square meaning
@@ -87,6 +86,7 @@ head -c 1048576 /dev/urandom > www/file.bin
 docker run -d --name quic-go -p 4433:443/udp \
   -v "$PWD/certs":/certs:ro -v "$PWD/www":/www:ro -v "$PWD/logs":/logs \
   -e ROLE=server -e TESTCASE=transfer -e SSLKEYLOGFILE=/logs/keys.log \
+  -e QLOGDIR=/logs/qlog/ \
   martenseemann/quic-go-interop:latest
 # ghcr.io/ngtcp2/ngtcp2-interop:latest   on 4434
 # aiortc/aioquic-qns:latest              on 4435
@@ -115,7 +115,19 @@ connection went nowhere, which located the defect in `Connection` rather than in
 
 **`VERBOSE=1` narrates the loop**, flushed per line. Buffered would be worse
 than silent: the interesting runs are the ones killed by a timeout, and a buffer
-that never flushed loses exactly the lines that say where it stopped.
+that never flushed loses exactly the lines that say where it stopped. A peer's
+CONNECTION_CLOSE is reported with its code whether or not the run is verbose,
+because "the peer closed" without the code throws away the only thing that says
+why.
+
+### And one thing that is not our bug
+
+**Set `QLOGDIR` on the server containers even if you never read a qlog.**
+ngtcp2's `run_endpoint.sh` interpolates it unquoted, so an unset `QLOGDIR`
+produces `--qlog-dir --cc bbr` — the flag swallows the next argument and the
+server comes up misconfigured and answers nothing. It costs an hour to find
+from the client side, where it is indistinguishable from a handshake the client
+got wrong.
 
 ## Environment
 

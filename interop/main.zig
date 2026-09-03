@@ -31,17 +31,15 @@
 //! It is the runner's transport-only application protocol and it exercises
 //! exactly what this package implements.
 //!
-//! Two are refused with exit 127, which is the runner's "unsupported" and the
-//! reason the code is not 1:
+//! `retry` works too, and needs nothing from this file beyond asking for it:
+//! `Connection.receiveRetry` adopts the server's identifier, re-derives the
+//! Initial keys, carries the token into every subsequent Initial and checks
+//! `retry_source_connection_id` against the handshake. It was the first gap
+//! this directory named and it is closed.
 //!
-//! - **`retry`.** `packet.zig` parses a Retry packet and `Connection`
-//!   discards it: a client here never re-sends its Initial under the new
-//!   Destination Connection ID, never carries the token, and never checks
-//!   `retry_source_connection_id`. That is a real gap in `src/`, named in
-//!   `packet.zig` as an exception on the *server* side and silently absent on
-//!   the client's.
-//! - **`http3`.** The control stream and the settings exchange are not built,
-//!   so `h3` as an ALPN would be a lie told to a server.
+//! **`http3` is refused with exit 127**, which is the runner's "unsupported"
+//! and the reason the code is not 1: the control stream and the settings
+//! exchange are not built, so `h3` as an ALPN would be a lie told to a server.
 //!
 //! A test case this binary has never heard of is also 127. Reporting 1 for an
 //! unimplemented feature is how an implementation ends up with a red square
@@ -142,6 +140,7 @@ const Testcase = enum {
     multiconnect,
     handshakeloss,
     transferloss,
+    retry,
 
     fn parse(name: []const u8) ?Testcase {
         return std.meta.stringToEnum(Testcase, name);
@@ -450,7 +449,7 @@ const Session = struct {
             }
 
             try self.drainStreams(testcase, now);
-            self.drainEvents();
+            try self.drainEvents(log);
 
             try self.flush(io, log, &socket, &peer, now);
 
@@ -571,10 +570,20 @@ const Session = struct {
     /// the accessors do not also answer — but `overflowed` is a real signal
     /// and a queue polled by nobody is a queue that reports its own overflow
     /// to nobody.
-    fn drainEvents(self: *Session) void {
+    fn drainEvents(self: *Session, log: *Io.Writer) !void {
         // Bounded: the queue is fixed and `poll` removes what it returns.
         for (0..events_per_drain_max) |_| {
-            _ = self.connection.poll() orelse return;
+            const event = self.connection.poll() orelse return;
+            switch (event) {
+                // The one event worth a line whether or not the run is
+                // verbose: a peer's close carries the reason the transfer
+                // stopped, and reporting "the peer closed" without the code
+                // throws away the only thing that says why.
+                .closed => |value| try note(log, "peer closed: code 0x{x} application={any}", .{ value.code, value.application }),
+                .stream_reset => |value| try note(log, "stream {d} reset: code 0x{x}", .{ value.stream, value.code }),
+                .overflowed => |count| try note(log, "{d} events dropped", .{count}),
+                else => {},
+            }
         }
     }
 
@@ -663,8 +672,8 @@ test "an unknown test case is unsupported rather than a failure" {
     // The distinction the runner draws, and the reason `main` returns 127 for
     // one and 1 for the other: a red square meaning "not attempted" and a red
     // square meaning "wrong" are not the same result.
-    try testing.expectEqual(@as(?Testcase, null), Testcase.parse("retry"));
     try testing.expectEqual(@as(?Testcase, null), Testcase.parse("http3"));
+    try testing.expectEqual(@as(?Testcase, .retry), Testcase.parse("retry"));
     try testing.expectEqual(@as(?Testcase, .transfer), Testcase.parse("transfer"));
 }
 

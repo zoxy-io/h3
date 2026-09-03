@@ -139,7 +139,7 @@ pub const Header = union(Kind) {
     //# as described in Section 17.2.5.3, reusing packet numbers could
     //# compromise packet protection.
     //= type=exception
-    //= reason=this rule governs the 0-RTT data a client resends after a Retry, and neither 0-RTT nor Retry is in scope; the general no-reuse property is `Connection`'s monotonic per-space counter, which never rewinds because no packet number space is ever reset. See docs/DESIGN.md section 2 and section 6.
+    //= reason=this rule governs the 0-RTT data a client resends after a Retry, and 0-RTT is out of scope, so there is no early data to re-send under a new number. The general no-reuse property is `Connection`'s monotonic per-space counter, which `receiveRetry` deliberately does not rewind. See docs/DESIGN.md section 2 and section 6.
     //
     //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.3
     //# A server SHOULD treat a violation of remembered limits (Section
@@ -151,29 +151,20 @@ pub const Header = union(Kind) {
     zero_rtt: Protected,
     /// Section 17.2.4.
     handshake: Protected,
-    /// A Retry packet parses to its fields, and nothing here acts on one:
-    /// honouring a Retry means re-deriving Initial keys from a new destination
-    /// identifier and re-sending the first flight, which `Connection` does not
-    /// do. Every client-side Retry rule below is that decision.
+    /// A Retry packet parses to its fields here and is acted on in
+    /// `Connection.receiveRetry`, which is where every client-side rule of
+    /// section 17.2.5 now lives: the integrity tag check, the one-per-attempt
+    /// rule, the new Destination Connection ID, the new Initial keys and the
+    /// token that goes into every subsequent Initial.
+    ///
+    /// What stays out of scope is the *sending* half. A server here issues no
+    /// Retry, because issuing one needs a token, which needs randomness and a
+    /// clock that docs/DESIGN.md section 3 keeps outside the seam.
     //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.5.1
     //# This value MUST NOT be equal to the Destination Connection ID field
     //# of the packet sent by the client.
     //= type=exception
-    //= reason=Retry is out of scope and no Retry packet is ever written; see docs/DESIGN.md section 2 for what this package owns and section 6 for the not-built list Retry sits on.
-    //
-    //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.5.1
-    //# A client MUST discard a Retry packet that contains a Source
-    //# Connection ID field that is identical to the Destination Connection
-    //# ID field of its Initial packet.
-    //= type=exception
-    //= reason=every Retry packet is discarded, whatever its Source Connection ID, because honouring one is out of scope; see docs/DESIGN.md section 2 and section 6.
-    //
-    //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.5.1
-    //# The client MUST use the value from the Source Connection ID field of
-    //# the Retry packet in the Destination Connection ID field of
-    //# subsequent packets that it sends.
-    //= type=exception
-    //= reason=no Retry is honoured, so no destination identifier is ever adopted from one; see docs/DESIGN.md section 2 and section 6.
+    //= reason=a rule on the server that writes a Retry packet, and this package writes none: issuing one needs a token, which needs the randomness and the clock docs/DESIGN.md section 3 keeps outside the seam. The client's half of the same rule — discarding such a Retry — is implemented and tested in `Connection.receiveRetry`.
     //
     //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.5.1
     //# A server MUST NOT send more than one Retry packet in response to a
@@ -181,43 +172,6 @@ pub const Header = union(Kind) {
     //= type=exception
     //= reason=a server here sends no Retry packet at all; issuing one needs a token, which needs randomness and a clock that docs/DESIGN.md section 3 keeps outside the seam. See docs/DESIGN.md section 2 and section 6.
     //
-    //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.5.2
-    //# After the client has received and processed an Initial or Retry
-    //# packet from the server, it MUST discard any subsequent Retry packets
-    //# that it receives.
-    //= type=exception
-    //= reason=every Retry packet is discarded, first or subsequent, because none is processed; see docs/DESIGN.md section 2 and section 6.
-    //
-    //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.5.2
-    //# Clients MUST discard Retry packets that have a Retry Integrity Tag
-    //# that cannot be validated; see Section 5.8 of [QUIC-TLS].
-    //= type=exception
-    //= reason=the integrity tag is parsed out and never checked, because no Retry is honoured; crypto/retry.zig can compute one and nothing calls it. See docs/DESIGN.md section 2 and section 6.
-    //
-    //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.5.2
-    //# A client MUST discard a Retry packet with a zero-length Retry Token
-    //# field.
-    //= type=exception
-    //= reason=a zero-length token parses to an empty slice and the packet is discarded with every other Retry; see docs/DESIGN.md section 2 and section 6.
-    //
-    //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.5.2
-    //# The client MUST NOT change the Source Connection ID because the
-    //# server could include the connection ID as part of its token
-    //# validation logic; see Section 8.1.4.
-    //= type=exception
-    //= reason=nothing here changes a Source Connection ID after the handshake begins, and no Retry is processed that could prompt it; see docs/DESIGN.md section 2 and section 6.
-    //
-    //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.5.3
-    //# A client MUST use the same cryptographic handshake message it
-    //# included in this packet.
-    //= type=exception
-    //= reason=no first flight is ever re-sent in answer to a Retry, because Retry is out of scope; the handshake bytes are the consumer's TLS engine's anyway, per docs/DESIGN.md section 4. See docs/DESIGN.md section 2 and section 6.
-    //
-    //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.5.3
-    //# A client MUST NOT reset the packet number for any packet number
-    //# space after processing a Retry packet.
-    //= type=exception
-    //= reason=no Retry packet is processed, so no packet number space is ever reset; see docs/DESIGN.md section 2 and section 6.
     /// Section 17.2.5. No packet number and no length: the rest of the datagram
     /// is the token followed by the 16-octet integrity tag.
     retry: struct {
