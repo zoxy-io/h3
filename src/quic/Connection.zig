@@ -3901,6 +3901,7 @@ pub fn Connection(comptime config: Config) type {
             //# After the handshake is confirmed (see Section 4.1.2 of
             //# [QUIC-TLS]), an endpoint MUST send any CONNECTION_CLOSE frames
             //# in a 1-RTT packet.
+            //
             // Held, because `send` walks the levels oldest first: while Initial keys are
             // still installed the close is framed into the Initial packet, which is the one
             // a client that has not yet reached Handshake keys can read.
