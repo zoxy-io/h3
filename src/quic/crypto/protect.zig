@@ -66,10 +66,16 @@ pub const sample_octets: usize = 16;
 comptime {
     assert(sample_offset == packet_number.octets_max);
     assert(sample_octets == 16);
-    // The invariant that makes a fixed sample offset safe: after the longest
-    // packet number there are still at least `tag_octets` octets, so the sample
-    // never runs past a well-formed packet.
-    assert(sample_octets <= crypto.tag_octets + packet_number.octets_max - sample_offset + sample_offset);
+    // The invariant that makes a fixed sample offset safe: a sample begins
+    // `sample_offset` past the packet number field and runs `sample_octets`,
+    // so a packet carrying the longest packet number and nothing but an AEAD
+    // tag still contains it.
+    //
+    // This read `sample_octets <= tag_octets + octets_max - sample_offset +
+    // sample_offset`, where the two `sample_offset` terms cancel — so it
+    // asserted `16 <= 20` and said nothing about the offset it was named for.
+    // Stated as the relation it meant instead.
+    assert(sample_offset + sample_octets <= packet_number.octets_max + crypto.tag_octets);
 }
 
 //= https://www.rfc-editor.org/rfc/rfc9001#section-5.4.1
@@ -248,13 +254,14 @@ pub const Keys = struct {
         //# packet payloads and packet numbers MUST be free from side
         //# channels that would reveal the packet number or its encoded
         //# size.
-        //= type=todo
-        // A todo rather than an implementation claim, and the gap is one line
-        // down: `applyHeaderMask` XORs `number_octets` octets, so its trip
-        // count *is* the encoded size of a field header protection exists to
-        // hide. `std.crypto`'s AEADs and the AES and ChaCha20 cores below are
-        // constant-time, so the payload half of this holds; the loop is not,
-        // and saying so is cheaper than pretending otherwise.
+        //
+        // `maskPacketNumber` runs a fixed number of steps whatever the encoded
+        // size, and `std.crypto`'s AEADs and the AES and ChaCha20 cores are
+        // constant-time, so both halves of this sentence hold. This was a
+        // `type=todo` describing the loop it points at, and stayed one after
+        // the loop was fixed — a stale todo reads as a known gap and hides
+        // that the gap moved elsewhere, which is exactly what happened: the
+        // rewrite reached `applyHeaderMask` and not the receive path.
         const mask = self.headerMask(buffer[packet_number_offset + sample_offset ..][0..sample_octets]);
         applyHeaderMask(buffer, packet_number_offset, number_octets, mask);
 
@@ -432,9 +439,7 @@ pub const Keys = struct {
         assert(number_octets >= packet_number.octets_min);
         assert(number_octets <= packet_number.octets_max);
 
-        for (packet[packet_number_offset..][0..number_octets], 0..) |*octet, index| {
-            octet.* ^= mask[1 + index];
-        }
+        maskPacketNumber(packet, packet_number_offset, number_octets, mask);
 
         //= https://www.rfc-editor.org/rfc/rfc9001#section-9.5
         //# For authentication to be free from side channels, the entire
@@ -519,9 +524,7 @@ pub const Keys = struct {
         assert(number_octets >= packet_number.octets_min);
         assert(number_octets <= packet_number.octets_max);
 
-        for (packet[packet_number_offset..][0..number_octets], 0..) |*octet, index| {
-            octet.* ^= mask[1 + index];
-        }
+        maskPacketNumber(packet, packet_number_offset, number_octets, mask);
 
         // As in `unprotectHeader`: held until the AEAD has said whether the
         // peer wrote these bits at all.
@@ -754,7 +757,32 @@ fn applyHeaderMask(
     // length is public — the attacker chose it.
     const long = buffer[0] & header_form_long != 0;
     buffer[0] ^= mask[0] & (if (long) first_octet_mask_long else first_octet_mask_short);
+    maskPacketNumber(buffer, packet_number_offset, number_octets, mask);
+}
 
+/// XOR the packet number field with its half of the mask, in a number of steps
+/// that does not depend on how long that field is.
+///
+/// Its own function because the two directions cannot share `applyHeaderMask`:
+/// a sender knows `number_octets` before it masks anything, and a receiver only
+/// learns it by unmasking the first octet, so the receive path has to do the
+/// two halves in order. Sharing *this* half is what stops the two drifting —
+/// and they had. The constant-span rewrite landed on `applyHeaderMask`, which
+/// only `seal` calls, so the send path was fixed and the receive path, the one
+/// an attacker can actually probe by injecting packets and timing the refusal,
+/// kept the channel.
+fn maskPacketNumber(
+    buffer: []u8,
+    packet_number_offset: usize,
+    number_octets: usize,
+    mask: [crypto.header_mask_octets]u8,
+) void {
+    assert(number_octets >= packet_number.octets_min);
+    assert(number_octets <= packet_number.octets_max);
+    assert(packet_number_offset + number_octets <= buffer.len);
+
+    // Clamped by the buffer's length rather than by `number_octets`, because a
+    // length is public — the attacker chose it — and the encoded size is not.
     const available = buffer.len - packet_number_offset;
     const span = @min(@as(usize, packet_number.octets_max), available);
     assert(span >= number_octets);
