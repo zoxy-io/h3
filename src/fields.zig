@@ -506,6 +506,26 @@ pub const MessageValidator = struct {
     //# empty.  If both fields are present, they MUST contain the same value.
     fn checkHost(self: *MessageValidator, value: []const u8) Error!void {
         assert(!self.host_seen or self.ordinary_seen);
+        //= https://www.rfc-editor.org/rfc/rfc9112#section-3.2
+        //# A server MUST respond with a 400 (Bad Request) status code to any
+        //# HTTP/1.1 request message that lacks a Host header field and to any
+        //# request message that contains more than one Host header field line or
+        //# a Host header field with an invalid field value.
+        //
+        // A second `Host` was accepted here whenever no `:authority` stood
+        // beside it: with one, each `Host` is compared against it and two
+        // disagreeing values cannot both pass, but with none there was nothing
+        // to compare against and `{host: example.com, host: evil.example}` was
+        // a well-formed request. RFC 9114 section 4.3.1 does not cover it —
+        // it speaks only to `:authority` versus `Host` — which is why the
+        // existing check was literally correct and still left the hole.
+        //
+        // The rule that closes it is HTTP/1.1's, and that is the point: this
+        // package is written to zoxy's threat model, and zoxy is a proxy that
+        // may translate this request into an HTTP/1.1 one, where two `Host`
+        // lines are a 400. Refusing it here is refusing to build a message
+        // whose meaning depends on which hop reads it.
+        if (self.host_seen) return error.AuthorityMismatch;
         self.host_seen = true;
         if (value.len == 0) return error.AuthorityMismatch;
         if (!self.seen.contains(.authority)) return;
@@ -1171,4 +1191,41 @@ test "section 4.2: te belongs to a request, and only with one value" {
             .{ .name = "te", .value = value },
         });
     }
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9112#section-3.2
+//# A server MUST respond with a 400 (Bad Request) status code to any
+//# HTTP/1.1 request message that lacks a Host header field and to any
+//# request message that contains more than one Host header field line or
+//# a Host header field with an invalid field value.
+//= type=test
+test "a second Host is refused even with no :authority to compare it against" {
+    // Found by the annotation pass. With an `:authority` present each `Host`
+    // is compared against it, so two disagreeing values could not both pass —
+    // and that made the hole invisible: it only opened when the pair a proxy
+    // would build its request line from was the only thing present.
+    try testing.expectError(error.AuthorityMismatch, validate(.request, &.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = "host", .value = "example.com" },
+        .{ .name = "host", .value = "evil.example" },
+    }));
+    // Two identical ones are refused too. RFC 9112 section 3.2 counts field
+    // lines rather than values, and a proxy writing them out produces two
+    // `Host` lines whatever they say.
+    try testing.expectError(error.AuthorityMismatch, validate(.request, &.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = "host", .value = "example.com" },
+        .{ .name = "host", .value = "example.com" },
+    }));
+    // One is still fine.
+    try validate(.request, &.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = "host", .value = "example.com" },
+    });
 }
