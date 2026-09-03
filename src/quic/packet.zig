@@ -316,6 +316,15 @@ pub const Header = union(Kind) {
     }
 };
 
+//= https://www.rfc-editor.org/rfc/rfc9001#section-4
+//# When packets of different types need to be sent, endpoints SHOULD use
+//# coalesced packets to send them in the same UDP datagram.
+// The Length field is the whole of what makes coalescing possible, and it is
+// read in both directions: a receiver steps by `octets` to reach the next
+// packet, and a sender writes each level's header knowing where the one
+// before it ended. `Connection` does the sending half, oldest encryption
+// level first, which is what puts an Initial and a Handshake packet in one
+// datagram rather than two.
 /// One packet, and how much of the datagram it took.
 ///
 /// `octets` is what advances a caller to the next packet of a coalesced
@@ -462,15 +471,27 @@ fn parseInitial(
         return error.LengthMalformed) catch return error.LengthMalformed;
     if (token_end > datagram.len) return error.Truncated;
     const token = datagram[cursor..token_end];
-    // A token is read at both roles and at any length. A client is required to
-    // refuse one from a server, and neither this parser nor `Connection` does:
-    // the role is not known here, and nothing downstream asks.
+    // A token is read at both roles and at any length, because the role is not
+    // known here. The rule is enforced one layer up, in
+    // `Connection.receivePacket`, which discards an Initial carrying a token
+    // when this endpoint is the client; this comment said "neither this parser
+    // nor `Connection` does" for as long as that was true and no longer is.
     //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.2
     //# Initial packets sent by the server MUST set the Token Length field
     //# to 0; clients that receive an Initial packet with a non-zero Token
     //# Length field MUST either discard the packet or generate a connection
     //# error of type PROTOCOL_VIOLATION.
-    //= type=todo
+    //
+    //= https://www.rfc-editor.org/rfc/rfc9001#section-7
+    //# Implementations SHOULD use caution in relying on any data that is
+    //# contained in Initial packets that is not otherwise authenticated.
+    // The token is the one field of an Initial packet whose contents an
+    // attacker chooses and the AEAD does not vouch for -- Initial keys come
+    // from a connection identifier anyone on the path has seen, so an Initial
+    // packet authenticates nobody. The caution this package takes is total:
+    // the token is borrowed out of the caller's datagram and never parsed,
+    // compared or acted on, here or downstream. Nothing in the tree reads an
+    // octet of it.
     cursor = token_end;
 
     const body = try readBody(datagram, &cursor);

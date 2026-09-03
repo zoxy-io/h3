@@ -53,6 +53,18 @@ pub const initial_salt_v1: [20]u8 = .{
 };
 
 //= https://www.rfc-editor.org/rfc/rfc9001#section-5.2
+//# Future versions of QUIC SHOULD generate a new salt value, thus
+//# ensuring that the keys are different for each version of QUIC.
+//= type=exception
+//= reason=addressed to whoever specifies a future version of QUIC, not to an implementation of version 1. What this package owes the rule is that the constant is named `initial_salt_v1` rather than `initial_salt`, so a second version arrives as a table entry beside it instead of as an edit to a shared name; see the module comment.
+//
+//= https://www.rfc-editor.org/rfc/rfc9001#section-9.6
+//# New QUIC versions SHOULD define a new salt value used in calculating
+//# initial secrets.
+//= type=exception
+//= reason=the same rule stated again under key diversity, and the same answer: this package implements one version and defines no other. `initial_salt_v1` is version 1's, named for its version so that adding a second changes nothing that already exists.
+
+//= https://www.rfc-editor.org/rfc/rfc9001#section-5.2
 //# The hash function for HKDF when deriving initial secrets and keys is
 //# SHA-256 [SHA].
 //
@@ -137,6 +149,13 @@ pub const Secret = struct {
 //# used with QUIC.
 //= type=exception
 //= reason=the seam takes traffic secrets, not a TLS engine, and `Suite` names only TLS 1.3 cipher suites -- so there is no version of TLS other than 1.3 that can reach these labels. A requirement on the specification of a future TLS, not on this package. See docs/DESIGN.md section 4.
+//
+//= https://www.rfc-editor.org/rfc/rfc9001#section-9.6
+//# To preserve this separation, a new version of QUIC SHOULD define new
+//# labels for key derivation for packet protection key and IV, plus the
+//# header protection keys.
+//= type=exception
+//= reason=addressed to the specification of a future QUIC version rather than to an implementation of version 1. The three labels this package expands with -- "quic key", "quic iv" and "quic hp" -- are version 1's and carry its "quic" string; a version that changed them would pass different labels to the function below, which takes the label as an argument for exactly that reason.
 /// RFC 8446 section 7.1's HKDF-Expand-Label, with the empty context every QUIC
 /// use of it has.
 ///
