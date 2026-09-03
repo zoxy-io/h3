@@ -42,6 +42,122 @@ pub const retry = @import("crypto/retry.zig");
 pub const Keys = protect.Keys;
 pub const Secret = secrets.Secret;
 
+// What RFC 9001 asks of the TLS engine rather than of this package.
+//
+// The module comment above says the handshake is outside; this is the same
+// claim in a form the ledger can check. Every requirement below is one this
+// package will never satisfy, because satisfying it means holding a private
+// key, verifying a certificate, choosing an application protocol or decoding
+// a TLS message — and the whole shape of the seam is that a consumer brings
+// the engine that does those. Left silent, each of them is indistinguishable
+// from an oversight, which is the thing docs/VERIFICATION.md section 5.1
+// exists to end.
+
+//= https://www.rfc-editor.org/rfc/rfc9001#section-4.2
+//# Clients MUST NOT offer TLS versions older than 1.3.
+//= type=exception
+//= reason=the TLS handshake is the consumer's engine, not this package: h3 never builds or parses a TLS message, and hands CRYPTO stream octets across the seam as data. See docs/DESIGN.md section 4.
+//
+//= https://www.rfc-editor.org/rfc/rfc9001#section-4.2
+//# An endpoint MUST terminate the connection if a version of TLS older than
+//# 1.3 is negotiated.
+//= type=exception
+//= reason=the TLS handshake is the consumer's engine, not this package: h3 never builds or parses a TLS message, and hands CRYPTO stream octets across the seam as data. See docs/DESIGN.md section 4.
+//
+//= https://www.rfc-editor.org/rfc/rfc9001#section-4.4
+//# A client MUST authenticate the identity of the server.
+//= type=exception
+//= reason=certificate verification and hostname checking are the consumer's, which is what docs/DESIGN.md section 4 means by "what the consumer owes in return". This package holds no certificate and no private key.
+//
+//= https://www.rfc-editor.org/rfc/rfc9001#section-4.4
+//# A server MUST NOT use post-handshake client authentication (as defined
+//# in Section 4.6.2 of [TLS13]) because the multiplexing offered by QUIC
+//# prevents clients from correlating the certificate request with the
+//# application-level event that triggered it (see [HTTP2-TLS13]).
+//= type=exception
+//= reason=the TLS handshake is the consumer's engine, not this package: h3 never builds or parses a TLS message, and hands CRYPTO stream octets across the seam as data. See docs/DESIGN.md section 4.
+//
+//= https://www.rfc-editor.org/rfc/rfc9001#section-4.4
+//# More specifically, servers MUST NOT send post- handshake TLS
+//# CertificateRequest messages, and clients MUST treat receipt of such
+//# messages as a connection error of type PROTOCOL_VIOLATION.
+//= type=exception
+//= reason=the TLS handshake is the consumer's engine, not this package: h3 never builds or parses a TLS message, and hands CRYPTO stream octets across the seam as data. See docs/DESIGN.md section 4.
+//
+//= https://www.rfc-editor.org/rfc/rfc9001#section-4.8
+//# As QUIC provides alternative mechanisms for connection termination and
+//# the TLS connection is only closed if an error is encountered, a QUIC
+//# endpoint MUST treat any alert from TLS as if it were at the "fatal"
+//# level.
+//= type=exception
+//= reason=a TLS alert is produced by the consumer's TLS engine, which reports it across the seam as an error rather than as a record this package decodes. The CONNECTION_CLOSE that carries it is `Connection.close`.
+//
+//= https://www.rfc-editor.org/rfc/rfc9001#section-8.1
+//# Unless another mechanism is used for agreeing on an application
+//# protocol, endpoints MUST use ALPN for this purpose.
+//= type=exception
+//= reason=ALPN is one of the four things docs/DESIGN.md section 4 names as the consumer's: certificate verification, hostname checking, ALPN, and the 0-RTT decision. This package never sees the extension.
+//
+//= https://www.rfc-editor.org/rfc/rfc9001#section-8.1
+//# When using ALPN, endpoints MUST immediately close a connection (see
+//# Section 10.2 of [QUIC-TRANSPORT]) with a no_application_protocol TLS
+//# alert (QUIC error code 0x0178; see Section 4.8) if an application
+//# protocol is not negotiated. While [ALPN] only specifies that servers use
+//# this alert, QUIC clients MUST use error 0x0178 to terminate a connection
+//# when ALPN negotiation fails.
+//= type=exception
+//= reason=ALPN is one of the four things docs/DESIGN.md section 4 names as the consumer's: certificate verification, hostname checking, ALPN, and the 0-RTT decision. This package never sees the extension.
+//
+//= https://www.rfc-editor.org/rfc/rfc9001#section-8.1
+//# Servers MUST select an application protocol compatible with the QUIC
+//# version that the client has selected. The server MUST treat the
+//# inability to select a compatible application protocol as a connection
+//# error of type 0x0178 (no_application_protocol). Similarly, a client MUST
+//# treat the selection of an incompatible application protocol by a server
+//# as a connection error of type 0x0178.
+//= type=exception
+//= reason=ALPN is one of the four things docs/DESIGN.md section 4 names as the consumer's: certificate verification, hostname checking, ALPN, and the 0-RTT decision. This package never sees the extension.
+//
+//= https://www.rfc-editor.org/rfc/rfc9001#section-8.2
+//# Endpoints MUST send the quic_transport_parameters extension; endpoints
+//# that receive ClientHello or EncryptedExtensions messages without the
+//# quic_transport_parameters extension MUST close the connection with an
+//# error of type 0x016d (equivalent to a fatal TLS missing_extension alert,
+//# see Section 4.8).
+//= type=exception
+//= reason=transport parameters cross the seam as the extension's octets in both directions; carrying them in the ClientHello and EncryptedExtensions, and noticing that the extension is absent, is the TLS engine's half. See docs/DESIGN.md section 4.
+//
+//= https://www.rfc-editor.org/rfc/rfc9001#section-8.2
+//# Endpoints MUST NOT send this extension in a TLS connection that does not
+//# use QUIC (such as the use of TLS with TCP defined in [TLS13]). A fatal
+//# unsupported_extension alert MUST be sent by an implementation that
+//# supports this extension if the extension is received when the transport
+//# is not QUIC.
+//= type=exception
+//= reason=transport parameters cross the seam as the extension's octets in both directions; carrying them in the ClientHello and EncryptedExtensions, and noticing that the extension is absent, is the TLS engine's half. See docs/DESIGN.md section 4.
+//
+//= https://www.rfc-editor.org/rfc/rfc9001#section-8.3
+//# Clients MUST NOT send the EndOfEarlyData message.
+//= type=exception
+//= reason=the TLS handshake is the consumer's engine, not this package: h3 never builds or parses a TLS message, and hands CRYPTO stream octets across the seam as data. See docs/DESIGN.md section 4.
+//
+//= https://www.rfc-editor.org/rfc/rfc9001#section-8.4
+//# A client MUST NOT request the use of the TLS 1.3 compatibility mode.
+//= type=exception
+//= reason=the TLS handshake is the consumer's engine, not this package: h3 never builds or parses a TLS message, and hands CRYPTO stream octets across the seam as data. See docs/DESIGN.md section 4.
+//
+//= https://www.rfc-editor.org/rfc/rfc9001#section-9.2
+//# Endpoints MUST implement and use the replay protections described in
+//# [TLS13], however it is recognized that these protections are imperfect.
+//= type=exception
+//= reason=TLS's replay protections are session-ticket machinery inside the consumer's TLS engine, and this package neither issues nor validates a ticket. 0-RTT, the thing they protect, is out of scope. See docs/DESIGN.md section 4.
+//
+//= https://www.rfc-editor.org/rfc/rfc9001#section-9.2
+//# These MUST NOT be used to communicate application semantics between
+//# endpoints; clients MUST treat them as opaque values.
+//= type=exception
+//= reason=this package issues no session ticket and no NEW_TOKEN frame, so it defines the contents of neither; the address validation token it does carry is copied between packets without being read.
+
 // The rule below is implemented in two places and neither half is it alone:
 // keys are chosen by level here, and `Connection.onPacketsLost` rewinds the
 // *level's* CRYPTO cursor, so data lost at one level is framed again at that
@@ -86,6 +202,90 @@ comptime {
     assert(Level.zero_rtt.space() == Level.one_rtt.space());
     assert(Level.initial.space() != Level.handshake.space());
 }
+
+// What `zero_rtt` above costs, and what it does not.
+//
+// The level exists because RFC 9001 section 4.1.1 defines four of them and
+// because 0-RTT shares the application-data number space with 1-RTT — a rule
+// `space()` has to state whether or not a packet is ever sent at that level.
+// Nothing installs a 0-RTT secret, so no `Keys` is ever derived for it and no
+// packet is sealed or opened there. Every 0-RTT requirement RFC 9001 places on
+// an endpoint therefore has the same answer, and it is written out once here
+// rather than inferred from an absence.
+
+//= https://www.rfc-editor.org/rfc/rfc9001#section-4.6.1
+//# Servers MUST NOT send the early_data extension with a
+//# max_early_data_size field set to any value other than 0xffffffff. A
+//# client MUST treat receipt of a NewSessionTicket that contains an
+//# early_data extension with any other value as a connection error of type
+//# PROTOCOL_VIOLATION.
+//= type=exception
+//= reason=0-RTT is out of scope: no 0-RTT keys are ever installed, so no packet is sealed or opened at this level. See docs/DESIGN.md section 2 for what this package owns and section 6 for the list this sits on.
+//
+//= https://www.rfc-editor.org/rfc/rfc9001#section-4.6.2
+//# When rejecting 0-RTT, a server MUST NOT process any 0-RTT packets, even
+//# if it could.
+//= type=exception
+//= reason=0-RTT is out of scope: no 0-RTT keys are ever installed, so no packet is sealed or opened at this level. See docs/DESIGN.md section 2 for what this package owns and section 6 for the list this sits on.
+//
+//= https://www.rfc-editor.org/rfc/rfc9001#section-4.6.2
+//# The client therefore MUST reset the state of all streams, including
+//# application state bound to those streams.
+//= type=exception
+//= reason=0-RTT is out of scope: no 0-RTT keys are ever installed, so no packet is sealed or opened at this level. See docs/DESIGN.md section 2 for what this package owns and section 6 for the list this sits on.
+//
+//= https://www.rfc-editor.org/rfc/rfc9001#section-4.9.3
+//# After receiving a 1-RTT packet, servers MUST discard 0-RTT keys within a
+//# short time; the RECOMMENDED time period is three times the Probe Timeout
+//# (PTO, see [QUIC-RECOVERY]).
+//= type=exception
+//= reason=0-RTT is out of scope: no 0-RTT keys are ever installed, so no packet is sealed or opened at this level. See docs/DESIGN.md section 2 for what this package owns and section 6 for the list this sits on.
+//
+//= https://www.rfc-editor.org/rfc/rfc9001#section-5.6
+//# An application protocol that uses QUIC MUST include a profile that
+//# defines acceptable use of 0-RTT; otherwise, 0-RTT can only be used to
+//# carry QUIC frames that do not carry application data.
+//= type=exception
+//= reason=a requirement on an application protocol's specification rather than on a QUIC implementation, and moot here: 0-RTT is out of scope and no 0-RTT keys are ever installed. See docs/DESIGN.md section 2.
+//
+//= https://www.rfc-editor.org/rfc/rfc9001#section-5.6
+//# A server MUST NOT use 0-RTT keys to protect packets; it uses 1-RTT keys
+//# to protect acknowledgments of 0-RTT packets.
+//= type=exception
+//= reason=0-RTT is out of scope: no 0-RTT keys are ever installed, so no packet is sealed or opened at this level. See docs/DESIGN.md section 2 for what this package owns and section 6 for the list this sits on.
+//
+//= https://www.rfc-editor.org/rfc/rfc9001#section-5.6
+//# A client MUST NOT attempt to decrypt 0-RTT packets it receives and
+//# instead MUST discard them.
+//= type=exception
+//= reason=0-RTT is out of scope: no 0-RTT keys are ever installed, so no packet is sealed or opened at this level. See docs/DESIGN.md section 2 for what this package owns and section 6 for the list this sits on.
+//
+//= https://www.rfc-editor.org/rfc/rfc9001#section-5.6
+//# Once a client has installed 1-RTT keys, it MUST NOT send any more 0-RTT
+//# packets.
+//= type=exception
+//= reason=0-RTT is out of scope: no 0-RTT keys are ever installed, so no packet is sealed or opened at this level. See docs/DESIGN.md section 2 for what this package owns and section 6 for the list this sits on.
+//
+//= https://www.rfc-editor.org/rfc/rfc9001#section-8.3
+//# A server MUST treat receipt of a CRYPTO frame in a 0-RTT packet as a
+//# connection error of type PROTOCOL_VIOLATION.
+//= type=exception
+//= reason=0-RTT is out of scope: no 0-RTT keys are ever installed, so no packet is sealed or opened at this level. See docs/DESIGN.md section 2 for what this package owns and section 6 for the list this sits on.
+//
+//= https://www.rfc-editor.org/rfc/rfc9001#section-9.2
+//# An application protocol that uses QUIC MUST describe how the protocol
+//# uses 0-RTT and the measures that are employed to protect against replay
+//# attack.
+//= type=exception
+//= reason=a requirement on an application protocol's specification rather than on a QUIC implementation, and moot here: 0-RTT is out of scope and no 0-RTT keys are ever installed. See docs/DESIGN.md section 2.
+//
+//= https://www.rfc-editor.org/rfc/rfc9001#section-9.2
+//# QUIC extensions MUST either describe how replay attacks affect their
+//# operation or prohibit the use of the extension in 0-RTT. Application
+//# protocols MUST either prohibit the use of extensions that carry
+//# application semantics in 0-RTT or provide replay mitigation strategies.
+//= type=exception
+//= reason=a requirement on an application protocol's specification rather than on a QUIC implementation, and moot here: 0-RTT is out of scope and no 0-RTT keys are ever installed. See docs/DESIGN.md section 2.
 
 /// Which half of the connection a key protects.
 ///
