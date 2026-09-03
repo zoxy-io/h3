@@ -164,6 +164,7 @@ zig build ci -Doptimize=ReleaseFast                      # release, assertions o
 zig build ci -Doptimize=ReleaseFast -Dassertions=false   # release, assertions off
 zig build fuzz --fuzz                                    # coverage-guided fuzzing
 zig build requirements                                   # RFC citations against the vendored specs in specs/
+zig build sim -- --seeds 4096                            # seeded network simulation; --seed N replays one
 zig build bench                                          # packet protection and codec microbenchmarks
 zig build fmt-fix                                        # reformat
 ```

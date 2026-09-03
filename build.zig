@@ -264,4 +264,9 @@ pub fn build(b: *std.Build) void {
     ci_step.dependOn(test_step);
     ci_step.dependOn(lint_step);
     ci_step.dependOn(requirements_step);
+    // The simulator joins the per-change gates now that its census reaches
+    // every behaviour it requires. 256 seeds is seconds in either build; the
+    // 4096-seed sweep of docs/VERIFICATION.md section 5.2 is a nightly job
+    // rather than a per-change one.
+    ci_step.dependOn(sim_step);
 }

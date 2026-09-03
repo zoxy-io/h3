@@ -273,9 +273,9 @@ The link has delay, jitter, a rotating loss mask, reordering, duplication, MTU
 and a token-bucket queue with tail drop. Four oracles are live and the census
 counts thirteen behaviours.
 
-It is **not** in `zig build ci` yet, because the census reports four behaviours
-no seed reaches — completed transfers among them — and a gate that passes while
-saying that would be the same lie the fuzz targets were telling in §1's table.
+It is part of `zig build ci`. It was held out while the census reported
+behaviours no seed reached, because a gate that passes while saying so would be
+the same lie the fuzz targets were telling in §1's table.
 
 It has already paid for itself. Two defects in its first working sweep, both of
 the class this document predicted and neither reachable by a test of a
@@ -317,12 +317,34 @@ because it is the failure mode of oracle-writing:
   server's lower numbers read as the client's going backwards. It fired on
   every seed before a single packet had been sent.
 
-What is left: transfers do not complete yet — the client writes its payload and
-the server reads none of it — so the delivered-equals-written oracle has never
-actually run. Until it does, the harness proves the handshake and the timers
-and nothing about data. The adversary node, fault injection, the `poll` of
-§5.3, and the 4096-seed cadence under all three build legs are all still to
-come.
+Transfers now complete and the delivered-equals-written oracle runs. Over 256
+seeds the census reaches every behaviour it requires — handshakes, transfers,
+halved and collapsed windows, loss, reordering, and the amplification limit
+binding — so `sim` is part of `zig build ci`. It costs seconds in either build.
+
+Three more fidelity gaps had to be closed before any of that was true, and each
+one had the census reporting a behaviour unreached rather than a run passing
+with nothing in it:
+
+- Both endpoints were given the **same source connection identifier**, so the
+  client addressed its 1-RTT packets to something the server did not answer to
+  and every one was discarded as a forgery. Silently, because section 5.4
+  requires exactly that — which is the shape a simulator exists to catch.
+- The **client never sent a Handshake flight**, so the server never saw a
+  Handshake packet, never treated the address as validated under section 8.1,
+  and stayed throttled to three times what it received for the whole
+  connection.
+- The **server's first flight was 38 octets**. A real one is a certificate
+  chain of a few kilobytes against a single 1200-octet client Initial, which is
+  when the three-times limit actually binds. With a token-sized flight the
+  amplification counter never moved, and it was right not to.
+
+Still to come: the adversary node, fault injection, the `poll` of §5.3, and the
+4096-seed nightly cadence under all three build legs. One census row stays at
+zero on purpose — "packets declared lost" — because `Recovery` reports losses
+per acknowledgement and keeps no lifetime total, so nothing outside the library
+can count them. That is what §5.3 is for, and until then the halved-window
+count is the signal that loss was reached.
 
 ### 5.3 Events out — with 5.2
 

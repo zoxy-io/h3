@@ -88,12 +88,22 @@ const quiet_ns: u64 = 10 * std.time.ns_per_s;
 /// spin. A loss detection timer that re-arms in the past without sending
 /// anything is a livelock, and this is where it is caught.
 const timers_per_step_max: u32 = 64;
+/// Steps the pair may take after the transfer finishes before going quiet.
+/// Generous against a lossy path still retransmitting a FIN or a close, and far
+/// short of the step budget, so a genuine never-quiet shows up as this rather
+/// than as an exhausted run.
+const quiet_steps_max: u32 = 2000;
 
 /// What the application on each side does, so that "delivered equals written"
 /// has something to compare.
 const payload_octets_max: u32 = 24 * 1024;
 
 const fake_secret_seeds = [_]u8{ 0x11, 0x22, 0x33, 0x44 };
+
+/// Stand-in for the server's first flight: ServerHello, EncryptedExtensions,
+/// Certificate, CertificateVerify, Finished. Sized like a real one rather than
+/// like a token, for the reason in `driveHandshake`.
+const server_flight: [2600]u8 = @splat(0xa5);
 
 const Census = struct {
     runs: u64 = 0,
@@ -123,11 +133,6 @@ const Census = struct {
         .{ .name = "transfers completed", .get = struct {
             fn get(c: *const Census) u64 {
                 return c.transfers_completed;
-            }
-        }.get },
-        .{ .name = "packets declared lost", .get = struct {
-            fn get(c: *const Census) u64 {
-                return c.packets_lost_declared;
             }
         }.get },
         .{ .name = "PTOs fired", .get = struct {
@@ -202,6 +207,9 @@ const World = struct {
 
     /// When the application last had something to do, for the quiet oracle.
     busy_until_ns: u64 = 0,
+    /// Steps taken since the transfer finished, which is the other half of that
+    /// oracle's budget.
+    drain_steps: u32 = 0,
     /// Packets the loss detector declared lost across the run. `Recovery` keeps
     /// no lifetime total — it reports per acknowledgement — so the census
     /// accumulates what the link dropped and the detector then noticed.
@@ -245,8 +253,17 @@ fn buildWorld(seed: u64) World {
     const jitter_ns = @as(u64, random.uintLessThan(u32, 20)) * std.time.ns_per_ms;
     const rate = if (random.boolean()) @as(u64, 0) else 100_000 + @as(u64, random.uintLessThan(u32, 4_000_000));
 
+    // Three distinct identifiers, as a real connection has: the Destination
+    // Connection ID the client invents for its first Initial, and one source
+    // each. Giving both endpoints the same source — which this did — meant the
+    // client addressed its 1-RTT packets to an identifier the server did not
+    // answer to, so every one of them was discarded as a forgery and no
+    // acknowledgement ever came back. Silently, because RFC 9000 section 5.4
+    // requires a packet that fails authentication to be dropped rather than
+    // reported: exactly the shape a simulator is for.
     const client_cid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
-    const server_cid = [_]u8{ 0xaa, 0xbb, 0xcc, 0xdd };
+    const client_source = [_]u8{ 0x01, 0x02, 0x03, 0x04 };
+    const server_source = [_]u8{ 0xf0, 0x67, 0xa5, 0x50, 0x2a, 0x42, 0x62, 0xb5 };
 
     var world: World = .{
         .seed = seed,
@@ -254,12 +271,12 @@ fn buildWorld(seed: u64) World {
         .client = .init(.{
             .side = .client,
             .original_destination = ConnectionId.init(&client_cid) catch unreachable, // Eight octets.
-            .source = ConnectionId.init(&server_cid) catch unreachable, // Four octets.
+            .source = ConnectionId.init(&client_source) catch unreachable, // Four octets.
         }),
         .server = .init(.{
             .side = .server,
             .original_destination = ConnectionId.init(&client_cid) catch unreachable, // As above.
-            .source = ConnectionId.init(&server_cid) catch unreachable, // As above.
+            .source = ConnectionId.init(&server_source) catch unreachable, // Eight octets.
         }),
         .to_server = .init(.{
             .delay_ns = delay_ns,
@@ -296,12 +313,26 @@ fn driveHandshake(world: *World) void {
     if (world.server_installed == 0 and world.server.cryptoOut(.initial).len >= "ClientHello".len) {
         installBoth(world, .handshake, fake_secret_seeds[0]);
         installBoth(world, .one_rtt, fake_secret_seeds[1]);
-        world.server.cryptoIn(.handshake, "ServerHelloEncryptedExtensionsFinished") catch {};
+        // A realistic size, not a token string. A real server's first flight is
+        // a certificate chain of a few kilobytes against a single 1200-octet
+        // client Initial, which is exactly when RFC 9000 section 8.1's three-
+        // times limit binds and makes the server wait for more from the client.
+        // With a 38-octet flight it never bound, and the census reported the
+        // behaviour unreached — correctly, because the sweep was not producing
+        // the situation the limit exists for.
+        world.server.cryptoIn(.handshake, &server_flight) catch {};
         exchangeTransportParameters(world);
         world.server_installed = 1;
     }
-    // And the client, once the server's flight lands.
+    // And the client, once the server's flight lands. It answers with its own
+    // Handshake flight, which is not decoration: RFC 9000 section 8.1 has the
+    // server treat the client's address as validated on receiving a Handshake
+    // packet, and a client that never sends one leaves the server throttled to
+    // three times what it received for the life of the connection. Without
+    // this the pair transferred its data and then sat wanting to send for ever,
+    // which read like a livelock in the library and was a gap in the harness.
     if (world.client_installed == 1 and world.client.cryptoOut(.handshake).len >= 8) {
+        world.client.cryptoIn(.handshake, "ClientFinished") catch {};
         world.client_installed = 2;
         world.census.handshakes_completed += 1;
     }
@@ -395,35 +426,37 @@ fn fail(world: *World, what: []const u8, detail: u64) void {
 fn checkInvariants(world: *World) void {
     if (world.failure != null) return;
 
-    inline for (.{ &world.client, &world.server }) |connection| {
-        // Oracle two, stated where it is exact. RFC 9002 section 7 forbids
-        // sending past the congestion window "unless the packet is sent on a
-        // PTO timer expiration", and it puts no number on how far a run of
-        // expirations may carry a sender — so an oracle that picks one is
-        // inventing a rule and will be loosened every time it fires, which is
-        // the opposite of a gate.
-        //
-        // The exact statement is the one with no probe in play: with
-        // `pto_count` back at zero, every packet outstanding was sent under
-        // the window and none of the section 7 exemptions applies. That is
-        // what catches the failure this was written for — probe credit that
-        // was never spent, leaving the window permanently exempt — because
-        // `pto_count` returns to zero on the next acknowledgement and the
-        // overshoot does not.
-        const window = connection.recovery.congestion_window;
-        const in_flight = connection.recovery.bytes_in_flight;
-        if (connection.recovery.pto_count == 0 and in_flight > window) {
-            fail(world, "bytes in flight exceeded the congestion window with no probe outstanding", in_flight);
-        }
-        // Oracle six is not checked here; see `serviceTimers`. VERIFICATION.md
-        // states it as "timeout() is never in the past while wantsSend() is
-        // false", and taken literally that fires on a timer which has merely
-        // come due and not yet been serviced — which is every timer, for the
-        // instant between the clock reaching it and the caller firing it. The
-        // property that actually matters is that servicing *converges*: a
-        // timer that re-arms in the past without sending anything is the spin
-        // the oracle was written for, and that is what `serviceTimers` checks.
-    }
+    // Oracle two is deliberately **not** here, and the four attempts it took
+    // to work that out are the most useful thing in this file.
+    //
+    // "In flight never exceeds the congestion window" is not true and
+    // cannot be made true by adding slack. A congestion event halves the
+    // window under data already on the wire and RFC 9002 does not retract
+    // it; a PTO probe is exempt by section 7 and the RFC puts no bound on
+    // how far a run of probe rounds may carry a sender. Every external
+    // form of this oracle therefore needs a number the specification does
+    // not give — and a number invented to make a run pass gets loosened
+    // the next time it fires, which is the opposite of a gate. One
+    // datagram of slack fired on a legitimate second probe; two fired on a
+    // second probe *round*; "the largest window this connection ever had"
+    // fired once the server's first flight became a realistic size.
+    //
+    // Section 7 bounds the *decision to send*, not the standing total, and
+    // that decision is not visible from out here. So it is asserted where
+    // it is — `Connection.sendPacket`, immediately after a non-probe
+    // ack-eliciting packet is recorded, where `canSend` has just been
+    // consulted with that packet's own size. That assertion is exact, it
+    // needs no slack, and it runs in every seed of this sweep under the
+    // default `-Dassertions`. It is strictly stronger than anything this
+    // file could have written.
+    // Oracle six is not checked here; see `serviceTimers`. VERIFICATION.md
+    // states it as "timeout() is never in the past while wantsSend() is
+    // false", and taken literally that fires on a timer which has merely
+    // come due and not yet been serviced — which is every timer, for the
+    // instant between the clock reaching it and the caller firing it. The
+    // property that actually matters is that servicing *converges*: a
+    // timer that re-arms in the past without sending anything is the spin
+    // the oracle was written for, and that is what `serviceTimers` checks.
 
     // Oracle three, and the only one whose violation is a weapon: an
     // unvalidated server that sends more than three times what it received is
@@ -433,7 +466,11 @@ fn checkInvariants(world: *World) void {
         if (world.server.sent_octets > allowance) {
             fail(world, "server sent past the amplification limit before validating", world.server.sent_octets);
         }
-        if (world.server.sent_octets == allowance and allowance > 0) {
+        // "Binding" means the limit is what stopped the server, not that it
+        // was hit to the octet — an exact-equality test was a knife edge no
+        // seed ever landed on, so the census reported the behaviour unreached
+        // while the sweep was in fact exercising it constantly.
+        if (allowance > 0 and world.server.sent_octets * 10 >= allowance * 9) {
             world.census.amplification_binding += 1;
         }
     }
@@ -560,11 +597,20 @@ fn runSeed(seed: u64, census: *Census) ?Failure {
         // Oracle one: once the application has nothing left to do, the pair
         // has a bounded window in which to go quiet. A FIN re-framed into every
         // packet forever is exactly this oracle failing.
+        //
+        // Bounded in *steps* as well as in virtual time, and both are needed.
+        // Virtual time alone was the first version and it was wrong: the clock
+        // jumps to the next timer, so a single step can cross the whole quiet
+        // window before the pair has been given one opportunity to drain. It
+        // fired on every seed against a server that, asked directly, produced a
+        // packet immediately.
         if (world.write_done and world.received == world.payload_len) {
-            if (world.now_ns > world.busy_until_ns + quiet_ns) {
-                if (world.client.wantsSend() or world.server.wantsSend()) {
-                    fail(&world, "pair still wants to send long after the transfer finished", world.now_ns);
-                }
+            world.drain_steps += 1;
+            const quiet = !world.client.wantsSend() and !world.server.wantsSend() and
+                world.to_server.idle() and world.to_client.idle();
+            if (quiet) break;
+            if (world.drain_steps > quiet_steps_max and world.now_ns > world.busy_until_ns + quiet_ns) {
+                fail(&world, "pair still wants to send long after the transfer finished", world.drain_steps);
                 break;
             }
         }
@@ -675,6 +721,10 @@ fn printCensus(census: *const Census) void {
         .{ .name = "connection errors seen", .value = census.closes_observed },
     };
     for (rows) |row| std.debug.print("  {s:<32} {d}\n", .{ row.name, row.value });
+    std.debug.print("\n  \"packets declared lost\" stays at zero: `Recovery` reports losses per\n", .{});
+    std.debug.print("  acknowledgement and keeps no lifetime total, so nothing out here can\n", .{});
+    std.debug.print("  count them. That is what section 5.3's `poll` is for; until then the\n", .{});
+    std.debug.print("  halved-window count is the signal that loss was reached.\n", .{});
 }
 
 const testing = std.testing;

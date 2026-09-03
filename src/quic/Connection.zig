@@ -1218,6 +1218,7 @@ pub fn Connection(comptime config: Config) type {
             //
             // A probe is exempt (section 6.2.4 requires it to be ack-eliciting)
             // and so is a level with no congestion state of its own.
+            const probes_before = space.probes_pending;
             const window_open = space.probes_pending > 0 or
                 self.recovery.canSend(config.datagram_octets);
             const written = self.writePayload(buffer[header.header_octets..][0..payload_room], level, now_ns, window_open);
@@ -1291,6 +1292,16 @@ pub fn Connection(comptime config: Config) type {
             // next one through.
             if (written.ack_eliciting and space.probes_pending > 0) {
                 space.probes_pending -= 1;
+            }
+            // Section 7's rule, asserted where it is decidable: at the instant
+            // a non-probe ack-eliciting packet is recorded, everything in
+            // flight fits the window, because `canSend` was just consulted
+            // with this packet's own size. It is *not* an invariant that holds
+            // between sends — a congestion event halves the window under data
+            // already on the wire, and RFC 9002 does not retract it — which is
+            // why `sim/` cannot state this and this line can.
+            if (written.ack_eliciting and probes_before == 0) {
+                assert(self.recovery.bytes_in_flight <= self.recovery.congestion_window);
             }
 
             // Section 2 of RFC 9002: a packet is in flight when it is
