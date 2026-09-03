@@ -539,8 +539,33 @@ pub const MessageValidator = struct {
             if (connectionSpecific(one.name)) return error.ConnectionSpecific;
         }
 
-        if (std.mem.eql(u8, one.name, host_field_name)) try self.checkHost(one.value);
-        if (std.mem.eql(u8, one.name, content_length_field_name)) try self.checkContentLength(one.value);
+        //= https://www.rfc-editor.org/rfc/rfc9110#section-6.5.1
+        //# A recipient MUST NOT merge a trailer field into a header
+        //# section unless the recipient understands the corresponding header
+        //# field definition and that definition explicitly permits and defines
+        //# how trailer field values can be safely merged.
+        //
+        // `content-length` and `host` are message framing and routing, and
+        // section 6.5.1 opens by naming exactly that class: "Many fields cannot
+        // be processed outside the header section because their evaluation is
+        // necessary prior to receiving the content". Neither definition permits
+        // a trailer, so neither may be read from one.
+        //
+        // Both checks used to run whatever the `Kind` was, so a
+        // `content-length` in a trailer section was accepted *and* handed to a
+        // consumer through `contentLength()` — indistinguishable there from one
+        // in the header section. For zoxy's threat model that is the vector this
+        // file exists to close: an intermediary that merges a trailer into the
+        // header section on the way to HTTP/1.1 emits a second, later
+        // `Content-Length`. `transfer-encoding` was already caught by
+        // `connectionSpecific`, which is what made the gap easy to miss.
+        if (self.kind == .trailer) {
+            if (std.mem.eql(u8, one.name, host_field_name)) return error.ConnectionSpecific;
+            if (std.mem.eql(u8, one.name, content_length_field_name)) return error.ConnectionSpecific;
+        } else {
+            if (std.mem.eql(u8, one.name, host_field_name)) try self.checkHost(one.value);
+            if (std.mem.eql(u8, one.name, content_length_field_name)) try self.checkContentLength(one.value);
+        }
 
         // Set last, so a field this function refused cannot make a later
         // pseudo-header look out of order.
@@ -1287,4 +1312,26 @@ test "a second Host is refused even with no :authority to compare it against" {
         .{ .name = ":path", .value = "/" },
         .{ .name = "host", .value = "example.com" },
     });
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9110#section-6.5.1
+//# A recipient MUST NOT merge a trailer field into a header
+//# section unless the recipient understands the corresponding header
+//# field definition and that definition explicitly permits and defines
+//# how trailer field values can be safely merged.
+//= type=test
+test "section 6.5.1: framing and routing fields may not arrive in a trailer" {
+    // `content-length` in a trailer used to pass *and* be handed to a consumer
+    // through `contentLength()`, indistinguishable there from one in the header
+    // section. An intermediary merging that trailer on the way to HTTP/1.1
+    // emits a second, later `Content-Length` — the smuggling pair this file
+    // exists to prevent.
+    try testing.expectError(error.ConnectionSpecific, validate(.trailer, &.{
+        .{ .name = "content-length", .value = "10" },
+    }));
+    try testing.expectError(error.ConnectionSpecific, validate(.trailer, &.{
+        .{ .name = "host", .value = "example.com" },
+    }));
+    // A trailer field whose definition does permit one is still fine.
+    try validate(.trailer, &.{.{ .name = "grpc-status", .value = "0" }});
 }

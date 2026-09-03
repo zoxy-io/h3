@@ -496,7 +496,17 @@ pub fn iterate(section: []const u8, buffer: []u8, list_size_max: u64) Error!Iter
     // Section 2.2: a section that depends on the dynamic table cannot be
     // decoded by an endpoint that has none, and one that advertised a zero
     // capacity has told the peer so.
-    if (prefix.required_insert_count != 0 or prefix.base != 0) return error.DecompressionFailed;
+    //= https://www.rfc-editor.org/rfc/rfc9204#section-4.5.1.2
+    //# A field section that was encoded without references to the dynamic table
+    //# can use any value for the Base; setting Delta Base to zero is one of the
+    //# most efficient encodings.
+    //
+    // The Base was refused unless it was zero, which rejects a field section the
+    // RFC explicitly permits: with a Required Insert Count of zero there are no
+    // dynamic references for a Base to resolve, so its value cannot matter. The
+    // comment beside it — "with no dynamic table both are zero" — was true of
+    // *this* endpoint's encoder and not of a conforming peer's.
+    if (prefix.required_insert_count != 0) return error.DecompressionFailed;
     return .{
         .section = section,
         .offset = prefix.octets,
@@ -887,4 +897,30 @@ test "a field section prefix at the encoding's limits does not overflow" {
         // Either answer is fine; not crashing is the point.
         _ = iterate(wire[0..offset], &buffer, 1 << 16) catch {};
     }
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9204#section-4.5.1.2
+//# A field section that was encoded without references to the dynamic table
+//# can use any value for the Base; setting Delta Base to zero is one of the
+//# most efficient encodings.
+//= type=test
+test "section 4.5.1.2: a non-zero Base with no dynamic references is legal" {
+    // Refused before: the check demanded both the Required Insert Count *and*
+    // the Base be zero. With no dynamic references there is nothing for a Base
+    // to resolve, so a conforming peer choosing any value was told its section
+    // failed to decompress.
+    // A whole section from this package's encoder, then its Delta Base octet
+    // rewritten to a non-zero value — which is the one thing a peer may choose
+    // freely and this decoder refused.
+    var wire: [128]u8 = undefined;
+    const written = try encode(&wire, &.{.{ .name = ":method", .value = "GET" }});
+    try testing.expectEqual(@as(u8, 0), wire[0]);
+    try testing.expectEqual(@as(u8, 0), wire[1]);
+    wire[1] = 0x05;
+
+    var buffer: [128]u8 = undefined;
+    var iterator = try iterate(wire[0..written], &buffer, 1 << 16);
+    const one = (try iterator.next()).?;
+    try testing.expectEqualStrings(":method", one.name);
+    try testing.expectEqualStrings("GET", one.value);
 }
