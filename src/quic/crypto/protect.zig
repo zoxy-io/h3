@@ -280,9 +280,17 @@ pub const Keys = struct {
         /// tearing the connection down on one is the attack.
         AuthenticationFailed,
         /// RFC 9000 sections 17.2 and 17.3: a reserved bit was set once header
-        /// protection came off. Unlike the two above, this *is* a connection
-        /// error of type `PROTOCOL_VIOLATION` — the bits are authenticated, so
-        /// only the real peer can have set them.
+        /// protection came off *and* the AEAD authenticated the packet. Unlike
+        /// the two above, this is a connection error of type
+        /// `PROTOCOL_VIOLATION`, and that is only sound because of the order:
+        /// the bits are covered by the AEAD, so only the real peer can have set
+        /// them — but they are not authenticated until `decrypt` has run.
+        ///
+        /// This comment used to make that claim about a check that ran *before*
+        /// the AEAD, where it was false, and RFC 9001 section 9.5 makes the
+        /// ordering a MUST for a second reason: returning early told an
+        /// attacker, by timing, whether its guessed mask cleared the two
+        /// reserved bits.
         ReservedBitsSet,
     };
 
@@ -337,6 +345,19 @@ pub const Keys = struct {
         number: u64,
         number_octets: u8,
         header_octets: usize,
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-9.5
+        //# For authentication to be free from side channels, the entire
+        //# process of header protection removal, packet number recovery,
+        //# and packet protection removal MUST be applied together without
+        //# timing and other side channels.
+        ///
+        /// Carried rather than returned. A reserved bit that survives unmasking
+        /// is a protocol violation, but saying so before the AEAD has run
+        /// answers, in the time taken to refuse, whether an injected packet's
+        /// guessed mask cleared those two bits. The verdict travels to
+        /// `decrypt`, which raises it only once the packet is the peer's.
+        reserved_set: bool = false,
+
         /// Section 17.3.1's Key Phase bit. Meaningless outside 1-RTT, where the
         /// octet holds a long header's packet type instead.
         key_phase: bool,
@@ -375,16 +396,11 @@ pub const Keys = struct {
         //# process of header protection removal, packet number recovery,
         //# and packet protection removal MUST be applied together without
         //# timing and other side channels.
-        //= type=todo
-        // "Applied together" is exactly what the next line does not do: a
-        // reserved bit that survives unmasking returns before the AEAD runs,
-        // so the time an injected packet takes to be refused says whether the
-        // mask's two reserved bits came off zero. The bits are worth two of an
-        // attacker's guesses per packet, and the fix is to carry the verdict
-        // to after `decrypt` rather than to return here — which is a change to
-        // behaviour, so this pass records it rather than making it.
+        // Recorded, not returned: see `Unprotected.reserved_set`. Returning
+        // here answered an injected packet in a time that depended on whether
+        // the guessed mask cleared these two bits.
         const reserved = if (long) reserved_mask_long else reserved_mask_short;
-        if (packet[0] & reserved != 0) return error.ReservedBitsSet;
+        const reserved_set = packet[0] & reserved != 0;
 
         const header_octets = packet_number_offset + number_octets;
         if (packet.len < header_octets + crypto.tag_octets) return error.Truncated;
@@ -395,6 +411,7 @@ pub const Keys = struct {
             .number_octets = number_octets,
             .header_octets = header_octets,
             .key_phase = !long and (packet[0] & key_phase_bit) != 0,
+            .reserved_set = reserved_set,
         };
     }
 
@@ -414,6 +431,10 @@ pub const Keys = struct {
         self.aeadOpen(ciphertext, ciphertext, tag.*, packet[0..header.header_octets], packet_nonce) catch {
             return error.AuthenticationFailed;
         };
+        // Now, and only now, the reserved bits are the peer's — which is what
+        // makes RFC 9000 sections 17.2 and 17.3 a connection error rather than
+        // a discard, and what keeps the refusal off an injected packet's clock.
+        if (header.reserved_set) return error.ReservedBitsSet;
         return .{
             .number = header.number,
             .number_octets = header.number_octets,
@@ -457,11 +478,10 @@ pub const Keys = struct {
             octet.* ^= mask[1 + index];
         }
 
-        // Section 9.5's todo on `unprotectHeader` is this line too: the verdict
-        // is reached before the AEAD has said whether the peer wrote these bits
-        // at all.
+        // As in `unprotectHeader`: held until the AEAD has said whether the
+        // peer wrote these bits at all.
         const reserved = if (long) reserved_mask_long else reserved_mask_short;
-        if (packet[0] & reserved != 0) return error.ReservedBitsSet;
+        const reserved_set = packet[0] & reserved != 0;
 
         const header_octets = packet_number_offset + number_octets;
         assert(header_octets <= packet.len);
@@ -478,6 +498,8 @@ pub const Keys = struct {
         self.aeadOpen(ciphertext, ciphertext, tag.*, packet[0..header_octets], packet_nonce) catch {
             return error.AuthenticationFailed;
         };
+        // As in `decrypt`: authenticated first, judged second.
+        if (reserved_set) return error.ReservedBitsSet;
 
         return .{
             .number = number,
@@ -667,10 +689,37 @@ fn applyHeaderMask(
     assert(number_octets <= packet_number.octets_max);
     assert(packet_number_offset + number_octets <= buffer.len);
 
+    //= https://www.rfc-editor.org/rfc/rfc9001#section-9.5
+    //# Similarly, guesses for the packet number length can be tried and
+    //# exposed.
+    //
+    //= https://www.rfc-editor.org/rfc/rfc9001#section-9.5
+    //# For the sending of packets, construction and protection of packet
+    //# payloads and packet numbers MUST be free from side channels that
+    //# would reveal the packet number or its encoded size.
+    //
+    // The loop below used to run `number_octets` times, so its trip count *was*
+    // the encoded size the two sentences above forbid revealing — and this is
+    // the one place that size is secret, because it comes out of the first
+    // octet only after the mask is applied.
+    //
+    // It now runs a fixed number of times and selects branchlessly: an index
+    // past the packet number XORs with zero, which changes nothing. The span is
+    // clamped by the buffer's length rather than by `number_octets`, and a
+    // length is public — the attacker chose it.
     const long = buffer[0] & header_form_long != 0;
     buffer[0] ^= mask[0] & (if (long) first_octet_mask_long else first_octet_mask_short);
-    for (buffer[packet_number_offset..][0..number_octets], 0..) |*octet, index| {
-        octet.* ^= mask[1 + index];
+
+    const available = buffer.len - packet_number_offset;
+    const span = @min(@as(usize, packet_number.octets_max), available);
+    assert(span >= number_octets);
+    for (0..span) |index| {
+        // 0xff while inside the packet number, 0x00 past it. Written as a
+        // subtraction from zero rather than an `if`, so the compiler has no
+        // branch to predict on a value the attacker is guessing.
+        const inside: u8 = @intFromBool(index < number_octets);
+        const selected: u8 = 0 -% inside;
+        buffer[packet_number_offset + index] ^= mask[1 + index] & selected;
     }
 }
 
@@ -857,4 +906,81 @@ test "reserved bits set are a protocol violation, not a discard" {
     buffer[0] |= reserved_mask_long;
     const total = try keys.seal(&buffer, shape.packet_number_offset, shape.header_octets, shape.payload_octets, shape.number);
     try std.testing.expectError(error.ReservedBitsSet, keys.open(buffer[0..total], shape.packet_number_offset, 2));
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9001#section-9.5
+//# For authentication to be free from side channels, the entire
+//# process of header protection removal, packet number recovery,
+//# and packet protection removal MUST be applied together without
+//# timing and other side channels.
+//= type=test
+test "section 9.5: a reserved bit is judged after the AEAD, not before" {
+    // The check used to return before `decrypt` ran, so the time an injected
+    // packet took to be refused said whether the attacker's guessed mask had
+    // cleared the two reserved bits — two guesses answered per packet. It also
+    // made `ReservedBitsSet`'s own doc comment ("the bits are authenticated")
+    // false at the point it was claimed.
+    const dcid: [8]u8 = .{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    const keys: Keys = .initial(&dcid, .client);
+
+    // A packet with a reserved bit set *and* a corrupted tag is both things at
+    // once. It must be refused as a forgery, because until the AEAD speaks
+    // nobody knows the peer set that bit — and the two answers differ: a
+    // forgery is discarded, a reserved bit closes the connection.
+    var buffer: [256]u8 = @splat(0);
+    const shape = sampleLongHeader(&buffer, "payload that is long enough", 3);
+    buffer[0] |= reserved_mask_long;
+    const total = try keys.seal(&buffer, shape.packet_number_offset, shape.header_octets, shape.payload_octets, shape.number);
+    buffer[total - 1] ^= 0xff;
+    try std.testing.expectError(
+        error.AuthenticationFailed,
+        keys.open(buffer[0..total], shape.packet_number_offset, 2),
+    );
+
+    // And the same packet with its tag intact is the connection error, which
+    // is the case the test above this one already pins.
+    var honest: [256]u8 = @splat(0);
+    const shape_two = sampleLongHeader(&honest, "payload that is long enough", 3);
+    honest[0] |= reserved_mask_long;
+    const total_two = try keys.seal(&honest, shape_two.packet_number_offset, shape_two.header_octets, shape_two.payload_octets, shape_two.number);
+    try std.testing.expectError(
+        error.ReservedBitsSet,
+        keys.open(honest[0..total_two], shape_two.packet_number_offset, 2),
+    );
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9001#section-9.5
+//# Similarly, guesses for the packet number length can be tried and
+//# exposed.
+//= type=test
+test "section 9.5: the header mask does the same work whatever the number length" {
+    // **This test cannot catch the bug it sits under.** Replacing the fixed
+    // span with `number_octets` restores the timing channel and every
+    // assertion below still passes, because the extra iterations XOR with zero
+    // and change nothing observable. That is not a weak test — it is the shape
+    // of the property: constant time is a statement about the machine, not
+    // about the output, and no assertion over the output can see it.
+    //
+    // What this does check is the part that *could* have gone wrong while
+    // making the loop constant: that masking is still exact for every encoded
+    // size and still touches nothing past the packet number. The timing
+    // property itself is held by reading the loop, which is why it is written
+    // to be read — a fixed bound, and a branchless select on the secret.
+    for (1..packet_number.octets_max + 1) |number_octets| {
+        var buffer: [32]u8 = @splat(0xcc);
+        const original = buffer;
+        const mask: [crypto.header_mask_octets]u8 = @splat(0xa5);
+        const offset: usize = 4;
+
+        applyHeaderMask(&buffer, offset, number_octets, mask);
+        // Everything past the packet number is untouched.
+        try std.testing.expectEqualSlices(
+            u8,
+            original[offset + number_octets ..],
+            buffer[offset + number_octets ..],
+        );
+        // And the round trip is the identity.
+        applyHeaderMask(&buffer, offset, number_octets, mask);
+        try std.testing.expectEqualSlices(u8, &original, &buffer);
+    }
 }
