@@ -2,19 +2,26 @@
 
 Why the review keeps finding what the gates do not, what the other QUIC stacks
 run that this package does not, and the order in which to close the gap.
-Written 2026-09-02 against commit `07684e1`. [DESIGN.md](DESIGN.md) is the
+Written 2026-09-02, revised 2026-09-03 against commit `8e77c63`. [DESIGN.md](DESIGN.md) is the
 argument for the code; this is the argument for the evidence.
 
 ---
 
 ## 1. The signal
 
-The last eight commits fixed roughly twenty defects. Every one of them was found
-by an agent reading the code, and not one by `zig build ci`. That is the signal
-this document exists to explain, and the explanation is not "there are no
-tests". There are 252 unit tests, 16 fuzz targets, and RFC 9001 appendix A's
-four packets checked octet for octet. What there is none of is the three kinds
-of evidence that would have caught this particular list.
+Roughly twenty defects were fixed in the eight commits that prompted this
+document. Every one was found by an agent reading the code, and not one by
+`zig build ci`. That is the signal this document exists to explain, and the
+explanation is not "there are no tests": there were 252 of them, 16 fuzz
+targets, and RFC 9001 appendix A's four packets checked octet for octet. What
+there was none of is the three kinds of evidence that would have caught that
+particular list.
+
+**Since then the two new gates have found about twenty-five more**, which is
+the part worth reading. §5.1's ledger and §5.2's simulator were built to catch
+the classes in the table below; they did, and they also caught classes nobody
+had written down. The second table records those, because a gate's real yield
+is only knowable after it runs.
 
 Each finding, with the gate that would have caught it first:
 
@@ -55,6 +62,53 @@ same reason the code is wrong. Only evidence from outside escapes that: the
 RFC's own vectors, encodings other implementations produced, a live peer, or a
 requirement list extracted from the specification.
 
+### What the new gates then found
+
+| Finding | Found by | Why nothing else would have |
+|---|---|---|
+| The server never sent HANDSHAKE_DONE, so a client never confirmed the handshake and never armed an application-data probe timeout | simulator, first working sweep | Every unit test injects the frame by hand |
+| A probe carrying CRYPTO never spent its credit, so a non-zero `probes_pending` exempted the sender from the congestion window for the rest of the connection | simulator, three seeds with the same excess | Correct in isolation at every step; only a connection over time diverges |
+| The ACK-only exemption was accidental: a full window refused the whole packet, so the acknowledgement that would have opened it never went out | fixing the above | A mutual deadlock — each side is individually correct |
+| `transport_parameters.validate` was tested and called from nowhere; a client could send a `stateless_reset_token` and a server would keep it | ledger | The third instance of "implemented and never wired in"; the tests passed because they called it directly |
+| STOP_SENDING and MAX_STREAM_DATA each *created* the stream they named, so a peer could fill the table with identifiers this endpoint never opened | ledger | Two rules with one shape, both looking correct beside their own code |
+| A repeated `Host` with no `:authority`, and `content-length` accepted in a trailer section, both feeding a downgraded HTTP/1.1 request line | ledger | `transfer-encoding` was guarded, so the other two looked like they must be |
+| A client's anti-deadlock PTO was never armed with nothing in flight, so a client and a server could both wait forever | ledger | Neither endpoint is wrong alone |
+| Two RFC 9001 §9.5 timing channels: the reserved-bits check ran before the AEAD, and the header mask's trip count was the packet number length | ledger | Not a behavioural property; no assertion over output can see it |
+| The §9.5 fix then reached only the send path, because the receive path inlines its own copy of the loop | ledger, second pass | The fixed half is the half nobody can measure |
+| A CONNECTION_CLOSE reached one encryption level; and a closing endpoint's `wantsSend` disagreed with its `send`, so an event loop polling the pair never sleeps | ledger, and writing the test for it | The close *worked* against a peer that could read that level |
+
+Two things about that table.
+
+**The ledger found more than the simulator, and neither found what the other
+did.** The simulator finds properties of a connection over time; the ledger
+finds requirements nobody implemented and claims nobody checked. A defect is
+usually visible to exactly one of them.
+
+**Six of these were introduced by the same session that fixed the rest**, and
+four were mine. Two stale `type=todo` comments described gaps that had moved,
+which is worse than no comment: a todo reads as a known gap and so hides that
+the gap is now somewhere else.
+
+### The failure mode that kept recurring
+
+Six times in one session a check turned out to be ignoring its input rather
+than answering wrongly:
+
+- `parseUrl` accepted only `#section-`, so six RFC 9002 appendix citations were
+  dropped without a word. Three of them were misattributed, and the gate found
+  all three within a second of being allowed to see them.
+- A revert-check reported "not caught" four separate times when the revert had
+  broken the build — a compile error and a passing test look identical through
+  a grep for a failing one.
+- A gate piped through `tail` returned the pipe's exit status, and a broken
+  commit went out.
+- A comptime assertion read `x <= y - n + n`, so it asserted `16 <= 20` and
+  said nothing about the offset it was named for.
+
+Every one presented as *silence*. None presented as a wrong answer. The
+practical rule: a check that produces no output has not passed, it has not run,
+and the two must be made to look different.
+
 There is a third signal, and it is structural. zoxy's
 [DESIGN.md §9](https://github.com/zoxy-io/zoxy/blob/main/docs/DESIGN.md) states
 "a feature without its gate is not done" and runs a deterministic simulator on
@@ -68,17 +122,17 @@ moves a datagram from one `Connection` to another.
 
 | Gate | What it proves | What it cannot prove |
 |---|---|---|
-| 252 `test` blocks | Each function does what its author meant | That the author read the RFC correctly, or that anything calls the function |
-| 16 fuzz targets, Debug, assertions on | Decoders reject or parse with no third outcome | Anything about the shipping builds; anything a `u16` draw cannot reach; and — until `b9c796d` — whether a target reaches its accept path at all, which two of them did not |
+| 348 `test` blocks | Each function does what its author meant | That the author read the RFC correctly, or that anything calls the function |
+| 16 fuzz targets, replayed in all three build legs | Decoders reject or parse with no third outcome | Anything a `u16` draw cannot reach; and — until `b9c796d` — whether a target reaches its accept path at all, which two of them did not |
 | `corpus/`, RFC 9001 appendix A | The key schedule, AEAD, nonce, sampling offset and mask are right at once | Anything after the first flight |
 | `zig build lint` | No I/O, no allocator, no unbounded loop | Nothing about behaviour |
 | The `tiger-style-reviewer` agent | Assertion density, function length, named bounds | It is a reader, not a gate: it found the twenty above, and it will not find the same class twice at the same cost |
-| `zig build requirements` | That every RFC quote in the source is really in the section it cites, and that every exception states a reason | Coverage — the sentence extraction is a heuristic, so `7 cited / 571 mandatory` is a trend to move, not a threshold to pass |
+| `zig build requirements` | That every RFC quote in the source is in the section it cites, that every exception states a reason, and that no `//=` URL is silently unreadable | Coverage — the sentence extraction is a heuristic, so the count is a trend rather than a threshold. And "cited" is not "correct": a citation says someone looked, not that they were right |
+| `zig build sim` | 256 seeded runs of two connections over a modelled link, five oracles, a census that fails the sweep when a behaviour goes unreached | Anything no oracle states. It is deterministic and cross-platform — the same seeds pass on four targets — but its reach is exactly the sum of its oracles |
 
-Missing outright: a seeded simulator, an interop image, a QPACK
-cross-implementation corpus, qlog output, and any run of the fuzz targets in a
-release mode. The requirement ledger of §5.1 now exists; §5.2's simulator is
-the next item, and it is the one the ledger's oracles feed.
+Missing outright: an interop image, a QPACK cross-implementation corpus, qlog
+output, and the event seam of §5.3 that the last two want. The requirement
+ledger of §5.1 and the simulator of §5.2 both exist and are both in `ci`.
 
 ## 3. What the other stacks do
 
@@ -249,46 +303,38 @@ preferred address, PMTU discovery, server push, the QPACK dynamic table, ECN
 and pacing are each now marked out of scope with a mechanism named. Before this
 work every one of them was indistinguishable from an oversight.
 
-The annotation was done by three agents working on disjoint files, and the
-method is worth keeping. Every one of them generated its `//#` blocks by
-slicing the vendored text with a script rather than typing them, and between
-them they produced **292 citations with zero quote failures**. The two quote
-failures in this pass were both mine, both hand-typed, and both the same
-mistake: copying a requirement out of my own terminal output, which had wrapped
-`ack-eliciting` across a line the RFC does not wrap. The gate caught both. If
-you take one working rule from this document, it is *extract the quote, never
-retype it*.
-
-The exceptions are the product here as much as the citations. 60 requirements
-are now marked deliberately-out-of-scope with a reason naming the mechanism —
-migration, 0-RTT, version negotiation, stateless reset, NEW_TOKEN issuance,
-server push, the QPACK dynamic table and encoder streams, the HTTP/3 control
-stream, ECN and pacing. Before this pass, every one of those was
-indistinguishable from an oversight.
+The annotation was done by agents working on disjoint files, and the method is
+the most transferable thing here. Every one of them generated its `//#` blocks
+by slicing the vendored text with a script rather than typing them, and between
+them they produced roughly **850 citations with zero quote failures**. Every
+quote failure in this project was mine, and every one was hand-typed: a
+requirement copied out of my own terminal output that had wrapped
+`ack-eliciting` across a line the RFC does not wrap, and three RFC 9002
+appendix citations that named the wrong appendix. If you take one working rule
+from this document, it is *extract the quote, never retype it*.
 
 Two of its checks are gates and the rest is a report, which is a deliberate
 split:
 
-- **A quote must appear in the section it cites.** This one has already earned
-  its place: the first `//#` block written for RFC 9002 §7.6.2 was paraphrased
-  from memory rather than copied, and the gate rejected it. A citation that
-  misquotes an RFC is worse than no citation, because it is a claim of
-  diligence a reader will believe.
-- **An exception must carry a `reason=`.** Without one, "deliberately not
-  done" and "forgotten" are the same string.
+- **A quote must appear in the section it cites.** This has earned its place
+  repeatedly. The first `//#` block written for RFC 9002 §7.6.2 was paraphrased
+  from memory and rejected within minutes of the gate existing; three appendix
+  citations were caught the moment the parser was taught to read `#appendix-`
+  anchors. A citation that misquotes an RFC is worse than no citation, because
+  it is a claim of diligence a reader will believe.
+- **An exception must carry a `reason=`, and a `//=` URL the tool cannot read
+  is a violation.** Without the first, "deliberately not done" and "forgotten"
+  are the same string. The second was added after `parseUrl` was found silently
+  dropping six citations: a checker that ignores its input reports success
+  either way, which is worse than having no checker.
 - **Coverage is a report.** Extracting "the requirements" from prose is a
   heuristic — `splitSentences` breaks on a full stop before a capital, with a
-  short abbreviation list — and a gate resting on a heuristic teaches everyone
-  to work around the heuristic rather than to cite the RFC. The number to watch
-  is the trend, and the honest reading of `7 / 571` is that this has started
-  rather than that it is done.
+  short abbreviation list, and RFC 8174's keyword boilerplate had to be excluded
+  by name. A gate resting on a heuristic teaches everyone to work around the
+  heuristic rather than to cite the RFC.
 
-The work left is the annotation, and it is the bulk of it: 564 mandatory
-requirements with nothing said about them. Not all are in scope — migration,
-0-RTT, the QPACK dynamic table and version negotiation are all out, and each
-wants a `type=exception` naming that rather than silence. Distinguishing "out
-of scope" from "nobody looked" is the whole product of this exercise, and it is
-what makes the next 57-finding review smaller than the last.
+What is left in the ledger: four SHOULD-level requirements in RFC 9000, all
+IANA registry policy. The mandatory sweep is complete.
 
 ### 5.2 A `sim/` in this package — one to two weeks — **started**
 
@@ -407,11 +453,17 @@ key updated, closed. The simulator's oracle becomes a trace; a qlog writer
 outside `src/` becomes a consumer of that trace; picoquic-style golden trace
 diffs become possible between seeds and between versions.
 
-### 5.4 Fuzz where it ships — days
+### 5.4 Fuzz where it ships — partly done
 
-Run `zig build fuzz` under `-Doptimize=ReleaseFast` with and without
-`-Dassertions`, on every change. Draw peer-chosen fields at their wire width:
-a `u62` where the wire carries one. Add model-based targets: `AckRanges`
+**Already true, and this document said otherwise for a day.** `ci_step`
+depends on `test_step`, which depends on `fuzz_run`, so all three build legs
+replay the corpus — including `-Doptimize=ReleaseFast -Dassertions=false`. §1's
+table claimed "the build that ships is never the build that is fuzzed"; it was
+wrong when written or fixed shortly after, and nobody noticed because a plan
+listing finished work as pending reads exactly like a plan.
+
+What is left: Draw peer-chosen fields at their wire width: a
+`u62` where the wire carries one. Add model-based targets: `AckRanges`
 against a bitset, `Reassembler` against a byte array, `Streams` against a
 flow-control ledger. Each of the three data-structure findings in §1 is a
 model disagreeing with the structure.
@@ -431,13 +483,22 @@ once the control stream lands, then point h3spec at the same binary. This is
 the only gate that catches a shared misreading, and it is why the corpus
 README's "second corpus" line has stayed open.
 
-Cheap and immediate: decode qifs's capacity-zero encodings from every
-contributor and diff against the source `.qif`. That is the QPACK half of the
-second corpus, and it needs nothing this package does not have.
+**Cheap and immediate, and the next thing to build:** decode qifs's
+capacity-zero encodings from every contributor and diff against the source
+`.qif`. It needs nothing this package does not have — a static-only decoder is
+exactly what those files exercise — and it is the only evidence in this
+document that comes from outside the project.
+
+The argument for doing it before the rest of §5.5 is a defect this package
+already had: `field_line.iterate` refused a field section whose Required Insert
+Count was zero but whose Base was not, which RFC 9204 §4.5.1.2 explicitly
+permits. Every internal test agreed with the decoder because every internal
+test was fed by this package's own encoder, which never produces that shape. A
+corpus of ten other encoders is precisely the thing that disagrees.
 
 ### 5.6 Structure — only if rewriting anyway
 
-`Connection.zig` is 2469 lines carrying 43 tests. Both send-path findings were
+`Connection.zig` is 5977 lines, roughly half of them RFC citations. Both send-path findings were
 about the order in which state is committed, so a rewrite would separate the
 send scheduler from the packet builder, and pull address validation and the
 amplification budget into a struct with its own invariant check the simulator
