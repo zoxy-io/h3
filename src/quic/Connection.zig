@@ -52,6 +52,7 @@ const error_code = @import("error_code.zig");
 const frame = @import("frame.zig");
 const packet = @import("packet.zig");
 const packet_number = @import("packet_number.zig");
+const stream_id = @import("stream_id.zig");
 const transport_parameters = @import("transport_parameters.zig");
 const varint = @import("../varint.zig");
 
@@ -580,6 +581,33 @@ pub fn Connection(comptime config: Config) type {
         /// Both directions at once. The Key Phase bit is one bit shared by both
         /// peers, so an endpoint that updated only its write keys would be
         /// sending in a phase its own reader does not recognise.
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-4.9.2
+        //# An endpoint MUST discard its Handshake keys when the TLS handshake is
+        //# confirmed (Section 4.1.2).
+        ///
+        /// The client reaches this on HANDSHAKE_DONE by itself. A server cannot:
+        /// section 4.1.2 confirms the handshake at the server "when the
+        /// handshake completes", which is when its TLS engine has processed the
+        /// client's Finished — and that engine is the consumer's, by the design
+        /// in docs/DESIGN.md section 4. Installing 1-RTT send keys is not the
+        /// same moment: there the server has sent its own Finished and still
+        /// needs Handshake keys to read the client's.
+        ///
+        /// So confirmation is an entry point rather than an inference. A server
+        /// whose consumer never calls it keeps its Handshake keys and its
+        /// Handshake packet number space alive for the life of the connection,
+        /// which is what this package did before there was anything to call.
+        ///
+        /// Idempotent: a consumer that calls it twice, or a client that has
+        /// already discarded, must not discard a space twice.
+        pub fn confirmHandshake(self: *Self) void {
+            self.state = .established;
+            self.recovery.handshake_confirmed = true;
+            if (self.spaces[@intFromEnum(Space.handshake)].discarded) return;
+            self.discard(.handshake);
+            assert(self.spaces[@intFromEnum(Space.handshake)].discarded);
+        }
+
         pub fn updateKeys(self: *Self) void {
             const one = &self.one_rtt;
             const send_secret = one.send_secret orelse return;
@@ -824,27 +852,44 @@ pub fn Connection(comptime config: Config) type {
             //# permitted if the values are taken from NEW_CONNECTION_ID frames; if
             //# subsequent Initial packets include a different Source Connection ID,
             //# they MUST be discarded.
-            //= type=todo
             //
-            // And the client half of the same rule is absent: only a server
-            // pins its peer's Source Connection ID below.
             //= https://www.rfc-editor.org/rfc/rfc9000#section-7.2
             //# Once a
             //# client has received a valid Initial packet from the server, it MUST
             //# discard any subsequent packet it receives on that connection with a
             //# different Source Connection ID.
-            //= type=todo
-            if (self.side == .server) {
-                switch (header) {
-                    .initial => |value| {
-                        if (self.peer_source) |known| {
-                            if (!known.eql(&value.source)) return error.Protocol;
-                        } else {
-                            self.peer_source = value.source;
-                            self.destination = value.source;
-                        }
-                    },
-                    else => {},
+            //
+            // Both halves, and both are a *discard* rather than a connection
+            // error. This used to answer a mismatch with `error.Protocol`,
+            // which closes the connection — and Initial keys are derivable by
+            // anyone who watched the first flight, so one forged Initial from
+            // an off-path observer ended the connection. The RFC's remedy is to
+            // drop the packet and carry on, which costs an attacker the ability
+            // to do anything at all.
+            //
+            // The client half was absent entirely. A short header carries no
+            // Source Connection ID, so this can only speak for long headers,
+            // which is where the identifier is established.
+            // The three long-header kinds carry a source; `initial` has its own
+            // struct because of the token field, so the identifier is pulled out
+            // before the comparison rather than captured across arms.
+            const carried_source: ?ConnectionId = switch (header) {
+                .initial => |value| value.source,
+                .handshake, .zero_rtt => |value| value.source,
+                else => null,
+            };
+            if (carried_source) |source| {
+                if (self.peer_source) |known| {
+                    if (!known.eql(&source)) return;
+                } else {
+                    // A server pins on the first Initial; a client pins on the
+                    // first long header it opens from the server, which by this
+                    // point has authenticated.
+                    const pins = (self.side == .server and header == .initial) or self.side == .client;
+                    if (pins) {
+                        self.peer_source = source;
+                        self.destination = source;
+                    }
                 }
             }
         }
@@ -1036,7 +1081,16 @@ pub fn Connection(comptime config: Config) type {
                 //# repair losses of previously sent NEW_TOKEN frames.
                 //= type=exception
                 //= reason=NEW_TOKEN issuance is out of scope; the token is a server's own encrypted state and needs randomness and a clock, neither of which crosses the seam of docs/DESIGN.md section 3. See docs/DESIGN.md section 2.
-                .new_token => {},
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-19.7
+                //# Clients MUST NOT send NEW_TOKEN frames.  A server MUST treat receipt
+                //# of a NEW_TOKEN frame as a connection error of type
+                //# PROTOCOL_VIOLATION.
+                //
+                // Ignored at both roles before this. A client has no use for
+                // the frame either — this package requests no token and stores
+                // none — but only the server's half is a rule, so only the
+                // server's half is enforced.
+                .new_token => if (self.side == .server) return error.Protocol,
                 // Both take `@max`, so a limit that moved backwards under loss
                 // or reordering leaves the send window where it was.
                 //= https://www.rfc-editor.org/rfc/rfc9000#section-4.1
@@ -1117,7 +1171,25 @@ pub fn Connection(comptime config: Config) type {
                 //# endpoint that receives a STOP_SENDING frame for a receive-only stream
                 //# MUST terminate the connection with error STREAM_STATE_ERROR.
                 //= type=todo
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-19.5
+                //# Receiving a STOP_SENDING frame for a
+                //# locally initiated stream that has not yet been created MUST be
+                //# treated as a connection error of type STREAM_STATE_ERROR.  An
+                //# endpoint that receives a STOP_SENDING frame for a receive-only stream
+                //# MUST terminate the connection with error STREAM_STATE_ERROR.
+                //
+                // Neither half was checked. The second let a peer stop a stream
+                // it is the only one allowed to write on; the first is worse,
+                // because `open` *creates* the stream — so a peer could fill
+                // the table with identifiers this endpoint never opened, up to
+                // `streams_max`, using a frame that names them.
                 .stop_sending => |value| {
+                    if (!self.streams.weMaySend(value.stream)) return error.StreamState;
+                    if (self.streams.find(value.stream) == null and
+                        stream_id.kindOf(value.stream).initiator() == self.side)
+                    {
+                        return error.StreamState;
+                    }
                     const stream = self.streams.open(value.stream) catch |err| return streamError(err);
                     stream.send_state = .reset;
                     stream.reset_code = @intFromEnum(value.code);
@@ -1215,12 +1287,11 @@ pub fn Connection(comptime config: Config) type {
         fn receiveHandshakeDone(self: *Self) ReceiveError!void {
             if (self.side == .server) return error.Protocol;
             assert(self.side == .client);
-            self.state = .established;
-            self.recovery.handshake_confirmed = true;
-            //= https://www.rfc-editor.org/rfc/rfc9001#section-4.9.2
-            //# An endpoint MUST discard its Handshake keys when the TLS handshake is
-            //# confirmed (Section 4.1.2).
-            self.discard(.handshake);
+            // Section 4.1.2: "At the client, the handshake is considered
+            // confirmed when a HANDSHAKE_DONE frame is received." A server
+            // reaches the same door through `confirmHandshake`, which its
+            // consumer calls — see there for why it cannot be inferred here.
+            self.confirmHandshake();
             assert(self.recovery.handshake_confirmed);
         }
 
@@ -1421,8 +1492,11 @@ pub fn Connection(comptime config: Config) type {
             //# An endpoint SHOULD include multiple frames in a single packet if they
             //# are to be sent at the same encryption level, instead of coalescing
             //# multiple packets at the same encryption level.
+            var initial_ack_eliciting = false;
             for ([_]Level{ .initial, .handshake, .one_rtt }) |level| {
-                offset += self.sendPacket(buffer[offset..limit], level, now_ns) catch 0;
+                var eliciting = false;
+                offset += self.sendPacket(buffer[offset..limit], level, now_ns, &eliciting) catch 0;
+                if (level == .initial and eliciting) initial_ack_eliciting = true;
             }
             if (offset == 0) return 0;
 
@@ -1437,18 +1511,26 @@ pub fn Connection(comptime config: Config) type {
             //# size of 1200 bytes by adding PADDING frames to the Initial packet or
             //# by coalescing the Initial packet; see Section 12.2.
             //
-            // Only the client half. A server's Initial carrying CRYPTO is
-            // ack-eliciting and is sent short, and the test below
-            // ("the server's reply completes the Initial exchange in both
-            // directions") asserts that it is — so the assertion is the
-            // requirement's opposite, which is the shape section 1 of
-            // docs/VERIFICATION.md calls a test that asserts the bug.
             //= https://www.rfc-editor.org/rfc/rfc9000#section-14.1
             //# Similarly, a server MUST expand the payload of all UDP
             //# datagrams carrying ack-eliciting Initial packets to at least the
             //# smallest allowed maximum datagram size of 1200 bytes.
-            //= type=todo
-            if (self.side == .client and self.send_keys[@intFromEnum(Level.initial)] != null) {
+            //
+            // The server's half, which was a `todo` here and — worse — was
+            // asserted the other way by a test that called the floor "the
+            // client's obligation". Both halves now run through the same
+            // padding, gated on what each side actually owes: a client pads
+            // every datagram carrying an Initial, a server only those carrying
+            // an *ack-eliciting* Initial, because a bare ACK from a server
+            // neither probes the path nor needs to.
+            //
+            // Padding past `limit` is not possible and that is correct: for an
+            // unvalidated server `limit` is section 8.1's three-times budget,
+            // and section 14.1 does not license exceeding it.
+            const owes_padding = (self.side == .client and
+                self.send_keys[@intFromEnum(Level.initial)] != null) or
+                initial_ack_eliciting;
+            if (owes_padding) {
                 if (offset < initial_datagram_min and limit >= initial_datagram_min) {
                     @memset(buffer[offset..initial_datagram_min], 0);
                     offset = initial_datagram_min;
@@ -1554,7 +1636,7 @@ pub fn Connection(comptime config: Config) type {
 
         /// One packet at one level, or `error.Empty` when the level has nothing
         /// to say.
-        fn sendPacket(self: *Self, buffer: []u8, level: Level, now_ns: u64) !usize {
+        fn sendPacket(self: *Self, buffer: []u8, level: Level, now_ns: u64, ack_eliciting_out: *bool) !usize {
             const index = @intFromEnum(level);
             const keys = self.send_keys[index] orelse return error.Empty;
             const space = &self.spaces[@intFromEnum(level.space())];
@@ -1713,6 +1795,7 @@ pub fn Connection(comptime config: Config) type {
             // Consumed after the seal rather than before it, so a packet that
             // failed to seal has not spent the credit that would have let the
             // next one through.
+            ack_eliciting_out.* = written.ack_eliciting;
             if (written.ack_eliciting and space.probes_pending > 0) {
                 space.probes_pending -= 1;
             }
@@ -2244,8 +2327,20 @@ test "the server's reply completes the Initial exchange in both directions" {
     try server.cryptoIn(.initial, "ServerHello");
     const octets = try deliver(&server, &client, 1000);
     try testing.expect(octets > 0);
-    // A server does not pad: section 14.1's floor is the client's obligation.
-    try testing.expect(octets < initial_datagram_min);
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-14.1
+    //# Similarly, a server MUST expand the payload of all UDP
+    //# datagrams carrying ack-eliciting Initial packets to at least the
+    //# smallest allowed maximum datagram size of 1200 bytes.
+    //= type=test
+    //
+    // This line read `try testing.expect(octets < initial_datagram_min)`, with
+    // the comment "a server does not pad: section 14.1's floor is the client's
+    // obligation". Section 14.1 says the opposite in the sentence quoted above,
+    // so the test was not merely silent about the requirement — it defended its
+    // absence, which is the shape docs/VERIFICATION.md section 1 calls a test
+    // that asserts the bug. This server's Initial carries CRYPTO and is
+    // therefore ack-eliciting, so it is padded.
+    try testing.expect(octets >= initial_datagram_min);
     try testing.expectEqualStrings("ServerHello", client.cryptoOut(.initial));
 
     // The server's packet carried an ACK for the client's Initial, which is
@@ -3207,7 +3302,26 @@ test "section 7.2: a client's source connection id is fixed for the connection" 
     var datagram: [TestConnection.datagram_octets]u8 = @splat(0);
     const octets = try impostor.send(&datagram, 1000);
 
-    try testing.expectError(error.Protocol, server.receive(datagram[0..octets], 1000));
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-7.2
+    //# Any further changes to the Destination Connection ID are only
+    //# permitted if the values are taken from NEW_CONNECTION_ID frames; if
+    //# subsequent Initial packets include a different Source Connection ID,
+    //# they MUST be discarded.
+    //= type=test
+    //
+    // Discarded, and the connection carries on. This asserted `error.Protocol`
+    // — a connection error — which reads like the stricter, safer answer and is
+    // the opposite: closing hands the off-path observer exactly what it wants,
+    // since one forged Initial then ends a connection it could otherwise only
+    // watch. The RFC's remedy costs the attacker everything.
+    try server.receive(datagram[0..octets], 1000);
+    try testing.expectEqualSlices(u8, &client_source, server.destination.bytes());
+    try testing.expect(server.state != .closing);
+    try testing.expect(server.state != .draining);
+
+    // And the real client is still heard.
+    try client.cryptoIn(.initial, "more");
+    _ = try deliver(&client, &server, 2000);
     try testing.expectEqualSlices(u8, &client_source, server.destination.bytes());
 }
 
@@ -3407,4 +3521,102 @@ test "RFC 9002 section 6.2.4: a probe carrying data still spends its credit" {
     try testing.expect(octets > 0);
     try testing.expectEqual(@as(u8, 1), space.probes_pending);
     _ = &server;
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9001#section-4.9.2
+//# An endpoint MUST discard its Handshake keys when the TLS handshake is
+//# confirmed (Section 4.1.2).
+//= type=test
+test "RFC 9001 section 4.9.2: a server discards its Handshake keys on confirmation" {
+    // The client did this for itself on HANDSHAKE_DONE and the server did it
+    // never, so a server's Handshake keys and Handshake packet number space
+    // stayed live for the whole connection. It cannot be inferred from
+    // installing 1-RTT send keys: at that moment the server has sent its own
+    // Finished and still needs Handshake keys to read the client's.
+    var client = testClient();
+    var server = testServer();
+    try client.cryptoIn(.initial, "ClientHello");
+    _ = try deliver(&client, &server, 0);
+    try installBoth(&server, &client, .handshake, 0x11);
+    try installBoth(&client, &server, .handshake, 0x22);
+    try installBoth(&server, &client, .one_rtt, 0x33);
+    try installBoth(&client, &server, .one_rtt, 0x44);
+
+    // Still live: the client's Finished has not been processed yet.
+    try testing.expect(server.send_keys[@intFromEnum(Level.handshake)] != null);
+    try testing.expect(!server.spaces[@intFromEnum(Space.handshake)].discarded);
+
+    server.confirmHandshake();
+    try testing.expect(server.send_keys[@intFromEnum(Level.handshake)] == null);
+    try testing.expect(server.receive_keys[@intFromEnum(Level.handshake)] == null);
+    try testing.expect(server.spaces[@intFromEnum(Space.handshake)].discarded);
+    try testing.expectEqual(State.established, server.state);
+
+    // Idempotent: a consumer that calls it twice, or a client that already
+    // discarded on HANDSHAKE_DONE, must not discard a space twice.
+    server.confirmHandshake();
+    try testing.expect(server.spaces[@intFromEnum(Space.handshake)].discarded);
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9000#section-19.7
+//# Clients MUST NOT send NEW_TOKEN frames.  A server MUST treat receipt
+//# of a NEW_TOKEN frame as a connection error of type
+//# PROTOCOL_VIOLATION.
+//= type=test
+test "section 19.7: a server refuses NEW_TOKEN" {
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+
+    var payload: [64]u8 = @splat(0);
+    const written = try frame.encode(&payload, .{ .new_token = .{ .token = "tok" } });
+    try testing.expectError(
+        error.Protocol,
+        server.receiveFrames(.one_rtt, payload[0..written], 1000),
+    );
+    // A client has no rule to break here, so it keeps ignoring the frame.
+    _ = try client.receiveFrames(.one_rtt, payload[0..written], 1000);
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9000#section-19.5
+//# Receiving a STOP_SENDING frame for a
+//# locally initiated stream that has not yet been created MUST be
+//# treated as a connection error of type STREAM_STATE_ERROR.  An
+//# endpoint that receives a STOP_SENDING frame for a receive-only stream
+//# MUST terminate the connection with error STREAM_STATE_ERROR.
+//= type=test
+test "section 19.5: STOP_SENDING may not create a stream or stop a read-only one" {
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+
+    // A stream the *client* would initiate, which the client has not opened.
+    // `open` used to create it, so a peer could fill the table with
+    // identifiers this endpoint never opened.
+    const uncreated = stream_id.make(.client_bidirectional, 3);
+    var payload: [64]u8 = @splat(0);
+    var written = try frame.encode(&payload, .{ .stop_sending = .{
+        .stream = uncreated,
+        .code = @enumFromInt(0),
+    } });
+    try testing.expectError(
+        error.StreamState,
+        client.receiveFrames(.one_rtt, payload[0..written], 1000),
+    );
+    try testing.expect(client.findStream(uncreated) == null);
+
+    // And a stream this endpoint may only read from: the peer is the only one
+    // allowed to write on it, so asking us to stop is meaningless.
+    var other = testClient();
+    var peer = testServer();
+    try established(&other, &peer);
+    const theirs = stream_id.make(.server_unidirectional, 0);
+    written = try frame.encode(&payload, .{ .stop_sending = .{
+        .stream = theirs,
+        .code = @enumFromInt(0),
+    } });
+    try testing.expectError(
+        error.StreamState,
+        other.receiveFrames(.one_rtt, payload[0..written], 1000),
+    );
 }

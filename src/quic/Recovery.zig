@@ -36,6 +36,7 @@ const std = @import("std");
 const assert = @import("../assert.zig").assert;
 const frame = @import("frame.zig");
 const packet_number = @import("packet_number.zig");
+const varint = @import("../varint.zig");
 
 const Space = packet_number.Space;
 const Side = @import("crypto.zig").Side;
@@ -226,6 +227,19 @@ pub fn Recovery(comptime config: Config) type {
         //= reason=section 5.2's optional reestablishment is not implemented, so there is no refresh whose frequency could be wrong
         min_rtt: u64 = 0,
         has_rtt_sample: bool = false,
+        //= https://www.rfc-editor.org/rfc/rfc9002#appendix-A.7
+        //# if (first_rtt_sample == 0):
+        //#   min_rtt = latest_rtt
+        //#   smoothed_rtt = latest_rtt
+        //#   rttvar = latest_rtt / 2
+        //#   first_rtt_sample = now()
+        //#   return
+        /// When the first RTT sample was taken. Appendix B.8 builds its
+        /// persistent-congestion candidate set from lost packets sent *after*
+        /// this, and nothing tracked it — so a packet sent before any RTT was
+        /// ever measured could widen the span and collapse the window on a
+        /// duration the RFC would not count.
+        first_rtt_sample_ns: u64 = 0,
         pto_count: u32 = 0,
 
         // --- Section B.2's variables.
@@ -380,7 +394,7 @@ pub fn Recovery(comptime config: Config) type {
                 if (one.ack_eliciting) includes_ack_eliciting = true;
             }
             if (largest.number == ack.largest and includes_ack_eliciting) {
-                self.updateRtt(now_ns - largest.time_sent, ack_delay_ns);
+                self.updateRtt(now_ns - largest.time_sent, ack_delay_ns, now_ns);
                 result.rtt_sampled = true;
             }
 
@@ -391,7 +405,7 @@ pub fn Recovery(comptime config: Config) type {
             // window an eighth too wide after every loss event — which is a
             // sender that is quietly unfair to everything else on the path, and
             // which no crash would ever reveal.
-            result.lost = self.detectAndRemoveLostPackets(space, now_ns, lost);
+            result.lost = self.detectAndRemoveLostPackets(space, now_ns, lost, acked[0..@min(result.acked, acked.len)]);
             // Section B.5, one call per acknowledged packet, and after loss
             // detection so a packet sent before a recovery period does not grow
             // the window that loss just halved.
@@ -494,7 +508,7 @@ pub fn Recovery(comptime config: Config) type {
             return self.spaces[@intFromEnum(Space.handshake)].largest_acked != null;
         }
 
-        fn updateRtt(self: *Self, sample: u64, ack_delay_ns: u64) void {
+        fn updateRtt(self: *Self, sample: u64, ack_delay_ns: u64, now_ns: u64) void {
             // A sample is an elapsed time computed by the caller from two of
             // its own timestamps, so a zero is a clock that did not move rather
             // than a packet that arrived before it left.
@@ -507,6 +521,7 @@ pub fn Recovery(comptime config: Config) type {
             //# min_rtt MUST be set to the lesser of min_rtt and latest_rtt
             //# (Section 5.1) on all other samples.
             if (!self.has_rtt_sample) {
+                self.first_rtt_sample_ns = now_ns;
                 self.min_rtt = sample;
                 self.smoothed_rtt = sample;
                 self.rttvar = sample / 2;
@@ -592,7 +607,13 @@ pub fn Recovery(comptime config: Config) type {
         //= https://www.rfc-editor.org/rfc/rfc9002#section-7.4
         //# Endpoints MUST NOT ignore the loss of packets that were sent after
         //# the earliest acknowledged packet in a given packet number space.
-        fn detectAndRemoveLostPackets(self: *Self, space: Space, now_ns: u64, lost: []Context) u32 {
+        fn detectAndRemoveLostPackets(
+            self: *Self,
+            space: Space,
+            now_ns: u64,
+            lost: []Context,
+            acked: []const AckedPacket,
+        ) u32 {
             const state = &self.spaces[@intFromEnum(space)];
             const largest_acked = state.largest_acked orelse return 0;
             state.loss_time = null;
@@ -647,11 +668,28 @@ pub fn Recovery(comptime config: Config) type {
                     if (largest_lost == null or packet.number > largest_lost.?.number) largest_lost = packet;
                 }
                 if (packet.ack_eliciting) {
-                    if (earliest_eliciting == null or packet.time_sent < earliest_eliciting.?) {
-                        earliest_eliciting = packet.time_sent;
-                    }
-                    if (latest_eliciting == null or packet.time_sent > latest_eliciting.?) {
-                        latest_eliciting = packet.time_sent;
+                    //= https://www.rfc-editor.org/rfc/rfc9002#appendix-A.10
+                    //# // Only consider packets sent after getting an RTT sample.
+                    //# if (first_rtt_sample == 0):
+                    //#   return
+                    //# pc_lost = []
+                    //# for lost in lost_packets:
+                    //#   if lost.time_sent > first_rtt_sample:
+                    //#     pc_lost.insert(lost)
+                    //
+                    // The filter appendix B.8 applies and this did not. A packet
+                    // sent before the first RTT sample says nothing about a
+                    // duration measured in RTTs, and letting one set the
+                    // earliest end of the span stretches it across the whole
+                    // handshake — collapsing the window on a period the RFC
+                    // never counted.
+                    if (packet.time_sent > self.first_rtt_sample_ns) {
+                        if (earliest_eliciting == null or packet.time_sent < earliest_eliciting.?) {
+                            earliest_eliciting = packet.time_sent;
+                        }
+                        if (latest_eliciting == null or packet.time_sent > latest_eliciting.?) {
+                            latest_eliciting = packet.time_sent;
+                        }
                     }
                 }
                 if (count < lost.len) lost[count] = packet.context;
@@ -666,7 +704,21 @@ pub fn Recovery(comptime config: Config) type {
                 // window collapses to the floor rather than halving, and the
                 // recovery period is cleared so the next delivery can grow it
                 // again from there.
-                if (self.inPersistentCongestion(earliest_eliciting, latest_eliciting)) {
+                //= https://www.rfc-editor.org/rfc/rfc9002#section-7.6.2
+                //# *  across all packet number spaces, none of the packets sent between
+                //#    the send times of these two packets are acknowledged;
+                //
+                // The second of section 7.6.2's three conditions, which was
+                // unchecked. `removeAcked` runs before this in the same
+                // `onAckReceived`, so a packet acknowledged by this very frame
+                // and sent between the two lost ones is already gone from
+                // `sent` — persistent congestion was declared over a span the
+                // peer had just proved was not a blackhole. The newly
+                // acknowledged set is passed down so the question can be asked
+                // of the packets that answered it.
+                if (self.acknowledgedBetween(acked, earliest_eliciting, latest_eliciting)) {
+                    // Something got through: this is congestion, not a dead path.
+                } else if (self.inPersistentCongestion(earliest_eliciting, latest_eliciting)) {
                     self.congestion_window = minimum_window;
                     self.congestion_recovery_start_time = null;
                 }
@@ -749,6 +801,18 @@ pub fn Recovery(comptime config: Config) type {
         //# number spaces.
         //= type=exception
         //= reason=section 7.6.2's own MAY: send times are compared only within the acknowledged space, which can miss a persistent congestion event but never invent one
+        /// Whether any newly acknowledged packet was sent strictly between the
+        /// two lost ones, which is section 7.6.2's second condition.
+        fn acknowledgedBetween(self: *const Self, acked: []const AckedPacket, earliest: ?u64, latest: ?u64) bool {
+            _ = self;
+            const from = earliest orelse return false;
+            const to = latest orelse return false;
+            for (acked) |one| {
+                if (one.time_sent > from and one.time_sent < to) return true;
+            }
+            return false;
+        }
+
         fn inPersistentCongestion(self: *const Self, earliest: ?u64, latest: ?u64) bool {
             //= https://www.rfc-editor.org/rfc/rfc9002#section-7.6.2
             //# The persistent congestion period SHOULD NOT start until there is at
@@ -999,7 +1063,7 @@ pub fn Recovery(comptime config: Config) type {
                 }
             }
             if (earliest_space) |space| {
-                const count = self.detectAndRemoveLostPackets(space, now_ns, lost);
+                const count = self.detectAndRemoveLostPackets(space, now_ns, lost, &.{});
                 return .{ .lost = count };
             }
 
@@ -1577,4 +1641,86 @@ test "appendix A.7: a client keeps its PTO backoff until the server is validated
     try server.onPacketSent(.initial, sentPacket(0, 0));
     _ = try server.onAckReceived(.initial, ackOf(0, 0), 0, 100 * ms, &lost);
     try testing.expectEqual(@as(u32, 0), server.pto_count);
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9002#section-7.6.2
+//# *  across all packet number spaces, none of the packets sent between
+//#    the send times of these two packets are acknowledged;
+//= type=test
+test "section 7.6.2: something getting through is not a dead path" {
+    var recovery: TestRecovery = .{};
+    var lost: [16]u64 = undefined;
+
+    try recovery.onPacketSent(.initial, sentPacket(0, 0));
+    _ = try recovery.onAckReceived(.initial, ackOf(0, 0), 0, 100 * ms, &lost);
+
+    // Two ack-eliciting packets far enough apart to be persistent congestion,
+    // and one *between* them that this very ACK acknowledges. Section 7.6.2's
+    // second condition says that is congestion, not a blackhole — the peer just
+    // proved the path carries traffic.
+    try recovery.onPacketSent(.initial, sentPacket(1, 200 * ms));
+    try recovery.onPacketSent(.initial, sentPacket(2, 1000 * ms));
+    try recovery.onPacketSent(.initial, sentPacket(3, 2000 * ms));
+    try recovery.onPacketSent(.initial, sentPacket(4, 2100 * ms));
+
+    // Acknowledge 2 and 4, losing 1 and 3.
+    var ranges: [8]u8 = undefined;
+    var octets: usize = 0;
+    octets += try varint.encode(ranges[octets..], 0);
+    octets += try varint.encode(ranges[octets..], 0);
+    _ = try recovery.onAckReceived(.initial, .{
+        .largest = 4,
+        .delay = 0,
+        .first_range = 0,
+        .range_count = 1,
+        .ranges = ranges[0..octets],
+        .ecn = null,
+    }, 0, 2200 * ms, &lost);
+
+    // Halved rather than collapsed: packet 2 landed between the two lost ones.
+    //
+    // Asserted on the recovery period rather than on the window, because the
+    // window is ambiguous here for the reason appendix A.7 gives: persistent
+    // congestion sets the window to the floor *and clears the period*, and the
+    // acknowledgement that follows then grows the floor by one packet — so
+    // `window > 2 * 1200` is true either way. `congestion_recovery_start_time`
+    // is not: a collapse clears it, an ordinary halving sets it to now.
+    try testing.expect(recovery.congestion_recovery_start_time != null);
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9002#appendix-A.10
+//# // Only consider packets sent after getting an RTT sample.
+//# if (first_rtt_sample == 0):
+//#   return
+//= type=test
+test "appendix B.8: a packet sent before the first RTT sample cannot widen the span" {
+    var recovery: TestRecovery = .{};
+    var lost: [16]u64 = undefined;
+
+    // The old packet lives in the Initial space and is never acknowledged, so
+    // nothing there runs loss detection over it until the very end. The first
+    // RTT sample is taken in the Handshake space instead — `first_rtt_sample`
+    // is a property of the connection, not of a space.
+    //
+    // Written this way on the second attempt. The first put both in one space,
+    // where the old packet was declared lost by the very first acknowledgement
+    // and was gone long before the event under test — so the test passed with
+    // the filter removed, which is a test that proves nothing.
+    try recovery.onPacketSent(.initial, sentPacket(0, 0));
+
+    try recovery.onPacketSent(.handshake, sentPacket(0, 2900 * ms));
+    _ = try recovery.onAckReceived(.handshake, ackOf(0, 0), 0, 3000 * ms, &lost);
+    try testing.expect(recovery.has_rtt_sample);
+    try testing.expectEqual(@as(u64, 3000 * ms), recovery.first_rtt_sample_ns);
+
+    // Now an Initial loss event long after. Packet 0 was sent at zero, before
+    // any RTT was measured; appendix B.8 excludes it from the span, leaving
+    // only packet 1 — and one packet is not two, so there is no persistent
+    // congestion. Without the filter the span runs 0 to 3100 ms and collapses
+    // the window on a period that predates every measurement.
+    try recovery.onPacketSent(.initial, sentPacket(1, 3100 * ms));
+    try recovery.onPacketSent(.initial, sentPacket(2, 3200 * ms));
+    const result = try recovery.onAckReceived(.initial, ackOf(2, 0), 0, 3300 * ms, &lost);
+    try testing.expect(result.lost >= 2);
+    try testing.expect(recovery.congestion_recovery_start_time != null);
 }

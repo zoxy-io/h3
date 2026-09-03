@@ -252,7 +252,7 @@ pub fn Streams(comptime config: Config) type {
         }
 
         /// And the mirror: whether this endpoint may write on it.
-        fn weMaySend(self: *const Self, id: u64) bool {
+        pub fn weMaySend(self: *const Self, id: u64) bool {
             return stream_id.sendable(id, self.side);
         }
 
