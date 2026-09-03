@@ -489,12 +489,26 @@ capacity-zero encodings from every contributor and diff against the source
 exactly what those files exercise — and it is the only evidence in this
 document that comes from outside the project.
 
-The argument for doing it before the rest of §5.5 is a defect this package
-already had: `field_line.iterate` refused a field section whose Required Insert
-Count was zero but whose Base was not, which RFC 9204 §4.5.1.2 explicitly
-permits. Every internal test agreed with the decoder because every internal
-test was fed by this package's own encoder, which never produces that shape. A
-corpus of ten other encoders is precisely the thing that disagrees.
+**Done**, and the result corrects the argument that justified it. It was
+proposed on the strength of a defect it does not catch: `field_line.iterate`
+refused a section whose Required Insert Count was zero and whose Base was not,
+and the reasoning was that other encoders produce shapes this package's own
+never does. They do — but not that one. All four emit a prefix of `00 00` at
+capacity zero, because a zero Delta Base is what §4.5.1.2 calls "one of the
+most efficient encodings". Reverting the fix leaves the corpus green.
+
+What it does prove: 144 field sections from four implementations decode to
+exactly the fields those implementations were handed, and all eight vendored
+files differ octet for octet from what `field_line.encode` emits for the same
+input. Indexed against literal, which names get Huffman coding, where a
+static-table reference is preferred — those choices are theirs, and the decoder
+handles them.
+
+The general lesson, which applies to the interop shim below: **a corpus
+disagrees with you only where its producers had a reason to differ.**
+Capacity-zero QPACK leaves an encoder very little room, so it is strong
+evidence about representation and none at all about the prefix. Choosing
+external evidence means choosing which disagreements are possible.
 
 ### 5.6 Structure — only if rewriting anyway
 
