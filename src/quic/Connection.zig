@@ -981,14 +981,59 @@ pub fn Connection(comptime config: Config) type {
                     self.close_is_application = value.application;
                     // Section 10.2.2: a receiver enters draining and sends
                     // nothing further but a single close of its own.
+                    //= https://www.rfc-editor.org/rfc/rfc9000#section-10.2.2
+                    //# An endpoint that receives a CONNECTION_CLOSE frame MAY send a single
+                    //# packet containing a CONNECTION_CLOSE frame before entering the
+                    //# draining state, using a NO_ERROR code if appropriate.  An endpoint
+                    //# MUST NOT send further packets.
                     self.state = .draining;
                 },
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-9
+                //# An endpoint MUST
+                //# perform path validation (Section 8.2) if it detects any change to a
+                //# peer's address, unless it has previously validated that address.
+                //= type=exception
+                //= reason=connection migration is out of scope; a connection here has one path and never sees an address change, because the seam of docs/DESIGN.md section 3 takes datagrams rather than sockets. See docs/DESIGN.md section 2 for what this package owns and section 6 for what it does not.
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-8.2.2
+                //# On receiving a PATH_CHALLENGE frame, an endpoint MUST respond by
+                //# echoing the data contained in the PATH_CHALLENGE frame in a
+                //# PATH_RESPONSE frame.
+                //= type=exception
+                //= reason=path validation belongs to migration, which is out of scope; see docs/DESIGN.md section 2 and section 6. PATH_CHALLENGE payloads would also need randomness, which docs/DESIGN.md section 3 keeps outside this package.
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-5.1.1
+                //# When an endpoint issues a connection ID, it MUST accept packets that
+                //# carry this connection ID for the duration of the connection or until
+                //# its peer invalidates the connection ID via a RETIRE_CONNECTION_ID
+                //# frame (Section 19.16).
+                //= type=exception
+                //= reason=this endpoint issues exactly one connection identifier, the one in Options.source, and never a second; issuing more is migration's business. See docs/DESIGN.md section 2 and section 6.
                 .new_connection_id, .retire_connection_id, .path_challenge, .path_response => {
                     // Migration is not this slice; the frames parse and are
                     // ignored rather than refused, because they are legal and a
                     // conforming peer may send them.
                 },
+                // Ignored in both directions, and the receive half of that is
+                // wrong: a server is required to refuse the frame outright.
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-19.7
+                //# Clients MUST NOT send NEW_TOKEN frames.  A server MUST treat receipt
+                //# of a NEW_TOKEN frame as a connection error of type
+                //# PROTOCOL_VIOLATION.
+                //= type=todo
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.3
+                //# A server MUST ensure that every NEW_TOKEN frame it sends
+                //# is unique across all clients, with the exception of those sent to
+                //# repair losses of previously sent NEW_TOKEN frames.
+                //= type=exception
+                //= reason=NEW_TOKEN issuance is out of scope; the token is a server's own encrypted state and needs randomness and a clock, neither of which crosses the seam of docs/DESIGN.md section 3. See docs/DESIGN.md section 2.
                 .new_token => {},
+                // Both take `@max`, so a limit that moved backwards under loss
+                // or reordering leaves the send window where it was.
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-4.1
+                //# A sender MUST ignore any MAX_STREAM_DATA or MAX_DATA frames that do
+                //# not increase flow control limits.
                 .max_data => |value| self.streams.setConnectionSendLimit(value.maximum),
                 .max_stream_data => |value| self.streams.setSendLimit(value.stream, value.maximum) catch |err| {
                     return streamError(err);
@@ -1001,18 +1046,48 @@ pub fn Connection(comptime config: Config) type {
                 // never recorded, so a peer permitting two streams while
                 // `streams_max` is sixty-four got as many as the application
                 // asked for and answered with `STREAM_LIMIT_ERROR`.
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-19.11
+                //# MAX_STREAMS frames that do not increase the stream limit MUST be
+                //# ignored.
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-19.11
+                //# An endpoint MUST NOT open more streams than permitted by the current
+                //# stream limit set by its peer.
                 .max_streams => |value| self.streams.setPeerStreamLimit(value.bidirectional, value.maximum),
                 // Section 4.1 and 4.6: the peer says it is blocked. Purely
                 // informational — it is a signal that our advertised limit is
                 // too low, and raising it is what `writePayload` already does
                 // as the application reads.
+                //
+                // The mirror image is missing: this endpoint never *sends* one,
+                // so a peer whose limit is too low learns it only from silence.
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-4.1
+                //# A sender SHOULD send a
+                //# STREAM_DATA_BLOCKED or DATA_BLOCKED frame to indicate to the receiver
+                //# that it has data to write but is blocked by flow control limits.
+                //= type=todo
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-19.14
+                //# A sender SHOULD send a STREAMS_BLOCKED frame (type=0x16 or 0x17) when
+                //# it wishes to open a stream but is unable to do so due to the maximum
+                //# stream limit set by its peer; see Section 19.11.
+                //= type=todo
                 .data_blocked, .stream_data_blocked, .streams_blocked => {},
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-19.8
+                //# An endpoint MUST terminate the connection with error
+                //# STREAM_STATE_ERROR if it receives a STREAM frame for a locally
+                //# initiated stream that has not yet been created, or for a send-only
+                //# stream.
                 .stream => |value| {
                     if (level != .one_rtt and level != .zero_rtt) return error.Protocol;
                     self.streams.receive(value.stream, value.offset, value.data, value.fin) catch |err| {
                         return streamError(err);
                     };
                 },
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-4.5
+                //# The receiver MUST use the final size of the stream to
+                //# account for all bytes sent on the stream in its connection-level flow
+                //# controller.
                 .reset_stream => |value| {
                     self.streams.reset(value.stream, @intFromEnum(value.code), value.final_size) catch |err| {
                         return streamError(err);
@@ -1021,6 +1096,19 @@ pub fn Connection(comptime config: Config) type {
                 // Section 3.5: the peer wants us to stop sending. Recorded as a
                 // reset of our send half; what to tell the application is the
                 // consumer's decision.
+                //
+                // `Streams.open` creates whatever identifier it is handed and
+                // asks nothing about direction, so neither half of the rule
+                // below is enforced here: a STOP_SENDING for a receive-only
+                // stream is accepted, and one for a locally initiated stream
+                // that was never created brings that stream into existence.
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-19.5
+                //# Receiving a STOP_SENDING frame for a
+                //# locally initiated stream that has not yet been created MUST be
+                //# treated as a connection error of type STREAM_STATE_ERROR.  An
+                //# endpoint that receives a STOP_SENDING frame for a receive-only stream
+                //# MUST terminate the connection with error STREAM_STATE_ERROR.
+                //= type=todo
                 .stop_sending => |value| {
                     const stream = self.streams.open(value.stream) catch |err| return streamError(err);
                     stream.send_state = .reset;
@@ -1038,6 +1126,10 @@ pub fn Connection(comptime config: Config) type {
 
             // A peer cannot acknowledge a number we never sent; doing so would
             // move our packet number encoding window somewhere we never were.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-13.1
+            //# An endpoint SHOULD treat receipt of an acknowledgment for a packet it
+            //# did not send as a connection error of type PROTOCOL_VIOLATION, if it
+            //# is able to detect the condition.
             if (value.largest >= space.next) return error.Protocol;
             assert(space.next > 0);
             space.largest_acked = @max(space.largest_acked orelse 0, value.largest);
@@ -1046,6 +1138,10 @@ pub fn Connection(comptime config: Config) type {
             // Section 6.1: a second update waits for an acknowledgement of
             // something sent in the current phase, which is what proves the
             // peer has these keys.
+            //= https://www.rfc-editor.org/rfc/rfc9001#section-6.1
+            //# An endpoint MUST NOT initiate a
+            //# subsequent key update unless it has received an acknowledgment for a
+            //# packet that was sent protected with keys from the current key phase.
             if (level == .one_rtt) self.one_rtt.phase_acknowledged = true;
 
             // Section 13.2.5: the delay is in microseconds, scaled by the
@@ -1083,15 +1179,29 @@ pub fn Connection(comptime config: Config) type {
             assert(frame.Type.crypto.allowedIn(level));
             assert(@intFromEnum(level) < self.levels.len);
             const stream = &self.levels[@intFromEnum(level)];
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-19.6
+            //# The largest offset delivered on a stream -- the sum of the offset and
+            //# data length -- cannot exceed 2^62-1.  Receipt of a frame that exceeds
+            //# this limit MUST be treated as a connection error of type
+            //# FRAME_ENCODING_ERROR or CRYPTO_BUFFER_EXCEEDED.
             stream.received.push(value.offset, value.data) catch |err| return switch (err) {
                 // A CRYPTO stream that outruns its buffer is a resource limit
                 // rather than a peer breaking a rule, and section 7.5 gives it
                 // its own code.
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-7.5
+                //# If an endpoint does not expand its buffer, it MUST close
+                //# the connection with a CRYPTO_BUFFER_EXCEEDED error code.
                 error.BeyondWindow, error.TooFragmented => error.CryptoBufferExceeded,
                 error.Inconsistent, error.FinalSizeViolated => error.Protocol,
             };
         }
 
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-19.20
+        //# A HANDSHAKE_DONE frame can only be sent by the server.  Servers MUST
+        //# NOT send a HANDSHAKE_DONE frame before completing the handshake.  A
+        //# server MUST treat receipt of a HANDSHAKE_DONE frame as a connection
+        //# error of type PROTOCOL_VIOLATION.
+        //
         /// RFC 9001 section 4.1.2: only a server sends HANDSHAKE_DONE, and it
         /// is what confirms the handshake for a client.
         fn receiveHandshakeDone(self: *Self) ReceiveError!void {
@@ -1099,6 +1209,9 @@ pub fn Connection(comptime config: Config) type {
             assert(self.side == .client);
             self.state = .established;
             self.recovery.handshake_confirmed = true;
+            //= https://www.rfc-editor.org/rfc/rfc9001#section-4.9.2
+            //# An endpoint MUST discard its Handshake keys when the TLS handshake is
+            //# confirmed (Section 4.1.2).
             self.discard(.handshake);
             assert(self.recovery.handshake_confirmed);
         }
@@ -1159,6 +1272,15 @@ pub fn Connection(comptime config: Config) type {
             // Section 4.9 of RFC 9001: discarding is one-way. A level whose
             // keys came back would be one where a packet number could repeat,
             // and a repeated number in a space is a repeated AEAD nonce.
+            //
+            // Each level keeps its own CRYPTO buffer and its own send cursor,
+            // so the only thing a discarded level could still have carried is
+            // exactly what this drops with it.
+            //= https://www.rfc-editor.org/rfc/rfc9001#section-4.9
+            //# Though an endpoint might retain older keys, new data MUST be sent at
+            //# the highest currently available encryption level.  Only ACK frames
+            //# and retransmissions of data in CRYPTO frames are sent at a previous
+            //# encryption level.
             assert(level != .one_rtt);
             self.send_keys[@intFromEnum(level)] = null;
             self.receive_keys[@intFromEnum(level)] = null;
@@ -1208,6 +1330,14 @@ pub fn Connection(comptime config: Config) type {
         /// two consumers arm one very differently and neither wants this
         /// package's idea of a timer wheel.
         pub fn timeout(self: *const Self) ?u64 {
+            // Only `Recovery`'s timer is reported. There is no close timer, so
+            // nothing here tells the caller when the closing or draining state
+            // is over — the connection stops answering and the consumer decides
+            // when to let go of it.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-10.2
+            //# These states SHOULD persist for at least three
+            //# times the current PTO interval as defined in [QUIC-RECOVERY].
+            //= type=todo
             if (self.state == .draining) return null;
             return self.recovery.timeoutAt();
         }
@@ -1224,6 +1354,13 @@ pub fn Connection(comptime config: Config) type {
                 // a probe that carries nothing only asks whether the path is
                 // alive. The PING in `writePayload` is the fallback for when
                 // there is no data to resend.
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1
+                //# To
+                //# prevent this deadlock, clients MUST send a packet on a Probe Timeout
+                //# (PTO); see Section 6.2 of [QUIC-RECOVERY].  Specifically, the client
+                //# MUST send an Initial packet in a UDP datagram that contains at least
+                //# 1200 bytes if it does not have Handshake keys, and otherwise send a
+                //# Handshake packet.
                 .probe => |probe| {
                     self.spaces[@intFromEnum(probe.space)].probes_pending = probe.packets;
                     if (self.recovery.earliestContext(probe.space)) |context| {
