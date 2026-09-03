@@ -73,6 +73,12 @@ pub const persistent_congestion_threshold: u64 = 3;
 pub const pto_backoff_shift_max: u6 = 20;
 
 /// Section 7.3.2: what the window is multiplied by on a congestion event.
+//= https://www.rfc-editor.org/rfc/rfc9002#section-7
+//# If a sender uses a different controller than that specified in this
+//# document, the chosen controller MUST conform to the congestion
+//# control guidelines specified in Section 3.1 of [RFC8085].
+//= type=exception
+//= reason=this is section 7's own NewReno, transcribed from appendix B rather than replaced, so the conditional requirement on a different controller does not arise
 pub const loss_reduction_divisor: u64 = 2;
 
 comptime {
@@ -121,6 +127,27 @@ pub fn Recovery(comptime config: Config) type {
     }
 
     // Section B.1: ten datagrams, but never below two and never above 14720.
+    //= https://www.rfc-editor.org/rfc/rfc9002#section-7.2
+    //# Endpoints SHOULD use an initial congestion
+    //# window of ten times the maximum datagram size (max_datagram_size),
+    //# while limiting the window to the larger of 14,720 bytes or twice the
+    //# maximum datagram size.
+    //
+    // `max_datagram_size` is a comptime field of `Config`, so the two
+    // recalculation rules below have no event to fire on: the size is fixed
+    // when the type is instantiated and there is no PMTU discovery here.
+    //= https://www.rfc-editor.org/rfc/rfc9002#section-7.2
+    //# If the maximum datagram size changes during the connection, the
+    //# initial congestion window SHOULD be recalculated with the new size.
+    //= type=exception
+    //= reason=`Config.max_datagram_size` is comptime, so the size cannot change during a connection
+    //
+    //= https://www.rfc-editor.org/rfc/rfc9002#section-7.2
+    //# If the maximum datagram size is decreased in order to complete the
+    //# handshake, the congestion window SHOULD be set to the new initial
+    //# congestion window.
+    //= type=exception
+    //= reason=`Config.max_datagram_size` is comptime and is never decreased to complete a handshake
     const initial_window: u64 = @min(
         10 * @as(u64, config.max_datagram_size),
         @max(14_720, 2 * @as(u64, config.max_datagram_size)),
@@ -271,6 +298,18 @@ pub fn Recovery(comptime config: Config) type {
         /// either. `lost` receives the contexts of packets declared lost, and a
         /// caller that passes a short slice gets the first that fit; `lost` in
         /// the result is the true count.
+        //
+        // `ack.ecn` is decoded by `frame.zig` and is not read here: an
+        // ACK_ECN frame's counts reach this function and are dropped, so a
+        // rising ECN-CE count is not the congestion event section 7.3.1 says
+        // it is. Loss is the only signal this controller responds to.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-19.3
+        //# QUIC implementations MUST properly handle both
+        //# types, and, if they have enabled ECN for packets they send, they
+        //# SHOULD use the information in the ECN section to manage their
+        //# congestion state.
+        //= type=exception
+        //= reason=ECN is a documented gap in docs/DESIGN.md section 6 — the counts are parsed into `frame.Ack.ecn` and dropped — and this endpoint never marks its own packets ECN-Capable, so the conditional half does not arise
         pub fn onAckReceived(
             self: *Self,
             space: Space,
@@ -582,6 +621,20 @@ pub fn Recovery(comptime config: Config) type {
         /// congestion avoidance adding roughly half what it should. Neither
         /// shows up as a failure; it shows up as a connection that is slower
         /// than it should be and a sender whose algorithm is quietly its own.
+        // Section 7.8: an acknowledgement grows the window whether or not the
+        // window was ever full, so a sender starved of application data still
+        // inflates one it never used. Nothing here knows it was starved —
+        // `bytes_in_flight` at *send* time is what would say so.
+        //= https://www.rfc-editor.org/rfc/rfc9002#section-7.8
+        //# When this occurs, the congestion window
+        //# SHOULD NOT be increased in either slow start or congestion avoidance.
+        //= type=todo
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9002#section-7.8
+        //# A sender SHOULD NOT consider itself application limited if it
+        //# would have fully utilized the congestion window without pacing delay.
+        //= type=exception
+        //= reason=nothing here paces, so no pacing delay can make a sender look application limited; pacing is a documented gap in docs/DESIGN.md section 6
         fn onPacketAcked(self: *Self, packet: AckedPacket) void {
             if (!packet.in_flight) return; // Section B.5: an ACK-only packet grows nothing.
             if (self.inCongestionRecovery(packet.time_sent)) return;
@@ -590,7 +643,15 @@ pub fn Recovery(comptime config: Config) type {
                 self.congestion_window += packet.octets;
                 return;
             }
-            // Congestion avoidance: roughly one datagram per round trip.
+            // Congestion avoidance: roughly one datagram per round trip. The
+            // increment is `max_datagram_size * acked / cwnd`, so a full
+            // window's worth of acknowledgements adds one datagram and no more
+            // — the additive half of AIMD, expressed per packet.
+            //= https://www.rfc-editor.org/rfc/rfc9002#section-7.3.3
+            //# A sender in congestion avoidance uses an Additive Increase
+            //# Multiplicative Decrease (AIMD) approach that MUST limit the increase
+            //# to the congestion window to at most one maximum datagram size for
+            //# each congestion window that is acknowledged.
             self.congestion_window += (@as(u64, config.max_datagram_size) * packet.octets) / self.congestion_window;
         }
 
@@ -605,7 +666,30 @@ pub fn Recovery(comptime config: Config) type {
         //# window MUST be reduced to the minimum congestion window
         //# (kMinimumWindow), similar to a TCP sender's response on an RTO
         //# [RFC5681].
+        //
+        // `earliest` and `latest` are collected in `detectAndRemoveLostPackets`
+        // from ack-eliciting packets only, which is the requirement below: a
+        // PADDING-only packet the peer never owed an acknowledgement for says
+        // nothing about how long the path has been silent.
+        //= https://www.rfc-editor.org/rfc/rfc9002#section-7.6.2
+        //# These two packets MUST be ack-eliciting, since a receiver is required
+        //# to acknowledge only ack-eliciting packets within its maximum
+        //# acknowledgment delay; see Section 13.2 of [QUIC-TRANSPORT].
+        //
+        // One space's losses, not every space's: the caller is
+        // `detectAndRemoveLostPackets`, which runs per packet number space, so
+        // the send times compared here are the acknowledged space's alone —
+        // the narrower reading section 7.6.2 explicitly permits.
+        //= https://www.rfc-editor.org/rfc/rfc9002#section-7.6.2
+        //# Since network congestion is not affected by packet number spaces,
+        //# persistent congestion SHOULD consider packets sent across packet
+        //# number spaces.
+        //= type=exception
+        //= reason=section 7.6.2's own MAY: send times are compared only within the acknowledged space, which can miss a persistent congestion event but never invent one
         fn inPersistentCongestion(self: *const Self, earliest: ?u64, latest: ?u64) bool {
+            //= https://www.rfc-editor.org/rfc/rfc9002#section-7.6.2
+            //# The persistent congestion period SHOULD NOT start until there is at
+            //# least one RTT sample.
             if (!self.has_rtt_sample) return false;
             const from = earliest orelse return false;
             const to = latest orelse return false;
@@ -628,17 +712,35 @@ pub fn Recovery(comptime config: Config) type {
         }
 
         /// Section B.6: halve the window, once per recovery period.
+        ///
+        /// Entering a recovery period is also how slow start ends: `ssthresh`
+        /// drops to the halved window and `congestion_window` is set equal to
+        /// it, so the `congestion_window < ssthresh` test in `onPacketAcked`
+        /// answers false from here on.
+        //= https://www.rfc-editor.org/rfc/rfc9002#section-7.3.1
+        //# The sender MUST exit slow start and enter a recovery period when a
+        //# packet is lost or when the ECN-CE count reported by its peer
+        //# increases.
         fn onCongestionEvent(self: *Self, time_sent: u64, now_ns: u64) void {
             // Everything lost in one round trip is one event: reacting to each
             // packet would collapse the window by a factor of two per packet.
             if (self.inCongestionRecovery(time_sent)) return;
             assert(self.congestion_window >= minimum_window);
             self.congestion_recovery_start_time = now_ns;
+            //= https://www.rfc-editor.org/rfc/rfc9002#section-7.3.2
+            //# On entering a recovery period, a sender MUST set the slow start
+            //# threshold to half the value of the congestion window when loss is
+            //# detected.
             self.ssthresh = @max(self.congestion_window / loss_reduction_divisor, minimum_window);
             // Section 7.3.2: the window never goes below two datagrams, or a
             // sender in recovery could not put a packet on the wire to find out
             // that the path came back.
             assert(self.ssthresh >= minimum_window);
+            // Immediately rather than gradually, which is the simplest of the
+            // choices section 7.3.2 offers.
+            //= https://www.rfc-editor.org/rfc/rfc9002#section-7.3.2
+            //# The congestion window MUST be set to the reduced value of
+            //# the slow start threshold before exiting the recovery period.
             self.congestion_window = self.ssthresh;
             assert(self.congestion_window >= minimum_window);
         }
@@ -646,6 +748,44 @@ pub fn Recovery(comptime config: Config) type {
         /// Whether `octets` may go out now. Section 7: a sender is limited by
         /// the congestion window, and probes are exempt because a connection
         /// that cannot probe cannot recover.
+        //= https://www.rfc-editor.org/rfc/rfc9002#section-7
+        //# An endpoint MUST NOT send a packet if it would cause bytes_in_flight
+        //# (see Appendix B.2) to be larger than the congestion window, unless
+        //# the packet is sent on a PTO timer expiration (see Section 6.2) or
+        //# when entering recovery (see Section 7.3.2).
+        //
+        // The exemption is the caller's to take: `Connection.sendPacket` skips
+        // this predicate for an ACK-only packet and for a PTO probe, which is
+        // the only way a probe can leave a full window.
+        //= https://www.rfc-editor.org/rfc/rfc9002#section-7.5
+        //# Probe packets MUST NOT be blocked by the congestion controller.
+        //
+        // Section 7.7: nothing here paces. `canSend` answers yes for as long
+        // as the window has room, so a sender with a full window's worth of
+        // data puts it on the wire back to back. Named as a gap in
+        // docs/DESIGN.md section 6 rather than left to be discovered.
+        //= https://www.rfc-editor.org/rfc/rfc9002#section-7.7
+        //# A sender SHOULD pace sending of all in-flight packets based on input
+        //# from the congestion controller.
+        //= type=exception
+        //= reason=pacing is a documented gap in docs/DESIGN.md section 6: it matters to zoxy more than to zrk and blocks no handshake
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9002#section-7.7
+        //# Senders MUST either use pacing or limit such bursts.
+        //= type=exception
+        //= reason=pacing is a documented gap in docs/DESIGN.md section 6, and no burst limit stands in for it: a burst is bounded only by the congestion window
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9002#section-7.7
+        //# Senders SHOULD limit bursts to the initial congestion window; see
+        //# Section 7.2.
+        //= type=exception
+        //= reason=pacing is a documented gap in docs/DESIGN.md section 6; a grown window is sent in one burst rather than in initial-window-sized ones
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9002#section-7.7
+        //# To avoid delaying their delivery to the peer, packets
+        //# containing only ACK frames SHOULD therefore not be paced.
+        //= type=exception
+        //= reason=nothing is paced, so an ACK-only packet cannot be delayed by a pacer; pacing is a documented gap in docs/DESIGN.md section 6
         pub fn canSend(self: *const Self, octets: u64) bool {
             // Both terms are ours rather than the peer's: `bytes_in_flight` is
             // the sum of what this endpoint sent and has not had acknowledged,
@@ -1025,6 +1165,16 @@ test "a packet still in doubt arms the timer rather than being declared lost" {
     try testing.expectEqual(@as(u64, 0), lost[0]);
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9002#section-7.3.2
+//# On entering a recovery period, a sender MUST set the slow start
+//# threshold to half the value of the congestion window when loss is
+//# detected.
+//= type=test
+//
+//= https://www.rfc-editor.org/rfc/rfc9002#section-7.3.2
+//# The congestion window MUST be set to the reduced value of
+//# the slow start threshold before exiting the recovery period.
+//= type=test
 test "the window halves once per round trip, not once per lost packet" {
     var recovery: TestRecovery = .{};
     var lost: [8]u64 = undefined;
@@ -1075,6 +1225,12 @@ test "bytes in flight follow what is outstanding" {
     try testing.expectEqual(@as(u32, 0), recovery.outstanding(.initial));
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9002#section-7
+//# An endpoint MUST NOT send a packet if it would cause bytes_in_flight
+//# (see Appendix B.2) to be larger than the congestion window, unless
+//# the packet is sent on a PTO timer expiration (see Section 6.2) or
+//# when entering recovery (see Section 7.3.2).
+//= type=test
 test "a full window stops the sender" {
     var recovery: TestRecovery = .{};
     try testing.expect(recovery.canSend(1200));
