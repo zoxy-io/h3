@@ -37,10 +37,36 @@ const varint = @import("varint.zig");
 pub const Type = enum(u64) {
     data = 0x00,
     headers = 0x01,
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.3
+    //# If a CANCEL_PUSH frame is received that
+    //# references a push ID greater than currently allowed on the
+    //# connection, this MUST be treated as a connection error of type
+    //# H3_ID_ERROR.
+    //= type=exception
+    //= reason=server push is not implemented and the push ID a connection currently allows is connection state the HTTP/3 layer docs/DESIGN.md section 6 lists as next would hold
     cancel_push = 0x03,
     settings = 0x04,
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.5
+    //# A server MUST NOT use a push ID that is larger than the client has
+    //# provided in a MAX_PUSH_ID frame (Section 7.2.7).  A client MUST treat
+    //# receipt of a PUSH_PROMISE frame that contains a larger push ID than
+    //# the client has advertised as a connection error of H3_ID_ERROR.
+    //= type=exception
+    //= reason=server push is not implemented; the advertised maximum push ID is connection state the HTTP/3 layer docs/DESIGN.md section 6 lists as next would hold, and this file decodes one frame at a time
     push_promise = 0x05,
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.6
+    //# A client MUST treat receipt of a GOAWAY frame containing a stream ID
+    //# of any other type as a connection error of type H3_ID_ERROR.
+    //= type=exception
+    //= reason=whether GOAWAY's single integer is a stream ID or a push ID depends on the direction, which parseSingleVarint cannot see; the HTTP/3 connection layer docs/DESIGN.md section 6 lists as next is what knows which end it is
     goaway = 0x07,
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.7
+    //# A MAX_PUSH_ID frame cannot reduce the maximum push
+    //# ID; receipt of a MAX_PUSH_ID frame that contains a smaller value than
+    //# previously received MUST be treated as a connection error of type
+    //# H3_ID_ERROR.
+    //= type=exception
+    //= reason=comparing a MAX_PUSH_ID against the one before it needs the previous value, which is connection state the HTTP/3 layer docs/DESIGN.md section 6 lists as next would hold
     max_push_id = 0x0d,
     _,
 
@@ -119,6 +145,14 @@ pub const Type = enum(u64) {
     //# Receipt
     //# of a MAX_PUSH_ID frame on any other stream MUST be treated as a
     //# connection error of type H3_FRAME_UNEXPECTED.
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-4.4
+    //# Once the CONNECT method has completed, only DATA frames are permitted
+    //# to be sent on the stream.  Extension frames MAY be used if
+    //# specifically permitted by the definition of the extension.  Receipt
+    //# of any other known frame type MUST be treated as a connection error
+    //# of type H3_FRAME_UNEXPECTED.
+    //= type=exception
+    //= reason=whether a CONNECT tunnel has been established is per-stream state, and the request/response state machine that would hold it is the HTTP/3 connection layer docs/DESIGN.md section 6 lists as next; this decides by frame type alone
     pub fn allowedOnRequestStream(frame_type: Type) bool {
         return switch (frame_type) {
             .data, .headers, .push_promise => true,

@@ -275,6 +275,22 @@ const te_field_name = "te";
 /// permits the field in.
 const te_permitted_value = "trailers";
 
+//= https://www.rfc-editor.org/rfc/rfc9114#section-4.3.1
+//# To ensure that the HTTP/1.1 request line can be reproduced
+//# accurately, this pseudo-header field MUST be omitted when
+//# translating from an HTTP/1.1 request that has a request target in
+//# a method-specific form; see Section 7.1 of [HTTP].
+//= type=exception
+//= reason=this package never translates a message; docs/DESIGN.md section 3 leaves the HTTP/1.1 side to the consumer, and only a party holding the original request target can know it was in method-specific form
+//= https://www.rfc-editor.org/rfc/rfc9114#section-4.3.1
+//# Clients that
+//# generate HTTP/3 requests directly SHOULD use the :authority
+//# pseudo-header field instead of the Host header field.  An
+//# intermediary that converts an HTTP/3 request to HTTP/1.1 MUST
+//# create a Host field if one is not present in a request by copying
+//# the value of the :authority pseudo-header field.
+//= type=exception
+//= reason=generating a request and converting one to HTTP/1.1 are both the consumer's, per docs/DESIGN.md section 3; fields.zig checks a field section it is handed and creates no field
 const host_field_name = "host";
 const content_length_field_name = "content-length";
 
@@ -533,6 +549,11 @@ pub const MessageValidator = struct {
     /// had to be there, and which had to not be. Separate from `field` because
     /// pseudo-headers may appear in any order among themselves, so a CONNECT
     /// request's `:method` can arrive after the `:path` its presence forbids.
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.2
+    //# Clients MUST NOT
+    //# accept a malformed response.
+    //= type=exception
+    //= reason=accepting or refusing is the consumer's decision, as this file's header says: zoxy must reject and zrk may want to record what it got, so finish() reports and never acts
     pub fn finish(self: *const MessageValidator) Error!void {
         if (self.kind == .trailer) assert(self.seen.count() == 0);
         if (self.method_is_connect) assert(self.kind == .request);
