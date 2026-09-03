@@ -4,3 +4,6 @@
 zig-cache
 zig-out
 zig-pkg
+
+# Agent worktrees: local scratch, never part of the repository.
+.claude/worktrees/
