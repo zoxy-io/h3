@@ -104,6 +104,24 @@ pub const Type = enum(u64) {
         };
     }
 
+    /// Table 3 is where two rules stated elsewhere land: a Handshake packet
+    /// carries only CRYPTO, ACK, PING, PADDING and a transport
+    /// CONNECTION_CLOSE, and an ACK cannot travel at the 0-RTT level because
+    /// there is nothing at that level it could be acknowledging.
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.4
+    //# Endpoints MUST treat receipt of Handshake packets with other frames
+    //# as a connection error of type PROTOCOL_VIOLATION.
+    //
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.3
+    //# An acknowledgment for a 1-RTT packet MUST be carried in a 1-RTT
+    //# packet.
+    // The 0-RTT level is answered for completeness and nothing here ever writes
+    // a packet at it.
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.3
+    //# A client MUST NOT send 0-RTT packets once it starts processing 1-RTT
+    //# packets from the server.
+    //= type=exception
+    //= reason=0-RTT is out of scope; no header is ever written at that level, so no 0-RTT packet leaves this endpoint at any point in the handshake. See docs/DESIGN.md section 2 for what this package owns and section 6 for the list this sits on.
     /// Section 12.4, Table 3: whether this frame may appear at this encryption
     /// level.
     pub fn allowedIn(frame_type: Type, level: @import("crypto.zig").Level) bool {
@@ -1065,6 +1083,14 @@ test "an unknown frame type cannot be skipped" {
 //= https://www.rfc-editor.org/rfc/rfc9000#section-12.4
 //# An endpoint MUST treat receipt of a frame in a packet type that is
 //# not permitted as a connection error of type PROTOCOL_VIOLATION.
+//= type=test
+//= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.4
+//# Endpoints MUST treat receipt of Handshake packets with other frames
+//# as a connection error of type PROTOCOL_VIOLATION.
+//
+//= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.3
+//# An acknowledgment for a 1-RTT packet MUST be carried in a 1-RTT
+//# packet.
 //= type=test
 test "section 12.4 table 3: where a frame is allowed" {
     const Level = @import("crypto.zig").Level;

@@ -86,6 +86,28 @@ comptime {
     assert(max_udp_payload_size_min <= max_udp_payload_size_default);
 }
 
+// Section 18.2's preferred address is decoded and encoded so that a consumer
+// can see what a server offered, and nothing here acts on one: moving to a
+// preferred address is migration, and migration is out of scope. The three
+// rules that constrain the field are that decision.
+//= https://www.rfc-editor.org/rfc/rfc9000#section-18.2
+//# A server that chooses a zero-length connection ID MUST NOT provide a
+//# preferred address.
+//= type=exception
+//= reason=this package never composes a preferred address of its own, because a server here has one address and never moves; see docs/DESIGN.md section 2 for what this package owns and section 6 for migration's place on the not-built list.
+//
+//= https://www.rfc-editor.org/rfc/rfc9000#section-18.2
+//# Similarly, a server MUST NOT include a zero- length connection ID in
+//# this transport parameter.
+//= type=exception
+//= reason=no preferred address is ever sent, so no connection identifier of ours is ever put in one; see docs/DESIGN.md section 2 and section 6.
+//
+//= https://www.rfc-editor.org/rfc/rfc9000#section-18.2
+//# A client MUST treat a violation of these requirements as a
+//# connection error of type TRANSPORT_PARAMETER_ERROR.
+//= type=exception
+//= reason=a received preferred address is decoded and then ignored rather than checked, because a client here never migrates to one; see docs/DESIGN.md section 2 and section 6.
+
 /// Section 18.2's `preferred_address`.
 ///
 /// Addresses are octets and ports are integers, deliberately: `std.net` is
@@ -115,6 +137,12 @@ pub const PreferredAddress = struct {
 pub const Parameters = struct {
     original_destination_connection_id: ?ConnectionId = null,
     max_idle_timeout_ms: u64 = 0,
+    /// Section 18.2's `stateless_reset_token`. Optional rather than defaulted,
+    /// because absent and empty are different answers — and `validate` is what
+    /// refuses one from a client.
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-18.2
+    //# This transport parameter MUST NOT be sent by a client but MAY be
+    //# sent by a server.
     stateless_reset_token: ?[stateless_reset_token_octets]u8 = null,
     max_udp_payload_size: u64 = max_udp_payload_size_default,
     initial_max_data: u64 = 0,
@@ -124,7 +152,23 @@ pub const Parameters = struct {
     initial_max_streams_bidi: u64 = 0,
     initial_max_streams_uni: u64 = 0,
     ack_delay_exponent: u64 = ack_delay_exponent_default,
+    /// Section 18.2's `max_ack_delay`, in milliseconds. What to put in it is
+    /// the consumer's call, because the alarm that would be late is the
+    /// consumer's timer: nothing here reads a clock.
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-18.2
+    //# This value SHOULD include the receiver's expected delays in alarms
+    //# firing.
+    //= type=exception
+    //= reason=this package neither owns a timer nor knows how late its consumer's fires; `now_ns` arrives as a parameter per docs/DESIGN.md section 3, so the margin a receiver should add is the consumer's to choose and this type only carries it.
     max_ack_delay_ms: u64 = max_ack_delay_default,
+    /// Section 18.2's `disable_active_migration`, carried so that a consumer
+    /// can honour it. Honouring it costs nothing here.
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-18.2
+    //# An endpoint that receives this transport parameter MUST NOT use a
+    //# new local address when sending to the address that the peer used
+    //# during the handshake.
+    //= type=exception
+    //= reason=nothing here chooses a local address, or sees one: the seam of docs/DESIGN.md section 3 takes datagrams rather than sockets, so this endpoint never migrates whether or not the peer forbids it. Migration is out of scope per docs/DESIGN.md section 2 and section 6.
     disable_active_migration: bool = false,
     preferred_address: ?PreferredAddress = null,
     active_connection_id_limit: u64 = active_connection_id_limit_default,
@@ -240,6 +284,10 @@ fn apply(parameters: *Parameters, known: Known, value: []const u8) ParseError!vo
         },
         .active_connection_id_limit => {
             const limit = try integer(value, varint.max);
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-18.2
+            //# The value of the active_connection_id_limit parameter MUST be at
+            //# least 2. An endpoint that receives a value less than 2 MUST close
+            //# the connection with an error of type TRANSPORT_PARAMETER_ERROR.
             if (limit < active_connection_id_limit_min) return error.Malformed;
             parameters.active_connection_id_limit = limit;
         },
@@ -297,6 +345,14 @@ pub const ValidateError = error{
 /// Separate from `parse` because the same octets are legal from one side and
 /// not from the other, and a decoder that took a side would be two decoders.
 pub fn validate(parameters: *const Parameters, sender: @import("crypto.zig").Side) ValidateError!void {
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-18.2
+    //# A client MUST NOT include any server-only transport parameter:
+    //# original_destination_connection_id, preferred_address,
+    //# retry_source_connection_id, or stateless_reset_token.
+    //
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-18.2
+    //# A server MUST treat receipt of any of these transport parameters as
+    //# a connection error of type TRANSPORT_PARAMETER_ERROR.
     if (sender == .client) {
         if (parameters.original_destination_connection_id != null) return error.ServerOnlyParameter;
         if (parameters.stateless_reset_token != null) return error.ServerOnlyParameter;
@@ -427,6 +483,11 @@ test "a duplicate identifier is refused rather than resolved" {
     try testing.expectError(error.Malformed, parse(&wire));
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9000#section-18.2
+//# The value of the active_connection_id_limit parameter MUST be at
+//# least 2. An endpoint that receives a value less than 2 MUST close
+//# the connection with an error of type TRANSPORT_PARAMETER_ERROR.
+//= type=test
 test "the ranges section 18.2 states are enforced" {
     // ack_delay_exponent above 20.
     try testing.expectError(error.Malformed, parse(&.{ 0x0a, 0x01, 0x15 }));
@@ -506,6 +567,15 @@ test "a preferred address round-trips with both families" {
     try testing.expectEqualSlices(u8, &.{ 9, 8, 7 }, address.connection_id.bytes());
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9000#section-18.2
+//# A client MUST NOT include any server-only transport parameter:
+//# original_destination_connection_id, preferred_address,
+//# retry_source_connection_id, or stateless_reset_token.
+//
+//= https://www.rfc-editor.org/rfc/rfc9000#section-18.2
+//# A server MUST treat receipt of any of these transport parameters as
+//# a connection error of type TRANSPORT_PARAMETER_ERROR.
+//= type=test
 test "the server-only parameters are refused from a client" {
     var parameters: Parameters = .{ .initial_source_connection_id = try ConnectionId.init(&.{1}) };
     parameters.stateless_reset_token = @splat(0);
