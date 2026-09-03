@@ -57,6 +57,19 @@ pub const granularity_ns: u64 = std.time.ns_per_ms;
 //= https://www.rfc-editor.org/rfc/rfc9002#section-6.2.2
 //# When no previous RTT is available, the initial RTT
 //# SHOULD be set to 333 milliseconds.
+//
+// The other way section 6.2.2 offers to seed this is a path validation
+// exchange, which needs PATH_CHALLENGE and PATH_RESPONSE. Migration is out of
+// scope — see the README and docs/DESIGN.md section 6 — so no such delay ever
+// reaches `updateRtt`, and the prohibition on treating one as a sample has
+// nothing to prohibit.
+//= https://www.rfc-editor.org/rfc/rfc9002#section-6.2.2
+//# A connection MAY use the delay between sending a PATH_CHALLENGE and
+//# receiving a PATH_RESPONSE to set the initial RTT (see kInitialRtt in
+//# Appendix A.2) for a new path, but the delay SHOULD NOT be considered
+//# an RTT sample.
+//= type=exception
+//= reason=connection migration and path validation are out of scope, so there is no PATH_RESPONSE delay to seed an initial RTT from or to mistake for a sample
 pub const initial_rtt_ns: u64 = 333 * std.time.ns_per_ms;
 
 /// Section 7.6: consecutive PTO periods without a delivery that mean the path
@@ -815,6 +828,18 @@ pub fn Recovery(comptime config: Config) type {
         //# acknowledgment for any of its Handshake packets and the handshake is
         //# not confirmed (see Section 4.1.2 of [QUIC-TLS]), even if there are no
         //# packets in flight.
+        //= type=todo
+        //
+        // The server's half of section 6.2.2.1 is missing for the same reason,
+        // and it is the more consequential one: this file holds no
+        // address-validation state, `Connection.timeout` returns `timeoutAt`
+        // unconditionally, and a probe sent under the anti-amplification limit
+        // spends allowance the handshake needs.
+        //= https://www.rfc-editor.org/rfc/rfc9002#section-6.2.2.1
+        //# If
+        //# no additional data can be sent, the server's PTO timer MUST NOT be
+        //# armed until datagrams have been received from the client because
+        //# packets sent on PTO count against the anti-amplification limit.
         //= type=todo
         fn ptoTimeAndSpace(self: *const Self) ?PtoTime {
             // Section 6.2.1: the floor is inside the base rather than applied
