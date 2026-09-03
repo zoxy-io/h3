@@ -333,6 +333,51 @@ pub const Keys = struct {
         return keys;
     }
 
+    // What `nextGeneration` returning a *value* buys, and where it is spent.
+    //
+    // A generation is derived rather than installed: the old `Keys` is
+    // untouched, so retaining it costs a copy and no bookkeeping. That is what
+    // lets `Connection.one_rtt` hold three of them at once —
+    // `previous_receive`, the current pair in `receive_keys`, and
+    // `next_receive` — which is between them the whole of the three rules
+    // below. `Connection.updateKeys` is where they are moved along.
+
+    //= https://www.rfc-editor.org/rfc/rfc9001#section-6.1
+    //# An endpoint SHOULD retain old keys for some time after unprotecting a
+    //# packet sent using the new keys.
+    // Implemented as `Connection.one_rtt.previous_receive`, which the update
+    // fills with the outgoing generation and `openPacket` falls back to when
+    // the current one does not authenticate. How long "some time" lasts is
+    // section 6.5's, and that half is a todo below.
+    //
+    //= https://www.rfc-editor.org/rfc/rfc9001#section-6.3
+    //# Once generated, the next set of packet protection keys SHOULD be
+    //# retained, even if the packet that was received was subsequently
+    //# discarded.
+    //
+    //= https://www.rfc-editor.org/rfc/rfc9001#section-9.5
+    //# After receiving a key update, an endpoint SHOULD generate and save the
+    //# next set of receive packet protection keys, as described in Section
+    //# 6.3.
+    // Both are the same field: `Connection.one_rtt.next_receive` is derived
+    // when the 1-RTT secret is installed and re-derived at the end of every
+    // update, never during the processing of the packet that needs it. That
+    // ordering is the point — deriving on demand would time-stamp the arrival
+    // of a key update and leak the Key Phase bit, which is section 9.5's
+    // reason for asking.
+    //
+    //= https://www.rfc-editor.org/rfc/rfc9001#section-6.5
+    //# Endpoints SHOULD wait three times the PTO before initiating a key
+    //# update after receiving an acknowledgment that confirms that the
+    //# previous key update was received.
+    //= type=todo
+    // `Connection.canUpdateKeys` enforces section 6.1's MUST — the handshake
+    // is confirmed and the current phase is acknowledged — and then permits an
+    // update immediately. The three-PTO wait is the sibling of the retention
+    // deadline already marked a todo in `Connection.updateKeys`, and it is
+    // missing for the same reason: nothing in the key schedule reads `now_ns`,
+    // so there is no clock here to hang either deadline off.
+
     /// A header with its protection removed, and what it says.
     ///
     /// Separated from decryption because RFC 9001 section 6.1 keeps the header

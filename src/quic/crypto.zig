@@ -157,6 +157,41 @@ pub const Secret = secrets.Secret;
 //# endpoints; clients MUST treat them as opaque values.
 //= type=exception
 //= reason=this package issues no session ticket and no NEW_TOKEN frame, so it defines the contents of neither; the address validation token it does carry is copied between packets without being read.
+//
+//= https://www.rfc-editor.org/rfc/rfc9001#section-4.5
+//# Clients SHOULD NOT reuse tickets as that allows entities other than
+//# the server to correlate connections; see Appendix C.4 of [TLS13].
+//= type=exception
+//= reason=a session ticket is a TLS 1.3 NewSessionTicket message, and this package neither stores, offers nor recognises one: resumption state lives on the consumer's side of the seam with the TLS engine that issued it. Declining to reuse a ticket is a decision taken where the ticket is kept. See docs/DESIGN.md section 4.
+//
+//= https://www.rfc-editor.org/rfc/rfc9001#section-8.4
+//# A server SHOULD treat the receipt of a TLS ClientHello with a
+//# non-empty legacy_session_id field as a connection error of type
+//# PROTOCOL_VIOLATION.
+//= type=exception
+//= reason=the ClientHello is never decoded here -- CRYPTO stream octets cross the seam as data -- so `legacy_session_id` is a field only the consumer's TLS engine can read. What crosses back is a connection error, which `Connection.close` carries. See docs/DESIGN.md section 4.
+
+// Keys that have not arrived yet, and what happens to a packet that needs them.
+//
+// The seam of docs/DESIGN.md section 4 means a level's keys appear when the
+// consumer's TLS engine hands over a secret, which can be after a packet
+// protected with them is already in hand. Section 4.1.4 says what to do about
+// that, and this package does one of the two things it asks.
+
+//= https://www.rfc-editor.org/rfc/rfc9001#section-4.1.4
+//# While waiting for TLS processing to complete, an endpoint SHOULD
+//# buffer received packets if they might be processed using keys that are
+//# not yet available.
+//= type=exception
+//= reason=there is nowhere to buffer one: docs/DESIGN.md section 5 makes the package allocation-free, so `Connection` holds no queue of datagrams it cannot yet read and discards a packet whose level has no keys. The cost is a retransmission the peer's loss recovery already covers, not a broken handshake -- which is why this is a trade rather than a gap.
+//
+//= https://www.rfc-editor.org/rfc/rfc9001#section-4.1.4
+//# An endpoint SHOULD continue to respond to packets that can be
+//# processed during this time.
+// The other half, and this one is implemented: each packet of a coalesced
+// datagram is opened at its own level, so one whose keys are missing is
+// discarded on its own and the packets beside it are still processed. A
+// missing key stops one packet rather than the datagram.
 
 // The rule below is implemented in two places and neither half is it alone:
 // keys are chosen by level here, and `Connection.onPacketsLost` rewinds the
@@ -286,6 +321,19 @@ comptime {
 //# application semantics in 0-RTT or provide replay mitigation strategies.
 //= type=exception
 //= reason=a requirement on an application protocol's specification rather than on a QUIC implementation, and moot here: 0-RTT is out of scope and no 0-RTT keys are ever installed. See docs/DESIGN.md section 2.
+//
+//= https://www.rfc-editor.org/rfc/rfc9001#section-4.6.2
+//# When 0-RTT was rejected, a client SHOULD treat receipt of an
+//# acknowledgment for a 0-RTT packet as a connection error of type
+//# PROTOCOL_VIOLATION, if it is able to detect the condition.
+//= type=exception
+//= reason=0-RTT is out of scope: no 0-RTT keys are ever installed, so this endpoint sends no 0-RTT packet and there is no acknowledgment of one for it to detect. See docs/DESIGN.md section 2 for what this package owns and section 6 for the list this sits on.
+//
+//= https://www.rfc-editor.org/rfc/rfc9001#section-5.6
+//# A client SHOULD stop sending 0-RTT data if it receives an indication
+//# that 0-RTT data has been rejected.
+//= type=exception
+//= reason=0-RTT is out of scope: no 0-RTT keys are ever installed, so no 0-RTT data is ever sent and there is nothing to stop. See docs/DESIGN.md section 2 for what this package owns and section 6 for the list this sits on.
 
 /// Which half of the connection a key protects.
 ///

@@ -19,6 +19,13 @@ const std = @import("std");
 const assert = @import("../../assert.zig").assert;
 const crypto = @import("../crypto.zig");
 
+//= https://www.rfc-editor.org/rfc/rfc9001#section-4.7
+//# Although it is in principle possible to use this feature for address
+//# verification, QUIC implementations SHOULD instead use the Retry
+//# feature; see Section 8.1 of [QUIC-TRANSPORT].
+//= type=exception
+//= reason=the choice between HelloRetryRequest and Retry belongs to the endpoint that validates an address, and this package makes neither move: HelloRetryRequest is a TLS handshake message the consumer's engine produces (docs/DESIGN.md section 4), and a server here sends no Retry at all, because issuing one needs a token and so a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 keeps outside. See docs/DESIGN.md section 2 and section 6. What is implemented is the receiving half -- the integrity tag a client checks before honouring a Retry -- which is what makes preferring Retry safe in the first place.
+
 //= https://www.rfc-editor.org/rfc/rfc9001#section-5.8
 //# The secret key, K, is 128 bits equal to
 //# 0xbe0c690b9f66575a1d766b54e368c84e.

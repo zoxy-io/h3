@@ -133,6 +133,11 @@ pub const PreferredAddress = struct {
     }
 };
 
+//= https://www.rfc-editor.org/rfc/rfc9000#section-7.4.1
+//# The applicable subset of transport parameters that permit the sending
+//# of application data SHOULD be set to non-zero values for 0-RTT.
+//= type=exception
+//= reason=0-RTT is out of scope: no early-data key is ever installed, so no packet is ever sent under remembered parameters and there is no resumed set to keep non-zero. `Parameters` is the peer's current values, decoded once per connection, and nothing here stores them across one. See docs/DESIGN.md section 2 and section 6.
 /// Everything section 18.2 defines, with the defaults it assigns.
 pub const Parameters = struct {
     original_destination_connection_id: ?ConnectionId = null,
@@ -186,6 +191,15 @@ pub const ParseError = error{
     Malformed,
 };
 
+//= https://www.rfc-editor.org/rfc/rfc9000#section-7.4
+//# An endpoint SHOULD treat receipt of duplicate transport parameters as
+//# a connection error of type TRANSPORT_PARAMETER_ERROR.
+// Taken at its strongest reading: `seen` below refuses the second copy of any
+// identifier this package understands, and `ParseError.Malformed` is the
+// `TRANSPORT_PARAMETER_ERROR` the caller raises. A SHOULD rather than a MUST
+// because an endpoint could resolve the duplicate instead; resolving it is
+// the option that lets two implementations disagree about which copy counts,
+// which is the shape of a smuggled parameter.
 /// Decode the contents of the `quic_transport_parameters` TLS extension.
 ///
 /// Duplicates are refused rather than last-one-wins: section 18 makes a
