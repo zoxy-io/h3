@@ -870,6 +870,10 @@ test "section 2.2: data at an offset never changes" {
     try testing.expectError(error.Protocol, set.receive(0, 0, "HELLO", false));
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9000#section-2.2
+//# An endpoint MUST NOT send data on any stream without ensuring that it
+//# is within the flow control limits set by its peer.
+//= type=test
 test "writes are bounded by the peer's limits, in both levels" {
     var set = testSet();
     // No limits yet: the peer has offered nothing, so nothing may go out.

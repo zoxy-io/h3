@@ -54,6 +54,18 @@ const Span = struct {
 
 pub const Config = struct {
     /// Octets held at once. This is the stream's flow control window.
+    ///
+    /// It is also the interface below, for the one caller that is a
+    /// cryptographic protocol: `Connection.crypto_octets` builds one of these
+    /// per encryption level, so the consumer whose TLS engine does the
+    /// buffering states the limit at comptime and this window is derived from
+    /// it. There is one number rather than a buffer and a limit that can drift
+    /// apart — see the module comment for why that direction of drift is a
+    /// heap overflow.
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-4
+    //# To avoid excessive buffering at multiple layers, QUIC implementations
+    //# SHOULD provide an interface for the cryptographic protocol
+    //# implementation to communicate its buffering limits.
     capacity: u32,
     /// Distinct received spans tolerated before a peer is refused.
     ///
@@ -365,6 +377,10 @@ test "in-order chunks read back as one run" {
     try testing.expectEqual(@as(u64, 6), stream.readOffset());
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9000#section-2.2
+//# Endpoints MUST be able to deliver stream data to an application as an
+//# ordered byte stream.
+//= type=test
 test "a gap holds everything after it back" {
     var stream: Small = .{};
     try stream.push(6, "world");
