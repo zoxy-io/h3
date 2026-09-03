@@ -76,13 +76,21 @@ requirement list extracted from the specification.
 | Two RFC 9001 §9.5 timing channels: the reserved-bits check ran before the AEAD, and the header mask's trip count was the packet number length | ledger | Not a behavioural property; no assertion over output can see it |
 | The §9.5 fix then reached only the send path, because the receive path inlines its own copy of the loop | ledger, second pass | The fixed half is the half nobody can measure |
 | A CONNECTION_CLOSE reached one encryption level; and a closing endpoint's `wantsSend` disagreed with its `send`, so an event loop polling the pair never sleeps | ledger, and writing the test for it | The close *worked* against a peer that could read that level |
+| `Recovery` reported losses to `Streams` and acknowledgements to nobody, so RFC 9000 §3.1's terminal send states were unreachable and the simulator's loss census was permanently zero | `poll`, section 5.3 | Both halves look complete from inside; nothing asked the connection what had *changed* |
+| A client discarded its Initial keys on *installing* Handshake keys rather than on *sending* a Handshake packet, losing the ACK it owed — the peer then retransmits into §8.1's amplification limit and both endpoints wait | interop shim, first real connection | The rule was quoted verbatim two lines above the code that broke it, and both endpoints are individually correct |
+| The server half of the same rule was absent entirely | interop shim | Nothing tested a server's Initial keys after the handshake moved on |
+| §14.1's padding asked whether the client *had* Initial keys rather than whether the datagram *carried* an Initial packet — a proxy that held only because of the bug above, and that corrupted every 1-RTT packet once it was fixed | interop shim, immediately after fixing the first | One bug was holding another one up; and reverting this fix broke no test until one was written for it |
+| The peer's four flow control limits were parsed and applied to nothing, so a stream opened with a send limit of zero and the first request could never be written | interop shim | `sim/` sends explicit MAX_DATA and MAX_STREAM_DATA, which is what a peer sends *after* the initial limit rather than instead of it |
 
 Two things about that table.
 
-**The ledger found more than the simulator, and neither found what the other
+**Each gate found what the others could not, and no gate found what another
 did.** The simulator finds properties of a connection over time; the ledger
-finds requirements nobody implemented and claims nobody checked. A defect is
-usually visible to exactly one of them.
+finds requirements nobody implemented and claims nobody checked; `poll` found
+the transitions no accessor reports; the interop shim found the four things
+that only a peer written by somebody else can see. A defect is usually visible
+to exactly one of them, which is the argument against ever calling any one of
+them sufficient.
 
 **Six of these were introduced by the same session that fixed the rest**, and
 four were mine. Two stale `type=todo` comments described gaps that had moved,
@@ -501,29 +509,103 @@ accepted. `b9c796d` is the argument for it: two targets spent every run being
 refused at the door, and nothing in the gate output distinguished that from
 coverage.
 
-### 5.5 An interop shim — one to two weeks, needs TLS glue
+### 5.5 An interop shim — **done**
 
-A binary under `interop/`, outside the lint, with a UDP loop and one of the
-organisation's TLS engines, honouring the runner's environment contract. Start
-with `hq-interop`: `handshake`, `transfer`, `retry`, `keyupdate`,
-`amplificationlimit`, `chacha20`, `handshakeloss`, `transferloss`. Add `http3`
-once the control stream lands, then point h3spec at the same binary. This is
-the only gate that catches a shared misreading, and it is why the corpus
-README's "second corpus" line has stayed open.
+`interop/` is the QUIC Interop Runner client: a UDP loop, a TLS 1.3 client
+written for this purpose, and the runner's environment contract. It covers
+`handshake`, `transfer`, `chacha20`, `keyupdate`, `multiconnect`,
+`handshakeloss` and `transferloss` over `hq-interop`, and exits 127 — the
+runner's "unsupported" — for `retry` and `http3`, which are gaps rather than
+failures. `interop/README.md` has the docker recipe that reproduces all of it
+without the network simulator.
 
-**Cheap and immediate, and the next thing to build:** decode qifs's
-capacity-zero encodings from every contributor and diff against the source
-`.qif`. It needs nothing this package does not have — a static-only decoder is
-exactly what those files exercise — and it is the only evidence in this
-document that comes from outside the project.
+**It found four defects on the first connection it completed**, and the shape
+of them is the argument for the whole directory. Every one had passed the unit
+tests, the fuzz corpus and 256 simulator seeds, because every one of those is
+fed by this package.
 
-**Done**, and the result corrects the argument that justified it. It was
-proposed on the strength of a defect it does not catch: `field_line.iterate`
-refused a section whose Required Insert Count was zero and whose Base was not,
-and the reasoning was that other encoders produce shapes this package's own
-never does. They do — but not that one. All four emit a prefix of `00 00` at
-capacity zero, because a zero Delta Base is what §4.5.1.2 calls "one of the
-most efficient encodings". Reverting the fix leaves the corpus green.
+1. **The client discarded its Initial keys one event too early.** RFC 9001
+   §4.9.1 retires them when a client *sends* a Handshake packet;
+   `installSecret` retired them when Handshake keys were *installed*. One
+   datagram of difference, and it deadlocks: a client that has just been handed
+   Handshake keys still owes an ACK for the Initial that carried the
+   ServerHello, and the space it would go out in is gone. The server
+   retransmits an Initial nobody acknowledges, reaches §8.1's three-times
+   amplification limit, and stops. Both endpoints then wait. The rule was
+   quoted verbatim two lines above the code that broke it.
+2. **The server half of the same rule was missing** — a server is supposed to
+   discard Initial keys when it first successfully processes a Handshake
+   packet, and nothing did.
+3. **The padding condition was a proxy that only held because of (1).** §14.1's
+   1200-octet floor applies to a datagram *carrying an Initial packet*; the
+   code asked whether the client still *had* Initial keys. Correcting (1) made
+   the proxy false, and a client began padding datagrams that carried nothing
+   but a 1-RTT packet. A short header runs to the end of the datagram, so the
+   padding landed inside the AEAD's ciphertext and every one of those packets
+   failed to open at the peer — silently, because a packet that does not
+   authenticate is indistinguishable from one that was never sent. One bug was
+   holding another one up.
+4. **The peer's transport parameters were parsed and not applied.**
+   `transportParametersIn` read all four of §4.1's flow control limits and used
+   none of them. A stream therefore opened with a send limit of zero and stayed
+   there: no `MAX_STREAM_DATA` is coming for credit the peer believes it
+   already granted in its extension. The first request on a real connection
+   could not be written.
+
+A fifth is not a defect and is worth as much. `Connection.canUpdateKeys`
+answers §6.1's "has the current phase been acknowledged" and **cannot** answer
+§6.5's "wait three times the PTO", because it reads no clock. Spacing key
+updates in time is therefore the consumer's, and `interop/` learned it by
+being wrong: over loopback the octet threshold alone fired a second update
+about one round trip after the first. quic-go and aioquic both accepted it;
+ngtcp2 stopped answering. **Two implementations agreeing with us was not
+evidence that we were right** — which is this section's whole thesis, arriving
+as a bug in the thing built to test the thesis.
+
+Why `sim/` could not have found any of the four: its handshake installs both
+sides' secrets in the same step, so the ACK a client owes is never the only
+thing keeping the peer alive; and its endpoints exchange explicit `MAX_DATA`
+and `MAX_STREAM_DATA`, which is what a peer sends *after* the initial limit
+rather than instead of it. A simulator built from the same reading as the
+library simulates the reading, not the protocol.
+
+One of the four also shows why a fix needs its own revert-check. Three of the
+four failed a test the moment their fix was reverted; **(3) did not**, and
+nothing in the tree noticed. The test that catches it had to be written
+afterwards, and it is the one that asserts a datagram carrying no Initial
+packet stays under 1200 octets.
+
+Verified against three independent implementations — quic-go, ngtcp2 and
+aioquic — at five test cases each, transferring a megabyte byte for byte, with
+all four TLS secrets matching each server's own key log exactly.
+
+What is left here:
+
+- **`retry`**, which needs client-side Retry handling in `src/`: re-sending the
+  Initial under the new Destination Connection ID, carrying the token, and
+  checking `retry_source_connection_id`.
+- **`http3`**, which needs the control stream and the settings exchange, and
+  then h3spec pointed at the same binary.
+- **A server role**, which needs a certificate, a Retry token and address
+  validation.
+- **Running it in the real runner**, inside the network simulator, so that
+  `handshakeloss` and `transferloss` are run against the loss the runner
+  injects rather than against a loopback that drops nothing.
+
+#### The other outside evidence: `corpus/qifs.zig` — **done**
+
+The cheap half, and it landed first. It decodes qifs's capacity-zero
+encodings from four other implementations and diffs the result against the
+source `.qif`. It needed nothing this package does not have — a static-only
+decoder is exactly what those files exercise.
+
+The result corrects the argument that justified it. It was proposed on the
+strength of a defect it does **not** catch: `field_line.iterate` refused a
+section whose Required Insert Count was zero and whose Base was not, and the
+reasoning was that other encoders produce shapes this package's own never does.
+They do — but not that one. All four emit a prefix of `00 00` at capacity zero,
+because a zero Delta Base is what RFC 9204 §4.5.1.2 calls "one of the most
+efficient encodings". Reverting the fix leaves the corpus green.
 
 What it does prove: 144 field sections from four implementations decode to
 exactly the fields those implementations were handed, and all eight vendored
@@ -532,10 +614,10 @@ input. Indexed against literal, which names get Huffman coding, where a
 static-table reference is preferred — those choices are theirs, and the decoder
 handles them.
 
-The general lesson, which applies to the interop shim below: **a corpus
-disagrees with you only where its producers had a reason to differ.**
-Capacity-zero QPACK leaves an encoder very little room, so it is strong
-evidence about representation and none at all about the prefix. Choosing
+The general lesson, which the interop shim above then demonstrated at a larger
+scale: **a corpus disagrees with you only where its producers had a reason to
+differ.** Capacity-zero QPACK leaves an encoder very little room, so it is
+strong evidence about representation and none at all about the prefix. Choosing
 external evidence means choosing which disagreements are possible.
 
 ### 5.6 Structure — only if rewriting anyway

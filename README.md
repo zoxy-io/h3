@@ -46,6 +46,14 @@ Key derivation, packet protection and packet number coding are checked
 against the test vectors in RFC 9000 appendix A and RFC 9001 appendix A,
 including the complete worked packets in `corpus/`.
 
+Evidence that does not come from this package: `corpus/qifs.zig` decodes 144
+QPACK field sections produced by four other implementations, and `interop/` is
+a [QUIC Interop Runner](https://github.com/quic-interop/quic-interop-runner)
+client that completes a real handshake and transfer against quic-go, ngtcp2 and
+aioquic. The second found four defects on the first connection it made; see
+[docs/VERIFICATION.md](docs/VERIFICATION.md) §5.5 for what they were and
+[interop/README.md](interop/README.md) for how to run it.
+
 ## Installation
 
 ```sh

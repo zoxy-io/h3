@@ -968,7 +968,26 @@ pub fn Connection(comptime config: Config) type {
             // goes out in by asking whether Handshake keys exist, which is not
             // the same as asking whether the Handshake space was discarded.
             if (level == .handshake) self.recovery.handshake_keys = true;
-            if (level == .handshake) self.discard(.initial);
+            // The Initial keys are *not* dropped here, and for one connection in
+            // this package's history they were. Section 4.9.1 says a client
+            // discards them when it first **sends** a Handshake packet, and this
+            // line said "when it can". The difference is one datagram wide and it
+            // deadlocks a real handshake: a client that has just been handed
+            // Handshake keys still owes an ACK for the Initial packet that
+            // carried the ServerHello, and discarding the space here throws that
+            // ACK away. The server retransmits its Initial, gets nothing back,
+            // reaches section 8.1's three-times amplification limit and stops.
+            // Both endpoints then wait.
+            //
+            // Found by `interop/`, against quic-go, on the first connection this
+            // package ever completed with something it did not write. Nothing in
+            // `sim/` could see it: the simulated handshake installs both sides'
+            // secrets in the same step, so the ACK the client owes is never the
+            // only thing keeping the server alive.
+            //
+            // `discard` now happens where the two rules below actually put it:
+            // in `send`, once a Handshake packet has gone into a datagram, and in
+            // `receivePacket`, once a server has opened one.
 
             // RFC 9001 section 4.1.2: the handshake is confirmed at the *server*
             // when the handshake completes, which is when it can send 1-RTT — a
@@ -1483,6 +1502,26 @@ pub fn Connection(comptime config: Config) type {
             //= reason=connection migration and a server's preferred address are out of scope: a connection here has one path, never learns an address, and never sends preferred_address. See docs/DESIGN.md section 2 and section 6.
             self.streams.setPeerStreamLimit(true, parsed.initial_max_streams_bidi);
             self.streams.setPeerStreamLimit(false, parsed.initial_max_streams_uni);
+
+            // Section 4.1: the flow control limits a connection starts with are
+            // these, and until `interop/` ran, this function parsed all four of
+            // them and applied none. A stream therefore opened with a send limit
+            // of zero and stayed there — no `MAX_STREAM_DATA` is coming for
+            // credit the peer believes it already granted in its transport
+            // parameters — so the first request on a real connection could never
+            // be written. `sim/` did not see it because its two endpoints send
+            // each other explicit `MAX_DATA` and `MAX_STREAM_DATA` frames, which
+            // is what a peer does *after* the initial limit rather than instead
+            // of it.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-4.1
+            //# Senders MUST NOT send data in excess of either limit.
+            //= type=test
+            self.streams.setConnectionSendLimit(parsed.initial_max_data);
+            self.streams.setPeerInitialLimits(
+                parsed.initial_max_stream_data_bidi_local,
+                parsed.initial_max_stream_data_bidi_remote,
+                parsed.initial_max_stream_data_uni,
+            );
 
             @memcpy(self.peer_parameters[0..octets.len], octets);
             self.peer_parameters_len = @intCast(octets.len);
@@ -2082,6 +2121,18 @@ pub fn Connection(comptime config: Config) type {
             // Section 8.1: receiving a Handshake packet proves the peer holds
             // keys only the real one could have, which validates the address.
             if (level == .handshake) self.address_validated = true;
+            // The server's half of section 4.9.1, at the point it names: a
+            // Handshake packet that opened is one that was successfully
+            // processed.
+            //= https://www.rfc-editor.org/rfc/rfc9001#section-4.9.1
+            //# a server MUST discard Initial keys when it first
+            //# successfully processes a Handshake packet.
+            //= type=test
+            if (level == .handshake and self.side == .server and
+                !self.spaces[@intFromEnum(Space.initial)].discarded)
+            {
+                self.discard(.initial);
+            }
 
             // The ACK debt is recorded only after every frame has been applied,
             // so a payload that fails halfway is never acknowledged.
@@ -3461,10 +3512,15 @@ pub fn Connection(comptime config: Config) type {
             //# SHOULD use coalesced packets to send them in the same UDP
             //# datagram.
             var initial_ack_eliciting = false;
+            var initial_written = false;
+            var handshake_sent = false;
             for ([_]Level{ .initial, .handshake, .one_rtt }) |level| {
                 var eliciting = false;
-                offset += self.sendPacket(buffer[offset..limit], level, now_ns, &eliciting) catch 0;
+                const written = self.sendPacket(buffer[offset..limit], level, now_ns, &eliciting) catch 0;
+                offset += written;
+                if (level == .initial and written > 0) initial_written = true;
                 if (level == .initial and eliciting) initial_ack_eliciting = true;
+                if (level == .handshake and written > 0) handshake_sent = true;
             }
             if (offset == 0) return 0;
 
@@ -3510,14 +3566,36 @@ pub fn Connection(comptime config: Config) type {
             //= https://www.rfc-editor.org/rfc/rfc9001#section-9.3
             //# First, the packet containing a ClientHello MUST be padded to a
             //# minimum size.
-            const owes_padding = (self.side == .client and
-                self.send_keys[@intFromEnum(Level.initial)] != null) or
+            // Whether this datagram *carries* an Initial packet, which is what
+            // section 14.1's floor is about. It used to ask whether the Initial
+            // keys still existed, which was a proxy — and a proxy that held only
+            // because the keys were discarded one event too early, immediately
+            // on installing Handshake keys. Correcting that discard turned the
+            // proxy false: a client with Initial keys it had not yet retired
+            // began padding datagrams that carried nothing but a 1-RTT packet,
+            // and a short header runs to the end of the datagram, so the
+            // padding landed inside the AEAD's ciphertext and every one of them
+            // failed to open at the peer. One bug held another one up.
+            const owes_padding = (self.side == .client and initial_written) or
                 initial_ack_eliciting;
             if (owes_padding) {
                 if (offset < initial_datagram_min and limit >= initial_datagram_min) {
                     @memset(buffer[offset..initial_datagram_min], 0);
                     offset = initial_datagram_min;
                 }
+            }
+            // Section 4.9.1, at the point it names: the Handshake packet is in
+            // the datagram, so the Initial keys go. After the padding above
+            // rather than before, because this datagram may still carry an
+            // Initial packet and section 14.1's floor applies to it either way.
+            //= https://www.rfc-editor.org/rfc/rfc9001#section-4.9.1
+            //# Thus, a client MUST discard Initial keys when it first sends a
+            //# Handshake packet
+            //= type=test
+            if (self.side == .client and handshake_sent and
+                !self.spaces[@intFromEnum(Space.initial)].discarded)
+            {
+                self.discard(.initial);
             }
             self.sent_octets += offset;
             return offset;
@@ -4611,14 +4689,15 @@ test "a handshake reaches 1-RTT through all three levels" {
     try client.cryptoIn(.initial, "ClientHello");
     _ = try deliver(&client, &server, now_ns);
 
-    // Both sides derive Handshake keys. Installing them discards Initial, which
-    // is section 4.9.1 of RFC 9001: keys anyone who saw the first packet can
-    // compute are not kept.
+    // Both sides derive Handshake keys. Having them is not the event section
+    // 4.9.1 names: the keys go when a Handshake packet is *sent* by a client
+    // and when one is *processed* by a server, and the round trip below is
+    // where each of those happens.
     now_ns += 1000;
     try installBoth(&server, &client, .handshake, 0x11);
     try installBoth(&client, &server, .handshake, 0x22);
-    try testing.expect(client.send_keys[@intFromEnum(Level.initial)] == null);
-    try testing.expect(server.receive_keys[@intFromEnum(Level.initial)] == null);
+    try testing.expect(client.send_keys[@intFromEnum(Level.initial)] != null);
+    try testing.expect(server.receive_keys[@intFromEnum(Level.initial)] != null);
 
     try server.cryptoIn(.handshake, "EncryptedExtensions, Certificate, Finished");
     _ = try deliver(&server, &client, now_ns);
@@ -4631,6 +4710,9 @@ test "a handshake reaches 1-RTT through all three levels" {
     try client.cryptoIn(.handshake, "Finished");
     _ = try deliver(&client, &server, now_ns);
     try testing.expectEqualStrings("Finished", server.cryptoOut(.handshake));
+    // And now, at the two points section 4.9.1 names.
+    try testing.expect(client.send_keys[@intFromEnum(Level.initial)] == null);
+    try testing.expect(server.receive_keys[@intFromEnum(Level.initial)] == null);
 
     // HANDSHAKE_DONE is the server's alone, and it is what establishes the
     // connection for the client.
@@ -4976,6 +5058,15 @@ fn established(client: *TestConnection, server: *TestConnection) !void {
     _ = try deliver(client, server, 0);
     try installBoth(server, client, .handshake, 0x11);
     try installBoth(client, server, .handshake, 0x22);
+
+    // The client's Handshake flight, which a simulated handshake used to skip.
+    // Skipping it left the client holding Initial keys for the life of the
+    // connection — RFC 9001 section 4.9.1 retires them when a Handshake packet
+    // is sent, and nothing here ever sent one. Every test built on this helper
+    // was then running against an endpoint no real handshake produces.
+    try client.cryptoIn(.handshake, "ClientFinished");
+    _ = try deliver(client, server, 0);
+
     try installBoth(server, client, .one_rtt, 0x33);
     try installBoth(client, server, .one_rtt, 0x44);
 
@@ -6161,4 +6252,167 @@ test "poll reports a dropped event rather than losing it" {
         kept += 1;
     }
     try testing.expectEqual(events_max, kept);
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9001#section-4.9.1
+//# Thus, a client MUST discard Initial keys when it first sends a
+//# Handshake packet
+//= type=test
+test "section 4.9.1: a client keeps Initial keys until it sends a Handshake packet" {
+    var client = testClient();
+    var server = testServer();
+
+    // The client's Initial goes out; the server answers with one of its own.
+    // That reply is what the client then owes an acknowledgement for, and the
+    // acknowledgement can only travel under Initial keys.
+    try client.cryptoIn(.initial, "ClientHello");
+    _ = try deliver(&client, &server, 0);
+    try server.cryptoIn(.initial, "ServerHello");
+    _ = try deliver(&server, &client, 1000);
+    const initial_space = @intFromEnum(Space.initial);
+    try testing.expect(client.spaces[initial_space].received.ack_eliciting_pending);
+
+    // Handshake keys arrive. This is where the Initial keys used to go, and
+    // where RFC 9001 does not put them: a client here has an unsent ACK, and
+    // throwing the space away throws the ACK away with it. The server then
+    // retransmits an Initial nobody acknowledges until section 8.1's
+    // three-times amplification limit stops it, and both endpoints wait.
+    // `interop/` found this against quic-go on the first connection this
+    // package ever completed with an implementation it did not write.
+    try installBoth(&server, &client, .handshake, 0x11);
+    try testing.expect(!client.spaces[initial_space].discarded);
+    try testing.expect(client.send_keys[@intFromEnum(Level.initial)] != null);
+
+    // Now there is something to send at Handshake, so the next datagram
+    // carries both the Initial ACK and a Handshake packet — and only then are
+    // the Initial keys gone.
+    try client.cryptoIn(.handshake, "ClientFinished");
+    try installBoth(&client, &server, .handshake, 0x22);
+    const octets = try deliver(&client, &server, 2000);
+    try testing.expect(octets > 0);
+    try testing.expect(client.spaces[initial_space].discarded);
+    try testing.expect(client.send_keys[@intFromEnum(Level.initial)] == null);
+
+    // And the acknowledgement arrived: the server's Initial packet 0 is
+    // acknowledged, which is the whole point of keeping the keys.
+    try testing.expectEqual(@as(?u64, 0), server.spaces[initial_space].largest_acked);
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9001#section-4.9.1
+//# a server MUST discard Initial keys when it first
+//# successfully processes a Handshake packet.
+//= type=test
+test "section 4.9.1: a server discards Initial keys on the first Handshake packet it opens" {
+    var client = testClient();
+    var server = testServer();
+    const initial_space = @intFromEnum(Space.initial);
+
+    try client.cryptoIn(.initial, "ClientHello");
+    _ = try deliver(&client, &server, 0);
+    try testing.expect(!server.spaces[initial_space].discarded);
+
+    // Installing Handshake keys is not the event: a server that has them and
+    // has processed nothing under them is a server whose peer may still be
+    // sending Initials.
+    try installBoth(&client, &server, .handshake, 0x22);
+    try testing.expect(!server.spaces[initial_space].discarded);
+
+    try client.cryptoIn(.handshake, "ClientFinished");
+    _ = try deliver(&client, &server, 1000);
+    try testing.expect(server.spaces[initial_space].discarded);
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9000#section-4.1
+//# Senders MUST NOT send data in excess of either limit.
+//= type=test
+test "section 4.1: a stream starts with the credit the peer's transport parameters granted" {
+    var client = testClient();
+
+    // What a server's extension carries. `initial_max_stream_data_bidi_remote`
+    // is the limit on a stream the *client* opens: "remote" is that
+    // parameter's view of who initiated it.
+    var buffer: [256]u8 = undefined;
+    const written = try transport_parameters.encode(&buffer, &.{
+        .initial_max_data = 4096,
+        .initial_max_stream_data_bidi_remote = 1024,
+        .initial_max_stream_data_bidi_local = 64,
+        .initial_max_streams_bidi = 4,
+        .original_destination_connection_id = ConnectionId.init(&client_cid) catch unreachable, // Eight octets.
+        .initial_source_connection_id = ConnectionId.init(&server_source) catch unreachable, // As above.
+    });
+    try client.transportParametersIn(buffer[0..written]);
+
+    // Before this was applied, `transportParametersIn` parsed all four flow
+    // control parameters and used none of them: a stream opened with a send
+    // limit of zero and stayed there, because no MAX_STREAM_DATA is coming for
+    // credit the peer believes it already granted. The first request on a real
+    // connection could not be written. Found by `interop/`; `sim/` never saw it
+    // because its endpoints exchange explicit MAX_DATA and MAX_STREAM_DATA,
+    // which is what a peer sends *after* the initial limit rather than instead
+    // of it.
+    var body: [2048]u8 = @splat(0x5a);
+    try testing.expectEqual(@as(usize, 1024), try client.write(0, &body, false));
+}
+
+test "section 4.1: the connection-level limit binds before the stream's" {
+    var client = testClient();
+
+    // A connection limit below the stream's, so that the smaller of the two is
+    // the one that has to be honoured. Two streams, because the connection
+    // limit is what they share.
+    var buffer: [256]u8 = undefined;
+    const written = try transport_parameters.encode(&buffer, &.{
+        .initial_max_data = 512,
+        .initial_max_stream_data_bidi_remote = 4096,
+        .initial_max_streams_bidi = 4,
+        .original_destination_connection_id = ConnectionId.init(&client_cid) catch unreachable, // Eight octets.
+        .initial_source_connection_id = ConnectionId.init(&server_source) catch unreachable, // As above.
+    });
+    try client.transportParametersIn(buffer[0..written]);
+
+    var body: [2048]u8 = @splat(0x5a);
+    try testing.expectEqual(@as(usize, 512), try client.write(0, &body, false));
+    // And nothing is left for the second stream.
+    try testing.expectEqual(@as(usize, 0), try client.write(4, &body, false));
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9000#section-14.1
+//# A client MUST expand the payload of all UDP datagrams carrying
+//# Initial packets to at least the smallest allowed maximum datagram
+//# size of 1200 bytes by adding PADDING frames to the Initial packet or
+//# by coalescing the Initial packet; see Section 12.2.
+//= type=test
+test "section 14.1: a datagram carrying no Initial packet is not padded" {
+    var client = testClient();
+    var server = testServer();
+
+    // A client that has 1-RTT keys and has not yet sent a Handshake packet, so
+    // section 4.9.1 has not retired its Initial keys. That state is ordinary —
+    // it is one flight wide on every real connection — and it is the state the
+    // padding condition used to get wrong, because it asked whether the client
+    // *had* Initial keys rather than whether this datagram carried an Initial
+    // packet.
+    try client.cryptoIn(.initial, "ClientHello");
+    _ = try deliver(&client, &server, 0);
+    try installBoth(&server, &client, .handshake, 0x11);
+    try installBoth(&client, &server, .handshake, 0x22);
+    try installBoth(&server, &client, .one_rtt, 0x33);
+    try installBoth(&client, &server, .one_rtt, 0x44);
+    try testing.expect(client.send_keys[@intFromEnum(Level.initial)] != null);
+
+    client.streams.setPeerStreamLimit(true, 4);
+    client.streams.setConnectionSendLimit(1 << 16);
+    try client.streams.setSendLimit(0, 1 << 16);
+    _ = try client.write(0, "a 1-RTT packet", false);
+
+    var datagram: [TestConnection.datagram_octets]u8 = @splat(0);
+    const octets = try client.send(&datagram, 1000);
+    try testing.expect(octets > 0);
+    // A short header runs to the end of the datagram, so padding appended after
+    // one lands inside the AEAD's ciphertext. The peer's failure is silent: the
+    // packet does not authenticate and is discarded, which is indistinguishable
+    // from a packet that was never sent.
+    try testing.expect(octets < initial_datagram_min);
+    try server.receive(datagram[0..octets], 1000);
+    try testing.expectEqualStrings("a 1-RTT packet", server.readable(0));
 }

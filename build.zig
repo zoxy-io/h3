@@ -214,6 +214,45 @@ pub fn build(b: *std.Build) void {
     const corpus_step = b.step("corpus", "RFC 9001 appendix A's worked packets, octet for octet");
     corpus_step.dependOn(&corpus_run.step);
 
+    // The QUIC Interop Runner client. Everything `src/` forbids is in here — a
+    // socket, a clock, an allocator, an entropy draw and a TLS handshake — so
+    // it is a separate binary outside the lint's reach and outside
+    // `build.zig.zon`'s `paths`. It is never a dependency of anything a
+    // consumer builds.
+    const interop_module = b.createModule(.{
+        .root_source_file = b.path("interop/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "h3", .module = h3_module }},
+    });
+    const interop_exe = b.addExecutable(.{ .name = "h3-interop", .root_module = interop_module });
+    const interop_install = b.addInstallArtifact(interop_exe, .{});
+    const interop_step = b.step("interop", "Build the QUIC Interop Runner client");
+    interop_step.dependOn(&interop_install.step);
+
+    // Its unit tests are the parts that can be checked without a peer: the
+    // ClientHello's shape, the transcript boundaries, the URL and test case
+    // parsing. The handshake itself is only checked by a server, which is the
+    // point of the binary.
+    const interop_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("interop/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "h3", .module = h3_module }},
+        }),
+    });
+    const interop_tests_run = b.addRunArtifact(interop_tests);
+    const interop_tls_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("interop/tls.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "h3", .module = h3_module }},
+        }),
+    });
+    const interop_tls_tests_run = b.addRunArtifact(interop_tls_tests);
+
     // A negative fixture: `checks/` holds files that must FAIL to compile. This
     // one proves that a `comptime` assertion is still checked with
     // `-Dassertions=false`, which no `test` block can express.
@@ -241,11 +280,15 @@ pub fn build(b: *std.Build) void {
     // So that `zig build ci` fails on a README example that stopped compiling.
     test_step.dependOn(&example_run.step);
     test_step.dependOn(&comptime_check.step);
+    // So that a shim that stopped compiling fails the build a developer runs
+    // rather than the one the interop runner runs a week later.
+    test_step.dependOn(&interop_tests_run.step);
+    test_step.dependOn(&interop_tls_tests_run.step);
 
     // The format gate. A build step rather than a documented `zig fmt --check`
     // incantation, so that the list of formatted paths lives in exactly one
     // place and CI cannot check a different set than a developer does.
-    const fmt_paths = &.{ "src", "scripts", "bench", "fuzz", "example", "checks", "corpus/all.zig", "corpus/rfc9001.zig", "build.zig", "build.zig.zon" };
+    const fmt_paths = &.{ "src", "scripts", "bench", "fuzz", "example", "checks", "corpus/all.zig", "corpus/rfc9001.zig", "corpus/qifs.zig", "interop", "build.zig", "build.zig.zon" };
     const fmt_check = b.addFmt(.{ .paths = fmt_paths, .check = true });
     const fmt_step = b.step("fmt", "Check formatting (zig build fmt-fix rewrites)");
     fmt_step.dependOn(&fmt_check.step);

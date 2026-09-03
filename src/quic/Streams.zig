@@ -77,14 +77,19 @@ pub const ReceiveState = enum {
 
 /// Section 3.1: what has happened to a stream's send half.
 ///
-/// Three of section 3.1's six states. "Ready" and "Send" are one `sending`
+/// Four of section 3.1's six states. "Ready" and "Send" are one `sending`
 /// here, because nothing distinguishes a stream that has buffered data from
-/// one that has framed it. The two terminal states are the gap: "Data Recvd"
-/// and "Reset Recvd" are entered on *acknowledgement*, and this type is never
-/// told that a FIN or a RESET_STREAM was acknowledged — `Recovery` reports
-/// losses to `Streams.rewind` and reports acknowledgements to nothing here. So
-/// no stream ever reaches a terminal state, and the rule below has nothing to
-/// test against.
+/// one that has framed it.
+///
+/// "Data Recvd" arrived with `Connection.onPacketsDelivered`, which is the
+/// counterpart of `onPacketsLost` that did not exist: `Recovery` reported
+/// losses to `Streams.rewind` and reported acknowledgements to nothing, so a
+/// stream could be written, sent, fully acknowledged and sit in "Data Sent"
+/// for the life of the connection.
+///
+/// **"Reset Recvd" is still the gap.** It is entered when a RESET_STREAM is
+/// acknowledged, and no RESET_STREAM is ever framed — see `reset` below, which
+/// is the same hole seen from the other end.
 //= https://www.rfc-editor.org/rfc/rfc9000#section-3.3
 //# A sender MUST NOT send any of these frames from a terminal state
 //# ("Data Recvd" or "Reset Recvd").
@@ -310,6 +315,22 @@ pub fn Streams(comptime config: Config) type {
         consumed_total: u64 = 0,
         /// The peer's `MAX_DATA` for this connection.
         send_limit: u64 = 0,
+
+        /// Section 4.1: the peer's `initial_max_stream_data_*`, which is the
+        /// send limit a stream *starts* with. Held here rather than pushed into
+        /// each stream, because the streams a connection will open do not exist
+        /// when the transport parameters arrive — and a limit applied only to
+        /// the streams that happened to be open is a limit that silently does
+        /// not apply to the first request.
+        ///
+        /// Named from this endpoint's point of view. The peer's
+        /// `initial_max_stream_data_bidi_remote` is the limit on a stream *this*
+        /// endpoint opened, because "remote" is that parameter's view of who
+        /// initiated it; getting the two the wrong way round gives a limit that
+        /// is usually the same number and occasionally not.
+        peer_initial_bidi_local: u64 = 0,
+        peer_initial_bidi_remote: u64 = 0,
+        peer_initial_uni: u64 = 0,
         /// Octets this endpoint has queued across all streams, against that.
         sent_total: u64 = 0,
 
@@ -408,9 +429,43 @@ pub fn Streams(comptime config: Config) type {
             assert(id <= varint.max);
             if (self.find(id)) |stream| return stream;
             if (self.count == streams_max) return error.TooManyStreams;
-            self.streams[self.count] = .{ .id = id };
+            self.streams[self.count] = .{ .id = id, .send_limit = self.initialSendLimit(id) };
             self.count += 1;
             return &self.streams[self.count - 1];
+        }
+
+        /// Section 4.1's starting credit for a stream, from whichever of the
+        /// peer's three `initial_max_stream_data` parameters applies to it.
+        fn initialSendLimit(self: *const Self, id: u64) u64 {
+            const kind = stream_id.kindOf(id);
+            if (!kind.bidirectional()) {
+                // A unidirectional stream this endpoint did not open is one it
+                // cannot send on at all, so the parameter that would apply to it
+                // does not exist.
+                return if (kind.initiator() == self.side) self.peer_initial_uni else 0;
+            }
+            return if (kind.initiator() == self.side)
+                self.peer_initial_bidi_remote
+            else
+                self.peer_initial_bidi_local;
+        }
+
+        /// Apply the peer's `initial_max_stream_data_*`. Called once, when the
+        /// transport parameters arrive.
+        ///
+        /// Streams already open are updated too: a server can have accepted the
+        /// client's first stream out of a 0-RTT or coalesced packet before the
+        /// handshake delivered the parameters, and a stream that missed its
+        /// starting credit would never get it — no `MAX_STREAM_DATA` is coming
+        /// for a limit the peer believes it already stated.
+        pub fn setPeerInitialLimits(self: *Self, bidi_local: u64, bidi_remote: u64, uni: u64) void {
+            self.peer_initial_bidi_local = bidi_local;
+            self.peer_initial_bidi_remote = bidi_remote;
+            self.peer_initial_uni = uni;
+            // Bounded by `count`, which never exceeds `streams_max`.
+            for (self.streams[0..self.count]) |*stream| {
+                stream.send_limit = @max(stream.send_limit, self.initialSendLimit(stream.id));
+            }
         }
 
         /// Section 4.6: a stream this endpoint initiates has to fit inside the
