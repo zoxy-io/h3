@@ -99,6 +99,32 @@ pub fn build(b: *std.Build) void {
     const requirements_step = b.step("requirements", "Requirement ledger: RFC citations against the vendored specs");
     requirements_step.dependOn(&requirements_run.step);
 
+    // The seeded simulator of docs/VERIFICATION.md section 5.2. Outside `src/`
+    // and outside the lint's walk, because it needs a PRNG and a virtual clock
+    // — the two things the seam exists to keep out of the library.
+    const sim_seeds = b.option(u64, "sim-seeds", "Seeds per sweep (default 256)") orelse 256;
+    const sim_options = b.addOptions();
+    sim_options.addOption(u64, "seeds", sim_seeds);
+
+    const sim_exe = b.addExecutable(.{
+        .name = "h3-sim",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("sim/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "h3", .module = h3_module },
+                .{ .name = "sim_options", .module = sim_options.createModule() },
+            },
+        }),
+    });
+    const sim_tests = b.addRunArtifact(b.addTest(.{ .root_module = sim_exe.root_module }));
+
+    const sim_run = b.addRunArtifact(sim_exe);
+    if (b.args) |args| sim_run.addArgs(args);
+    const sim_step = b.step("sim", "Seeded network simulation over two connections");
+    sim_step.dependOn(&sim_run.step);
+
     // The fuzz gate. `zig build fuzz` replays the corpus as regression; with
     // `--fuzz` it runs coverage-guided. See fuzz/fuzz.zig for why the harness
     // lives outside `src/`.
@@ -208,6 +234,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&module_tests.step);
     test_step.dependOn(&lint_tests.step);
     test_step.dependOn(&requirements_tests.step);
+    test_step.dependOn(&sim_tests.step);
     // A corpus replayed only under `zig build fuzz` is a corpus that rots.
     test_step.dependOn(&fuzz_run.step);
     test_step.dependOn(&corpus_run.step);

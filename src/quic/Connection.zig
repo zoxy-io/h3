@@ -241,6 +241,10 @@ pub fn Connection(comptime config: Config) type {
         stream_end: u32 = 0,
         /// Whether the packet carried a FIN, which no byte range can express.
         stream_fin: bool = false,
+        /// Whether the packet carried HANDSHAKE_DONE, which likewise has no
+        /// range: losing it has to re-owe the frame or the client never
+        /// confirms.
+        handshake_done: bool = false,
     };
 
     // RFC 9001 section 6: 1-RTT keys come in generations, and the Key Phase
@@ -353,6 +357,20 @@ pub fn Connection(comptime config: Config) type {
         /// for a frame this package does not generate.
         max_data_sent: u64 = 0,
 
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-4.1.2
+        //# The server MUST send a HANDSHAKE_DONE frame as soon as the handshake
+        //# is complete.
+        //
+        /// Owed once, framed once, and owed again if the packet carrying it is
+        /// lost. Found missing by `sim/` on its first working sweep: the frame
+        /// was handled on receipt and never generated, so a client talking to
+        /// this server stayed in `handshaking` for the life of the connection
+        /// — and RFC 9002 section 6.2.1 declines to arm an application-data
+        /// probe timeout before confirmation, so its 1-RTT packets were never
+        /// retransmitted either.
+        handshake_done_pending: bool = false,
+        handshake_done_framed: bool = false,
+
         /// Set by a CONNECTION_CLOSE in either direction.
         close_code: u64 = 0,
         close_is_application: bool = false,
@@ -425,6 +443,7 @@ pub fn Connection(comptime config: Config) type {
             if (level == .one_rtt and direction == .send and self.side == .server) {
                 self.state = .established;
                 self.recovery.handshake_confirmed = true;
+                self.handshake_done_pending = true;
             }
 
             // Section 6 needs the secret, not just the keys: the next
@@ -1000,6 +1019,7 @@ pub fn Connection(comptime config: Config) type {
                     assert(@min(level.framed, context.crypto_start) <= level.framed);
                     level.framed = @min(level.framed, context.crypto_start);
                 }
+                if (context.handshake_done) self.handshake_done_framed = false;
                 if (context.stream_end > context.stream_start or context.stream_fin) {
                     self.streams.rewind(context.stream, context.stream_start, context.stream_fin);
                 }
@@ -1184,8 +1204,23 @@ pub fn Connection(comptime config: Config) type {
                 .probes_pending = space.probes_pending,
                 .close_pending = self.close_pending,
                 .crypto_framed = self.levels[index].framed,
+                .handshake_done_framed = self.handshake_done_framed,
             };
-            const written = self.writePayload(buffer[header.header_octets..][0..payload_room], level, now_ns);
+            // Whether an ack-eliciting frame may be added at all. Without this
+            // the ACK-only exemption below was accidental rather than real: a
+            // sender with a full window framed its stream data *and* its ACK,
+            // had the whole packet refused, and so never sent the
+            // acknowledgement that would have opened the window. The peer keeps
+            // sending, this endpoint keeps owing an ACK it cannot deliver, and
+            // neither side moves. Adding HANDSHAKE_DONE made that reachable on
+            // a handshake rather than only under load, which is how `sim/`
+            // surfaced it.
+            //
+            // A probe is exempt (section 6.2.4 requires it to be ack-eliciting)
+            // and so is a level with no congestion state of its own.
+            const window_open = space.probes_pending > 0 or
+                self.recovery.canSend(config.datagram_octets);
+            const written = self.writePayload(buffer[header.header_octets..][0..payload_room], level, now_ns, window_open);
             const payload_octets = written.octets;
             if (payload_octets == 0) {
                 self.rollback(level, undo, written);
@@ -1240,6 +1275,24 @@ pub fn Connection(comptime config: Config) type {
             space.next += 1;
             self.countSealed(level);
 
+            // Section 6.2.4: the probe is spent by any ack-eliciting packet,
+            // not only by the PING. The credit used to be consumed on the PING
+            // path alone, so a probe that carried CRYPTO or stream data instead
+            // — the case section 6.2.4 actually prefers, because it makes
+            // progress rather than only asking whether the path is alive —
+            // left `probes_pending` standing. That is not a cosmetic leak: a
+            // non-zero `probes_pending` is what exempts a packet from the
+            // congestion window below, so the window stopped binding for the
+            // rest of the connection. Found by `sim/`, whose window oracle
+            // fired on three seeds with the same excess.
+            //
+            // Consumed after the seal rather than before it, so a packet that
+            // failed to seal has not spent the credit that would have let the
+            // next one through.
+            if (written.ack_eliciting and space.probes_pending > 0) {
+                space.probes_pending -= 1;
+            }
+
             // Section 2 of RFC 9002: a packet is in flight when it is
             // ack-eliciting *or contains a PADDING frame*. The second half
             // never applies to a packet this endpoint sends — section 14.1's
@@ -1271,6 +1324,7 @@ pub fn Connection(comptime config: Config) type {
                     .stream_start = written.stream_start,
                     .stream_end = written.stream_end,
                     .stream_fin = written.stream_fin,
+                    .handshake_done = written.handshake_done,
                 },
             }) catch {};
             return total;
@@ -1315,6 +1369,7 @@ pub fn Connection(comptime config: Config) type {
             probes_pending: u8,
             close_pending: bool,
             crypto_framed: u32,
+            handshake_done_framed: bool,
         };
 
         /// Put back everything `writePayload` committed. Called on every path
@@ -1325,6 +1380,7 @@ pub fn Connection(comptime config: Config) type {
             space.probes_pending = undo.probes_pending;
             self.close_pending = undo.close_pending;
             self.levels[@intFromEnum(level)].framed = undo.crypto_framed;
+            self.handshake_done_framed = undo.handshake_done_framed;
             if (written.stream_end > written.stream_start or written.stream_fin) {
                 self.streams.rewind(written.stream, written.stream_start, written.stream_fin);
             }
@@ -1347,6 +1403,8 @@ pub fn Connection(comptime config: Config) type {
             /// the range because a FIN carries no octets, so a lost one has no
             /// byte range to rewind.
             stream_fin: bool = false,
+            /// Likewise for HANDSHAKE_DONE.
+            handshake_done: bool = false,
         };
 
         /// Fill a payload: an ACK if one is owed, then whatever handshake bytes
@@ -1377,7 +1435,7 @@ pub fn Connection(comptime config: Config) type {
             return result.*;
         }
 
-        fn writePayload(self: *Self, payload: []u8, level: Level, now_ns: u64) Payload {
+        fn writePayload(self: *Self, payload: []u8, level: Level, now_ns: u64, window_open: bool) Payload {
             var result: Payload = .{};
             var offset: usize = 0;
             const space = &self.spaces[@intFromEnum(level.space())];
@@ -1400,6 +1458,13 @@ pub fn Connection(comptime config: Config) type {
                 if (written) |value| offset += value.octets;
             }
 
+            // Nothing below this point is ACK-only, so a closed window stops
+            // here and the packet goes out carrying the acknowledgement alone.
+            if (!window_open) {
+                result.octets = offset;
+                return result;
+            }
+
             // Section 6.2.4: a probe must be ack-eliciting, and a PING is the
             // cheapest frame that is. Real handshake data takes its place when
             // there is any, which is why this runs before the CRYPTO below and
@@ -1409,7 +1474,6 @@ pub fn Connection(comptime config: Config) type {
                 break :stream_has_nothing stream.framed >= stream.pending_len;
             }) {
                 offset += frame.encode(payload[offset..], .ping) catch 0;
-                space.probes_pending -= 1;
                 result.ack_eliciting = true;
             }
 
@@ -1424,6 +1488,15 @@ pub fn Connection(comptime config: Config) type {
             // Application data only: sections 4.1 and 2 put streams and their
             // limits in the 1-RTT space alone.
             if (level == .one_rtt) {
+                if (self.handshake_done_pending and !self.handshake_done_framed) {
+                    const written = frame.encode(payload[offset..], .handshake_done) catch 0;
+                    if (written > 0) {
+                        offset += written;
+                        self.handshake_done_framed = true;
+                        result.handshake_done = true;
+                        result.ack_eliciting = true;
+                    }
+                }
                 offset += self.writeFlowControl(payload[offset..]);
                 const framed = self.writeStream(payload[offset..], &result);
                 offset += framed;
@@ -1551,6 +1624,7 @@ pub fn Connection(comptime config: Config) type {
         pub fn wantsSend(self: *const Self) bool {
             if (self.state == .draining) return false;
             if (self.close_pending) return true;
+            if (self.handshake_done_pending and !self.handshake_done_framed) return true;
             for (self.spaces) |space| {
                 if (space.probes_pending > 0 and !space.discarded) return true;
             }
@@ -2626,4 +2700,79 @@ test "section 10.2: a closing endpoint sends only CONNECTION_CLOSE" {
     try testing.expectEqualStrings("", server.readable(0));
     // The stream data stayed queued rather than going out with the close.
     try testing.expect(client.streams.wantsSend());
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9001#section-4.1.2
+//# The server MUST send a HANDSHAKE_DONE frame as soon as the handshake
+//# is complete.
+//= type=test
+test "RFC 9001 section 4.1.2: the server sends HANDSHAKE_DONE" {
+    // Found by sim/: the frame was handled on receipt and generated never, so
+    // a client talking to this server stayed in `handshaking` for the life of
+    // the connection. Nothing in the unit tests caught it because every one of
+    // them injects the frame by hand — the helper below did too.
+    var client = testClient();
+    var server = testServer();
+    try client.cryptoIn(.initial, "ClientHello");
+    _ = try deliver(&client, &server, 0);
+    try installBoth(&server, &client, .handshake, 0x11);
+    try installBoth(&client, &server, .handshake, 0x22);
+    try installBoth(&server, &client, .one_rtt, 0x33);
+    try installBoth(&client, &server, .one_rtt, 0x44);
+
+    // Installing a 1-RTT send key is this seam's "the handshake is complete".
+    try testing.expect(server.handshake_done_pending);
+    try testing.expect(server.wantsSend());
+
+    _ = try deliver(&server, &client, 1000);
+    try testing.expectEqual(State.established, client.state);
+    try testing.expect(client.recovery.handshake_confirmed);
+}
+
+test "a lost HANDSHAKE_DONE is sent again" {
+    // It carries no byte range, so like a FIN it needs its own re-owing: a
+    // client that missed it never confirms, and RFC 9002 section 6.2.1 then
+    // declines to arm an application-data probe timeout for the rest of the
+    // connection.
+    var client = testClient();
+    var server = testServer();
+    try client.cryptoIn(.initial, "ClientHello");
+    _ = try deliver(&client, &server, 0);
+    try installBoth(&server, &client, .handshake, 0x11);
+    try installBoth(&client, &server, .handshake, 0x22);
+    try installBoth(&server, &client, .one_rtt, 0x33);
+    try installBoth(&client, &server, .one_rtt, 0x44);
+
+    // Send it into the void, then declare the packet lost.
+    var datagram: [TestConnection.datagram_octets]u8 = @splat(0);
+    const octets = try server.send(&datagram, 1000);
+    try testing.expect(octets > 0);
+    try testing.expect(server.handshake_done_framed);
+    try testing.expect(!server.wantsSend());
+
+    // The loss path reported directly, which is what `onTimeout` would hand it.
+    server.onPacketsLost(&.{.{ .level = .one_rtt, .handshake_done = true }});
+    try testing.expect(!server.handshake_done_framed);
+    try testing.expect(server.wantsSend());
+}
+
+test "RFC 9002 section 6.2.4: a probe carrying data still spends its credit" {
+    // The credit used to be consumed on the PING path alone, so a probe that
+    // carried CRYPTO — the case section 6.2.4 prefers, because it makes
+    // progress — left `probes_pending` standing. A non-zero `probes_pending`
+    // exempts a packet from the congestion window, so the window stopped
+    // binding for the rest of the connection. sim/ found it as an overshoot
+    // that three seeds reproduced exactly.
+    var client = testClient();
+    var server = testServer();
+    try client.cryptoIn(.initial, "ClientHello");
+
+    const space = &client.spaces[@intFromEnum(Space.initial)];
+    space.probes_pending = 2;
+    var datagram: [TestConnection.datagram_octets]u8 = @splat(0);
+    // The client has CRYPTO to send, so the probe carries it rather than a PING.
+    const octets = try client.send(&datagram, 1000);
+    try testing.expect(octets > 0);
+    try testing.expectEqual(@as(u8, 1), space.probes_pending);
+    _ = &server;
 }

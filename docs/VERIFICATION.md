@@ -237,7 +237,7 @@ wants a `type=exception` naming that rather than silence. Distinguishing "out
 of scope" from "nobody looked" is the whole product of this exercise, and it is
 what makes the next 57-finding review smaller than the last.
 
-### 5.2 A `sim/` in this package — one to two weeks
+### 5.2 A `sim/` in this package — one to two weeks — **started**
 
 Cheaper than zoxy's, because there is no I/O layer to virtualize: the seam
 already takes datagrams and `now_ns`. A seed derives a topology and a schedule.
@@ -267,6 +267,62 @@ already takes datagrams and `now_ns`. A seed derives a topology and a schedule.
 A test in this harness is a scenario, not a function: "handshake under 30%
 loss both ways completes within N round trips", "a blackhole of five seconds
 collapses the window and the transfer resumes".
+
+**Status.** `sim/Link.zig` and `sim/main.zig` exist and run as `zig build sim`.
+The link has delay, jitter, a rotating loss mask, reordering, duplication, MTU
+and a token-bucket queue with tail drop. Four oracles are live and the census
+counts thirteen behaviours.
+
+It is **not** in `zig build ci` yet, because the census reports four behaviours
+no seed reaches — completed transfers among them — and a gate that passes while
+saying that would be the same lie the fuzz targets were telling in §1's table.
+
+It has already paid for itself. Two defects in its first working sweep, both of
+the class this document predicted and neither reachable by a test of a
+function:
+
+- **The server never sent HANDSHAKE_DONE.** RFC 9001 §4.1.2 makes it a MUST.
+  The frame was handled on receipt and generated nowhere, so a client talking
+  to this server stayed in `handshaking` for the life of the connection — and
+  RFC 9002 §6.2.1 then declines to arm an application-data probe timeout, so
+  its 1-RTT packets were never retransmitted either. Every unit test missed it
+  because every unit test injects the frame by hand.
+- **A probe carrying data never spent its credit.** `probes_pending` was
+  decremented on the PING path alone, so a probe that carried CRYPTO — the case
+  §6.2.4 prefers — left the credit standing, and a non-zero credit is what
+  exempts a packet from the congestion window. The window stopped binding for
+  the rest of the connection. Three seeds reproduced it with the same excess.
+
+Fixing the second surfaced a third, which is the one worth reading: the
+ACK-only exemption was **accidental rather than real**. A sender with a full
+window framed its stream data *and* its ACK, had the whole packet refused for
+being ack-eliciting, and so never sent the acknowledgement that would have
+opened the window. `writePayload` now takes the window's verdict and stops
+before the first ack-eliciting frame.
+
+Three of the four oracles had to be restated, and how is worth recording,
+because it is the failure mode of oracle-writing:
+
+- "In-flight never exceeds the window by more than one datagram" fired on a
+  legitimate second probe. Widened to two — §6.2.4's number — it fired on two
+  legitimate probe *rounds*. The RFC puts no bound on that, so any number here
+  is invented and would be loosened each time it fired. It is now stated where
+  it is exact: with `pto_count` at zero, no exemption applies and the window
+  binds absolutely.
+- "`timeout()` is never in the past while `wantsSend()` is false", taken
+  literally, fires on every timer for the instant between coming due and being
+  serviced. The property that matters is that servicing *converges*, which is
+  what the harness now checks.
+- The packet-number oracle shared one array between both endpoints, so the
+  server's lower numbers read as the client's going backwards. It fired on
+  every seed before a single packet had been sent.
+
+What is left: transfers do not complete yet — the client writes its payload and
+the server reads none of it — so the delivered-equals-written oracle has never
+actually run. Until it does, the harness proves the handshake and the timers
+and nothing about data. The adversary node, fault injection, the `poll` of
+§5.3, and the 4096-seed cadence under all three build legs are all still to
+come.
 
 ### 5.3 Events out — with 5.2
 
