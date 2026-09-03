@@ -776,6 +776,55 @@ pub fn Connection(comptime config: Config) type {
             }
         }
 
+        // Section 8.1's application protocol negotiation, in full. The handshake
+        // crosses here as octets and leaves as octets; which protocol they agreed on,
+        // and whether they agreed at all, is a fact only the consumer's TLS engine
+        // ever holds.
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-8.1
+        //# Unless another mechanism is used for agreeing on an application
+        //# protocol, endpoints MUST use ALPN for this purpose.
+        //= type=exception
+        //= reason=ALPN is negotiated inside the TLS handshake, which docs/DESIGN.md section 4 puts in the consumer's engine: `cryptoIn` and `cryptoOut` carry the handshake as opaque octets, so nothing here can read a protocol list, select from one, or raise no_application_protocol. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-8.1
+        //# When using ALPN, endpoints MUST immediately close a connection (see
+        //# Section 10.2 of [QUIC-TRANSPORT]) with a no_application_protocol TLS
+        //# alert (QUIC error code 0x0178; see Section 4.8) if an application
+        //# protocol is not negotiated.
+        //= type=exception
+        //= reason=ALPN is negotiated inside the TLS handshake, which docs/DESIGN.md section 4 puts in the consumer's engine: `cryptoIn` and `cryptoOut` carry the handshake as opaque octets, so nothing here can read a protocol list, select from one, or raise no_application_protocol. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-8.1
+        //# While [ALPN] only specifies that servers use this alert, QUIC
+        //# clients MUST use error 0x0178 to terminate a connection when ALPN
+        //# negotiation fails.
+        //= type=exception
+        //= reason=ALPN is negotiated inside the TLS handshake, which docs/DESIGN.md section 4 puts in the consumer's engine: `cryptoIn` and `cryptoOut` carry the handshake as opaque octets, so nothing here can read a protocol list, select from one, or raise no_application_protocol. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-8.1
+        //# Servers MUST select an application protocol compatible with the QUIC
+        //# version that the client has selected.
+        //= type=exception
+        //= reason=ALPN is negotiated inside the TLS handshake, which docs/DESIGN.md section 4 puts in the consumer's engine: `cryptoIn` and `cryptoOut` carry the handshake as opaque octets, so nothing here can read a protocol list, select from one, or raise no_application_protocol. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-8.1
+        //# The server MUST treat the inability to select a compatible
+        //# application protocol as a connection error of type 0x0178
+        //# (no_application_protocol).
+        //= type=exception
+        //= reason=ALPN is negotiated inside the TLS handshake, which docs/DESIGN.md section 4 puts in the consumer's engine: `cryptoIn` and `cryptoOut` carry the handshake as opaque octets, so nothing here can read a protocol list, select from one, or raise no_application_protocol. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-8.1
+        //# Similarly, a client MUST treat the selection of an incompatible
+        //# application protocol by a server as a connection error of type
+        //# 0x0178.
+        //= type=exception
+        //= reason=ALPN is negotiated inside the TLS handshake, which docs/DESIGN.md section 4 puts in the consumer's engine: `cryptoIn` and `cryptoOut` carry the handshake as opaque octets, so nothing here can read a protocol list, select from one, or raise no_application_protocol. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-8.4
+        //# A client MUST NOT request the use of the TLS 1.3 compatibility mode.
+        //= type=exception
+        //= reason=the TLS handshake is the consumer's engine and not this package's: docs/DESIGN.md section 4 puts ztls and zssl on the other side of the seam, and what crosses it is handshake bytes and traffic secrets. Nothing here builds a TLS extension, chooses a transport for one, or sends an alert. See docs/DESIGN.md section 2 and section 6.
         /// Queue handshake bytes for sending at `level`.
         pub fn cryptoIn(self: *Self, level: Level, data: []const u8) error{CryptoBufferExceeded}!void {
             assert(@intFromEnum(level) < self.levels.len);
@@ -812,6 +861,31 @@ pub fn Connection(comptime config: Config) type {
             self.levels[@intFromEnum(level)].received.consume(octets);
         }
 
+        // The extension crosses this seam as octets in both directions, and its
+        // *absence* is what nobody notices: a peer whose ClientHello or
+        // EncryptedExtensions carried no quic_transport_parameters simply never
+        // reaches `transportParametersIn`, `peer_parameters_len` stays zero, and the
+        // connection proceeds on defaults rather than closing with 0x016d.
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-8.2
+        //# Endpoints MUST send the quic_transport_parameters extension;
+        //# endpoints that receive ClientHello or EncryptedExtensions messages
+        //# without the quic_transport_parameters extension MUST close the
+        //# connection with an error of type 0x016d (equivalent to a fatal TLS
+        //# missing_extension alert, see Section 4.8).
+        //= type=todo
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-8.2
+        //# Endpoints MUST NOT send this extension in a TLS connection that does
+        //# not use QUIC (such as the use of TLS with TCP defined in [TLS13]).
+        //= type=exception
+        //= reason=the TLS handshake is the consumer's engine and not this package's: docs/DESIGN.md section 4 puts ztls and zssl on the other side of the seam, and what crosses it is handshake bytes and traffic secrets. Nothing here builds a TLS extension, chooses a transport for one, or sends an alert. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-8.2
+        //# A fatal unsupported_extension alert MUST be sent by an
+        //# implementation that supports this extension if the extension is
+        //# received when the transport is not QUIC.
+        //= type=exception
+        //= reason=the TLS handshake is the consumer's engine and not this package's: docs/DESIGN.md section 4 puts ztls and zssl on the other side of the seam, and what crosses it is handshake bytes and traffic secrets. Nothing here builds a TLS extension, chooses a transport for one, or sends an alert. See docs/DESIGN.md section 2 and section 6.
         /// The peer's transport parameters, as the extension's octets, or an
         /// empty slice before they arrive.
         pub fn transportParametersOut(self: *const Self) []const u8 {
@@ -1412,6 +1486,24 @@ pub fn Connection(comptime config: Config) type {
             }
         }
 
+        // The three steps section 9.5 names are this function and nothing else:
+        // header protection is removed, the packet number is recovered from what it
+        // reveals, and the payload is opened, all before anything is reported. The
+        // branch on the Key Phase bit is the one place the timing could differ, and
+        // section 6.3's answer is why `next_receive` is derived in advance rather
+        // than inside this path.
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-9.5
+        //# For authentication to be free from side channels, the entire process
+        //# of header protection removal, packet number recovery, and packet
+        //# protection removal MUST be applied together without timing and other
+        //# side channels.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-9.4
+        //# Future header protection variants based on this construction MUST
+        //# use a PRF to ensure equivalent security guarantees.
+        //= type=exception
+        //= reason=a requirement on a future specification that defines another header protection variant, not on an implementation of the one in section 5.4. This package implements exactly the AES and ChaCha20 constructions RFC 9001 defines and adds no variant of its own.
+        //
         /// Remove protection, choosing the 1-RTT generation the Key Phase bit
         /// names, and count a failure against section 6.6's integrity limit.
         fn openPacket(
@@ -1534,6 +1626,13 @@ pub fn Connection(comptime config: Config) type {
                 //# receipt of a frame in a packet type that is not permitted as a
                 //# connection error of type PROTOCOL_VIOLATION.
                 if (!value.frameType().allowedIn(level)) return error.Protocol;
+
+                // Section 12.4's table carries RFC 9001 section 8.3's rule too: `allowedIn`
+                // answers false for CRYPTO at 0-RTT, so the check above is the one this
+                // requirement asks for.
+                //= https://www.rfc-editor.org/rfc/rfc9001#section-8.3
+                //# A server MUST treat receipt of a CRYPTO frame in a 0-RTT
+                //# packet as a connection error of type PROTOCOL_VIOLATION.
                 if (value.ackEliciting()) eliciting = true;
                 try self.receiveFrame(level, value, now_ns);
             }
@@ -1877,6 +1976,49 @@ pub fn Connection(comptime config: Config) type {
                     //# [QUIC-RECOVERY]).
                     //= type=exception
                     //= reason=0-RTT is out of scope: no early-data key is ever installed, and the session ticket, the early_data extension and the decision to accept or reject early data all live in the consumer's TLS engine, per docs/DESIGN.md section 4. See docs/DESIGN.md section 2 and section 6.
+                    //
+                    // The replay surface 0-RTT opens, and the reason its absence is a smaller
+                    // decision than it looks: what can be replayed is the application's data,
+                    // and there is no early-data key here to carry any.
+                    //= https://www.rfc-editor.org/rfc/rfc9001#section-8.3
+                    //# Clients MUST NOT send the EndOfEarlyData message.
+                    //= type=exception
+                    //= reason=0-RTT is out of scope: no early-data key is ever installed, and the session ticket, the early_data extension and the decision to accept or reject early data all live in the consumer's TLS engine, per docs/DESIGN.md section 4. See docs/DESIGN.md section 2 and section 6.
+                    //
+                    //= https://www.rfc-editor.org/rfc/rfc9001#section-9.2
+                    //# Endpoints MUST implement and use the replay protections
+                    //# described in [TLS13], however it is recognized that
+                    //# these protections are imperfect.
+                    //= type=exception
+                    //= reason=0-RTT is out of scope: no early-data key is ever installed, and the session ticket, the early_data extension and the decision to accept or reject early data all live in the consumer's TLS engine, per docs/DESIGN.md section 4. See docs/DESIGN.md section 2 and section 6.
+                    //
+                    //= https://www.rfc-editor.org/rfc/rfc9001#section-9.2
+                    //# An application protocol that uses QUIC MUST describe how
+                    //# the protocol uses 0-RTT and the measures that are
+                    //# employed to protect against replay attack.
+                    //= type=exception
+                    //= reason=0-RTT is out of scope: no early-data key is ever installed, and the session ticket, the early_data extension and the decision to accept or reject early data all live in the consumer's TLS engine, per docs/DESIGN.md section 4. See docs/DESIGN.md section 2 and section 6.
+                    //
+                    //= https://www.rfc-editor.org/rfc/rfc9001#section-9.2
+                    //# QUIC extensions MUST either describe how replay attacks
+                    //# affect their operation or prohibit the use of the
+                    //# extension in 0-RTT.
+                    //= type=exception
+                    //= reason=0-RTT is out of scope: no early-data key is ever installed, and the session ticket, the early_data extension and the decision to accept or reject early data all live in the consumer's TLS engine, per docs/DESIGN.md section 4. See docs/DESIGN.md section 2 and section 6.
+                    //
+                    //= https://www.rfc-editor.org/rfc/rfc9001#section-9.2
+                    //# Application protocols MUST either prohibit the use of
+                    //# extensions that carry application semantics in 0-RTT or
+                    //# provide replay mitigation strategies.
+                    //= type=exception
+                    //= reason=0-RTT is out of scope: no early-data key is ever installed, and the session ticket, the early_data extension and the decision to accept or reject early data all live in the consumer's TLS engine, per docs/DESIGN.md section 4. See docs/DESIGN.md section 2 and section 6.
+                    //
+                    //= https://www.rfc-editor.org/rfc/rfc9001#section-9.2
+                    //# These MUST NOT be used to communicate application
+                    //# semantics between endpoints; clients MUST treat them as
+                    //# opaque values.
+                    //= type=exception
+                    //= reason=session tickets and address validation tokens are out of scope: this package sends no Retry, issues no NEW_TOKEN and resumes no session, so it neither writes nor reads either kind of token. See docs/DESIGN.md section 2 and section 6.
                     if (level != .one_rtt and level != .zero_rtt) return error.Protocol;
                     self.streams.receive(value.stream, value.offset, value.data, value.fin) catch |err| {
                         return streamError(err);
@@ -2319,6 +2461,13 @@ pub fn Connection(comptime config: Config) type {
             //# Clients MUST ensure that UDP datagrams containing Initial
             //# packets have UDP payloads of at least 1200 bytes, adding PADDING
             //# frames as necessary.
+            //
+            // RFC 9001 section 9.3 states the same floor as a reflection defence rather
+            // than as a path check, and it is the same padding: a client's Initial is
+            // expanded to 1200 octets whatever it carries.
+            //= https://www.rfc-editor.org/rfc/rfc9001#section-9.3
+            //# First, the packet containing a ClientHello MUST be padded to a
+            //# minimum size.
             const owes_padding = (self.side == .client and
                 self.send_keys[@intFromEnum(Level.initial)] != null) or
                 initial_ack_eliciting;
@@ -2670,6 +2819,14 @@ pub fn Connection(comptime config: Config) type {
             return total;
         }
 
+        // The send-side half of section 9.5. The packet number's encoded width is
+        // chosen in `sendPacket` from `largest_acked`, which the peer already knows,
+        // and never from the number's own value; the header is then written and
+        // protected the same way for every width.
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-9.5
+        //# For the sending of packets, construction and protection of packet
+        //# payloads and packet numbers MUST be free from side channels that
+        //# would reveal the packet number or its encoded size.
         fn writeHeader(self: *const Self, buffer: []u8, level: Level, number: u64, number_octets: u8) !packet.Written {
             // A number wider than four octets has no encoding, and one at the
             // varint ceiling has no successor — either would make the next
