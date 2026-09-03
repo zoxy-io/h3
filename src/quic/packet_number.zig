@@ -73,6 +73,23 @@ comptime {
 /// `largest_acked` is null before anything in the space has been acknowledged,
 /// which section 17.1 handles by requiring the full range to be covered — the
 /// appendix writes that as a range of `full + 1`.
+//= https://www.rfc-editor.org/rfc/rfc9000#section-17.1
+//# Prior to receiving an acknowledgment for a packet number space, the
+//# full packet number MUST be included; it is not to be truncated, as
+//# described below.
+//
+//= https://www.rfc-editor.org/rfc/rfc9000#section-17.1
+//# After an acknowledgment is received for a packet number space, the
+//# sender MUST use a packet number size able to represent more than
+//# twice as large a range as the difference between the largest
+//# acknowledged packet number and the packet number being sent.
+//
+// The doubling above is exactly what the SHOULD below asks for: the window a
+// reordered packet can arrive within is the same window `decode` resolves in.
+//= https://www.rfc-editor.org/rfc/rfc9000#section-17.1
+//# An endpoint SHOULD use a large enough packet number encoding to
+//# allow the packet number to be recovered even if the packet arrives
+//# after packets that are sent afterwards.
 pub fn encodedLength(full: u64, largest_acked: ?u64) u8 {
     assert(full <= max);
     if (largest_acked) |acked| assert(acked <= full);
@@ -174,6 +191,12 @@ test "RFC 9000 appendix A.3: the worked example" {
     try std.testing.expectEqual(@as(u64, 0xa82f_9b32), decode(0xa82f_30ea, 0x9b32, 2));
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9000#section-17.1
+//# After an acknowledgment is received for a packet number space, the
+//# sender MUST use a packet number size able to represent more than
+//# twice as large a range as the difference between the largest
+//# acknowledged packet number and the packet number being sent.
+//= type=test
 test "RFC 9000 appendix A.2: the length covers twice the outstanding range" {
     // The appendix's own example: 0xac5c02 with 0xabe8b3 acknowledged needs two
     // octets, and one more outstanding packet tips it to three.
@@ -181,6 +204,11 @@ test "RFC 9000 appendix A.2: the length covers twice the outstanding range" {
     try std.testing.expectEqual(@as(u8, 3), encodedLength(0xace8fe, 0xabe8b3));
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9000#section-17.1
+//# Prior to receiving an acknowledgment for a packet number space, the
+//# full packet number MUST be included; it is not to be truncated, as
+//# described below.
+//= type=test
 test "before the first acknowledgement the whole number is covered" {
     try std.testing.expectEqual(@as(u8, 1), encodedLength(0, null));
     // The boundary: the range covered is `(full + 1) * 2`, so one octet lasts
