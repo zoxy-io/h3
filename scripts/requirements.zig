@@ -237,6 +237,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     var citations: std.ArrayList(Citation) = .empty;
     var list_uncited = false;
+    var list_advisory = false;
     for (args[2..]) |root_path| {
         // `--uncited` lists what is left rather than counting it. Counting is
         // what a gate needs; a listing is what the next person to do the work
@@ -246,10 +247,18 @@ pub fn main(init: std.process.Init) !u8 {
             list_uncited = true;
             continue;
         }
+        // SHOULD and SHOULD NOT, which the mandatory listing deliberately
+        // leaves out: a SHOULD nobody looked at is a different kind of gap
+        // from a MUST nobody looked at, and mixing them makes neither legible.
+        if (std.mem.eql(u8, root_path, "--uncited-should")) {
+            list_uncited = true;
+            list_advisory = true;
+            continue;
+        }
         try collectCitations(arena, io, root_path, &citations);
     }
 
-    return report(arena, sections.items, requirements.items, citations.items, list_uncited);
+    return report(arena, sections.items, requirements.items, citations.items, list_uncited, list_advisory);
 }
 
 fn loadSpecs(
@@ -491,6 +500,7 @@ fn report(
     requirements: []Requirement,
     citations: []const Citation,
     list_uncited: bool,
+    list_advisory: bool,
 ) !u8 {
     _ = arena;
     var violations: u32 = 0;
@@ -534,7 +544,7 @@ fn report(
     }
 
     printCoverage(sections, requirements);
-    if (list_uncited) printUncited(sections, requirements);
+    if (list_uncited) printUncited(sections, requirements, list_advisory);
 
     if (violations > 0) {
         std.debug.print("\nrequirements: {d} violation(s)\n", .{violations});
@@ -576,12 +586,14 @@ fn markCited(
 
 /// Every mandatory requirement in an implemented document that nothing cites,
 /// with enough of the sentence to find it.
-fn printUncited(sections: []const Section, requirements: []const Requirement) void {
-    std.debug.print("\nuncited mandatory requirements, implemented documents only\n\n", .{});
+fn printUncited(sections: []const Section, requirements: []const Requirement, advisory: bool) void {
+    std.debug.print("\nuncited {s} requirements, implemented documents only\n\n", .{
+        if (advisory) "SHOULD-level" else "mandatory",
+    });
     var count: u32 = 0;
     for (requirements) |requirement| {
         if (requirement.cited) continue;
-        if (!isMandatory(requirement.keyword)) continue;
+        if (isMandatory(requirement.keyword) == advisory) continue;
         const section = sections[requirement.section];
         if (!isImplemented(section.rfc)) continue;
         count += 1;
