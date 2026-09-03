@@ -1009,6 +1009,14 @@ pub fn Connection(comptime config: Config) type {
                 //# frame (Section 19.16).
                 //= type=exception
                 //= reason=this endpoint issues exactly one connection identifier, the one in Options.source, and never a second; issuing more is migration's business. See docs/DESIGN.md section 2 and section 6.
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-9.6
+                //# If a
+                //# client receives packets from a new server address when the client has
+                //# not initiated a migration to that address, the client SHOULD discard
+                //# these packets.
+                //= type=exception
+                //= reason=a server's preferred address is migration by another name and is out of scope; nothing here sees a source address at all, because the seam of docs/DESIGN.md section 3 hands over a datagram and not a peer. See docs/DESIGN.md section 2 and section 6.
                 .new_connection_id, .retire_connection_id, .path_challenge, .path_response => {
                     // Migration is not this slice; the frames parse and are
                     // ignored rather than refused, because they are legal and a
@@ -1869,6 +1877,15 @@ pub fn Connection(comptime config: Config) type {
             // triggered it and an application close does not. Writing `null`
             // for both makes a type 0x1c frame that omits a field the peer's
             // parser requires, which is a close the peer cannot read.
+            //
+            // `close` always sets `close_is_application` false, so the 0x1d
+            // form is never generated at any level and the rule below has no
+            // way to be broken from here.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-12.5
+            //# *  CONNECTION_CLOSE frames signaling errors at the QUIC layer (type
+            //# 0x1c) MAY appear in any packet number space.  CONNECTION_CLOSE
+            //# frames signaling application errors (type 0x1d) MUST only appear
+            //# in the application data packet number space.
             const written = frame.encode(payload, .{ .connection_close = .{
                 .application = self.close_is_application,
                 .code = self.close_code,
@@ -1934,6 +1951,9 @@ pub fn Connection(comptime config: Config) type {
 
             // Application data only: sections 4.1 and 2 put streams and their
             // limits in the 1-RTT space alone.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-12.5
+            //# *  All other frame types MUST only be sent in the application data
+            //# packet number space.
             if (level == .one_rtt) {
                 if (self.handshake_done_pending and !self.handshake_done_framed) {
                     const written = frame.encode(payload[offset..], .handshake_done) catch 0;
@@ -1992,6 +2012,16 @@ pub fn Connection(comptime config: Config) type {
             return offset;
         }
 
+        // Both limits are `Streams`': `write` refuses what would exceed the
+        // connection or stream window and what would follow a FIN, so
+        // everything in `send[framed..send_len]` is already within both.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-4.1
+        //# Senders MUST NOT send data in excess of either limit.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-4.5
+        //# An endpoint MUST NOT send data on a stream at or beyond the final
+        //# size.
+        //
         /// Frame whatever one stream has waiting.
         ///
         /// One stream per packet rather than as many as fit: a packet carrying
