@@ -610,6 +610,57 @@ pub fn Connection(comptime config: Config) type {
         //# function to generate flow labels.
         //= type=exception
         //= reason=an IPv6 flow label is a field of an IP header, and this package writes no IP header and opens no socket: the seam of docs/DESIGN.md section 3 is a UDP payload. See docs/DESIGN.md section 2 and section 6.
+        // Section 9's advisory half, which lands the same way as its mandatory one: an
+        // endpoint that cannot observe an address cannot decide when to change it, how
+        // often, or whether the peer's identifier makes the change linkable.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-9.5
+        //# An endpoint SHOULD NOT initiate migration with a peer that has
+        //# requested a zero-length connection ID, because traffic over the
+        //# new path might be trivially linkable to traffic over the old
+        //# one.
+        //= type=exception
+        //= reason=connection migration is out of scope: a connection here has exactly one path and never learns an address, because the seam of docs/DESIGN.md section 3 hands over a datagram rather than a peer. There is no second path to probe, revert to or reset a controller for. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-9.5
+        //# Changing address can cause a peer to reset its congestion
+        //# control state (see Section 9.4), so addresses SHOULD only be
+        //# changed infrequently.
+        //= type=exception
+        //= reason=connection migration is out of scope: a connection here has exactly one path and never learns an address, because the seam of docs/DESIGN.md section 3 hands over a datagram rather than a peer. There is no second path to probe, revert to or reset a controller for. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-9.5
+        //# To ensure that migration is possible and packets sent on
+        //# different paths cannot be correlated, endpoints SHOULD provide
+        //# new connection IDs before peers migrate; see Section 5.1.1. If a
+        //# peer might have exhausted available connection IDs, a migrating
+        //# endpoint could include a NEW_CONNECTION_ID frame in all packets
+        //# sent on a new network path.
+        //= type=exception
+        //= reason=this endpoint issues exactly one connection identifier, the one in Options.source, and never a second; issuing more is migration's business. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-9.7
+        //# Endpoints that send data using IPv6 SHOULD apply an IPv6 flow
+        //# label in compliance with [RFC6437], unless the local API does
+        //# not allow setting IPv6 flow labels.
+        //= type=exception
+        //= reason=an IPv6 flow label is a field of an IP header, and this package writes no IP header and opens no socket: the seam of docs/DESIGN.md section 3 is a UDP payload. See docs/DESIGN.md section 2 and section 6.
+        //
+        // Section 21.5.6's two rules are an address policy, and both directions of it —
+        // refuse this range, do not refuse that one — need an address to apply to.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-21.5.6
+        //# Endpoints SHOULD NOT allow connections or migration to a
+        //# loopback address if the same service was previously available at
+        //# a different interface or if the address was provided by a
+        //# service at a non-loopback address.
+        //= type=exception
+        //= reason=this package opens no socket and never sees an address: the seam of docs/DESIGN.md section 3 hands over a datagram, so which IP and port carry a connection is the consumer's choice and not this slice's. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-21.5.6
+        //# Endpoints SHOULD NOT refuse to use an address unless they have
+        //# specific knowledge about the network indicating that sending
+        //# datagrams to unvalidated addresses in a given range is not safe.
+        //= type=exception
+        //= reason=this package opens no socket and never sees an address: the seam of docs/DESIGN.md section 3 hands over a datagram, so which IP and port carry a connection is the consumer's choice and not this slice's. See docs/DESIGN.md section 2 and section 6.
         /// Section 8.1's accounting. A client validates its peer by construction
         /// — it chose the address — so this only ever restrains a server.
         address_validated: bool,
@@ -996,6 +1047,17 @@ pub fn Connection(comptime config: Config) type {
             return self.peer_parameters[0..self.peer_parameters_len];
         }
 
+        // The one advisory rule this package would want to obey and structurally cannot:
+        // a deployment on this code does not implement migration, so it *should* say so
+        // in disable_active_migration — and the extension that would carry the parameter
+        // is assembled on the other side of the TLS seam.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-5.2.3
+        //# A server in a deployment that does not implement a solution to
+        //# maintain connection continuity when the client address changes
+        //# SHOULD indicate that migration is not supported by using the
+        //# disable_active_migration transport parameter.
+        //= type=exception
+        //= reason=the transport parameters this endpoint advertises are built by the consumer's TLS engine and never by this package: `transportParametersIn` and `transportParametersOut` carry the *peer's* extension in and back out, and nothing here encodes one of its own. A deployment on this package should indeed advertise disable_active_migration, because migration is out of scope here — but only the consumer can, per docs/DESIGN.md section 4. See docs/DESIGN.md section 2 and section 6.
         // The receive half of the rule, which is the half this package can enforce:
         // the extension this endpoint *sends* is built by the consumer's TLS engine,
         // and `transport_parameters.parse` refuses a repeated identifier with
@@ -1201,6 +1263,45 @@ pub fn Connection(comptime config: Config) type {
             //# intentional simultaneous migration, this might also occur
             //# because the client's access network used a different NAT binding
             //# for the server's preferred address.
+            //= type=exception
+            //= reason=a server's preferred address is migration by another name and is out of scope: this package never sends the preferred_address transport parameter and never acts on one, and the address it would name is outside the seam of docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            // Section 9.6's advisory half, on the same footing as its mandatory one: the
+            // parameter is parsed and read by nobody, so neither role ever has a second
+            // address to select, to validate against, or to stop accepting packets on.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-9.6.1
+            //# Once the handshake is confirmed, the client SHOULD select
+            //# one of the two addresses provided by the server and initiate
+            //# path validation (see Section 8.2).
+            //= type=exception
+            //= reason=a server's preferred address is migration by another name and is out of scope: this package never sends the preferred_address transport parameter and never acts on one, and the address it would name is outside the seam of docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-9.6.1
+            //# As soon as path validation succeeds, the client SHOULD begin
+            //# sending all future packets to the new server address using
+            //# the new connection ID and discontinue use of the old server
+            //# address.
+            //= type=exception
+            //= reason=a server's preferred address is migration by another name and is out of scope: this package never sends the preferred_address transport parameter and never acts on one, and the address it would name is outside the seam of docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-9.6.2
+            //# The server SHOULD drop newer packets for this connection
+            //# that are received on the old IP address.
+            //= type=exception
+            //= reason=a server's preferred address is migration by another name and is out of scope: this package never sends the preferred_address transport parameter and never acts on one, and the address it would name is outside the seam of docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-9.6.3
+            //# In this case, the client SHOULD perform path validation to
+            //# both the original and preferred server address from the
+            //# client's new address concurrently.
+            //= type=exception
+            //= reason=a server's preferred address is migration by another name and is out of scope: this package never sends the preferred_address transport parameter and never acts on one, and the address it would name is outside the seam of docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-9.6.3
+            //# Servers SHOULD initiate path validation to the client's new
+            //# address upon receiving a probe packet from a different
+            //# address; see Section 8. A client that migrates to a new
+            //# address SHOULD use a preferred address from the same address
+            //# family for the server.
             //= type=exception
             //= reason=a server's preferred address is migration by another name and is out of scope: this package never sends the preferred_address transport parameter and never acts on one, and the address it would name is outside the seam of docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
             //= https://www.rfc-editor.org/rfc/rfc9000#section-21.5
@@ -1635,6 +1736,51 @@ pub fn Connection(comptime config: Config) type {
             //# attacks.
             //= type=exception
             //= reason=version negotiation is out of scope; a connection here speaks QUIC version 1 and the packet types that would begin a different one are the consumer's, per docs/DESIGN.md section 2. The rule is in any case addressed to a future version of QUIC rather than to an implementation of this one.
+            // Section 5.2.2's advisory half. The mandatory drops are cited above and are what
+            // this package does; the two sentences that ask a server to *answer* with a
+            // Version Negotiation packet are the ones it declines.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-5.2.2
+            //# If a server receives a packet that indicates an unsupported
+            //# version and if the packet is large enough to initiate a new
+            //# connection for any supported version, the server SHOULD send
+            //# a Version Negotiation packet as described in Section 6.1. A
+            //# server MAY limit the number of packets to which it responds
+            //# with a Version Negotiation packet.
+            //= type=exception
+            //= reason=version negotiation is out of scope; a connection here speaks QUIC version 1, and a Version Negotiation packet has no encryption level, so it leaves `receivePacket` discarded. Deciding to try another version means beginning a different connection, which is the consumer's, per docs/DESIGN.md section 2 and section 6.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-5.2.2
+            //# Servers SHOULD respond with a Version Negotiation packet,
+            //# provided that the datagram is sufficiently long.
+            //= type=exception
+            //= reason=version negotiation is out of scope; a connection here speaks QUIC version 1, and a Version Negotiation packet has no encryption level, so it leaves `receivePacket` discarded. Deciding to try another version means beginning a different connection, which is the consumer's, per docs/DESIGN.md section 2 and section 6.
+            //
+            // Vacuous here and excused rather than claimed: this client supports one version,
+            // so "the largest of the minimum datagram sizes" is section 14.1's 1200 octets,
+            // which `send` pads every client Initial datagram to.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-6
+            //# Clients that support multiple QUIC versions SHOULD ensure
+            //# that the first UDP datagram they send is sized to the
+            //# largest of the minimum datagram sizes from all versions they
+            //# support, using PADDING frames (Section 19.1) as necessary.
+            //= type=exception
+            //= reason=version negotiation is out of scope; a connection here speaks QUIC version 1, and a Version Negotiation packet has no encryption level, so it leaves `receivePacket` discarded. Deciding to try another version means beginning a different connection, which is the consumer's, per docs/DESIGN.md section 2 and section 6.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-5.2.2
+            //# If a server refuses to accept a new connection, it SHOULD
+            //# send an Initial packet containing a CONNECTION_CLOSE frame
+            //# with error code CONNECTION_REFUSED.
+            //= type=exception
+            //= reason=whether to accept a connection at all is decided before a `Connection` exists: the consumer routes the first datagram and constructs this type, so there is no state here that can be refusing one. A consumer that wants to refuse has the mechanism the sentence asks for — construct the connection and call `close(.connection_refused)`, which frames the CONNECTION_CLOSE into an Initial packet. See docs/DESIGN.md section 2 and section 3.
+            //
+            // Held by the key schedule rather than by a check on the packet: a server has no
+            // Handshake receive key until its TLS engine hands one over, which it does when
+            // it has processed the ClientHello and produced the response. Until then the
+            // `receive_keys[index] orelse return` below discards the packet.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-5.2.2
+            //# Clients are not able to send Handshake packets prior to
+            //# receiving a server response, so servers SHOULD ignore any
+            //# such packets.
             const level = header.level() orelse return; // Retry, Version Negotiation: not this slice.
             const offset = header.packetNumberOffset() orelse return;
             const index = @intFromEnum(level);
@@ -2108,6 +2254,41 @@ pub fn Connection(comptime config: Config) type {
                 //# the required MTU.
                 //= type=exception
                 //= reason=path validation belongs to connection migration, which is out of scope: a connection here has one path, never learns an address because the seam of docs/DESIGN.md section 3 hands over a datagram rather than a peer, and generates no PATH_CHALLENGE — whose payload would need randomness that same seam does not carry. See docs/DESIGN.md section 2 and section 6.
+                // Section 8.2's advisory half, and the arm below is the whole answer to it: a
+                // PATH_CHALLENGE that arrives is parsed and ignored, and one is never sent, so
+                // there is no packet to put two in, no probe to rate-limit and no validation in
+                // flight for a timer to abandon.
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-8.2.1
+                //# However, an endpoint SHOULD NOT send multiple
+                //# PATH_CHALLENGE frames in a single packet.
+                //= type=exception
+                //= reason=path validation belongs to connection migration, which is out of scope: a connection here has one path, never learns an address because the seam of docs/DESIGN.md section 3 hands over a datagram rather than a peer, and generates no PATH_CHALLENGE — whose payload would need randomness that same seam does not carry. See docs/DESIGN.md section 2 and section 6.
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-8.2.1
+                //# An endpoint SHOULD NOT probe a new path with packets
+                //# containing a PATH_CHALLENGE frame more frequently than
+                //# it would send an Initial packet.
+                //= type=exception
+                //= reason=path validation belongs to connection migration, which is out of scope: a connection here has one path, never learns an address because the seam of docs/DESIGN.md section 3 hands over a datagram rather than a peer, and generates no PATH_CHALLENGE — whose payload would need randomness that same seam does not carry. See docs/DESIGN.md section 2 and section 6.
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-8.2.4
+                //# Endpoints SHOULD abandon path validation based on a
+                //# timer.
+                //= type=exception
+                //= reason=path validation belongs to connection migration, which is out of scope: a connection here has one path, never learns an address because the seam of docs/DESIGN.md section 3 hands over a datagram rather than a peer, and generates no PATH_CHALLENGE — whose payload would need randomness that same seam does not carry. See docs/DESIGN.md section 2 and section 6.
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-9.3.3
+                //# An endpoint that receives a PATH_CHALLENGE on an active
+                //# path SHOULD send a non-probing packet in response.
+                //= type=exception
+                //= reason=path validation belongs to connection migration, which is out of scope: a connection here has one path, never learns an address because the seam of docs/DESIGN.md section 3 hands over a datagram rather than a peer, and generates no PATH_CHALLENGE — whose payload would need randomness that same seam does not carry. See docs/DESIGN.md section 2 and section 6.
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-9.3
+                //# After verifying a new client address, the server SHOULD
+                //# send new address validation tokens (Section 8) to the
+                //# client.
+                //= type=exception
+                //= reason=connection migration is out of scope: a connection here has exactly one path and never learns an address, because the seam of docs/DESIGN.md section 3 hands over a datagram rather than a peer. There is no second path to probe, revert to or reset a controller for. See docs/DESIGN.md section 2 and section 6.
                 .new_connection_id, .retire_connection_id, .path_challenge, .path_response => {
                     // Migration is not this slice; the frames parse and are
                     // ignored rather than refused, because they are legal and a
