@@ -1215,6 +1215,83 @@ pub fn Connection(comptime config: Config) type {
                 //# these packets.
                 //= type=exception
                 //= reason=a server's preferred address is migration by another name and is out of scope; nothing here sees a source address at all, because the seam of docs/DESIGN.md section 3 hands over a datagram and not a peer. See docs/DESIGN.md section 2 and section 6.
+                //
+                // Section 8.2's whole mechanism, both halves. Nothing here initiates a path
+                // validation and nothing answers one; the frames parse so that a conforming
+                // peer's datagram is not refused, and they end here.
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-8.2.1
+                //# The endpoint MUST use unpredictable data in every
+                //# PATH_CHALLENGE frame so that it can associate the peer's
+                //# response with the corresponding PATH_CHALLENGE.
+                //= type=exception
+                //= reason=path validation belongs to connection migration, which is out of scope: a connection here has one path, never learns an address because the seam of docs/DESIGN.md section 3 hands over a datagram rather than a peer, and generates no PATH_CHALLENGE — whose payload would need randomness that same seam does not carry. See docs/DESIGN.md section 2 and section 6.
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-8.2.1
+                //# An endpoint MUST expand datagrams that contain a
+                //# PATH_CHALLENGE frame to at least the smallest allowed
+                //# maximum datagram size of 1200 bytes, unless the
+                //# anti-amplification limit for the path does not permit
+                //# sending a datagram of this size.
+                //= type=exception
+                //= reason=path validation belongs to connection migration, which is out of scope: a connection here has one path, never learns an address because the seam of docs/DESIGN.md section 3 hands over a datagram rather than a peer, and generates no PATH_CHALLENGE — whose payload would need randomness that same seam does not carry. See docs/DESIGN.md section 2 and section 6.
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-8.2.1
+                //# To ensure that the path MTU is large enough, the endpoint
+                //# MUST perform a second path validation by sending a
+                //# PATH_CHALLENGE frame in a datagram of at least 1200 bytes.
+                //= type=exception
+                //= reason=path validation belongs to connection migration, which is out of scope: a connection here has one path, never learns an address because the seam of docs/DESIGN.md section 3 hands over a datagram rather than a peer, and generates no PATH_CHALLENGE — whose payload would need randomness that same seam does not carry. See docs/DESIGN.md section 2 and section 6.
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-8.2.1
+                //# Unlike other cases where datagrams are expanded, endpoints
+                //# MUST NOT discard datagrams that appear to be too small when
+                //# they contain PATH_CHALLENGE or PATH_RESPONSE.
+                //= type=exception
+                //= reason=path validation belongs to connection migration, which is out of scope: a connection here has one path, never learns an address because the seam of docs/DESIGN.md section 3 hands over a datagram rather than a peer, and generates no PATH_CHALLENGE — whose payload would need randomness that same seam does not carry. See docs/DESIGN.md section 2 and section 6.
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-8.2.2
+                //# An endpoint MUST NOT delay transmission of a packet
+                //# containing a PATH_RESPONSE frame unless constrained by
+                //# congestion control.
+                //= type=exception
+                //= reason=path validation belongs to connection migration, which is out of scope: a connection here has one path, never learns an address because the seam of docs/DESIGN.md section 3 hands over a datagram rather than a peer, and generates no PATH_CHALLENGE — whose payload would need randomness that same seam does not carry. See docs/DESIGN.md section 2 and section 6.
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-8.2.2
+                //# A PATH_RESPONSE frame MUST be sent on the network path where
+                //# the PATH_CHALLENGE frame was received.
+                //= type=exception
+                //= reason=path validation belongs to connection migration, which is out of scope: a connection here has one path, never learns an address because the seam of docs/DESIGN.md section 3 hands over a datagram rather than a peer, and generates no PATH_CHALLENGE — whose payload would need randomness that same seam does not carry. See docs/DESIGN.md section 2 and section 6.
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-8.2.2
+                //# This requirement MUST NOT be enforced by the endpoint that
+                //# initiates path validation, as that would enable an attack on
+                //# migration; see Section 9.3.3. An endpoint MUST expand
+                //# datagrams that contain a PATH_RESPONSE frame to at least the
+                //# smallest allowed maximum datagram size of 1200 bytes.
+                //= type=exception
+                //= reason=path validation belongs to connection migration, which is out of scope: a connection here has one path, never learns an address because the seam of docs/DESIGN.md section 3 hands over a datagram rather than a peer, and generates no PATH_CHALLENGE — whose payload would need randomness that same seam does not carry. See docs/DESIGN.md section 2 and section 6.
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-8.2.2
+                //# However, an endpoint MUST NOT expand the datagram containing
+                //# the PATH_RESPONSE if the resulting data exceeds the
+                //# anti-amplification limit.
+                //= type=exception
+                //= reason=path validation belongs to connection migration, which is out of scope: a connection here has one path, never learns an address because the seam of docs/DESIGN.md section 3 hands over a datagram rather than a peer, and generates no PATH_CHALLENGE — whose payload would need randomness that same seam does not carry. See docs/DESIGN.md section 2 and section 6.
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-8.2.2
+                //# An endpoint MUST NOT send more than one PATH_RESPONSE frame
+                //# in response to one PATH_CHALLENGE frame; see Section 13.3.
+                //# The peer is expected to send more PATH_CHALLENGE frames as
+                //# necessary to evoke additional PATH_RESPONSE frames.
+                //= type=exception
+                //= reason=path validation belongs to connection migration, which is out of scope: a connection here has one path, never learns an address because the seam of docs/DESIGN.md section 3 hands over a datagram rather than a peer, and generates no PATH_CHALLENGE — whose payload would need randomness that same seam does not carry. See docs/DESIGN.md section 2 and section 6.
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-8.2.3
+                //# However, the endpoint MUST initiate another path validation
+                //# with an expanded datagram to verify that the path supports
+                //# the required MTU.
+                //= type=exception
+                //= reason=path validation belongs to connection migration, which is out of scope: a connection here has one path, never learns an address because the seam of docs/DESIGN.md section 3 hands over a datagram rather than a peer, and generates no PATH_CHALLENGE — whose payload would need randomness that same seam does not carry. See docs/DESIGN.md section 2 and section 6.
                 .new_connection_id, .retire_connection_id, .path_challenge, .path_response => {
                     // Migration is not this slice; the frames parse and are
                     // ignored rather than refused, because they are legal and a
@@ -1243,6 +1320,101 @@ pub fn Connection(comptime config: Config) type {
                 // the frame either — this package requests no token and stores
                 // none — but only the server's half is a rule, so only the
                 // server's half is enforced.
+                //
+                // Sections 8.1.1 through 8.1.4 are the token's whole lifecycle — how a server
+                // builds one, how a client carries it, and what integrity it has to have —
+                // and none of it happens here. The frame is refused at a server and ignored
+                // at a client, which is the entirety of this package's relationship with a
+                // token.
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.1
+                //# A token sent in a NEW_TOKEN frame or a Retry packet MUST be
+                //# constructed in a way that allows the server to identify how
+                //# it was provided to a client.
+                //= type=exception
+                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.2
+                //# This token MUST be repeated by the client in all Initial
+                //# packets it sends for that connection after it receives the
+                //# Retry packet.
+                //= type=exception
+                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.3
+                //# The client MUST include the token in all Initial packets it
+                //# sends, unless a Retry replaces the token with a newer one.
+                //= type=exception
+                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.3
+                //# The client MUST NOT use the token provided in a Retry for
+                //# future connections.
+                //= type=exception
+                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.3
+                //# A token issued with NEW_TOKEN MUST NOT include information
+                //# that would allow values to be linked by an observer to the
+                //# connection on which it was issued.
+                //= type=exception
+                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.3
+                //# A client MUST NOT include a token that is not applicable to
+                //# the server that it is connecting to, unless the client has
+                //# the knowledge that the server that issued the token and the
+                //# server the client is connecting to are jointly managing the
+                //# tokens.
+                //= type=exception
+                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.3
+                //# In comparison, a token obtained in a Retry packet MUST be
+                //# used immediately during the connection attempt and cannot be
+                //# used in subsequent connection attempts.
+                //= type=exception
+                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.3
+                //# When a server receives an Initial packet with an address
+                //# validation token, it MUST attempt to validate the token,
+                //# unless it has already completed address validation.
+                //= type=exception
+                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.4
+                //# An address validation token MUST be difficult to guess.
+                //= type=exception
+                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.4
+                //# For this design to work, the token MUST be covered by
+                //# integrity protection against modification or falsification
+                //# by clients.
+                //= type=exception
+                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.4
+                //# Tokens sent in NEW_TOKEN frames MUST include information
+                //# that allows the server to verify that the client IP address
+                //# has not changed from when the token was issued.
+                //= type=exception
+                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.4
+                //# If the client IP address has changed, the server MUST adhere
+                //# to the anti-amplification limit; see Section 8. Note that in
+                //# the presence of NAT, this requirement might be insufficient
+                //# to protect other hosts that share the NAT from amplification
+                //# attacks.
+                //= type=exception
+                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.4
+                //# To protect against such attacks, servers MUST ensure that
+                //# replay of tokens is prevented or limited.
+                //= type=exception
+                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
                 .new_token => if (self.side == .server) return error.Protocol,
                 // Both take `@max`, so a limit that moved backwards under loss
                 // or reordering leaves the send window where it was.
@@ -1680,6 +1852,14 @@ pub fn Connection(comptime config: Config) type {
             // Padding past `limit` is not possible and that is correct: for an
             // unvalidated server `limit` is section 8.1's three-times budget,
             // and section 14.1 does not license exceeding it.
+            //
+            // Section 8.1 states the client's half of the floor as an obligation on the
+            // datagram rather than on the packet, which is the same padding read from
+            // the other end: this is the only place a datagram's length is decided.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1
+            //# Clients MUST ensure that UDP datagrams containing Initial
+            //# packets have UDP payloads of at least 1200 bytes, adding PADDING
+            //# frames as necessary.
             const owes_padding = (self.side == .client and
                 self.send_keys[@intFromEnum(Level.initial)] != null) or
                 initial_ack_eliciting;
