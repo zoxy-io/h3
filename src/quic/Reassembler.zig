@@ -126,6 +126,15 @@ pub fn Reassembler(comptime config: Config) type {
             if (offset > varint.max) return error.BeyondWindow;
             if (data.len > varint.max - offset) return error.BeyondWindow;
             const end = offset + data.len;
+            // "Even after a stream is closed" is the part that costs something:
+            // `final_size` is kept for the life of the reassembler rather than
+            // dropped once everything has been read, which is the state
+            // commitment section 4.5 warns about and the reason this is a
+            // SHOULD. It is paid here, because the alternative is that a peer
+            // can extend a stream it already ended.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-4.5
+            //# A receiver SHOULD treat receipt of data at or beyond the final size as
+            //# an error of type FINAL_SIZE_ERROR, even after a stream is closed.
             if (self.final_size) |final| {
                 if (end > final) return error.FinalSizeViolated;
             }
@@ -151,6 +160,16 @@ pub fn Reassembler(comptime config: Config) type {
         /// Section 2.2: whatever this chunk overlaps must already say the same
         /// thing. Checked before anything is written, so a rejected chunk
         /// leaves the buffer as it was.
+        ///
+        /// The MAY is taken: `error.Inconsistent` becomes `PROTOCOL_VIOLATION`
+        /// rather than a silently preferred copy, because the alternative is a
+        /// stream whose contents depend on arrival order — see the module
+        /// comment for why that is a smuggling primitive and not a curiosity.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-2.2
+        //# The data at a given offset MUST NOT change if it is sent multiple
+        //# times; an endpoint MAY treat receipt of different data at the same
+        //# offset within a stream as a connection error of type
+        //# PROTOCOL_VIOLATION.
         fn checkConsistent(self: *const Self, span: Span, data: []const u8) PushError!void {
             assert(data.len == span.length());
             for (self.spans[0..self.span_count]) |held| {
@@ -198,6 +217,15 @@ pub fn Reassembler(comptime config: Config) type {
         ///
         /// Borrows from the reassembler, so a caller holding it across a `push`
         /// is holding a slice into a buffer that may have been written.
+        ///
+        /// The whole of the ordering guarantee is the two lines below: the run
+        /// starts at `base` or it is empty, so an octet behind a gap is held
+        /// and never handed out. A structure that returned what it had would
+        /// deliver the stream in arrival order, which is what QUIC's
+        /// reassembly exists to prevent.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-2.2
+        //# Endpoints MUST be able to deliver stream data to an application as an
+        //# ordered byte stream.
         pub fn readable(self: *const Self) []const u8 {
             if (self.span_count == 0) return &.{};
             const first = self.spans[0];
@@ -246,12 +274,33 @@ pub fn Reassembler(comptime config: Config) type {
         /// The largest stream offset the peer may write, for `MAX_STREAM_DATA`.
         /// Derived from the capacity rather than tracked beside it, so the
         /// window and the buffer cannot disagree.
+        ///
+        /// This is the number the requirement below is measured against, and
+        /// `push` returns `BeyondWindow` for anything past it — which
+        /// `Streams.receive` turns into `error.FlowControl` and the connection
+        /// into `FLOW_CONTROL_ERROR`. Refusing rather than growing is the whole
+        /// reason the window is the buffer.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-4.1
+        //# A receiver MUST close the connection with an error of type
+        //# FLOW_CONTROL_ERROR if the sender violates the advertised connection or
+        //# stream data limits; see Section 11 for details on error handling.
         pub fn limit(self: *const Self) u64 {
             return self.base + capacity;
         }
 
         /// Section 4.5: name the stream's final size, from a FIN or a
         /// RESET_STREAM. Idempotent, and a second, different answer is an error.
+        ///
+        /// Both halves of "it cannot change" are here: a second, different size
+        /// is refused, and so is one below what has already been received. The
+        /// second is the one worth stating, because a size that retracts data
+        /// the peer itself delivered would give back flow control credit that
+        /// `Streams` has already charged.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-4.5
+        //# If a RESET_STREAM or STREAM frame is received indicating a change in
+        //# the final size for the stream, an endpoint SHOULD respond with an
+        //# error of type FINAL_SIZE_ERROR; see Section 11 for details on error
+        //# handling.
         pub fn finish(self: *Self, size: u64) PushError!void {
             assert(size <= varint.max);
             if (self.final_size) |final| {
@@ -342,6 +391,12 @@ test "out-of-order arrival converges on the same bytes" {
     try testing.expectEqual(@as(u32, 1), backward.span_count);
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9000#section-2.2
+//# The data at a given offset MUST NOT change if it is sent multiple
+//# times; an endpoint MAY treat receipt of different data at the same
+//# offset within a stream as a connection error of type
+//# PROTOCOL_VIOLATION.
+//= type=test
 test "a duplicate is free, and a contradiction is a protocol violation" {
     var stream: Small = .{};
     try stream.push(0, "hello");
@@ -366,6 +421,11 @@ test "a partial overlap is checked only where it overlaps" {
     try testing.expectEqualStrings("0123456789", stream.readable());
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9000#section-4.1
+//# A receiver MUST close the connection with an error of type
+//# FLOW_CONTROL_ERROR if the sender violates the advertised connection or
+//# stream data limits; see Section 11 for details on error handling.
+//= type=test
 test "the window is the buffer, and a peer may not write past it" {
     var stream: Small = .{};
     try testing.expectEqual(@as(u64, Small.capacity), stream.limit());
@@ -414,6 +474,17 @@ test "too many gaps is refused rather than grown into" {
     try stream.push(8, "e");
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9000#section-4.5
+//# If a RESET_STREAM or STREAM frame is received indicating a change in
+//# the final size for the stream, an endpoint SHOULD respond with an
+//# error of type FINAL_SIZE_ERROR; see Section 11 for details on error
+//# handling.
+//= type=test
+//
+//= https://www.rfc-editor.org/rfc/rfc9000#section-4.5
+//# A receiver SHOULD treat receipt of data at or beyond the final size as
+//# an error of type FINAL_SIZE_ERROR, even after a stream is closed.
+//= type=test
 test "section 4.5's final size" {
     var stream: Small = .{};
     try stream.push(0, "abc");
@@ -462,6 +533,10 @@ test "a long stream drains through a small window" {
     try testing.expectEqualStrings("0123", seen[0..4]);
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9000#section-4.5
+//# A receiver SHOULD treat receipt of data at or beyond the final size as
+//# an error of type FINAL_SIZE_ERROR, even after a stream is closed.
+//= type=test
 test "a final size below what was already consumed is refused" {
     // Section 4.5: data at or beyond the final size is an error "even after a
     // stream is closed". Once everything is drained there are no spans left, so

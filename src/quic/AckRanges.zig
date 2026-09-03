@@ -104,6 +104,26 @@ pub fn AckRanges(comptime config: Config) type {
     return struct {
         const Self = @This();
 
+        // One of these per packet number space, and it holds nothing that
+        // names its own. What keeps an ACK in the right packet is the pairing
+        // at the far end: `Connection.writePayload` takes the set from
+        // `spaces[level.space()]` and writes it into a packet at `level`, so
+        // the numbers in an ACK frame and the keys protecting the packet
+        // carrying it always come from the same space. There is no path that
+        // reaches one space's set from another space's packet.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-13.2.6
+        //# ACK frames MUST only be carried in a packet that has the same packet
+        //# number space as the packet being acknowledged; see Section 12.1.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-13.2.6
+        //# For instance, packets that are protected with 1-RTT keys MUST be
+        //# acknowledged in packets that are also protected with 1-RTT keys.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-13.2.6
+        //# Packets that a client sends with 0-RTT packet protection MUST be
+        //# acknowledged by the server in packets protected by 1-RTT keys.
+        //= type=exception
+        //= reason=0-RTT is out of scope: nothing here installs an early-data key or accepts a 0-RTT packet, so there is no 0-RTT packet to acknowledge. See docs/DESIGN.md section 6.
         pub const ranges_max: u32 = config.ranges_max;
 
         /// Descending by `largest`, non-overlapping, and separated by at least
@@ -139,6 +159,61 @@ pub fn AckRanges(comptime config: Config) type {
         //# reduce the peer's response time to congestion events.
         //= type=exception
         //= reason=the seam takes datagrams without their IP-level ECN codepoints, so a CE mark is not observable here; ECN is a documented gap in docs/DESIGN.md section 6
+        //
+        // There is no delay to bound, which is how the deadline is met without
+        // a timer: `Connection.writePayload` writes the ACK into the first
+        // packet it builds after this goes true, and `Connection.wantsSend`
+        // reports true while it is set, so the debt is paid at the next send
+        // opportunity at every level. "Within max_ack_delay" and "immediately"
+        // are the same behaviour here, and the two SHOULDs below are met by
+        // the same fact rather than by a policy that distinguishes them.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-13.2.1
+        //# An endpoint MUST acknowledge all ack-eliciting Initial and Handshake
+        //# packets immediately and all ack-eliciting 0-RTT and 1-RTT packets
+        //# within its advertised max_ack_delay, with the following exception.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-13.2.1
+        //# In order to assist loss detection at the sender, an endpoint SHOULD
+        //# generate and send an ACK frame without delay when it receives an ack-
+        //# eliciting packet either:
+        //
+        // And an ACK after one ack-eliciting packet satisfies "after at least
+        // two" a fortiori. Acknowledging sooner than the peer's loss detection
+        // requires costs packets, which is what section 13.2.2 is trading
+        // against; it is a trade this package has not made, not one it made
+        // and lost.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-13.2.2
+        //# A receiver SHOULD send an ACK frame after receiving at least two ack-
+        //# eliciting packets.
+        //
+        // The ACK is written first into a payload the rest of the packet is
+        // then built into, so it travels with whatever else was owed rather
+        // than in a packet of its own whenever anything else is waiting.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-13.2.1
+        //# An endpoint SHOULD send an ACK frame with other frames when there are
+        //# new ack-eliciting packets to acknowledge.
+        //
+        // What is not done is the other half: a packet built for some other
+        // reason carries an ACK only when this flag is set, so a set holding
+        // ranges that have already been sent once adds nothing to an outgoing
+        // packet. Nothing tracks when an ACK was last sent, which is what
+        // "recently" would need.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-13.2
+        //# When sending a packet for any reason, an endpoint SHOULD attempt to
+        //# include an ACK frame if one has not been sent recently.
+        //= type=todo
+        //
+        // PADDING is the one frame that sets nothing here, which is what
+        // section 13.2.7's deadlock is made of. It does not arise: the only
+        // PADDING this package emits is what `Connection` adds to reach
+        // section 14.1's 1200-octet Initial minimum, in the same packet as the
+        // CRYPTO frame that made the packet worth sending.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-13.2.7
+        //# To avoid a deadlock, a sender SHOULD ensure that other frames are sent
+        //# periodically in addition to PADDING frames to elicit acknowledgments
+        //# from the receiver.
+        //= type=exception
+        //= reason=this package emits PADDING only to reach section 14.1's 1200-octet Initial minimum, always in the same packet as the CRYPTO frame it pads, so it never sends the PADDING-only packet this deadlock needs
         ack_eliciting_pending: bool = false,
         /// Section 13.2.3's minimum packet number: everything below this is
         /// treated as already seen, whether or not a range still records it.
@@ -162,6 +237,25 @@ pub fn AckRanges(comptime config: Config) type {
         //# A packet MUST NOT be acknowledged until packet protection has been
         //# successfully removed and all frames contained in the packet have been
         //# processed.
+        //
+        // A packet that is not ack-eliciting is recorded and owes nothing:
+        // the flag is the only thing `Connection.wantsSend` consults about
+        // this set, so an ACK-only packet arriving — with or without gaps
+        // before it — produces no packet in reply and no infinite exchange of
+        // acknowledgements between two endpoints that have nothing to say.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-13.2.1
+        //# An endpoint MUST NOT send a non-ack-eliciting packet in response to a
+        //# non-ack-eliciting packet, even if there are packet gaps that precede
+        //# the received packet.
+        //
+        // The mirror of it on the send side, and the reason it holds is that
+        // the optional behaviour the rule constrains is not performed at all:
+        // nothing here or in `Connection.writePayload` adds a PING to a packet
+        // that would otherwise carry only an ACK.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-13.2.1
+        //# In that case, an endpoint MUST NOT send an ack-eliciting frame in all
+        //# packets that would otherwise be non-ack-eliciting, to avoid an
+        //# infinite feedback loop of acknowledgments.
         pub fn record(self: *Self, number: u64, now_ns: u64, ack_eliciting: bool) void {
             assert(number <= packet_number.max);
             if (ack_eliciting) self.ack_eliciting_pending = true;
@@ -315,6 +409,18 @@ pub fn AckRanges(comptime config: Config) type {
         //= https://www.rfc-editor.org/rfc/rfc9000#section-13.2.3
         //# A receiver SHOULD include an ACK Range containing the largest
         //# received packet number in every ACK frame.
+        //
+        // The last line of this function clears `ack_eliciting_pending`, and
+        // that clearing is the whole of the rule below: the debt an arriving
+        // ack-eliciting packet created is settled by the first ACK written for
+        // it, so a second packet built before anything else arrives finds
+        // nothing owed and `Connection.wantsSend` answers false. Without it,
+        // one ack-eliciting packet would keep producing ACK-only packets that
+        // no congestion controller is holding back.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-13.2.1
+        //# Since packets containing only ACK frames are not congestion
+        //# controlled, an endpoint MUST NOT send more than one such packet in
+        //# response to receiving an ack-eliciting packet.
         pub fn write(self: *Self, target: []u8, now_ns: u64, ack_delay_exponent: u6) WriteError!Written {
             if (self.count == 0) return error.Empty;
             self.assertInvariants();
@@ -611,6 +717,21 @@ test "an empty set has nothing to say" {
 //# packets MUST be acknowledged at least once within the maximum delay
 //# an endpoint communicated using the max_ack_delay transport parameter;
 //# see Section 18.2.
+//= type=test
+//
+// The first two lines are the second rule and the last two are the third: a
+// packet that is not ack-eliciting leaves nothing owed, and one ACK settles
+// what an ack-eliciting packet owed.
+//= https://www.rfc-editor.org/rfc/rfc9000#section-13.2.1
+//# An endpoint MUST NOT send a non-ack-eliciting packet in response to a
+//# non-ack-eliciting packet, even if there are packet gaps that precede
+//# the received packet.
+//= type=test
+//
+//= https://www.rfc-editor.org/rfc/rfc9000#section-13.2.1
+//# Since packets containing only ACK frames are not congestion
+//# controlled, an endpoint MUST NOT send more than one such packet in
+//# response to receiving an ack-eliciting packet.
 //= type=test
 test "writing an ACK clears the debt an ack-eliciting packet created" {
     var set: Set = .{};
