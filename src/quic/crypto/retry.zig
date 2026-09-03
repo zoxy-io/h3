@@ -19,6 +19,12 @@ const std = @import("std");
 const assert = @import("../../assert.zig").assert;
 const crypto = @import("../crypto.zig");
 
+//= https://www.rfc-editor.org/rfc/rfc9001#section-5.8
+//# The secret key, K, is 128 bits equal to
+//# 0xbe0c690b9f66575a1d766b54e368c84e.
+//
+//= https://www.rfc-editor.org/rfc/rfc9001#section-5.8
+//# The nonce, N, is 96 bits equal to 0x461599d35d632bf2239825bb.
 /// RFC 9001 section 5.8: the key and nonce for QUIC version 1. Constants of the
 /// version, published in the RFC, and named for the version because version 2
 /// changes both.
@@ -30,6 +36,9 @@ pub const nonce_v1: [12]u8 = .{
     0x46, 0x15, 0x99, 0xd3, 0x5d, 0x63, 0x2b, 0xf2, 0x23, 0x98, 0x25, 0xbb,
 };
 
+//= https://www.rfc-editor.org/rfc/rfc9001#section-5.8
+//# The Retry Integrity Tag is a 128-bit field that is computed as the
+//# output of AEAD_AES_128_GCM [AEAD] used with the following inputs:
 /// The tag's length, which is the AEAD's.
 pub const tag_octets: u8 = crypto.tag_octets;
 
@@ -51,6 +60,10 @@ pub const Error = error{
     IntegrityFailed,
 };
 
+//= https://www.rfc-editor.org/rfc/rfc9001#section-5.8
+//# The Retry Pseudo-Packet is not sent over the wire. It is computed by
+//# taking the transmitted Retry packet, removing the Retry Integrity Tag,
+//# and prepending the two following fields:
 /// Octets the pseudo-packet occupies: a one-octet length, the original
 /// Destination Connection ID, and the Retry packet up to but excluding its tag.
 ///
@@ -77,6 +90,10 @@ pub fn tag(
     const needed = pseudoPacketOctets(original_destination_connection_id.len, retry.len);
     if (scratch.len < needed) return error.ScratchTooSmall;
 
+    //= https://www.rfc-editor.org/rfc/rfc9001#section-5.8
+    //# ODCID Length: The ODCID Length field contains the length in bytes of
+    //# the Original Destination Connection ID field that follows it,
+    //# encoded as an 8-bit unsigned integer.
     scratch[0] = @intCast(original_destination_connection_id.len);
     @memcpy(scratch[1..][0..original_destination_connection_id.len], original_destination_connection_id);
     const body = retry[0 .. retry.len - tag_octets];
@@ -85,11 +102,22 @@ pub fn tag(
 
     // The plaintext is empty: the tag authenticates the pseudo-packet and
     // encrypts nothing, which is why the key can be published.
+    //= https://www.rfc-editor.org/rfc/rfc9001#section-5.8
+    //# The plaintext, P, is empty.
+    //
+    //= https://www.rfc-editor.org/rfc/rfc9001#section-5.8
+    //# The associated data, A, is the contents of the Retry Pseudo- Packet,
+    //# as illustrated in Figure 8:
     var computed: [tag_octets]u8 = undefined;
     std.crypto.aead.aes_gcm.Aes128Gcm.encrypt(&.{}, &computed, &.{}, scratch[0..needed], nonce_v1, key_v1);
     return computed;
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9001#section-5.8
+//# Retry packets (see Section 17.2.5 of [QUIC-TRANSPORT]) carry a Retry
+//# Integrity Tag that provides two properties: it allows the discarding of
+//# packets that have accidentally been corrupted by the network, and only
+//# an entity that observes an Initial packet can send a valid Retry packet.
 /// Verify the tag a Retry packet arrived with.
 ///
 /// The comparison is constant-time. Not because the tag is a secret — it
@@ -125,6 +153,14 @@ test "a tag this module computes is a tag this module accepts" {
     try verify(&scratch, &original, &retry);
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9001#section-5.8
+//# Original Destination Connection ID: The Original Destination Connection
+//# ID contains the value of the Destination Connection ID from the Initial
+//# packet that this Retry is in response to. The length of this field is
+//# given in ODCID Length. The presence of this field ensures that a valid
+//# Retry packet can only be sent by an entity that observes the Initial
+//# packet.
+//= type=test
 test "a Retry that names a different original connection is rejected" {
     const original: [8]u8 = .{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
     const other: [8]u8 = .{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x09 };

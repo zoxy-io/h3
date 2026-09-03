@@ -48,11 +48,18 @@ const Secret = secrets.Secret;
 const Side = crypto.Side;
 const Suite = crypto.Suite;
 
+//= https://www.rfc-editor.org/rfc/rfc9001#section-5.4.2
+//# The sample of ciphertext is taken starting from an offset of 4 bytes
+//# after the start of the Packet Number field. That is, in sampling packet
+//# ciphertext for header protection, the Packet Number field is assumed to
+//# be 4 bytes long (its maximum possible encoded length).
 /// Section 5.4.2: the sample begins four octets past the start of the packet
 /// number, so that it is the same octets whatever the number's length turns out
 /// to be.
 pub const sample_offset: usize = 4;
 
+//= https://www.rfc-editor.org/rfc/rfc9001#section-5.4.3
+//# This algorithm samples 16 bytes from the packet ciphertext.
 /// Section 5.4.1: sixteen octets, one AES block.
 pub const sample_octets: usize = 16;
 
@@ -65,6 +72,10 @@ comptime {
     assert(sample_octets <= crypto.tag_octets + packet_number.octets_max - sample_offset + sample_offset);
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9001#section-5.4.1
+//# if (packet[0] & 0x80) == 0x80: # Long header: 4 bits masked packet[0] ^=
+//# mask[0] & 0x0f else: # Short header: 5 bits masked packet[0] ^= mask[0]
+//# & 0x1f
 /// The bits header protection masks in the first octet, per form.
 ///
 /// Long headers protect the two reserved bits and the two packet number length
@@ -82,6 +93,11 @@ const reserved_mask_short: u8 = 0x18;
 /// The high bit of the first octet: set for a long header (section 17.2).
 const header_form_long: u8 = 0x80;
 
+//= https://www.rfc-editor.org/rfc/rfc9001#section-6
+//# The Key Phase bit indicates which packet protection keys are used to
+//# protect the packet. The Key Phase bit is initially set to 0 for the
+//# first set of 1-RTT packets and toggled to signal each subsequent key
+//# update.
 /// RFC 9001 section 6: the Key Phase bit of a short header, which says which
 /// generation of 1-RTT keys protected the packet.
 const key_phase_bit: u8 = 0x04;
@@ -99,6 +115,9 @@ comptime {
     assert(first_octet_mask_short & key_phase_bit != 0);
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9001#section-6.3
+//# For this reason, endpoints MUST be able to retain two sets of packet
+//# protection keys for receiving packets: the current and the next.
 /// One direction's protection state at one encryption level.
 ///
 /// Derived from a traffic secret and then immutable: a key update produces a
@@ -113,6 +132,11 @@ pub const Keys = struct {
     header_key_storage: [crypto.key_octets_max]u8,
     header_key_octets: u8,
 
+    //= https://www.rfc-editor.org/rfc/rfc9001#section-5.1
+    //# The current encryption level secret and the label "quic key" are
+    //# input to the KDF to produce the AEAD key; the label "quic iv" is
+    //# used to derive the Initialization Vector (IV); see Section 5.3. The
+    //# header protection key uses the "quic hp" label; see Section 5.4.
     /// RFC 9001 section 5.1: derive a level's keys from its traffic secret.
     pub fn fromSecret(suite: Suite, secret: *const Secret) Keys {
         assert(secret.length == suite.hashOctets());
@@ -190,11 +214,28 @@ pub const Keys = struct {
 
         const total = header_octets + payload_octets + crypto.tag_octets;
         if (buffer.len < total) return error.OutputTooLong;
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-5.4.2
+        //# To ensure that sufficient data is available for sampling,
+        //# packets are padded so that the combined lengths of the encoded
+        //# packet number and protected payload is at least 4 bytes longer
+        //# than the sample required for header protection.
         // Section 5.4.2 makes this the *sender's* obligation: a packet too
         // short to sample is one the peer cannot unprotect, so refusing to
         // build one is better than emitting a packet that will be discarded.
         if (total < packet_number_offset + sample_offset + sample_octets) return error.SampleUnavailable;
 
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-5.3
+        //# When constructing packets, the AEAD function is applied prior to
+        //# applying header protection; see Section 5.4. The unprotected
+        //# packet header is part of the associated data (A).
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-5.3
+        //# The associated data, A, for the AEAD is the contents of the QUIC
+        //# header, starting from the first byte of either the short or long
+        //# header, up to and including the unprotected packet number. The
+        //# input plaintext, P, for the AEAD is the payload of the QUIC
+        //# packet, as described in [QUIC-TRANSPORT]. The output ciphertext,
+        //# C, of the AEAD is transmitted in place of P.
         const packet_nonce = self.nonce(number);
         const associated_data = buffer[0..header_octets];
         const plaintext = buffer[header_octets..][0..payload_octets];
@@ -202,6 +243,18 @@ pub const Keys = struct {
         self.aeadSeal(plaintext, &tag, plaintext, associated_data, packet_nonce);
         @memcpy(buffer[header_octets + payload_octets ..][0..crypto.tag_octets], &tag);
 
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-9.5
+        //# For the sending of packets, construction and protection of
+        //# packet payloads and packet numbers MUST be free from side
+        //# channels that would reveal the packet number or its encoded
+        //# size.
+        //= type=todo
+        // A todo rather than an implementation claim, and the gap is one line
+        // down: `applyHeaderMask` XORs `number_octets` octets, so its trip
+        // count *is* the encoded size of a field header protection exists to
+        // hide. `std.crypto`'s AEADs and the AES and ChaCha20 cores below are
+        // constant-time, so the payload half of this holds; the loop is not,
+        // and saying so is cheaper than pretending otherwise.
         const mask = self.headerMask(buffer[packet_number_offset + sample_offset ..][0..sample_octets]);
         applyHeaderMask(buffer, packet_number_offset, number_octets, mask);
 
@@ -210,9 +263,18 @@ pub const Keys = struct {
     }
 
     pub const OpenError = error{
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-5.4.2
+        //# An endpoint MUST discard packets that are not long enough to
+        //# contain a complete sample.
         /// Too short to hold a sample, or too short to hold a tag. Section
         /// 5.4.2 requires such a packet to be discarded without further work.
         Truncated,
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-5.5
+        //# Failure to unprotect a packet does not necessarily indicate the
+        //# existence of a protocol error in a peer or an attack. The
+        //# truncated packet number encoding used in QUIC can cause packet
+        //# numbers to be decoded incorrectly if they are delayed
+        //# significantly.
         /// The AEAD tag did not verify. Section 5.4: discard the packet. Not a
         /// connection error — an off-path attacker can inject packets, and
         /// tearing the connection down on one is the attack.
@@ -236,6 +298,12 @@ pub const Keys = struct {
         payload: []u8,
     };
 
+    //= https://www.rfc-editor.org/rfc/rfc9001#section-6.1
+    //# The endpoint creates a new write secret from the existing write
+    //# secret as performed in Section 7.2 of [TLS13]. This uses the KDF
+    //# function provided by TLS with a label of "quic ku". The
+    //# corresponding key and IV are created from that secret as defined in
+    //# Section 5.1. The header protection key is not updated.
     /// RFC 9001 section 6.1: the next generation of packet protection keys.
     ///
     /// Takes its key and IV from the next secret and **keeps the header
@@ -274,6 +342,13 @@ pub const Keys = struct {
         key_phase: bool,
     };
 
+    //= https://www.rfc-editor.org/rfc/rfc9001#section-5.3
+    //# When processing packets, an endpoint first removes the header
+    //# protection.
+    //
+    //= https://www.rfc-editor.org/rfc/rfc9001#section-5.4.1
+    //# Removing header protection only differs in the order in which the
+    //# packet number length (pn_length) is determined
     /// Section 5.4: remove header protection, and nothing else.
     pub fn unprotectHeader(
         self: *const Keys,
@@ -295,6 +370,19 @@ pub const Keys = struct {
             octet.* ^= mask[1 + index];
         }
 
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-9.5
+        //# For authentication to be free from side channels, the entire
+        //# process of header protection removal, packet number recovery,
+        //# and packet protection removal MUST be applied together without
+        //# timing and other side channels.
+        //= type=todo
+        // "Applied together" is exactly what the next line does not do: a
+        // reserved bit that survives unmasking returns before the AEAD runs,
+        // so the time an injected packet takes to be refused says whether the
+        // mask's two reserved bits came off zero. The bits are worth two of an
+        // attacker's guesses per packet, and the fix is to carry the verdict
+        // to after `decrypt` rather than to return here — which is a change to
+        // behaviour, so this pass records it rather than making it.
         const reserved = if (long) reserved_mask_long else reserved_mask_short;
         if (packet[0] & reserved != 0) return error.ReservedBitsSet;
 
@@ -369,6 +457,9 @@ pub const Keys = struct {
             octet.* ^= mask[1 + index];
         }
 
+        // Section 9.5's todo on `unprotectHeader` is this line too: the verdict
+        // is reached before the AEAD has said whether the peer wrote these bits
+        // at all.
         const reserved = if (long) reserved_mask_long else reserved_mask_short;
         if (packet[0] & reserved != 0) return error.ReservedBitsSet;
 
@@ -396,6 +487,13 @@ pub const Keys = struct {
         };
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc9001#section-5.3
+    //# The key and IV for the packet are computed as described in Section
+    //# 5.1. The nonce, N, is formed by combining the packet protection IV
+    //# with the packet number. The 62 bits of the reconstructed QUIC packet
+    //# number in network byte order are left- padded with zeros to the size
+    //# of the IV. The exclusive OR of the padded packet number and the IV
+    //# forms the AEAD nonce.
     /// RFC 9001 section 5.3: the nonce is the write IV with the packet number
     /// XORed into its low octets, left-padded with zeroes.
     ///
@@ -414,11 +512,20 @@ pub const Keys = struct {
         return result;
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc9001#section-9.4
+    //# Future header protection variants based on this construction MUST
+    //# use a PRF to ensure equivalent security guarantees.
+    //= type=exception
+    //= reason=this package defines no header protection variant. It implements the two RFC 9001 specifies -- section 5.4.3's AES-ECB and section 5.4.4's ChaCha20 -- and `Suite` admits no cipher suite that would need a third.
     /// RFC 9001 sections 5.4.3 and 5.4.4: the five mask octets, from a sample.
     fn headerMask(self: *const Keys, sample: *const [sample_octets]u8) [crypto.header_mask_octets]u8 {
         var mask: [crypto.header_mask_octets]u8 = undefined;
         switch (self.suite.headerProtection()) {
             .aes => {
+                //= https://www.rfc-editor.org/rfc/rfc9001#section-5.4.3
+                //# AEAD_AES_128_GCM and AEAD_AES_128_CCM use 128-bit AES in
+                //# Electronic Codebook (ECB) mode. AEAD_AES_256_GCM uses
+                //# 256-bit AES in ECB mode.
                 // Section 5.4.3: one raw AES block, the sample as plaintext,
                 // the header protection key as the key. Not a mode — ECB over
                 // exactly one block — which is the one context where that is
@@ -438,6 +545,15 @@ pub const Keys = struct {
                 @memcpy(&mask, block[0..crypto.header_mask_octets]);
             },
             .chacha20 => {
+                //= https://www.rfc-editor.org/rfc/rfc9001#section-5.4.4
+                //# When AEAD_CHACHA20_POLY1305 is in use, header protection
+                //# uses the raw ChaCha20 function as defined in Section 2.4
+                //# of [CHACHA]. This uses a 256-bit key and 16 bytes
+                //# sampled from the packet protection output.
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9001#section-5.4.4
+                //# The encryption mask is produced by invoking ChaCha20 to
+                //# protect 5 zero bytes.
                 // Section 5.4.4: the first four octets of the sample are a
                 // little-endian block counter, the remaining twelve the nonce,
                 // and the mask is the keystream over five zero octets.
@@ -531,6 +647,13 @@ pub const Keys = struct {
     }
 };
 
+//= https://www.rfc-editor.org/rfc/rfc9001#section-5.4.1
+//# The output of this algorithm is a 5-byte mask that is applied to the
+//# protected header fields using exclusive OR. The least significant bits
+//# of the first byte of the packet are masked by the least significant bits
+//# of the first mask byte, and the packet number is masked with the
+//# remaining bytes. Any unused bytes of mask that might result from a
+//# shorter packet number encoding are unused.
 /// XOR the mask into the first octet and the packet number. Shared by `seal`
 /// and `open` so that the two cannot disagree about which bits are protected —
 /// which they would, silently, in one direction only.
@@ -551,6 +674,12 @@ fn applyHeaderMask(
     }
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9001#section-5.1
+//# The current encryption level secret and the label "quic key" are input
+//# to the KDF to produce the AEAD key; the label "quic iv" is used to
+//# derive the Initialization Vector (IV); see Section 5.3. The header
+//# protection key uses the "quic hp" label; see Section 5.4.
+//= type=test
 test "RFC 9001 appendix A.1: the client's Initial packet protection keys" {
     // Known-answer, transcribed from the appendix. If these three match, the
     // key schedule, the labels and the lengths are all right at once.
@@ -583,6 +712,14 @@ test "RFC 9001 appendix A.1: the server's Initial packet protection keys" {
     }, keys.headerKey());
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9001#section-5.3
+//# The key and IV for the packet are computed as described in Section 5.1.
+//# The nonce, N, is formed by combining the packet protection IV with the
+//# packet number. The 62 bits of the reconstructed QUIC packet number in
+//# network byte order are left- padded with zeros to the size of the IV.
+//# The exclusive OR of the padded packet number and the IV forms the AEAD
+//# nonce.
+//= type=test
 test "the nonce is the IV with the packet number XORed into its tail" {
     const dcid: [8]u8 = .{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
     const keys: Keys = .initial(&dcid, .client);
@@ -642,6 +779,15 @@ test "a sealed packet opens back to what went in" {
     try std.testing.expectEqualStrings(plaintext, opened.payload);
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9001#section-5.4.3
+//# This algorithm samples 16 bytes from the packet ciphertext. This value
+//# is used as the input to AES-ECB.
+//= type=test
+//
+//= https://www.rfc-editor.org/rfc/rfc9001#section-5.4.4
+//# The encryption mask is produced by invoking ChaCha20 to protect 5 zero
+//# bytes.
+//= type=test
 test "every suite round-trips, including the ChaCha20 header mask" {
     // The three suites take two different header protection paths and two
     // different hashes, and nothing else in the package exercises the wide one.
@@ -682,6 +828,10 @@ test "a flipped octet anywhere fails authentication rather than decoding" {
     }
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9001#section-5.4.2
+//# An endpoint MUST discard packets that are not long enough to contain a
+//# complete sample.
+//= type=test
 test "a packet too short to sample is refused in both directions" {
     const dcid: [8]u8 = .{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
     const keys: Keys = .initial(&dcid, .client);
