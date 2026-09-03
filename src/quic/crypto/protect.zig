@@ -671,6 +671,12 @@ fn applyHeaderMask(
     }
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9001#section-5.1
+//# The current encryption level secret and the label "quic key" are input
+//# to the KDF to produce the AEAD key; the label "quic iv" is used to
+//# derive the Initialization Vector (IV); see Section 5.3. The header
+//# protection key uses the "quic hp" label; see Section 5.4.
+//= type=test
 test "RFC 9001 appendix A.1: the client's Initial packet protection keys" {
     // Known-answer, transcribed from the appendix. If these three match, the
     // key schedule, the labels and the lengths are all right at once.
@@ -703,6 +709,14 @@ test "RFC 9001 appendix A.1: the server's Initial packet protection keys" {
     }, keys.headerKey());
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9001#section-5.3
+//# The key and IV for the packet are computed as described in Section 5.1.
+//# The nonce, N, is formed by combining the packet protection IV with the
+//# packet number. The 62 bits of the reconstructed QUIC packet number in
+//# network byte order are left- padded with zeros to the size of the IV.
+//# The exclusive OR of the padded packet number and the IV forms the AEAD
+//# nonce.
+//= type=test
 test "the nonce is the IV with the packet number XORed into its tail" {
     const dcid: [8]u8 = .{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
     const keys: Keys = .initial(&dcid, .client);
@@ -762,6 +776,15 @@ test "a sealed packet opens back to what went in" {
     try std.testing.expectEqualStrings(plaintext, opened.payload);
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9001#section-5.4.3
+//# This algorithm samples 16 bytes from the packet ciphertext. This value
+//# is used as the input to AES-ECB.
+//= type=test
+//
+//= https://www.rfc-editor.org/rfc/rfc9001#section-5.4.4
+//# The encryption mask is produced by invoking ChaCha20 to protect 5 zero
+//# bytes.
+//= type=test
 test "every suite round-trips, including the ChaCha20 header mask" {
     // The three suites take two different header protection paths and two
     // different hashes, and nothing else in the package exercises the wide one.
@@ -802,6 +825,10 @@ test "a flipped octet anywhere fails authentication rather than decoding" {
     }
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9001#section-5.4.2
+//# An endpoint MUST discard packets that are not long enough to contain a
+//# complete sample.
+//= type=test
 test "a packet too short to sample is refused in both directions" {
     const dcid: [8]u8 = .{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
     const keys: Keys = .initial(&dcid, .client);

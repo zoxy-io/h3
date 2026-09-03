@@ -40,6 +40,19 @@ const chacha_packet_number_offset: usize = 1;
 const chacha_header_octets: usize = 4;
 const chacha_packet_number: u64 = 654_360_564;
 
+//= https://www.rfc-editor.org/rfc/rfc9001#section-5.2
+//# The secret used by clients to construct Initial packets uses the PRK and
+//# the label "client in" as input to the HKDF-Expand-Label function from
+//# TLS [TLS13] to produce a 32-byte secret. Packets constructed by the
+//# server use the same process with the label "server in".
+//= type=test
+//
+//= https://www.rfc-editor.org/rfc/rfc9001#section-5.1
+//# The current encryption level secret and the label "quic key" are input
+//# to the KDF to produce the AEAD key; the label "quic iv" is used to
+//# derive the Initialization Vector (IV); see Section 5.3. The header
+//# protection key uses the "quic hp" label; see Section 5.4.
+//= type=test
 test "A.1: the Initial secrets and both sides' keys" {
     // src/quic/crypto/ tests these too. They are repeated here so that the
     // corpus is the whole appendix rather than the parts left over, and so a
@@ -61,6 +74,22 @@ test "A.1: the Initial secrets and both sides' keys" {
     try std.testing.expectEqualSlices(u8, &vectors.server_hp, server_keys.headerKey());
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9001#section-5.3
+//# The associated data, A, for the AEAD is the contents of the QUIC header,
+//# starting from the first byte of either the short or long header, up to
+//# and including the unprotected packet number. The input plaintext, P, for
+//# the AEAD is the payload of the QUIC packet, as described in
+//# [QUIC-TRANSPORT]. The output ciphertext, C, of the AEAD is transmitted
+//# in place of P.
+//= type=test
+//
+//= https://www.rfc-editor.org/rfc/rfc9001#section-5.4.1
+//# The output of this algorithm is a 5-byte mask that is applied to the
+//# protected header fields using exclusive OR. The least significant bits
+//# of the first byte of the packet are masked by the least significant bits
+//# of the first mask byte, and the packet number is masked with the
+//# remaining bytes.
+//= type=test
 test "A.2: sealing the client Initial reproduces the RFC's packet exactly" {
     // The strongest test in the package. Every part of the protection path has
     // to be right at once for these 1200 octets to match: the nonce, the
@@ -83,6 +112,10 @@ test "A.2: sealing the client Initial reproduces the RFC's packet exactly" {
     try std.testing.expectEqualSlices(u8, &vectors.client_initial_protected, datagram[0..total]);
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9001#section-5.3
+//# When processing packets, an endpoint first removes the header
+//# protection.
+//= type=test
 test "A.2: opening the RFC's packet recovers its payload" {
     const keys: quic.crypto.Keys = .initial(&vectors.destination_connection_id, .client);
 
@@ -141,6 +174,11 @@ test "A.2: writeLong builds the header the RFC printed" {
     try std.testing.expectEqualSlices(u8, &vectors.client_initial_header, target[0..written.header_octets]);
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9001#section-5.2
+//# Initial packets apply the packet protection process, but use a secret
+//# derived from the Destination Connection ID field from the client's first
+//# Initial packet.
+//= type=test
 test "A.3: sealing and opening the server Initial" {
     const keys: quic.crypto.Keys = .initial(&vectors.destination_connection_id, .server);
 
@@ -191,6 +229,15 @@ test "A.3: the frames the server's payload decodes to" {
     try std.testing.expectEqual(@as(?quic.frame.Frame, null), try iterator.next());
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9001#section-5.8
+//# The Retry Integrity Tag is a 128-bit field that is computed as the
+//# output of AEAD_AES_128_GCM [AEAD] used with the following inputs:
+//= type=test
+//
+//= https://www.rfc-editor.org/rfc/rfc9001#section-5.8
+//# The presence of this field ensures that a valid Retry packet can only be
+//# sent by an entity that observes the Initial packet.
+//= type=test
 test "A.4: the Retry integrity tag binds the original connection identifier" {
     var scratch: [128]u8 = undefined;
     try quic.crypto.retry.verify(&scratch, &vectors.destination_connection_id, &vectors.retry_packet);
@@ -206,6 +253,15 @@ test "A.4: the Retry integrity tag binds the original connection identifier" {
     try std.testing.expectEqualStrings("token", parsed.header.retry.token);
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9001#section-5.4.4
+//# When AEAD_CHACHA20_POLY1305 is in use, header protection uses the raw
+//# ChaCha20 function as defined in Section 2.4 of [CHACHA]. This uses a
+//# 256-bit key and 16 bytes sampled from the packet protection output.
+//= type=test
+//
+//= https://www.rfc-editor.org/rfc/rfc9001#section-6.1
+//# secret_<n+1> = HKDF-Expand-Label(secret_<n>, "quic ku", "", Hash.length)
+//= type=test
 test "A.5: the ChaCha20-Poly1305 short header packet" {
     // The only vector that exercises the ChaCha20 header protection path and
     // the only short header in the appendix. Both are otherwise checked only
@@ -246,6 +302,14 @@ test "A.5: the ChaCha20-Poly1305 short header packet" {
     try std.testing.expectEqualSlices(u8, &vectors.chacha_plaintext, opened.payload);
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9001#section-5.3
+//# The key and IV for the packet are computed as described in Section 5.1.
+//# The nonce, N, is formed by combining the packet protection IV with the
+//# packet number. The 62 bits of the reconstructed QUIC packet number in
+//# network byte order are left- padded with zeros to the size of the IV.
+//# The exclusive OR of the padded packet number and the IV forms the AEAD
+//# nonce.
+//= type=test
 test "A.5: the nonce the appendix prints" {
     const secret = try quic.crypto.secrets.Secret.init(&vectors.chacha_secret);
     const keys: quic.crypto.Keys = .fromSecret(.chacha20_poly1305_sha256, &secret);
@@ -260,6 +324,12 @@ test "A.5: the nonce the appendix prints" {
     try std.testing.expectEqualSlices(u8, &vectors.chacha_nonce, &nonce);
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9001#section-5.4.2
+//# The sample of ciphertext is taken starting from an offset of 4 bytes
+//# after the start of the Packet Number field. That is, in sampling packet
+//# ciphertext for header protection, the Packet Number field is assumed to
+//# be 4 bytes long (its maximum possible encoded length).
+//= type=test
 test "A.2: the header protection sample is drawn from the offset the RFC prints" {
     // The RFC prints this sample explicitly, and it was extracted and then
     // referenced by nothing — so the one step of header protection that a
