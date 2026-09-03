@@ -77,6 +77,12 @@ pub const Type = enum(u64) {
     //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2
     //# The recipient MUST NOT consider unknown stream types
     //# to be a connection error of any kind.
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-9
+    //# Implementations MUST discard data or
+    //# abort reading on unidirectional streams that have unknown or
+    //# unsupported types.
+    //= type=exception
+    //= reason=discarding a stream's data or aborting its read is an action on a QUIC stream, which docs/DESIGN.md section 3 puts on the consumer's side of the seam; Type.known is the classification it asks
     pub fn known(stream_type: Type) bool {
         return switch (stream_type) {
             .control, .push, .qpack_encoder, .qpack_decoder => true,

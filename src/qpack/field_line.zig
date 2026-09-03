@@ -41,6 +41,9 @@ const hpack = @import("hpack");
 
 /// RFC 9204 section 4.1.1's prefixed integer, at QPACK's width, and section
 /// 4.1.2's Huffman code. Both are RFC 7541's, adopted unchanged.
+//= https://www.rfc-editor.org/rfc/rfc9204#section-4.1.1
+//# QPACK implementations MUST be able to decode integers up to and
+//# including 62 bits long.
 const integer = hpack.integer.Integer(u62);
 const huffman = hpack.huffman;
 
@@ -170,10 +173,46 @@ pub const Error = error{
 };
 
 /// Section 4.5.1: the two integers every field section begins with.
+//= https://www.rfc-editor.org/rfc/rfc9204#section-2.1.2
+//# An encoder MUST limit the number of streams that could
+//# become blocked to the value of SETTINGS_QPACK_BLOCKED_STREAMS at all
+//# times.  If a decoder encounters more blocked streams than it promised
+//# to support, it MUST treat this as a connection error of type
+//# QPACK_DECOMPRESSION_FAILED.
+//= type=exception
+//= reason=blocked streams exist only where a field section may reference the dynamic table; this endpoint advertises SETTINGS_QPACK_MAX_TABLE_CAPACITY = 0, so a section is self-contained and no stream can block, per docs/DESIGN.md section 6
+//= https://www.rfc-editor.org/rfc/rfc9204#section-3.2.2
+//# The
+//# encoder MUST NOT cause a dynamic table entry to be evicted unless
+//# that entry is evictable; see Section 2.1.1.  The new entry is then
+//# added to the table.  It is an error if the encoder attempts to add an
+//# entry that is larger than the dynamic table capacity; the decoder
+//# MUST treat this as a connection error of type
+//# QPACK_ENCODER_STREAM_ERROR.
+//= type=exception
+//= reason=eviction is the dynamic table's, which docs/DESIGN.md section 6 lists as next rather than built; with a capacity of zero there is no entry to evict
+//= https://www.rfc-editor.org/rfc/rfc9204#section-3.2.3
+//# The encoder MUST NOT set a dynamic table capacity that exceeds this
+//# maximum, but it can choose to use a lower dynamic table capacity; see
+//# Section 4.3.1.
+//= type=exception
+//= reason=setting a dynamic table capacity belongs to the encoder stream, which is not built (docs/DESIGN.md section 6); this package sends no encoder instructions at all
+//= https://www.rfc-editor.org/rfc/rfc9204#section-2.2.1
+//# If it encounters a Required Insert
+//# Count smaller than expected, it MUST treat this as a connection error
+//# of type QPACK_DECOMPRESSION_FAILED; see Section 2.2.3.
+//= type=exception
+//= reason=comparing a Required Insert Count against the expected one needs the decoder's own Insert Count, which is dynamic table state this package does not keep (docs/DESIGN.md section 6); any non-zero count is refused instead
 pub const Prefix = struct {
     /// How much of the dynamic table this section depends on. Always zero from
     /// a peer that has been told the table's capacity is zero, and a non-zero
     /// value from one is a reference to a table it does not have.
+    //= https://www.rfc-editor.org/rfc/rfc9204#section-2.2.3
+    //# If the decoder encounters a reference in a field line representation
+    //# to a dynamic table entry that has already been evicted or that has an
+    //# absolute index greater than or equal to the declared Required Insert
+    //# Count (Section 4.5.1), it MUST treat this as a connection error of
+    //# type QPACK_DECOMPRESSION_FAILED.
     required_insert_count: u64,
     /// Section 4.5.1's Base, reconstructed from the sign bit and delta.
     base: u64,
@@ -213,6 +252,12 @@ pub fn parsePrefix(source: []const u8) Error!Prefix {
     // Section 4.5.1: a negative sign means the base is below the insert count,
     // which only happens when a section references entries it itself inserted.
     // With no dynamic table both are zero and the sign cannot be set.
+    //= https://www.rfc-editor.org/rfc/rfc9204#section-4.5.1.2
+    //# The value of Base MUST NOT be negative.  Though the protocol might
+    //# operate correctly with a negative Base using post-Base indexing, it
+    //# is unnecessary and inefficient.  An endpoint MUST treat a field block
+    //# with a Sign bit of 1 as invalid if the value of Required Insert Count
+    //# is less than or equal to the value of Delta Base.
     const base: u64 = if (negative)
         std.math.sub(u64, insert_count, delta_base + 1) catch return error.DecompressionFailed
     else
@@ -244,13 +289,27 @@ pub const Iterator = struct {
     /// Where the next decoded string goes. Its length is the bound on a
     /// compression bomb — a Huffman string can reach 8/5 of its input, and this
     /// is what stops that from being the peer's decision.
+    //= https://www.rfc-editor.org/rfc/rfc9204#section-7.4
+    //# An implementation has to set a limit for the values it accepts for
+    //# integers, as well as for the encoded length; see Section 4.1.1.  In
+    //# the same way, it has to set a limit to the length it accepts for
+    //# string literals; see Section 4.1.2.  These limits SHOULD be large
+    //# enough to process the largest individual field the HTTP
+    //# implementation can be configured to accept.
     buffer: []u8,
     used: usize = 0,
     /// Section 4.2.2's `SETTINGS_MAX_FIELD_SECTION_SIZE`, accumulated across
     /// the section.
     list_size: u64 = 0,
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2.2
+    //# The size of a field list is calculated based on the
+    //# uncompressed size of fields, including the length of the name and
+    //# value in bytes plus an overhead of 32 bytes for each field.
     list_size_max: u64,
 
+    //= https://www.rfc-editor.org/rfc/rfc9204#section-2.2
+    //# The decoder MUST emit field lines in the order their representations
+    //# appear in the encoded field section.
     pub fn next(self: *Iterator) Error!?Field {
         // `>=` rather than `==`: with assertions compiled out the equality test
         // does not catch an offset past the end, and the read below is then out
@@ -279,11 +338,21 @@ pub const Iterator = struct {
             // Sections 4.5.3 and 4.5.5: both post-base forms address the
             // dynamic table by construction, so neither can be honoured
             // without one.
+            //= https://www.rfc-editor.org/rfc/rfc9204#section-2.2.3
+            //# If the decoder encounters a reference in a field line representation
+            //# to a dynamic table entry that has already been evicted or that has an
+            //# absolute index greater than or equal to the declared Required Insert
+            //# Count (Section 4.5.1), it MUST treat this as a connection error of
+            //# type QPACK_DECOMPRESSION_FAILED.
             .indexed_post_base, .literal_post_base => error.DecompressionFailed,
         };
     }
 
     /// Section 4.5.2.
+    //= https://www.rfc-editor.org/rfc/rfc9204#section-3.1
+    //# When the decoder encounters an invalid static table index in a field
+    //# line representation, it MUST treat this as a connection error of type
+    //# QPACK_DECOMPRESSION_FAILED.
     fn indexed(self: *Iterator, first: u8) Error!Field {
         if (first & indexed_static_bit == 0) return error.DecompressionFailed;
         const index = try self.integerAt(indexed_prefix_bits);
@@ -292,6 +361,13 @@ pub const Iterator = struct {
     }
 
     /// Section 4.5.4.
+    //= https://www.rfc-editor.org/rfc/rfc9204#section-4.5.4
+    //# When
+    //# the 'N' bit is set, the encoded field line MUST always be encoded
+    //# with a literal representation.  In particular, when a peer sends a
+    //# field line that it received represented as a literal field line with
+    //# the 'N' bit set, it MUST use a literal representation to forward this
+    //# field line.
     fn literalNameReference(self: *Iterator, first: u8) Error!Field {
         if (first & literal_name_reference_static_bit == 0) return error.DecompressionFailed;
         const never = first & literal_name_reference_never_bit != 0;
@@ -309,6 +385,11 @@ pub const Iterator = struct {
         return .{ .name = name, .value = value, .never_indexed = never };
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc9204#section-7.4
+    //# If an implementation encounters a value larger than it is able to
+    //# decode, this MUST be treated as a stream error of type
+    //# QPACK_DECOMPRESSION_FAILED if on a request stream or a connection
+    //# error of the appropriate type if on the encoder or decoder stream.
     fn integerAt(self: *Iterator, prefix_bits: u4) Error!u64 {
         const decoded = integer.decode(self.section[self.offset..], prefix_bits) catch |err| return switch (err) {
             error.Incomplete => error.Truncated,
@@ -360,6 +441,11 @@ pub const Iterator = struct {
 /// `buffer` receives the Huffman-decoded strings and its length bounds the
 /// expansion; `list_size_max` is the `SETTINGS_MAX_FIELD_SECTION_SIZE` this
 /// endpoint advertised.
+//= https://www.rfc-editor.org/rfc/rfc9204#section-4.5.1.1
+//# If the decoder encounters a value
+//# of EncodedInsertCount that could not have been produced by a
+//# conformant encoder, it MUST treat this as a connection error of type
+//# QPACK_DECOMPRESSION_FAILED.
 pub fn iterate(section: []const u8, buffer: []u8, list_size_max: u64) Error!Iterator {
     const prefix = try parsePrefix(section);
     // Section 2.2: a section that depends on the dynamic table cannot be
@@ -380,8 +466,22 @@ pub fn iterate(section: []const u8, buffer: []u8, list_size_max: u64) Error!Iter
 /// simple: an exact static match becomes an index, a name-only match becomes a
 /// literal with an indexed name, and anything else spells both out. Without a
 /// dynamic table there is nothing else to decide.
+//= https://www.rfc-editor.org/rfc/rfc9114#section-4.2.2
+//# An implementation that
+//# has received this parameter SHOULD NOT send an HTTP message header
+//# that exceeds the indicated size, as the peer will likely refuse to
+//# process it.
+//= type=exception
+//= reason=encodeField holds no peer settings: SETTINGS_MAX_FIELD_SECTION_SIZE is connection state, and docs/DESIGN.md section 3 puts connection state on the consumer's side of the seam
 pub fn encodeField(target: []u8, field: Field) Error!u32 {
     if (static_table.lookup(field.name, field.value)) |match| {
+        //= https://www.rfc-editor.org/rfc/rfc9204#section-7.1.3
+        //# An intermediary MUST NOT re-encode a value that uses a literal
+        //# representation with the 'N' bit set with another representation that
+        //# would index it.  If QPACK is used for re-encoding, a literal
+        //# representation with the 'N' bit set MUST be used.  If HPACK is used
+        //# for re-encoding, the never-indexed literal representation (see
+        //# Section 6.2.3 of [RFC7541]) MUST be used.
         if (match.value_matched and !field.never_indexed) {
             // The index came out of the static table, so it cannot be too
             // large for the encoding; a target too small is the only failure.
@@ -443,6 +543,10 @@ fn encodeStringAt(target: []u8, text: []const u8, prefix_bits: u4, tag: u8, huff
 }
 
 /// Encode a whole field section, prefix included.
+//= https://www.rfc-editor.org/rfc/rfc9204#section-3.2.3
+//# When the maximum table capacity is zero, the encoder MUST NOT insert
+//# entries into the dynamic table and MUST NOT send any encoder
+//# instructions on the encoder stream.
 pub fn encode(target: []u8, fields: []const Field) Error!u32 {
     var offset = try writePrefix(target);
     for (fields) |field| {
@@ -468,6 +572,10 @@ fn roundTrip(fields: []const Field) !void {
     try testing.expectEqual(@as(?Field, null), try iterator.next());
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9204#section-2.2
+//# The decoder MUST emit field lines in the order their representations
+//# appear in the encoded field section.
+//= type=test
 test "a request's pseudo-headers are all static table entries" {
     // The common case, and the one the table was assembled from real traffic to
     // make cheap: every one of these is a single octet on the wire.
@@ -500,6 +608,22 @@ test "a name the table has never heard of is spelled out" {
     });
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9204#section-4.5.4
+//# When
+//# the 'N' bit is set, the encoded field line MUST always be encoded
+//# with a literal representation.  In particular, when a peer sends a
+//# field line that it received represented as a literal field line with
+//# the 'N' bit set, it MUST use a literal representation to forward this
+//# field line.
+//= type=test
+//= https://www.rfc-editor.org/rfc/rfc9204#section-7.1.3
+//# An intermediary MUST NOT re-encode a value that uses a literal
+//# representation with the 'N' bit set with another representation that
+//# would index it.  If QPACK is used for re-encoding, a literal
+//# representation with the 'N' bit set MUST be used.  If HPACK is used
+//# for re-encoding, the never-indexed literal representation (see
+//# Section 6.2.3 of [RFC7541]) MUST be used.
+//= type=test
 test "the never-indexed bit survives a round trip" {
     // Section 4.5.4's N bit exists so an intermediary cannot quietly downgrade
     // a field its sender judged too sensitive to enter any compression context.
@@ -535,6 +659,19 @@ test "a long value is Huffman-coded, and a short one is not" {
     try roundTrip(&.{.{ .name = "x-a", .value = "\xff\xfe" }});
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9204#section-2.2.3
+//# If the decoder encounters a reference in a field line representation
+//# to a dynamic table entry that has already been evicted or that has an
+//# absolute index greater than or equal to the declared Required Insert
+//# Count (Section 4.5.1), it MUST treat this as a connection error of
+//# type QPACK_DECOMPRESSION_FAILED.
+//= type=test
+//= https://www.rfc-editor.org/rfc/rfc9204#section-4.5.1.1
+//# If the decoder encounters a value
+//# of EncodedInsertCount that could not have been produced by a
+//# conformant encoder, it MUST treat this as a connection error of type
+//# QPACK_DECOMPRESSION_FAILED.
+//= type=test
 test "a reference to the dynamic table is refused" {
     var buffer: [64]u8 = undefined;
     // A non-zero Required Insert Count: the section depends on a table this
@@ -556,6 +693,11 @@ test "a reference to the dynamic table is refused" {
     try testing.expectError(error.DecompressionFailed, fourth.next());
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9204#section-3.1
+//# When the decoder encounters an invalid static table index in a field
+//# line representation, it MUST treat this as a connection error of type
+//# QPACK_DECOMPRESSION_FAILED.
+//= type=test
 test "an index past the static table is a decompression failure" {
     var buffer: [64]u8 = undefined;
     var wire: [16]u8 = .{ 0x00, 0x00 } ++ [_]u8{0} ** 14;
@@ -621,6 +763,16 @@ test "a target too small is refused rather than truncated" {
     }));
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9204#section-7.4
+//# If an implementation encounters a value larger than it is able to
+//# decode, this MUST be treated as a stream error of type
+//# QPACK_DECOMPRESSION_FAILED if on a request stream or a connection
+//# error of the appropriate type if on the encoder or decoder stream.
+//= type=test
+//= https://www.rfc-editor.org/rfc/rfc9204#section-4.1.1
+//# QPACK implementations MUST be able to decode integers up to and
+//# including 62 bits long.
+//= type=test
 test "a field section prefix at the encoding's limits does not overflow" {
     // Found by review: `Decoded.value` is a `u62`, and Zig does not widen
     // operands to a declared result type, so `count.value + delta.value` and

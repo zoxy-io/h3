@@ -42,6 +42,9 @@ const hpack = @import("hpack");
 /// `u62` because every QPACK index and length is ultimately bounded by a QUIC
 /// stream offset (RFC 9000 section 16). Naming the width here is what makes the
 /// bound visible at every call site instead of buried in a constant.
+//= https://www.rfc-editor.org/rfc/rfc9204#section-4.1.1
+//# QPACK implementations MUST be able to decode integers up to and
+//# including 62 bits long.
 pub const integer = hpack.integer.Integer(u62);
 
 /// RFC 9204 section 4.1.2's Huffman code, which is RFC 7541 section 5.2's
@@ -53,6 +56,11 @@ pub const huffman = hpack.huffman;
 pub const static_table = @import("qpack/static_table.zig");
 
 /// RFC 9204 section 4.5: encoded field sections, both directions.
+//= https://www.rfc-editor.org/rfc/rfc9204#section-4.2
+//# An endpoint MUST allow its peer to create an encoder stream and a
+//# decoder stream even if the connection's settings prevent their use.
+//= type=exception
+//= reason=creating and accepting unidirectional streams is the HTTP/3 connection layer's, which docs/DESIGN.md section 6 lists as next rather than built; stream.zig names both QPACK types so it can
 pub const field_line = @import("qpack/field_line.zig");
 
 /// A decoded field. RFC 9204 keeps RFC 7541's notion of one, so this is
