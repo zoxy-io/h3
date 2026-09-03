@@ -2081,6 +2081,16 @@ pub fn Connection(comptime config: Config) type {
             }
 
             for (self.streams.streams[0..self.streams.count]) |*stream| {
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-3.3
+                //# A sender MUST NOT send a STREAM or
+                //# STREAM_DATA_BLOCKED frame for a stream in the "Reset Sent" state or
+                //# any terminal state -- that is, after sending a RESET_STREAM frame.
+                //
+                // This loop read no send state at all, so `wantsSend` was the
+                // only thing standing between a stopped stream and the wire —
+                // and it tested `.reset` after it tested for unframed data, so
+                // it was not standing there either.
+                if (stream.send_state == .reset) continue;
                 if (offset >= target.len) break;
                 const stream_limit = stream.receiveLimit();
                 if (stream_limit < stream.max_data_sent + config.stream_receive_octets / 2) continue;

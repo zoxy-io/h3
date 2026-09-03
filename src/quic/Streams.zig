@@ -432,6 +432,25 @@ pub fn Streams(comptime config: Config) type {
             if (position >= limit) return error.TooManyStreams;
         }
 
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-4.6
+        //# An endpoint
+        //# that receives a frame with a stream ID exceeding the limit it has
+        //# sent MUST treat this as a connection error of type
+        //# STREAM_LIMIT_ERROR; see Section 11 for details on error handling.
+        ///
+        /// The limit this endpoint advertised is `streams_max`, and the rule is
+        /// about the stream *identifier* rather than about how many streams
+        /// happen to be open. `open` refusing the `streams_max + 1`-th stream
+        /// is a count, and a count is a sound proxy only if section 3.2's
+        /// lower-numbered streams are implicitly created — which this package
+        /// does not do. So a peer sending on index 10 000 while sixty-four were
+        /// advertised used to get a stream, because it was only the first one.
+        fn checkAdvertisedStreamLimit(self: *const Self, id: u64) Error!void {
+            const kind = stream_id.kindOf(id);
+            if (kind.initiator() == self.side) return;
+            if (stream_id.index(id) >= streams_max) return error.TooManyStreams;
+        }
+
         /// Take a STREAM frame.
         pub fn receive(self: *Self, id: u64, offset: u64, data: []const u8, fin: bool) Error!void {
             // Section 19.8 puts the sum past 2^62-1 in the same sentence as
@@ -440,6 +459,7 @@ pub fn Streams(comptime config: Config) type {
             // are 62-bit and peer-chosen, and an overflow lands ahead of any
             // check that was meant to catch it.
             if (!self.peerMaySend(id)) return error.StreamState;
+            try self.checkAdvertisedStreamLimit(id);
             if (offset > varint.max or data.len > varint.max - offset) return error.FinalSize;
             const end = offset + data.len;
 
@@ -685,10 +705,19 @@ pub fn Streams(comptime config: Config) type {
         //# A QUIC implementation SHOULD provide ways in which an application can
         //# indicate the relative priority of streams.
         //= type=todo
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-3.3
+        //# A sender MUST NOT send a STREAM or
+        //# STREAM_DATA_BLOCKED frame for a stream in the "Reset Sent" state or
+        //# any terminal state -- that is, after sending a RESET_STREAM frame.
         pub fn wantsSend(self: *const Self) bool {
             for (self.streams[0..self.count]) |*stream| {
-                if (stream.framed < stream.send_len) return true;
+                // The reset test used to come *after* the unframed-data test,
+                // so a stream the peer had stopped with STOP_SENDING still
+                // answered true while octets remained — and `writeStream` reads
+                // no send state at all, so it framed and sent them. The peer
+                // asked us to stop and we kept writing.
                 if (stream.send_state == .reset) continue;
+                if (stream.framed < stream.send_len) return true;
                 // A FIN is owed once, not once per poll.
                 if (stream.send_fin and !stream.fin_framed) return true;
             }
@@ -1095,4 +1124,40 @@ test "the two stream kinds carry separate limits" {
     // Unidirectional permission says nothing about bidirectional.
     const bidi = stream_id.make(.client_bidirectional, 0);
     try testing.expectError(error.TooManyStreams, set.write(bidi, "x", false));
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9000#section-3.3
+//# A sender MUST NOT send a STREAM or
+//# STREAM_DATA_BLOCKED frame for a stream in the "Reset Sent" state or
+//# any terminal state -- that is, after sending a RESET_STREAM frame.
+//= type=test
+test "section 3.3: a stopped stream stops being sent" {
+    var set = testSet();
+    set.setConnectionSendLimit(1000);
+    try set.setSendLimit(0, 1000);
+    _ = try set.write(0, "data", false);
+    try testing.expect(set.wantsSend());
+
+    // STOP_SENDING moves the send half to reset; nothing more may go out.
+    set.find(0).?.send_state = .reset;
+    try testing.expect(!set.wantsSend());
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9000#section-4.6
+//# An endpoint
+//# that receives a frame with a stream ID exceeding the limit it has
+//# sent MUST treat this as a connection error of type
+//# STREAM_LIMIT_ERROR; see Section 11 for details on error handling.
+//= type=test
+test "section 4.6: a stream identifier past our advertised limit is refused" {
+    var set: Set = .{ .side = .client };
+    // `Set` advertises four. The rule is about the identifier, not the count,
+    // so the *first* stream the peer opens can already break it.
+    const far = stream_id.make(.server_bidirectional, Set.streams_max);
+    try testing.expectError(error.TooManyStreams, set.receive(far, 0, "x", false));
+
+    // The highest one that fits is index `streams_max - 1`.
+    const highest = stream_id.make(.server_bidirectional, Set.streams_max - 1);
+    try set.receive(highest, 0, "x", false);
+    try testing.expectEqualStrings("x", set.find(highest).?.readable());
 }
