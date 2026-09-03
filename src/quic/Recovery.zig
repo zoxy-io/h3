@@ -38,6 +38,7 @@ const frame = @import("frame.zig");
 const packet_number = @import("packet_number.zig");
 
 const Space = packet_number.Space;
+const Side = @import("crypto.zig").Side;
 
 /// Section 6.1.1: packets this far before an acknowledged one are lost.
 //= https://www.rfc-editor.org/rfc/rfc9002#section-6.1.1
@@ -193,6 +194,7 @@ pub fn Recovery(comptime config: Config) type {
             time_sent: u64,
             octets: u32,
             in_flight: bool,
+            ack_eliciting: bool,
         };
 
         const SpaceState = struct {
@@ -239,6 +241,10 @@ pub fn Recovery(comptime config: Config) type {
         /// acknowledged (server). Before it, an application-data PTO is not
         /// armed, because 1-RTT keys may not exist on both sides yet.
         handshake_confirmed: bool = false,
+        /// Which end of the connection this is. Appendix A.7's
+        /// `PeerCompletedAddressValidation` answers differently for each, and
+        /// nothing else here needs to know — see that function.
+        side: Side = .client,
 
         /// Section 18.2's `max_ack_delay`, from the peer's transport
         /// parameters. Held rather than read from them, because the connection
@@ -360,7 +366,21 @@ pub fn Recovery(comptime config: Config) type {
             //= https://www.rfc-editor.org/rfc/rfc9002#section-5.1
             //# An RTT sample MUST NOT be generated on receiving an ACK frame that
             //# does not newly acknowledge at least one ack-eliciting packet.
-            if (largest.number == ack.largest and largest.ack_eliciting) {
+            //= https://www.rfc-editor.org/rfc/rfc9002#section-5.1
+            //# *  at least one of the newly acknowledged packets was ack-
+            //#    eliciting.
+            //
+            // "At least one of the newly acknowledged packets", not "the
+            // largest one". Requiring `largest` itself to be ack-eliciting
+            // meant an ACK whose highest newly acknowledged packet was ACK-only
+            // produced no sample even with an ack-eliciting packet below it.
+            // Conservative — it never invented a sample — but it starves the
+            // estimator on a path whose two directions carry different traffic.
+            var includes_ack_eliciting = false;
+            for (acked[0..@min(result.acked, acked.len)]) |one| {
+                if (one.ack_eliciting) includes_ack_eliciting = true;
+            }
+            if (largest.number == ack.largest and includes_ack_eliciting) {
                 self.updateRtt(now_ns - largest.time_sent, ack_delay_ns);
                 result.rtt_sampled = true;
             }
@@ -379,7 +399,16 @@ pub fn Recovery(comptime config: Config) type {
             for (acked[0..@min(result.acked, acked.len)]) |one| self.onPacketAcked(one);
             // Section A.7: a delivery means the path is working, so the PTO
             // backoff resets.
-            self.pto_count = 0;
+            //= https://www.rfc-editor.org/rfc/rfc9002#appendix-A.7
+            //# if (PeerCompletedAddressValidation()):
+            //#   pto_count = 0
+            //
+            // Guarded, where it used to be unconditional. Acknowledgements of
+            // Initial packets say nothing about whether the server can receive
+            // at this address, so a client that reset its backoff on them
+            // re-probes at the un-backed-off interval against a server that is
+            // merely slow — which is the case the guard exists for.
+            if (self.peerCompletedAddressValidation()) self.pto_count = 0;
             return result;
         }
 
@@ -416,6 +445,7 @@ pub fn Recovery(comptime config: Config) type {
                         .time_sent = packet.time_sent,
                         .octets = packet.octets,
                         .in_flight = packet.in_flight,
+                        .ack_eliciting = packet.ack_eliciting,
                     };
                     result.acked += 1;
                     remove(state, index);
@@ -444,6 +474,27 @@ pub fn Recovery(comptime config: Config) type {
         //# sample until the handshake is confirmed.
         //= type=exception
         //= reason=a packet whose keys are not yet installed is discarded rather than buffered, so no local delay of the kind section 5.3 describes is ever accumulated to subtract
+        //= https://www.rfc-editor.org/rfc/rfc9002#appendix-A.7
+        //# PeerCompletedAddressValidation():
+        //#   // Assume clients validate the server's address implicitly.
+        //#   if (endpoint is server):
+        //#     return true
+        //#   // Servers complete address validation when a
+        //#   // protected packet is received.
+        //#   return has received Handshake ACK ||
+        //#        handshake confirmed
+        ///
+        /// A server answers true always: the client picked the address it is
+        /// talking to, so there is nothing for the server to prove. A client
+        /// answers true once the handshake is confirmed or it has seen an
+        /// acknowledgement in the Handshake space, either of which means a
+        /// protected packet reached the server.
+        fn peerCompletedAddressValidation(self: *const Self) bool {
+            if (self.side == .server) return true;
+            if (self.handshake_confirmed) return true;
+            return self.spaces[@intFromEnum(Space.handshake)].largest_acked != null;
+        }
+
         fn updateRtt(self: *Self, sample: u64, ack_delay_ns: u64) void {
             // A sample is an elapsed time computed by the caller from two of
             // its own timestamps, so a zero is a clock that did not move rather
@@ -1297,7 +1348,13 @@ test "a silent peer produces a probe, and the backoff is exponential" {
     const second = recovery.timeoutAt().?;
     try testing.expectEqual(first * 2, second);
 
-    // And a delivery resets it — the path is working again.
+    // And a delivery resets it — the path is working again. Appendix A.7
+    // guards that on `PeerCompletedAddressValidation`, so this test says which
+    // endpoint it is asking: a server has nothing to wait for, while a client
+    // acknowledged only in the Initial space still does not know the server can
+    // receive at this address. The unguarded version of this assertion passed
+    // for both and was wrong for one.
+    recovery.side = .server;
     try recovery.onPacketSent(.initial, sentPacket(1, 0));
     _ = try recovery.onAckReceived(.initial, ackOf(1, 0), 0, 10 * ms, &lost);
     try testing.expectEqual(@as(u32, 0), recovery.pto_count);
@@ -1464,4 +1521,62 @@ test "a single loss is congestion, not a dead path" {
     // Halved, not collapsed: the lost packets were sent together, so no
     // duration passed between the first and last of them.
     try testing.expect(recovery.congestion_window > 2 * 1200);
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9002#section-5.1
+//# *  at least one of the newly acknowledged packets was ack-
+//#    eliciting.
+//= type=test
+test "section 5.1: any newly acknowledged ack-eliciting packet gives a sample" {
+    // The condition used to be that the *largest* newly acknowledged packet
+    // was ack-eliciting. An ACK whose top packet was ACK-only then produced no
+    // sample even with an ack-eliciting packet below it — conservative, but it
+    // starves the estimator on a path whose two directions carry different
+    // traffic, and appendix A.7 asks the question over the whole set.
+    var recovery: TestRecovery = .{};
+    var lost: [8]u64 = undefined;
+
+    var eliciting = sentPacket(0, 0);
+    eliciting.ack_eliciting = true;
+    try recovery.onPacketSent(.initial, eliciting);
+
+    var ack_only = sentPacket(1, 0);
+    ack_only.ack_eliciting = false;
+    ack_only.in_flight = false;
+    try recovery.onPacketSent(.initial, ack_only);
+
+    // Largest is packet 1, which is ACK-only; packet 0 below it is not.
+    _ = try recovery.onAckReceived(.initial, ackOf(1, 1), 0, 100 * ms, &lost);
+    try testing.expect(recovery.has_rtt_sample);
+    try testing.expectEqual(@as(u64, 100 * ms), recovery.latest_rtt);
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9002#appendix-A.7
+//# if (PeerCompletedAddressValidation()):
+//#   pto_count = 0
+//= type=test
+test "appendix A.7: a client keeps its PTO backoff until the server is validated" {
+    // Acknowledgements of Initial packets say nothing about whether the server
+    // can receive at this address, so a client that reset its backoff on them
+    // would re-probe at the un-backed-off interval against a server that is
+    // merely slow. The reset used to be unconditional.
+    var client: TestRecovery = .{ .side = .client };
+    var lost: [8]u64 = undefined;
+    client.pto_count = 3;
+    try client.onPacketSent(.initial, sentPacket(0, 0));
+    _ = try client.onAckReceived(.initial, ackOf(0, 0), 0, 100 * ms, &lost);
+    try testing.expectEqual(@as(u32, 3), client.pto_count);
+
+    // Confirmation is one of the two things that ends the doubt.
+    client.handshake_confirmed = true;
+    try client.onPacketSent(.initial, sentPacket(1, 0));
+    _ = try client.onAckReceived(.initial, ackOf(1, 1), 0, 200 * ms, &lost);
+    try testing.expectEqual(@as(u32, 0), client.pto_count);
+
+    // A server has nothing to wait for: the client chose the address.
+    var server: TestRecovery = .{ .side = .server };
+    server.pto_count = 3;
+    try server.onPacketSent(.initial, sentPacket(0, 0));
+    _ = try server.onAckReceived(.initial, ackOf(0, 0), 0, 100 * ms, &lost);
+    try testing.expectEqual(@as(u32, 0), server.pto_count);
 }

@@ -396,6 +396,9 @@ pub fn Connection(comptime config: Config) type {
                 // there is nothing to validate and nothing to amplify.
                 .address_validated = options.side == .client,
                 .streams = .{ .side = options.side },
+                // RFC 9002 appendix A.7's `PeerCompletedAddressValidation` is
+                // the only thing in `Recovery` that differs by side.
+                .recovery = .{ .side = options.side },
             };
             // Section 5.2 of RFC 9001: both sides can compute both halves from
             // the client's first Destination Connection ID.
