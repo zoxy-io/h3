@@ -126,6 +126,27 @@ pub const Header = union(Kind) {
         token: []const u8,
         packet_number_offset: usize,
     },
+    /// A 0-RTT packet parses, and none is ever written: the level exists in
+    /// `crypto.Level` so that a received one can be named and discarded.
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.3
+    //# A client SHOULD attempt to resend data in 0-RTT packets after it
+    //# sends a new Initial packet.
+    //= type=exception
+    //= reason=0-RTT is out of scope, so there is no early data to resend and no 0-RTT packet is ever written; see docs/DESIGN.md section 2 for what this package owns and section 6 for the list this sits on.
+    //
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.3
+    //# New packet numbers MUST be used for any new packets that are sent;
+    //# as described in Section 17.2.5.3, reusing packet numbers could
+    //# compromise packet protection.
+    //= type=exception
+    //= reason=this rule governs the 0-RTT data a client resends after a Retry, and neither 0-RTT nor Retry is in scope; the general no-reuse property is `Connection`'s monotonic per-space counter, which never rewinds because no packet number space is ever reset. See docs/DESIGN.md section 2 and section 6.
+    //
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.3
+    //# A server SHOULD treat a violation of remembered limits (Section
+    //# 7.4.1) as a connection error of an appropriate type (for instance, a
+    //# FLOW_CONTROL_ERROR for exceeding stream data limits).
+    //= type=exception
+    //= reason=no transport parameters are ever remembered across connections, because 0-RTT is out of scope and this package holds no session cache; there is therefore no remembered limit to violate. See docs/DESIGN.md section 2 and section 6.
     /// Section 17.2.3.
     zero_rtt: Protected,
     /// Section 17.2.4.
@@ -205,6 +226,13 @@ pub const Header = union(Kind) {
         token: []const u8,
         integrity_tag: *const [crypto.tag_octets]u8,
     },
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.1
+    //# Where QUIC might be multiplexed with other protocols (see
+    //# [RFC7983]), servers SHOULD set the most significant bit of this
+    //# field (0x40) to 1 so that Version Negotiation packets appear to have
+    //# the Fixed Bit field.
+    //= type=exception
+    //= reason=no Version Negotiation packet is written here, so there is no unused field of ours to set; version negotiation is out of scope per docs/DESIGN.md section 2 and section 6.
     /// A Version Negotiation packet is parsed, so that a client can see one and
     /// a consumer can act on it. Sending one is a server's answer to a version
     /// it does not implement, and building that answer is out of scope here —

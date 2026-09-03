@@ -280,6 +280,12 @@ pub const ParseError = error{
     //# frame to be sent.
     //= type=exception
     //= reason=no extension frame is ever sent or accepted, so there is none to congestion control or acknowledge; see docs/DESIGN.md section 2.
+    //
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-19.21
+    //# Such extensions SHOULD define their interaction with previously
+    //# defined extensions modifying the same protocol components.
+    //= type=exception
+    //= reason=this package defines no extension, so it has no interaction to specify; see docs/DESIGN.md section 2.
     UnknownType,
     /// A field the frame's own rules forbid: a `retire_prior_to` above the
     /// sequence number it arrived with, a stream offset that would put the
@@ -386,11 +392,31 @@ pub const Frame = union(enum) {
     reset_stream: struct { stream: u64, code: error_code.Application, final_size: u64 },
     stop_sending: struct { stream: u64, code: error_code.Application },
     crypto: Crypto,
+    /// Section 19.7. Decoded so that a client can see one; never composed,
+    /// which is what makes the client-side rule hold here.
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-19.7
+    //# Clients MUST NOT send NEW_TOKEN frames.
+    //= type=exception
+    //= reason=nothing in this package composes a NEW_TOKEN frame at either role: a token is a server's own encrypted state and needs randomness and a clock, neither of which crosses the seam of docs/DESIGN.md section 3. A client therefore cannot send one. See docs/DESIGN.md section 2.
     new_token: struct { token: []const u8 },
     stream: struct { stream: u64, offset: u64, data: []const u8, fin: bool },
     max_data: struct { maximum: u64 },
     max_stream_data: struct { stream: u64, maximum: u64 },
     max_streams: struct { bidirectional: bool, maximum: u64 },
+    /// Sections 19.12 and 19.13. Both frames encode and decode, and nothing
+    /// composes either: `Connection.receiveFrames` ignores them on arrival and
+    /// no send path builds one when a flow control limit blocks a write.
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-19.12
+    //# A sender SHOULD send a DATA_BLOCKED frame (type=0x14) when it wishes
+    //# to send data but is unable to do so due to connection-level flow
+    //# control
+    //= type=todo
+    //
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-19.13
+    //# A sender SHOULD send a STREAM_DATA_BLOCKED frame (type=0x15) when it
+    //# wishes to send data but is unable to do so due to stream-level flow
+    //# control.
+    //= type=todo
     data_blocked: struct { limit: u64 },
     stream_data_blocked: struct { stream: u64, limit: u64 },
     streams_blocked: struct { bidirectional: bool, limit: u64 },

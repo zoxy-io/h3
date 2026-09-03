@@ -106,6 +106,65 @@ pub const octets_max: u8 = 20;
 //# CONNECTION_ID_LIMIT_ERROR.
 //= type=exception
 //= reason=no identifier is ever forgotten because none is ever stored beyond the single one in use; the retirement bookkeeping this rule governs belongs to migration, which docs/DESIGN.md section 2 and section 6 place out of scope.
+//
+// The eight rules above are what an issuer owes its peer at the level of a
+// MUST; the eight below are the same shape at the level of a SHOULD, and they
+// are excused by the same fact — the pool of connection identifiers this
+// endpoint offers has one member and never grows or shrinks.
+//= https://www.rfc-editor.org/rfc/rfc9000#section-5.1.1
+//# An endpoint SHOULD ensure that its peer has a sufficient number of
+//# available and unused connection IDs.
+//= type=exception
+//= reason=the peer is given one connection identifier and needs no more, because it never migrates: migration is out of scope per docs/DESIGN.md section 2 and section 6.
+//
+//= https://www.rfc-editor.org/rfc/rfc9000#section-5.1.1
+//# An endpoint SHOULD supply a new connection ID when the peer retires
+//# a connection ID.
+//= type=exception
+//= reason=a RETIRE_CONNECTION_ID from the peer is parsed and ignored, and no replacement identifier is issued, because issuing a second one is migration's business. See docs/DESIGN.md section 2 and section 6.
+//
+//= https://www.rfc-editor.org/rfc/rfc9000#section-5.1.1
+//# An endpoint that initiates migration and requires non-zero-length
+//# connection IDs SHOULD ensure that the pool of connection IDs
+//# available to its peer allows the peer to use a new connection ID on
+//# migration, as the peer will be unable to respond if the pool is
+//# exhausted.
+//= type=exception
+//= reason=this endpoint initiates no migration, so it never puts its peer in the position this rule guards against; see docs/DESIGN.md section 2 and section 6.
+//
+//= https://www.rfc-editor.org/rfc/rfc9000#section-5.1.2
+//# Endpoints SHOULD retire connection IDs when they are no longer
+//# actively using either the local or destination address for which the
+//# connection ID was used.
+//= type=exception
+//= reason=the one destination identifier in use stays in use for the life of the connection, because the address it was chosen for never changes; nothing here sees an address at all, per docs/DESIGN.md section 3. Migration is out of scope per docs/DESIGN.md section 2 and section 6.
+//
+//= https://www.rfc-editor.org/rfc/rfc9000#section-5.1.2
+//# The endpoint SHOULD continue to accept the previously issued
+//# connection IDs until they are retired by the peer.
+//= type=exception
+//= reason=there is exactly one previously issued identifier and it is accepted for the whole connection, so there is no set to age out; see docs/DESIGN.md section 2 and section 6.
+//
+//= https://www.rfc-editor.org/rfc/rfc9000#section-5.1.2
+//# An endpoint SHOULD limit the number of connection IDs it has retired
+//# locally for which RETIRE_CONNECTION_ID frames have not yet been
+//# acknowledged.
+//= type=exception
+//= reason=no RETIRE_CONNECTION_ID frame is ever sent, so the unacknowledged count is zero by construction; see docs/DESIGN.md section 2 and section 6.
+//
+//= https://www.rfc-editor.org/rfc/rfc9000#section-5.1.2
+//# An endpoint SHOULD allow for sending and tracking a number of
+//# RETIRE_CONNECTION_ID frames of at least twice the value of the
+//# active_connection_id_limit transport parameter.
+//= type=exception
+//= reason=none is sent and none is tracked, because no identifier of the peer's is ever adopted and so none is ever retired; see docs/DESIGN.md section 2 and section 6.
+//
+//= https://www.rfc-editor.org/rfc/rfc9000#section-5.1.2
+//# Endpoints SHOULD NOT issue updates of the Retire Prior To field
+//# before receiving RETIRE_CONNECTION_ID frames that retire all
+//# connection IDs indicated by the previous Retire Prior To value.
+//= type=exception
+//= reason=no NEW_CONNECTION_ID frame is sent, so no Retire Prior To field of ours is ever issued or updated; see docs/DESIGN.md section 2 and section 6.
 pub const octets_min: u8 = 0;
 
 comptime {
