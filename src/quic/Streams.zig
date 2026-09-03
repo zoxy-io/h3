@@ -251,6 +251,19 @@ pub fn Streams(comptime config: Config) type {
             //# DATA_BLOCKED frame before sending a MAX_STREAM_DATA or MAX_DATA frame;
             //# doing so could result in the sender being blocked for the rest of the
             //# connection.
+            //
+            // What that loop does not read is `receive_state`, and this does
+            // not either: the limit keeps moving forward as the application
+            // drains a stream whose size the peer has already fixed with a FIN,
+            // or one the peer has reset, so a MAX_STREAM_DATA goes out
+            // extending a window nothing can ever be written into. Harmless on
+            // the wire and pure waste — the test belongs here, where the state
+            // is in reach, rather than in the caller.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-13.3
+            //# An endpoint SHOULD stop sending
+            //# MAX_STREAM_DATA frames when the receiving part of the stream
+            //# enters a "Size Known" or "Reset Recvd" state.
+            //= type=todo
             pub fn receiveLimit(self: *const Stream) u64 {
                 // Section 4.1: the limit moves forward as the application
                 // reads, so a stream that is never read never grows one.
@@ -583,6 +596,17 @@ pub fn Streams(comptime config: Config) type {
         //= https://www.rfc-editor.org/rfc/rfc9000#section-19.4
         //# An endpoint that receives a RESET_STREAM frame for a send-only
         //# stream MUST terminate the connection with error STREAM_STATE_ERROR.
+        //
+        // What a cancelled stream *means* stops at this line. The transport's
+        // share is the accounting below — the final size, the credit release,
+        // the state — and `reset_code` is carried through opaquely because
+        // section 11.2 puts its semantics in the application protocol. A
+        // consumer reads it off the stream and decides; nothing here does.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-11.2
+        //# Application protocols SHOULD define rules for handling streams that
+        //# are prematurely canceled by either endpoint.
+        //= type=exception
+        //= reason=this is addressed to the application protocol rather than to the transport; RESET_STREAM's error code is carried opaquely to the consumer, and the rules for a prematurely cancelled request are RFC 9114's and the consumer's, not this file's
         pub fn reset(self: *Self, id: u64, code: u64, final_size: u64) Error!void {
             if (!self.peerMaySend(id)) return error.StreamState;
             if (final_size > varint.max) return error.FinalSize;
@@ -761,6 +785,19 @@ pub fn Streams(comptime config: Config) type {
         //# If any outstanding data is declared lost, the endpoint SHOULD send a
         //# RESET_STREAM frame instead of retransmitting the data.
         //= type=todo
+        //
+        // The priority rule falls out of the buffer's shape rather than being
+        // scheduled: `framed` is a single watermark into `send`, everything
+        // below it has gone out and everything above it has not, and a rewind
+        // moves it backwards. `Connection.writeStream` then frames forward from
+        // `framed`, so the retransmitted octets — which are the lower offsets —
+        // are framed before any new data behind them, and no ordering decision
+        // is made anywhere. The application has no say in it, which is the
+        // half of this section 2.3 defers to and `wantsSend` marks as missing.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-13.3
+        //# Endpoints SHOULD prioritize retransmission of data over sending new
+        //# data, unless priorities specified by the application indicate
+        //# otherwise; see Section 2.3.
         pub fn rewind(self: *Self, id: u64, from: u32, fin_lost: bool) void {
             const stream = self.find(id) orelse return;
             stream.framed = @min(stream.framed, from);

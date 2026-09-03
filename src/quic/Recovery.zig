@@ -712,6 +712,19 @@ pub fn Recovery(comptime config: Config) type {
                 }
                 if (count < lost.len) lost[count] = packet.context;
                 count += 1;
+                // A packet declared lost is forgotten here rather than
+                // retained, so a later ACK naming it — the spurious-loss case
+                // reordering produces — matches nothing in `sent` and tells
+                // nobody. What it held has already gone back to the caller for
+                // retransmission, and if that retransmission is itself declared
+                // lost the same octets go out a third time even though the
+                // original was acknowledged in between. Holding the packet past
+                // `remove` for a reordering window — a PTO, which is what RFC
+                // 9000 section 13.3 suggests — is what would close it.
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-13.3
+                //# A sender SHOULD avoid retransmitting information from packets once
+                //# they are acknowledged.
+                //= type=todo
                 remove(state, index);
             }
 
@@ -866,6 +879,19 @@ pub fn Recovery(comptime config: Config) type {
         //# The sender MUST exit slow start and enter a recovery period when a
         //# packet is lost or when the ECN-CE count reported by its peer
         //# increases.
+        //
+        // Every lost packet reaches here without exception, and it can: no
+        // packet this package sends is a PMTU probe. The datagram size is fixed
+        // at comptime and nothing ever writes above it, so section 14.4's
+        // carve-out has nothing to carve out. `Sent` carries no probe flag
+        // either, which is the shape this would have to grow if it ever did.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-14.4
+        //# Loss of
+        //# a QUIC packet that is carried in a PMTU probe is therefore not a
+        //# reliable indication of congestion and SHOULD NOT trigger a congestion
+        //# control reaction;
+        //= type=exception
+        //= reason=PMTU discovery is out of scope, so no packet is ever a PMTU probe: the maximum datagram size is a comptime constant and nothing sends above it, leaving no probe loss for the congestion controller to exempt
         fn onCongestionEvent(self: *Self, time_sent: u64, now_ns: u64) void {
             // Everything lost in one round trip is one event: reacting to each
             // packet would collapse the window by a factor of two per packet.
@@ -1180,6 +1206,28 @@ pub fn Recovery(comptime config: Config) type {
         /// a bare PING where there is any, and this is what tells a caller
         /// where that data starts. The list is ascending by number, so the
         /// earliest is the first.
+        ///
+        /// The RFC's preference runs the other way, and the inversion is
+        /// deliberate rather than an oversight: nothing here knows what a
+        /// packet contained, so "new data" is a phrase this module cannot
+        /// name. The earliest unacknowledged context is the only thing it can.
+        //= https://www.rfc-editor.org/rfc/rfc9002#section-6.2.4
+        //# An endpoint SHOULD include new data in packets that are sent on PTO
+        //# expiration.
+        //= type=exception
+        //= reason=this module never learns what a packet contained, so it cannot name new data; the probe is driven from the earliest unacknowledged context instead, which is the same section's "Previously sent data MAY be sent", and whatever new data the caller has pending rides along in the same packet build
+        //
+        // A null answer is the other case section 6.2.4 names: nothing is
+        // outstanding in this space, so there is nothing to point a probe at,
+        // and `Connection.writePayload` frames a PING when a probe is pending
+        // and the space has nothing else to say. The timer is rearmed by that
+        // point without anything further here — `onLossDetectionTimeout` has
+        // already advanced `pto_count`, and `timeoutAt` recomputes the period
+        // from it on the next call.
+        //= https://www.rfc-editor.org/rfc/rfc9002#section-6.2.4
+        //# When there is no data to send, the sender SHOULD send
+        //# a PING or other ack-eliciting frame in a single packet, rearming the
+        //# PTO timer.
         pub fn earliestContext(self: *const Self, space: Space) ?Context {
             const state = &self.spaces[@intFromEnum(space)];
             if (state.count == 0) return null;

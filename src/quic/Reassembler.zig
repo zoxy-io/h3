@@ -75,6 +75,18 @@ pub const Config = struct {
     /// `TooFragmented` error the connection turns into a close. Sixteen is
     /// generous for loss and stingy for malice — a real path reorders within a
     /// few packets, not within a few hundred.
+    ///
+    /// Together with `capacity` this is section 21.7's mitigation, and it is
+    /// two of the ones that section names: the window is the buffer, so nothing
+    /// is overcommitted and a receiver cannot be made to promise memory it does
+    /// not have; and the tracking structure is a fixed array, so the holes an
+    /// adversarial sender manufactures cost a bounded number of spans and then
+    /// cost it the connection. Neither is a heuristic on the age of a hole,
+    /// which is the mitigation this does not take — a fixed ceiling needs no
+    /// clock, and this package has none.
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-21.7
+    //# QUIC deployments SHOULD provide mitigations for stream fragmentation
+    //# attacks.
     spans_max: u32 = 16,
 };
 
