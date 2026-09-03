@@ -43,6 +43,27 @@ const Reassembler = @import("Reassembler.zig").Reassembler;
 const Side = @import("crypto.zig").Side;
 
 /// Section 3.2: what has happened to a stream's receive half.
+///
+/// Four of section 3.2's six states. "Data Recvd" — everything has arrived but
+/// the application has not taken it — is folded into `size_known`, which
+/// `Streams.settle` tests together with `Reassembler.isComplete`; and "Reset
+/// Read" is folded into `reset`, because nothing here delivers a reset signal
+/// to an application separately from the data.
+///
+/// Nothing in this package asks the peer to stop. STOP_SENDING is *received*
+/// by `Connection.receiveFrames`, which moves the send half to `.reset`; no
+/// path generates one, so a reader that abandons a stream keeps paying for it
+/// until the peer finishes or resets.
+//= https://www.rfc-editor.org/rfc/rfc9000#section-3.5
+//# If the stream is in the "Recv" or "Size Known" state, the transport
+//# SHOULD signal this by sending a STOP_SENDING frame to prompt closure
+//# of the stream in the opposite direction.
+//= type=todo
+//
+//= https://www.rfc-editor.org/rfc/rfc9000#section-3.5
+//# STOP_SENDING SHOULD only be sent for a stream that has not been reset
+//# by the peer.
+//= type=todo
 pub const ReceiveState = enum {
     /// Data is arriving.
     receiving,
@@ -55,12 +76,41 @@ pub const ReceiveState = enum {
 };
 
 /// Section 3.1: what has happened to a stream's send half.
+///
+/// Three of section 3.1's six states. "Ready" and "Send" are one `sending`
+/// here, because nothing distinguishes a stream that has buffered data from
+/// one that has framed it. The two terminal states are the gap: "Data Recvd"
+/// and "Reset Recvd" are entered on *acknowledgement*, and this type is never
+/// told that a FIN or a RESET_STREAM was acknowledged — `Recovery` reports
+/// losses to `Streams.rewind` and reports acknowledgements to nothing here. So
+/// no stream ever reaches a terminal state, and the rule below has nothing to
+/// test against.
+//= https://www.rfc-editor.org/rfc/rfc9000#section-3.3
+//# A sender MUST NOT send any of these frames from a terminal state
+//# ("Data Recvd" or "Reset Recvd").
+//= type=todo
 pub const SendState = enum {
     /// Accepting writes.
     sending,
     /// A FIN was queued; no more writes are accepted.
     data_sent,
     /// This endpoint abandoned it with RESET_STREAM.
+    ///
+    /// Also where `Connection.receiveFrames` puts a stream on receiving
+    /// STOP_SENDING — which is section 3.5's cue to *send* a RESET_STREAM, and
+    /// no RESET_STREAM is ever framed. The state moves and the peer is never
+    /// told, so a peer that asked us to stop learns nothing and the final size
+    /// the two endpoints are supposed to agree on is never communicated.
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-3.5
+    //# An endpoint that receives a STOP_SENDING frame MUST send a
+    //# RESET_STREAM frame if the stream is in the "Ready" or "Send" state.
+    //= type=todo
+    //
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-3.5
+    //# An endpoint SHOULD copy the error code from the STOP_SENDING frame to
+    //# the RESET_STREAM frame it sends, but it can use any application error
+    //# code.
+    //= type=todo
     reset,
 };
 
@@ -112,6 +162,21 @@ pub fn Streams(comptime config: Config) type {
     return struct {
         const Self = @This();
 
+        /// The limit this endpoint advertises, and the only one it will ever
+        /// advertise: it is comptime, so it never rises and no MAX_STREAMS
+        /// frame is generated anywhere in the package (see
+        /// `Connection.max_data_sent`, which says the same about the field that
+        /// used to sit beside it). The MUST NOT below is therefore satisfied
+        /// vacuously — nothing waits for STREAMS_BLOCKED because nothing issues
+        /// credit at all — and the cost is the one the sentence is warning
+        /// about: a peer that closes streams never gets them back, so a
+        /// long-lived connection reaches `streams_max` and stays there.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-4.6
+        //# An endpoint MUST NOT wait to receive this signal before advertising
+        //# additional credit, since doing so will mean that the peer will be
+        //# blocked for at least an entire round trip, and potentially
+        //# indefinitely if the peer chooses not to send STREAMS_BLOCKED frames.
+        //= type=todo
         pub const streams_max: u32 = config.streams_max;
         pub const receive_octets: u32 = config.receive_octets;
         pub const connection_receive_octets: u64 = config.connection_receive_octets;
@@ -154,6 +219,13 @@ pub fn Streams(comptime config: Config) type {
             max_data_sent: u64 = 0,
 
             /// Bytes readable in order.
+            ///
+            /// The ordering is `Reassembler`'s: this returns the contiguous run
+            /// from the read offset and nothing past a gap, so an application
+            /// never sees an octet before the one that precedes it.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-2.2
+            //# Endpoints MUST be able to deliver stream data to an application as an
+            //# ordered byte stream.
             pub fn readable(self: *const Stream) []const u8 {
                 return self.received.readable();
             }
@@ -167,6 +239,18 @@ pub fn Streams(comptime config: Config) type {
             /// the application has taken rather than from what has arrived.
             /// Advertising from arrival would let a peer that sends faster than
             /// we read push the window ahead of the buffer.
+            ///
+            /// Nothing waits to be asked. `Connection.writePacket` compares this
+            /// against `max_data_sent` on every packet it builds and emits a
+            /// MAX_STREAM_DATA when the window has moved far enough to be worth
+            /// a frame, and `Connection.receiveFrames` discards
+            /// STREAM_DATA_BLOCKED and DATA_BLOCKED without reading them — so a
+            /// peer that never sends one is never blocked by that silence.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-4.2
+            //# Therefore, a receiver MUST NOT wait for a STREAM_DATA_BLOCKED or
+            //# DATA_BLOCKED frame before sending a MAX_STREAM_DATA or MAX_DATA frame;
+            //# doing so could result in the sender being blocked for the rest of the
+            //# connection.
             pub fn receiveLimit(self: *const Stream) u64 {
                 // Section 4.1: the limit moves forward as the application
                 // reads, so a stream that is never read never grows one.
@@ -266,6 +350,9 @@ pub fn Streams(comptime config: Config) type {
         /// Section 4.6: raise how many streams of one kind this endpoint may
         /// open. Limits only ever rise, so a lower value is ignored rather than
         /// refused — that is what section 4.6 says to do with a stale frame.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-4.6
+        //# MAX_STREAMS frames that do not increase the stream limit MUST be
+        //# ignored.
         pub fn setPeerStreamLimit(self: *Self, bidirectional: bool, maximum: u64) void {
             assert(maximum <= stream_id.count_max);
             const limit = if (bidirectional) &self.peer_streams_bidi else &self.peer_streams_uni;
@@ -274,6 +361,26 @@ pub fn Streams(comptime config: Config) type {
         }
 
         /// Open a stream, or return the one already open.
+        ///
+        /// A stream is never removed: `count` only rises, and a finished or
+        /// reset stream keeps its slot and its identifier for the life of the
+        /// connection. That is what makes reuse impossible here — there is no
+        /// path that hands the same identifier to a second stream — and it is
+        /// also why `received_total` can go on counting a closed stream's
+        /// credit, which section 4.1 requires.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-2.1
+        //# A QUIC endpoint MUST NOT reuse a stream ID within a connection.
+        //
+        // Only the named stream is created. A peer that opens index 3 without
+        // ever having opened 0, 1 and 2 gets one stream here, not four, so the
+        // creation order the two endpoints see is not the same — and the count
+        // this endpoint bounds with `streams_max` is not the count a
+        // conforming peer believes it has opened. See `checkPeerStreamLimit`
+        // for what that costs on the receive side.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-3.2
+        //# Before a stream is created, all streams of the same type with lower-
+        //# numbered stream IDs MUST be created.
+        //= type=todo
         pub fn open(self: *Self, id: u64) Error!*Stream {
             assert(id <= varint.max);
             if (self.find(id)) |stream| return stream;
@@ -296,6 +403,21 @@ pub fn Streams(comptime config: Config) type {
         /// the one *we* advertised, and `streams_max` is what enforces it.
         //= https://www.rfc-editor.org/rfc/rfc9000#section-4.6
         //# Endpoints MUST NOT exceed the limit set by their peer.
+        //
+        // And the mirror of it, which is not implemented. The rule below is
+        // about a stream *identifier*, and the only thing checked in that
+        // direction is a count: `open` refuses the `streams_max + 1`-th stream
+        // and nothing compares a peer-initiated identifier's index against the
+        // limit this endpoint advertised. A peer that sends on index 10_000
+        // while we advertised sixty-four gets a stream, because it is only the
+        // first one. The count is a sound proxy only if section 3.2's
+        // lower-numbered streams are created implicitly, and they are not —
+        // see `open`.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-4.6
+        //# An endpoint that receives a frame with a stream ID exceeding the limit
+        //# it has sent MUST treat this as a connection error of type
+        //# STREAM_LIMIT_ERROR; see Section 11 for details on error handling.
+        //= type=todo
         fn checkPeerStreamLimit(self: *const Self, id: u64) Error!void {
             assert(id <= varint.max);
             const kind = stream_id.kindOf(id);
@@ -400,6 +522,26 @@ pub fn Streams(comptime config: Config) type {
         }
 
         /// Section 19.4: the peer abandoned a stream.
+        ///
+        /// One direction only. Nothing below touches `send_state`,
+        /// `send_limit`, `send_offset` or `sent_total`, so a RESET_STREAM on a
+        /// bidirectional stream leaves this endpoint's own half writable and
+        /// still accounted for against both send-side windows.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-4.4
+        //# Both endpoints MUST maintain flow control state for the stream in the
+        //# unterminated direction until that direction enters a terminal state.
+        //
+        // The three `error.FinalSize` returns below are the three shapes a
+        // final size can change in: a size that contradicts one a FIN already
+        // fixed, one that retracts data already received, and — in
+        // `Reassembler.push` — data arriving past a size already named. Each
+        // reaches the consumer as `Connection.ReceiveError.FinalSize`, which
+        // is the `FINAL_SIZE_ERROR` this names.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-4.5
+        //# If a RESET_STREAM or STREAM frame is received indicating a change in
+        //# the final size for the stream, an endpoint SHOULD respond with an
+        //# error of type FINAL_SIZE_ERROR; see Section 11 for details on error
+        //# handling.
         pub fn reset(self: *Self, id: u64, code: u64, final_size: u64) Error!void {
             if (!self.peerMaySend(id)) return error.StreamState;
             if (final_size > varint.max) return error.FinalSize;
@@ -438,6 +580,24 @@ pub fn Streams(comptime config: Config) type {
         /// A short write is ordinary: the buffer is finite and the peer's flow
         /// control limit is not ours to exceed. A caller loops, or waits for
         /// `MAX_STREAM_DATA`.
+        ///
+        /// The refusal is here rather than at the sender, which is the point:
+        /// `Connection.writeStream` frames whatever sits in `send[framed..]`
+        /// without consulting a window, because nothing can get into that
+        /// buffer that both limits did not already allow.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-2.2
+        //# An endpoint MUST NOT send data on any stream without ensuring that it
+        //# is within the flow control limits set by its peer.
+        //
+        // What a short write does *not* do is tell the peer. Neither
+        // STREAM_DATA_BLOCKED nor STREAMS_BLOCKED is generated anywhere in the
+        // package — `Connection.receiveFrames` discards both on receipt and
+        // frames neither — so a caller that hits `take == 0` here has no way
+        // to say so, and a peer that is waiting to be asked waits forever.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-4.6
+        //# An endpoint that is unable to open a new stream due to the peer's
+        //# limits SHOULD send a STREAMS_BLOCKED frame (Section 19.14).
+        //= type=todo
         pub fn write(self: *Self, id: u64, data: []const u8, fin: bool) Error!usize {
             // Section 19.8's mirror: a unidirectional stream the peer opened is
             // receive-only here, and writing on one is this endpoint's bug
@@ -468,6 +628,16 @@ pub fn Streams(comptime config: Config) type {
             return take;
         }
 
+        // A room of zero is where a sender is blocked, and it is where the
+        // frame that says so would be generated. Nothing counts how long this
+        // has answered zero and nothing is periodic here, so the peer is told
+        // nothing and the only thing keeping the connection alive is whatever
+        // else it has to send.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-4.1
+        //# To keep the connection from closing, a sender that is flow control
+        //# limited SHOULD periodically send a STREAM_DATA_BLOCKED or DATA_BLOCKED
+        //# frame when it has no ack-eliciting packets in flight.
+        //= type=todo
         fn sendRoom(limit: u64, at: u64) u64 {
             // The comparison is the guard on the subtraction. `limit` is the
             // peer's advertised window and `at` is how far we have written, and
@@ -495,6 +665,26 @@ pub fn Streams(comptime config: Config) type {
         }
 
         /// Streams with data waiting to be framed.
+        ///
+        /// The `.reset` test comes *after* the data test, and only the FIN is
+        /// behind it: a stream whose send half was moved to `.reset` — which is
+        /// what `Connection.receiveFrames` does on STOP_SENDING — still answers
+        /// true while it has unframed octets, and `Connection.writeStream`,
+        /// which reads no state at all, then frames them. So this endpoint goes
+        /// on sending STREAM frames on a stream it has recorded as abandoned.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-3.3
+        //# A sender MUST NOT send a STREAM or STREAM_DATA_BLOCKED frame for a
+        //# stream in the "Reset Sent" state or any terminal state -- that is,
+        //# after sending a RESET_STREAM frame.
+        //= type=todo
+        //
+        // And what it does answer is a set, not an order: the caller takes the
+        // first stream with anything waiting, so a large body starves every
+        // stream after it in the array and an application has no say in which.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-2.3
+        //# A QUIC implementation SHOULD provide ways in which an application can
+        //# indicate the relative priority of streams.
+        //= type=todo
         pub fn wantsSend(self: *const Self) bool {
             for (self.streams[0..self.count]) |*stream| {
                 if (stream.framed < stream.send_len) return true;
@@ -510,6 +700,14 @@ pub fn Streams(comptime config: Config) type {
         /// `fin_lost` is separate because a FIN carries no octets: an empty
         /// FIN frame records an empty range, so a lost one would otherwise have
         /// no way back — it is the one thing a byte range cannot describe.
+        ///
+        /// Loss always means retransmission here. A stream the peer asked us to
+        /// stop is rewound like any other, because this reads no state; section
+        /// 3.5 wants the loss taken as the moment to give up on it instead.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-3.5
+        //# If any outstanding data is declared lost, the endpoint SHOULD send a
+        //# RESET_STREAM frame instead of retransmitting the data.
+        //= type=todo
         pub fn rewind(self: *Self, id: u64, from: u32, fin_lost: bool) void {
             const stream = self.find(id) orelse return;
             stream.framed = @min(stream.framed, from);
@@ -555,6 +753,11 @@ test "data arrives, is read, and the window moves forward with the reader" {
     try testing.expectEqual(@as(u64, 5), set.consumed_total);
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9000#section-4.1
+//# A receiver MUST close the connection with an error of type
+//# FLOW_CONTROL_ERROR if the sender violates the advertised connection or
+//# stream data limits; see Section 11 for details on error handling.
+//= type=test
 test "a peer may not send past a stream's limit" {
     var set = testSet();
     const oversized: [Set.receive_octets + 1]u8 = @splat('x');
@@ -613,6 +816,17 @@ test "a reset stream keeps its accounting" {
     try testing.expectEqual(@as(u64, 5), set.received_total);
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9000#section-4.5
+//# The receiver MUST use the final size of the stream to account for all
+//# bytes sent on the stream in its connection-level flow controller.
+//= type=test
+//
+//= https://www.rfc-editor.org/rfc/rfc9000#section-4.5
+//# If a RESET_STREAM or STREAM frame is received indicating a change in
+//# the final size for the stream, an endpoint SHOULD respond with an
+//# error of type FINAL_SIZE_ERROR; see Section 11 for details on error
+//# handling.
+//= type=test
 test "a reset that retracts data already charged is refused" {
     var set = testSet();
     try set.receive(0, 0, "hello", false);
@@ -681,6 +895,10 @@ test "the connection's send limit binds independently of a stream's" {
     try testing.expectEqual(@as(usize, 3), try set.write(0, "llo", false));
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9000#section-4.1
+//# A sender MUST ignore any MAX_STREAM_DATA or MAX_DATA frames that do
+//# not increase flow control limits.
+//= type=test
 test "a limit never falls" {
     var set = testSet();
     try set.setSendLimit(0, 100);
@@ -816,6 +1034,13 @@ test "a resource limit is not reported as the peer's fault" {
 
 //= https://www.rfc-editor.org/rfc/rfc9000#section-4.6
 //# Endpoints MUST NOT exceed the limit set by their peer.
+//= type=test
+//
+// The last two lines are the other half: a MAX_STREAMS that lowers the limit
+// leaves it where it was.
+//= https://www.rfc-editor.org/rfc/rfc9000#section-4.6
+//# MAX_STREAMS frames that do not increase the stream limit MUST be
+//# ignored.
 //= type=test
 test "section 4.6: this endpoint may not open past the peer's limit" {
     var set: Set = .{ .side = .client };
