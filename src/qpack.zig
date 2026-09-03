@@ -33,6 +33,15 @@
 //! The field line representations, the dynamic table and the encoder and
 //! decoder streams are the next slices; see docs/DESIGN.md section 6.
 
+//= https://www.rfc-editor.org/rfc/rfc9204#section-1.1
+//# The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
+//# "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and
+//# "OPTIONAL" in this document are to be interpreted as described in
+//# BCP 14 [RFC2119] [RFC8174] when, and only when, they appear in all
+//# capitals, as shown here.
+//= type=exception
+//= reason=RFC 8174's boilerplate: it says how the keywords in the rest of the document are to be read and requires no behaviour of an implementation. It is here because the ledger's sentence-splitter counts any sentence carrying a keyword, and an uncited line in the report should mean a rule nobody looked at
+
 const std = @import("std");
 
 const hpack = @import("hpack");

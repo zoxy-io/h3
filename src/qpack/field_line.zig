@@ -174,7 +174,12 @@ pub const Error = error{
 
 /// Section 4.5.1: the two integers every field section begins with.
 //= https://www.rfc-editor.org/rfc/rfc9204#section-2.1.2
-//# An encoder MUST limit the number of streams that could
+//# When the decoder receives an encoded field section with a Required
+//# Insert Count greater than its own Insert Count, the stream cannot be
+//# processed immediately and is considered "blocked"; see Section 2.2.1.
+//# The decoder specifies an upper bound on the number of streams that
+//# can be blocked using the SETTINGS_QPACK_BLOCKED_STREAMS setting; see
+//# Section 5.  An encoder MUST limit the number of streams that could
 //# become blocked to the value of SETTINGS_QPACK_BLOCKED_STREAMS at all
 //# times.  If a decoder encounters more blocked streams than it promised
 //# to support, it MUST treat this as a connection error of type
@@ -253,6 +258,14 @@ pub fn parsePrefix(source: []const u8) Error!Prefix {
     // which only happens when a section references entries it itself inserted.
     // With no dynamic table both are zero and the sign cannot be set.
     //= https://www.rfc-editor.org/rfc/rfc9204#section-4.5.1.2
+    //# If the encoder inserted entries in the dynamic table while
+    //# encoding the field section and is referencing them, Required Insert
+    //# Count will be greater than the Base, so the encoded difference is
+    //# negative and the Sign bit is set to 1.  If the field section was not
+    //# encoded using representations that reference the most recent entry in
+    //# the table and did not insert any new entries, the Base will be
+    //# greater than the Required Insert Count, so the encoded difference
+    //# will be positive and the Sign bit is set to 0.
     //# The value of Base MUST NOT be negative.  Though the protocol might
     //# operate correctly with a negative Base using post-Base indexing, it
     //# is unnecessary and inefficient.  An endpoint MUST treat a field block
@@ -446,6 +459,38 @@ pub const Iterator = struct {
 //# of EncodedInsertCount that could not have been produced by a
 //# conformant encoder, it MUST treat this as a connection error of type
 //# QPACK_DECOMPRESSION_FAILED.
+//= https://www.rfc-editor.org/rfc/rfc9204#section-2.2.2.1
+//# After the decoder finishes decoding a field section encoded using
+//# representations containing dynamic table references, it MUST emit a
+//# Section Acknowledgment instruction (Section 4.4.1).
+//= type=exception
+//= reason=the dynamic table is not built: this endpoint advertises SETTINGS_QPACK_MAX_TABLE_CAPACITY = 0, which forbids its peer the table entirely, and docs/DESIGN.md section 6 lists the table and its two streams as next rather than built; iterate refuses any section whose Required Insert Count is non-zero, so no section decoded here contains a dynamic table reference to acknowledge
+//= https://www.rfc-editor.org/rfc/rfc9204#section-2.2.3
+//# If the decoder encounters a reference in an encoder instruction to a
+//# dynamic table entry that has already been evicted, it MUST treat this
+//# as a connection error of type QPACK_ENCODER_STREAM_ERROR.
+//= type=exception
+//= reason=the dynamic table is not built: this endpoint advertises SETTINGS_QPACK_MAX_TABLE_CAPACITY = 0, which forbids its peer the table entirely, and docs/DESIGN.md section 6 lists the table and its two streams as next rather than built; there is no encoder stream to read an instruction from, and the field-line half of this rule is cited on Prefix.required_insert_count
+//= https://www.rfc-editor.org/rfc/rfc9204#section-3.2
+//# The dynamic table can contain duplicate entries (i.e., entries with
+//# the same name and same value).  Therefore, duplicate entries MUST NOT
+//# be treated as an error by the decoder.
+//= type=exception
+//= reason=the dynamic table is not built: this endpoint advertises SETTINGS_QPACK_MAX_TABLE_CAPACITY = 0, which forbids its peer the table entirely, and docs/DESIGN.md section 6 lists the table and its two streams as next rather than built; the static table's own duplicates are handled by static_table.lookup, which returns the first matching entry rather than treating a repeat as anything
+//= https://www.rfc-editor.org/rfc/rfc9204#section-4.4.1
+//# If an encoder receives a Section Acknowledgment instruction referring
+//# to a stream on which every encoded field section with a non-zero
+//# Required Insert Count has already been acknowledged, this MUST be
+//# treated as a connection error of type QPACK_DECODER_STREAM_ERROR.
+//= type=exception
+//= reason=the dynamic table is not built: this endpoint advertises SETTINGS_QPACK_MAX_TABLE_CAPACITY = 0, which forbids its peer the table entirely, and docs/DESIGN.md section 6 lists the table and its two streams as next rather than built; the decoder stream that carries a Section Acknowledgment is not built, so this encoder receives none
+//= https://www.rfc-editor.org/rfc/rfc9204#section-4.4.3
+//# An encoder that receives an Increment field equal to zero, or one
+//# that increases the Known Received Count beyond what the encoder has
+//# sent, MUST treat this as a connection error of type
+//# QPACK_DECODER_STREAM_ERROR.
+//= type=exception
+//= reason=the dynamic table is not built: this endpoint advertises SETTINGS_QPACK_MAX_TABLE_CAPACITY = 0, which forbids its peer the table entirely, and docs/DESIGN.md section 6 lists the table and its two streams as next rather than built; the Known Received Count exists only to track dynamic table insertions, and this encoder makes none
 pub fn iterate(section: []const u8, buffer: []u8, list_size_max: u64) Error!Iterator {
     const prefix = try parsePrefix(section);
     // Section 2.2: a section that depends on the dynamic table cannot be
@@ -521,6 +566,14 @@ fn encodeString(target: []u8, text: []const u8) Error!u32 {
 /// "When shorter" rather than always: section 4.1.2 leaves it to the encoder,
 /// and a Huffman coding that is longer than the octets it replaces is a coding
 /// that costs both sides work to grow the message.
+//= https://www.rfc-editor.org/rfc/rfc9114#section-10.6
+//# Implementations communicating on a secure channel MUST NOT compress
+//# content that includes both confidential and attacker-controlled data
+//# unless separate compression contexts are used for each source of
+//# data.  Compression MUST NOT be used if the source of data cannot be
+//# reliably determined.
+//= type=exception
+//= reason=the attack needs a compression context shared between a secret and attacker-controlled data, and with the dynamic table advertised away there is none: every field is coded against RFC 7541 section 5.2's fixed Huffman table, which has no state to carry one field's octets into another's. The 'N' bit that stops a field entering a context is honoured, and section 7.1.3's rule about it is cited on encodeField
 fn encodeStringAt(target: []u8, text: []const u8, prefix_bits: u4, tag: u8, huffman_bit: u8) Error!u32 {
     const coded_length = huffman.encodedLength(text);
     const coded = coded_length < text.len;
@@ -547,6 +600,49 @@ fn encodeStringAt(target: []u8, text: []const u8, prefix_bits: u4, tag: u8, huff
 //# When the maximum table capacity is zero, the encoder MUST NOT insert
 //# entries into the dynamic table and MUST NOT send any encoder
 //# instructions on the encoder stream.
+//= https://www.rfc-editor.org/rfc/rfc9204#section-2.1
+//# An encoder MUST emit field representations in the order
+//# they appear in the input field section.
+//= https://www.rfc-editor.org/rfc/rfc9204#section-2.1.1
+//# If the dynamic table does not contain enough room for a new entry
+//# without evicting other entries, and the entries that would be evicted
+//# are not evictable, the encoder MUST NOT insert that entry into the
+//# dynamic table (including duplicates of existing entries).
+//= type=exception
+//= reason=the dynamic table is not built: this endpoint advertises SETTINGS_QPACK_MAX_TABLE_CAPACITY = 0, which forbids its peer the table entirely, and docs/DESIGN.md section 6 lists the table and its two streams as next rather than built; with no table there is no insertion to refuse
+//= https://www.rfc-editor.org/rfc/rfc9204#section-4.3.1
+//# The new capacity MUST be lower than or equal to the limit described
+//# in Section 3.2.3.  In HTTP/3, this limit is the value of the
+//# SETTINGS_QPACK_MAX_TABLE_CAPACITY parameter (Section 5) received from
+//# the decoder.
+//= type=exception
+//= reason=the dynamic table is not built: this endpoint advertises SETTINGS_QPACK_MAX_TABLE_CAPACITY = 0, which forbids its peer the table entirely, and docs/DESIGN.md section 6 lists the table and its two streams as next rather than built; Set Dynamic Table Capacity is an encoder-stream instruction, and this encoder sends none
+//= https://www.rfc-editor.org/rfc/rfc9204#section-4.3.1
+//# The decoder MUST treat a new dynamic table capacity
+//# value that exceeds this limit as a connection error of type
+//# QPACK_ENCODER_STREAM_ERROR.
+//= type=exception
+//= reason=the dynamic table is not built: this endpoint advertises SETTINGS_QPACK_MAX_TABLE_CAPACITY = 0, which forbids its peer the table entirely, and docs/DESIGN.md section 6 lists the table and its two streams as next rather than built; no capacity instruction ever arrives, because a peer told the capacity is zero may send no encoder instructions at all
+//= https://www.rfc-editor.org/rfc/rfc9204#section-4.3.1
+//# Reducing the dynamic table capacity can cause entries to be evicted;
+//# see Section 3.2.2.  This MUST NOT cause the eviction of entries that
+//# are not evictable; see Section 2.1.1.  Changing the capacity of the
+//# dynamic table is not acknowledged as this instruction does not insert
+//# an entry.
+//= type=exception
+//= reason=the dynamic table is not built: this endpoint advertises SETTINGS_QPACK_MAX_TABLE_CAPACITY = 0, which forbids its peer the table entirely, and docs/DESIGN.md section 6 lists the table and its two streams as next rather than built; a capacity that is never set cannot be reduced, and there is no entry to evict
+//= https://www.rfc-editor.org/rfc/rfc9204#section-3.2.3
+//# For clients using 0-RTT data in HTTP/3, the server's maximum table
+//# capacity is the remembered value of the setting or zero if the value
+//# was not previously sent.  When the client's 0-RTT value of the
+//# SETTING is zero, the server MAY set it to a non-zero value in its
+//# SETTINGS frame.  If the remembered value is non-zero, the server MUST
+//# send the same non-zero value in its SETTINGS frame.  If it specifies
+//# any other value, or omits SETTINGS_QPACK_MAX_TABLE_CAPACITY from
+//# SETTINGS, the encoder must treat this as a connection error of type
+//# QPACK_DECODER_STREAM_ERROR.
+//= type=exception
+//= reason=0-RTT is out of scope, and the dynamic table is not built: this endpoint advertises SETTINGS_QPACK_MAX_TABLE_CAPACITY = 0, which forbids its peer the table entirely, and docs/DESIGN.md section 6 lists the table and its two streams as next rather than built; a decoder advertising zero has nothing to remember across connections
 pub fn encode(target: []u8, fields: []const Field) Error!u32 {
     var offset = try writePrefix(target);
     for (fields) |field| {

@@ -34,6 +34,23 @@ const assert = @import("assert.zig").assert;
 const varint = @import("varint.zig");
 
 /// RFC 9114 section 11.2.1's frame type registry.
+//= https://www.rfc-editor.org/rfc/rfc9114#section-11.2.1
+//# In addition to common fields as described in Section 11.2, permanent
+//# registrations in this registry MUST include the following field:
+//# Frame Type:  A name or label for the frame type.
+//= type=exception
+//= reason=an instruction to IANA and to the author of a registration rather than to an implementation; Type transcribes what Table 2 registers, which is all a codec can do with a registry
+//= https://www.rfc-editor.org/rfc/rfc9114#section-11.2.1
+//# Specifications of frame types MUST include a description of the frame
+//# layout and its semantics, including any parts of the frame that are
+//# conditionally present.
+//= type=exception
+//= reason=a requirement on the specification that registers a frame type, not on code; this package implements the layouts RFC 9114 section 7.2 already gives
+//= https://www.rfc-editor.org/rfc/rfc9114#section-9
+//# Extensions that could change the semantics of existing protocol
+//# components MUST be negotiated before being used.
+//= type=exception
+//= reason=negotiating an extension needs the SETTINGS exchange and the control stream, which docs/DESIGN.md section 6 lists as next rather than built; Type.known and allowedOn*Stream are what an extension would have to widen
 pub const Type = enum(u64) {
     data = 0x00,
     headers = 0x01,
@@ -44,6 +61,12 @@ pub const Type = enum(u64) {
     //# H3_ID_ERROR.
     //= type=exception
     //= reason=server push is not implemented and the push ID a connection currently allows is connection state the HTTP/3 layer docs/DESIGN.md section 6 lists as next would hold
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.3
+    //# If a server receives a CANCEL_PUSH frame for a push
+    //# ID that has not yet been mentioned by a PUSH_PROMISE frame, this MUST
+    //# be treated as a connection error of type H3_ID_ERROR.
+    //= type=exception
+    //= reason=server push is not implemented; which push IDs a PUSH_PROMISE has mentioned is connection state the HTTP/3 layer docs/DESIGN.md section 6 lists as next would hold
     cancel_push = 0x03,
     settings = 0x04,
     //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.5
@@ -53,12 +76,59 @@ pub const Type = enum(u64) {
     //# the client has advertised as a connection error of H3_ID_ERROR.
     //= type=exception
     //= reason=server push is not implemented; the advertised maximum push ID is connection state the HTTP/3 layer docs/DESIGN.md section 6 lists as next would hold, and this file decodes one frame at a time
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.5
+    //# If so, the decompressed request header sets MUST contain the same
+    //# fields in the same order, and both the name and the value in each
+    //# field MUST be exact matches.  Clients SHOULD compare the request
+    //# header sections for resources promised multiple times.  If a client
+    //# receives a push ID that has already been promised and detects a
+    //# mismatch, it MUST respond with a connection error of type
+    //# H3_GENERAL_PROTOCOL_ERROR.
+    //= type=exception
+    //= reason=server push is not implemented, and comparing a promise against an earlier one with the same push ID means retaining a decoded field section, which neither this file nor fields.zig does
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.5
+    //# If a PUSH_PROMISE frame is received on the control stream, the client
+    //# MUST respond with a connection error of type H3_FRAME_UNEXPECTED.
+    //= type=exception
+    //= reason=allowedOnControlStream already answers false for push_promise; raising H3_FRAME_UNEXPECTED on it is the connection layer's, which docs/DESIGN.md section 6 lists as next rather than built
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.5
+    //# A client MUST NOT send a PUSH_PROMISE frame.  A server MUST treat the
+    //# receipt of a PUSH_PROMISE frame as a connection error of type
+    //# H3_FRAME_UNEXPECTED.
+    //= type=exception
+    //= reason=which endpoint this is decides both halves of the rule, and this file encodes and decodes frames without knowing; the HTTP/3 connection layer docs/DESIGN.md section 6 lists as next is what knows
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
+    //# PUSH_PROMISE frames are not permitted on push streams;
+    //# a pushed response that includes PUSH_PROMISE frames MUST be treated
+    //# as a connection error of type H3_FRAME_UNEXPECTED.
+    //= type=exception
+    //= reason=server push is not implemented, so no push stream is ever read; allowedOnRequestStream is the per-stream-kind answer this file can give, and a push stream is not one of its two kinds
     push_promise = 0x05,
     //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.6
     //# A client MUST treat receipt of a GOAWAY frame containing a stream ID
     //# of any other type as a connection error of type H3_ID_ERROR.
     //= type=exception
     //= reason=whether GOAWAY's single integer is a stream ID or a push ID depends on the direction, which parseSingleVarint cannot see; the HTTP/3 connection layer docs/DESIGN.md section 6 lists as next is what knows which end it is
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-5.2
+    //# Endpoints MUST NOT initiate new requests or promise new pushes on the
+    //# connection after receipt of a GOAWAY frame from the peer.
+    //= type=exception
+    //= reason=whether a GOAWAY has arrived, and refusing to open a request stream after it, is connection state the HTTP/3 layer docs/DESIGN.md section 6 lists as next would hold; this file parses the frame's one integer
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-5.2
+    //# An endpoint MAY send multiple GOAWAY frames indicating different
+    //# identifiers, but the identifier in each frame MUST NOT be greater
+    //# than the identifier in any previous frame, since clients might
+    //# already have retried unprocessed requests on another HTTP connection.
+    //# Receiving a GOAWAY containing a larger identifier than previously
+    //# received MUST be treated as a connection error of type H3_ID_ERROR.
+    //= type=exception
+    //= reason=comparing a GOAWAY identifier against the one before it needs the previous value, which is connection state the HTTP/3 layer docs/DESIGN.md section 6 lists as next would hold; parseSingleVarint sees one frame at a time
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-5.4
+    //# If a connection terminates without a GOAWAY frame, clients MUST
+    //# assume that any request that was sent, whether in whole or in part,
+    //# might have been processed.
+    //= type=exception
+    //= reason=what a client assumes about a request it already sent is a decision about requests, and this package holds none: docs/DESIGN.md section 3 leaves the request/response state machine to the consumer
     goaway = 0x07,
     //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.7
     //# A MAX_PUSH_ID frame cannot reduce the maximum push
@@ -67,6 +137,12 @@ pub const Type = enum(u64) {
     //# H3_ID_ERROR.
     //= type=exception
     //= reason=comparing a MAX_PUSH_ID against the one before it needs the previous value, which is connection state the HTTP/3 layer docs/DESIGN.md section 6 lists as next would hold
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.7
+    //# A server MUST NOT send a MAX_PUSH_ID frame.  A client MUST treat the
+    //# receipt of a MAX_PUSH_ID frame as a connection error of type
+    //# H3_FRAME_UNEXPECTED.
+    //= type=exception
+    //= reason=which endpoint this is decides both halves of the rule, and this file encodes and decodes frames without knowing; server push is not implemented in either direction
     max_push_id = 0x0d,
     _,
 
@@ -94,6 +170,13 @@ pub const Type = enum(u64) {
     //# they MAY be sent on any stream where frames are allowed to be sent.
     //# This enables their use for application-layer padding.  Endpoints MUST
     //# NOT consider these frames to have any meaning upon receipt.
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-11.2.1
+    //# Each code of the format 0x1f * N + 0x21 for non-negative integer
+    //# values of N (that is, 0x21, 0x40, ..., through 0x3ffffffffffffffe)
+    //# MUST NOT be assigned by IANA and MUST NOT appear in the listing of
+    //# assigned values.
+    //= type=exception
+    //= reason=an instruction to IANA rather than to an implementation; isReserved is what this package does with the family IANA is told to leave unassigned, and the test below walks it
     pub fn isReserved(frame_type: Type) bool {
         const value = @intFromEnum(frame_type);
         if (value < 0x21) return false;
@@ -177,6 +260,47 @@ pub const Header = struct {
 //# H3_FRAME_ERROR.
 //= type=exception
 //= reason=parseHeader answers Incomplete and never sees a stream end; whether a truncated last frame closed a stream cleanly is a fact about the stream, which docs/DESIGN.md section 3 puts on the consumer's side of the seam
+//= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
+//# Receipt of an invalid sequence of frames MUST be treated as a
+//# connection error of type H3_FRAME_UNEXPECTED.
+//= type=exception
+//= reason=a sequence is more than one frame, and this file reads one header at a time; which frame may follow which is per-stream state the HTTP/3 connection layer docs/DESIGN.md section 6 lists as next would hold
+//= https://www.rfc-editor.org/rfc/rfc9114#section-8
+//# Because new error codes can be defined without negotiation (see
+//# Section 9), use of an error code in an unexpected context or receipt
+//# of an unknown error code MUST be treated as equivalent to
+//# H3_NO_ERROR.
+//= type=exception
+//= reason=an error code arrives on a QUIC RESET_STREAM or CONNECTION_CLOSE, which this file never sees; ParseError names what a frame header can be wrong about and the consumer maps it onto section 8.1's codes
+//= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.1
+//# Servers MUST NOT use the H3_REQUEST_REJECTED error code for requests
+//# that were partially or fully processed.
+//= type=exception
+//= reason=this package processes no request and resets no stream; whether a request was processed is the consumer's knowledge, per docs/DESIGN.md section 3
+//= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.1
+//# Clients MUST NOT use the
+//# H3_REQUEST_REJECTED error code, except when a server has requested
+//# closure of the request stream with this error code.
+//= type=exception
+//= reason=this package never resets a stream, so it chooses no error code for one; docs/DESIGN.md section 3 puts the QUIC stream and its reset on the consumer's side of the seam
+//= https://www.rfc-editor.org/rfc/rfc9114#section-11.2.3
+//# registry includes two additional fields.  Permanent registrations in
+//# this registry MUST include the following field:
+//# Name:  A name for the error code.
+//= type=exception
+//= reason=an instruction to IANA and to the author of a registration rather than to an implementation; the codes themselves are named in this file's prose and in quic/error_code.zig
+//= https://www.rfc-editor.org/rfc/rfc9114#section-11.2.3
+//# Each code of the format 0x1f * N + 0x21 for non-negative integer
+//# values of N (that is, 0x21, 0x40, ..., through 0x3ffffffffffffffe)
+//# MUST NOT be assigned by IANA and MUST NOT appear in the listing of
+//# assigned values.
+//= type=exception
+//= reason=an instruction to IANA rather than to an implementation; the reserved family is left unassigned so that an endpoint can send one to prove unknown values are ignored, which is what isReserved is for
+//= https://www.rfc-editor.org/rfc/rfc9114#section-A.4
+//# HTTP_1_1_REQUIRED (0x0d):  H3_VERSION_FALLBACK in Section 8.1.
+//# Error codes need to be defined for HTTP/2 and HTTP/3 separately.
+//= type=exception
+//= reason=the keyword here is part of the HTTP/2 error code name HTTP_1_1_REQUIRED rather than a normative REQUIRED; appendix A.4 is a mapping table for a proxy that translates between the two versions, which is the consumer
 pub const ParseError = error{
     /// The header is not all here yet. On a stream this is ordinary — more
     /// octets are coming — which is why it is a separate error from the two
@@ -243,6 +367,61 @@ pub fn writeHeader(target: []u8, frame_type: Type, length: u64) EncodeError!u8 {
 //# connection error of type H3_FRAME_UNEXPECTED.
 //= type=exception
 //= reason=the SETTINGS exchange needs the control stream, which is the HTTP/3 connection layer docs/DESIGN.md section 6 lists as next rather than built; this file is the codec for the frame, not the sequencer
+//= https://www.rfc-editor.org/rfc/rfc9114#section-3.2
+//# After the QUIC connection is
+//# established, a SETTINGS frame MUST be sent by each endpoint as the
+//# initial frame of their respective HTTP control stream.
+//= type=exception
+//= reason=sending SETTINGS as the first frame of the control stream needs the control stream, which docs/DESIGN.md section 6 lists as next rather than built; this file is the codec for the frame and sequences nothing
+//= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4.2
+//# An HTTP implementation MUST NOT send frames or requests that would be
+//# invalid based on its current understanding of the peer's settings.
+//= type=exception
+//= reason=the peer's settings are connection state, and docs/DESIGN.md section 3 puts connection state on the consumer's side of the seam; SettingsIterator hands every pair it decodes to that consumer and holds none
+//= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4.2
+//# Endpoints MUST NOT require any data to be received from
+//# the peer prior to sending the SETTINGS frame; settings MUST be sent
+//# as soon as the transport is ready to send data.
+//= type=exception
+//= reason=when to send a frame is the HTTP/3 connection layer's, which docs/DESIGN.md section 6 lists as next rather than built; writeSetting encodes one pair into a caller's buffer and decides no moment
+//= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4.2
+//# A client MUST comply
+//# with stored settings -- or default values if no values are stored --
+//# when attempting 0-RTT.  Once a server has provided new settings,
+//# clients MUST comply with those values.
+//= type=exception
+//= reason=0-RTT is out of scope: docs/DESIGN.md section 4 puts the TLS engine and its session tickets in the consumer, so no settings are remembered across connections here
+//= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4.2
+//# If the
+//# server cannot determine that the settings remembered by a client are
+//# compatible with its current settings, it MUST NOT accept 0-RTT data.
+//= type=exception
+//= reason=0-RTT is out of scope and accepting early data is the TLS engine's decision, which docs/DESIGN.md section 4 leaves to the consumer
+//= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4.2
+//# If 0-RTT data is accepted by the server, its
+//# SETTINGS frame MUST NOT reduce any limits or alter any values that
+//# might be violated by the client with its 0-RTT data.  The server MUST
+//# include all settings that differ from their default values.  If a
+//# server accepts 0-RTT but then sends settings that are not compatible
+//# with the previously specified settings, this MUST be treated as a
+//# connection error of type H3_SETTINGS_ERROR.  If a server accepts
+//# 0-RTT but then sends a SETTINGS frame that omits a setting value that
+//# the client understands (apart from reserved setting identifiers) that
+//# was previously specified to have a non-default value, this MUST be
+//# treated as a connection error of type H3_SETTINGS_ERROR.
+//= type=exception
+//= reason=0-RTT is out of scope, and comparing a SETTINGS frame against the settings a previous connection advertised needs both connections' state; docs/DESIGN.md sections 3 and 4 keep that outside this package
+//= https://www.rfc-editor.org/rfc/rfc9114#section-10.9
+//# The anti-replay mitigations in [HTTP-REPLAY] MUST be applied when
+//# using HTTP/3 with 0-RTT.
+//= type=exception
+//= reason=0-RTT is out of scope; the replay window belongs to the TLS engine and to the application deciding which requests are safe to replay, both of which are the consumer's per docs/DESIGN.md sections 3 and 4
+//= https://www.rfc-editor.org/rfc/rfc9114#section-11.2.2
+//# In addition to common fields as described in Section 11.2, permanent
+//# registrations in this registry MUST include the following fields:
+//# Setting Name:  A symbolic name for the setting.
+//= type=exception
+//= reason=an instruction to IANA and to the author of a registration rather than to an implementation; Setting transcribes what Table 3 registers plus RFC 9220's 0x08
 pub const Setting = enum(u64) {
     qpack_max_table_capacity = 0x01,
     max_field_section_size = 0x06,
@@ -272,6 +451,13 @@ pub const Setting = enum(u64) {
     //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4.1
     //# Endpoints MUST NOT consider such settings to have
     //# any meaning upon receipt.
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-11.2.2
+    //# Each code of the format 0x1f * N + 0x21 for non-negative integer
+    //# values of N (that is, 0x21, 0x40, ..., through 0x3ffffffffffffffe)
+    //# MUST NOT be assigned by IANA and MUST NOT appear in the listing of
+    //# assigned values.
+    //= type=exception
+    //= reason=an instruction to IANA rather than to an implementation; isReserved is what this package does with the family IANA is told to leave unassigned, so that a peer can send one to prove unknown settings are ignored
     pub fn isReserved(setting: Setting) bool {
         const value = @intFromEnum(setting);
         if (value < 0x21) return false;
@@ -356,6 +542,9 @@ pub fn writeSetting(target: []u8, setting: Setting, value: u64) EncodeError!u8 {
 //# the end of the identified fields MUST be treated as a connection
 //# error of type H3_FRAME_ERROR.  In particular, redundant length
 //# encodings MUST be verified to be self-consistent; see Section 10.8.
+//= https://www.rfc-editor.org/rfc/rfc9114#section-10.8
+//# An implementation MUST ensure that the length of a
+//# frame exactly matches the length of the fields it contains.
 pub fn parseSingleVarint(payload: []const u8) SettingsError!u64 {
     const decoded = varint.decode(payload) catch return error.Truncated;
     // Section 7.2.3, 7.2.6 and 7.2.7 all make a payload of any other length a
