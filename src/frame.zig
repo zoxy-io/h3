@@ -367,6 +367,61 @@ pub fn writeHeader(target: []u8, frame_type: Type, length: u64) EncodeError!u8 {
 //# connection error of type H3_FRAME_UNEXPECTED.
 //= type=exception
 //= reason=the SETTINGS exchange needs the control stream, which is the HTTP/3 connection layer docs/DESIGN.md section 6 lists as next rather than built; this file is the codec for the frame, not the sequencer
+//= https://www.rfc-editor.org/rfc/rfc9114#section-3.2
+//# After the QUIC connection is
+//# established, a SETTINGS frame MUST be sent by each endpoint as the
+//# initial frame of their respective HTTP control stream.
+//= type=exception
+//= reason=sending SETTINGS as the first frame of the control stream needs the control stream, which docs/DESIGN.md section 6 lists as next rather than built; this file is the codec for the frame and sequences nothing
+//= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4.2
+//# An HTTP implementation MUST NOT send frames or requests that would be
+//# invalid based on its current understanding of the peer's settings.
+//= type=exception
+//= reason=the peer's settings are connection state, and docs/DESIGN.md section 3 puts connection state on the consumer's side of the seam; SettingsIterator hands every pair it decodes to that consumer and holds none
+//= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4.2
+//# Endpoints MUST NOT require any data to be received from
+//# the peer prior to sending the SETTINGS frame; settings MUST be sent
+//# as soon as the transport is ready to send data.
+//= type=exception
+//= reason=when to send a frame is the HTTP/3 connection layer's, which docs/DESIGN.md section 6 lists as next rather than built; writeSetting encodes one pair into a caller's buffer and decides no moment
+//= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4.2
+//# A client MUST comply
+//# with stored settings -- or default values if no values are stored --
+//# when attempting 0-RTT.  Once a server has provided new settings,
+//# clients MUST comply with those values.
+//= type=exception
+//= reason=0-RTT is out of scope: docs/DESIGN.md section 4 puts the TLS engine and its session tickets in the consumer, so no settings are remembered across connections here
+//= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4.2
+//# If the
+//# server cannot determine that the settings remembered by a client are
+//# compatible with its current settings, it MUST NOT accept 0-RTT data.
+//= type=exception
+//= reason=0-RTT is out of scope and accepting early data is the TLS engine's decision, which docs/DESIGN.md section 4 leaves to the consumer
+//= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4.2
+//# If 0-RTT data is accepted by the server, its
+//# SETTINGS frame MUST NOT reduce any limits or alter any values that
+//# might be violated by the client with its 0-RTT data.  The server MUST
+//# include all settings that differ from their default values.  If a
+//# server accepts 0-RTT but then sends settings that are not compatible
+//# with the previously specified settings, this MUST be treated as a
+//# connection error of type H3_SETTINGS_ERROR.  If a server accepts
+//# 0-RTT but then sends a SETTINGS frame that omits a setting value that
+//# the client understands (apart from reserved setting identifiers) that
+//# was previously specified to have a non-default value, this MUST be
+//# treated as a connection error of type H3_SETTINGS_ERROR.
+//= type=exception
+//= reason=0-RTT is out of scope, and comparing a SETTINGS frame against the settings a previous connection advertised needs both connections' state; docs/DESIGN.md sections 3 and 4 keep that outside this package
+//= https://www.rfc-editor.org/rfc/rfc9114#section-10.9
+//# The anti-replay mitigations in [HTTP-REPLAY] MUST be applied when
+//# using HTTP/3 with 0-RTT.
+//= type=exception
+//= reason=0-RTT is out of scope; the replay window belongs to the TLS engine and to the application deciding which requests are safe to replay, both of which are the consumer's per docs/DESIGN.md sections 3 and 4
+//= https://www.rfc-editor.org/rfc/rfc9114#section-11.2.2
+//# In addition to common fields as described in Section 11.2, permanent
+//# registrations in this registry MUST include the following fields:
+//# Setting Name:  A symbolic name for the setting.
+//= type=exception
+//= reason=an instruction to IANA and to the author of a registration rather than to an implementation; Setting transcribes what Table 3 registers plus RFC 9220's 0x08
 pub const Setting = enum(u64) {
     qpack_max_table_capacity = 0x01,
     max_field_section_size = 0x06,
@@ -396,6 +451,13 @@ pub const Setting = enum(u64) {
     //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4.1
     //# Endpoints MUST NOT consider such settings to have
     //# any meaning upon receipt.
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-11.2.2
+    //# Each code of the format 0x1f * N + 0x21 for non-negative integer
+    //# values of N (that is, 0x21, 0x40, ..., through 0x3ffffffffffffffe)
+    //# MUST NOT be assigned by IANA and MUST NOT appear in the listing of
+    //# assigned values.
+    //= type=exception
+    //= reason=an instruction to IANA rather than to an implementation; isReserved is what this package does with the family IANA is told to leave unassigned, so that a peer can send one to prove unknown settings are ignored
     pub fn isReserved(setting: Setting) bool {
         const value = @intFromEnum(setting);
         if (value < 0x21) return false;
