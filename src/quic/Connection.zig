@@ -1008,6 +1008,19 @@ pub fn Connection(comptime config: Config) type {
             //# for the server's preferred address.
             //= type=exception
             //= reason=a server's preferred address is migration by another name and is out of scope: this package never sends the preferred_address transport parameter and never acts on one, and the address it would name is outside the seam of docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-21.5
+            //# Any future extension that allows server migration MUST also
+            //# define countermeasures for forgery attacks.
+            //= type=exception
+            //= reason=connection migration and a server's preferred address are out of scope: a connection here has one path, never learns an address, and never sends preferred_address. See docs/DESIGN.md section 2 and section 6.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-21.5.3
+            //# A client MUST NOT send non-probing frames to a preferred address
+            //# prior to validating that address; see Section 8. This greatly
+            //# reduces the options that a server has to control the encrypted
+            //# portion of datagrams.
+            //= type=exception
+            //= reason=connection migration and a server's preferred address are out of scope: a connection here has one path, never learns an address, and never sends preferred_address. See docs/DESIGN.md section 2 and section 6.
             self.streams.setPeerStreamLimit(true, parsed.initial_max_streams_bidi);
             self.streams.setPeerStreamLimit(false, parsed.initial_max_streams_uni);
 
@@ -1246,6 +1259,21 @@ pub fn Connection(comptime config: Config) type {
             //# maintains state sufficient to prevent looping.
             //= type=exception
             //= reason=stateless reset is out of scope: it needs a static key and a token this package neither holds nor advertises, and detecting one means recognising a datagram that belongs to no connection — a decision made by whatever routes datagrams to a Connection, which is the consumer's, per docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-21.11
+            //# To defend against this style of denial of service, endpoints
+            //# that share a static key for stateless resets (see Section
+            //# 10.3.2) MUST be arranged so that packets with a given connection
+            //# ID always arrive at an instance that has connection state,
+            //# unless that connection is no longer active.
+            //= type=exception
+            //= reason=stateless reset is out of scope: this endpoint holds no static key and no reset token, advertises none, and generates no reset — so it cannot be the oracle this section describes. How instances share connection state behind a load balancer is a deployment's question and outside the seam of docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-21.11
+            //# More generally, servers MUST NOT generate a stateless reset if a
+            //# connection with the corresponding connection ID could be active
+            //# on any endpoint using the same static key.
+            //= type=exception
+            //= reason=stateless reset is out of scope: this endpoint holds no static key and no reset token, advertises none, and generates no reset — so it cannot be the oracle this section describes. How instances share connection state behind a load balancer is a deployment's question and outside the seam of docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
             if (self.state == .draining) return;
 
             // Section 14.1: "A server MUST discard an Initial packet that is
@@ -1352,6 +1380,12 @@ pub fn Connection(comptime config: Config) type {
             //# 21.11.
             //= type=exception
             //= reason=stateless reset is out of scope; nothing here holds a reset token or recognises one, and a load balancer's addressing is outside the seam of docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-21.12
+            //# Future versions of QUIC that use Version Negotiation packets
+            //# MUST define a mechanism that is robust against version downgrade
+            //# attacks.
+            //= type=exception
+            //= reason=version negotiation is out of scope; a connection here speaks QUIC version 1 and the packet types that would begin a different one are the consumer's, per docs/DESIGN.md section 2. The rule is in any case addressed to a future version of QUIC rather than to an implementation of this one.
             const level = header.level() orelse return; // Retry, Version Negotiation: not this slice.
             const offset = header.packetNumberOffset() orelse return;
             const index = @intFromEnum(level);
@@ -1362,6 +1396,46 @@ pub fn Connection(comptime config: Config) type {
             //= https://www.rfc-editor.org/rfc/rfc9001#section-5.7
             //# Endpoints in either role MUST NOT decrypt 1-RTT packets from
             //# their peer prior to completing the handshake.
+            //
+            // Both roles, and both by the same mechanism as the rule already cited above:
+            // a 1-RTT read key exists only once the consumer's engine has handed one
+            // over, and it does that when the handshake completes.
+            //= https://www.rfc-editor.org/rfc/rfc9001#section-5.7
+            //# A server MUST NOT process incoming 1-RTT protected packets
+            //# before the TLS handshake is complete.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9001#section-5.7
+            //# Even if it has 1-RTT secrets, a client MUST NOT process incoming
+            //# 1-RTT protected packets before the TLS handshake is complete.
+            //
+            // The same line answers section 5.6: no 0-RTT key is ever installed in
+            // either direction, so a 0-RTT packet reaching a client has nothing to open
+            // it and leaves here discarded.
+            //= https://www.rfc-editor.org/rfc/rfc9001#section-5.6
+            //# A client MUST NOT attempt to decrypt 0-RTT packets it receives
+            //# and instead MUST discard them.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9001#section-5.6
+            //# A server MUST NOT use 0-RTT keys to protect packets; it uses
+            //# 1-RTT keys to protect acknowledgments of 0-RTT packets.
+            //= type=exception
+            //= reason=0-RTT is out of scope: no early-data key is ever installed in either direction, so this endpoint can neither protect a packet with one nor open a packet that was. See docs/DESIGN.md section 2 and section 6.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9001#section-5.6
+            //# Once a client has installed 1-RTT keys, it MUST NOT send any
+            //# more 0-RTT packets. | Note: 0-RTT data can be acknowledged by
+            //# the server as it | receives it, but any packets containing
+            //# acknowledgments of | 0-RTT data cannot have packet protection
+            //# removed by the client | until the TLS handshake is complete.
+            //= type=exception
+            //= reason=0-RTT is out of scope: no early-data key is ever installed in either direction, so this endpoint can neither protect a packet with one nor open a packet that was. See docs/DESIGN.md section 2 and section 6.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9001#section-5.6
+            //# An application protocol that uses QUIC MUST include a profile
+            //# that defines acceptable use of 0-RTT; otherwise, 0-RTT can only
+            //# be used to carry QUIC frames that do not carry application data.
+            //= type=exception
+            //= reason=0-RTT is out of scope: no early-data key is ever installed in either direction, so this endpoint can neither protect a packet with one nor open a packet that was. See docs/DESIGN.md section 2 and section 6.
             const keys = self.receive_keys[index] orelse return; // No keys yet: discard.
 
             const space = &self.spaces[@intFromEnum(level.space())];
@@ -1892,6 +1966,13 @@ pub fn Connection(comptime config: Config) type {
                 //= https://www.rfc-editor.org/rfc/rfc9000#section-4.1
                 //# A sender MUST ignore any MAX_STREAM_DATA or MAX_DATA frames that do
                 //# not increase flow control limits.
+                // Accepted rather than refused, which is the other half of taking `@max`: an
+                // outdated limit is a legal retransmission and closing on one would end a
+                // connection over reordering.
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-13.3
+                //# A receiver MUST accept packets containing an outdated frame,
+                //# such as a MAX_DATA frame carrying a smaller maximum data
+                //# value than one found in an older packet.
                 .max_data => |value| self.streams.setConnectionSendLimit(value.maximum),
                 .max_stream_data => |value| self.streams.setSendLimit(value.stream, value.maximum) catch |err| {
                     return streamError(err);
@@ -2077,6 +2158,33 @@ pub fn Connection(comptime config: Config) type {
 
         /// Section 13.2 and RFC 9002 section 5: what an acknowledgement moves.
         fn receiveAck(self: *Self, level: Level, value: frame.Ack, now_ns: u64) ReceiveError!void {
+            // Section 13.4's ECN, in full. `frame.Ack.ecn` holds the counts an ACK_ECN
+            // frame carried and nothing below reads it.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-13.4.1
+            //# Even if an endpoint does not set an ECT field in packets it sends,
+            //# the endpoint MUST provide feedback about ECN markings it receives,
+            //# if these are accessible.
+            //= type=exception
+            //= reason=ECN is parsed and not acted on, which docs/DESIGN.md section 6 states rather than hides: an ACK_ECN frame's counts reach `frame.Ack.ecn` and go no further, so there is no validation to fail and nothing to disable. Marking the field is also a socket option, and the socket is the consumer's, per docs/DESIGN.md section 3.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-13.4.2.1
+            //# An endpoint MUST NOT fail ECN validation as a result of processing
+            //# an ACK frame that does not increase the largest acknowledged packet
+            //# number.
+            //= type=exception
+            //= reason=ECN is parsed and not acted on, which docs/DESIGN.md section 6 states rather than hides: an ACK_ECN frame's counts reach `frame.Ack.ecn` and go no further, so there is no validation to fail and nothing to disable. Marking the field is also a socket option, and the socket is the consumer's, per docs/DESIGN.md section 3.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-13.4.2.2
+            //# If validation fails, then the endpoint MUST disable ECN.
+            //= type=exception
+            //= reason=ECN is parsed and not acted on, which docs/DESIGN.md section 6 states rather than hides: an ACK_ECN frame's counts reach `frame.Ack.ecn` and go no further, so there is no validation to fail and nothing to disable. Marking the field is also a socket option, and the socket is the consumer's, per docs/DESIGN.md section 3.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-13.4.2.2
+            //# Network routing and path elements can change mid-connection; an
+            //# endpoint MUST disable ECN if validation later fails.
+            //= type=exception
+            //= reason=ECN is parsed and not acted on, which docs/DESIGN.md section 6 states rather than hides: an ACK_ECN frame's counts reach `frame.Ack.ecn` and go no further, so there is no validation to fail and nothing to disable. Marking the field is also a socket option, and the socket is the consumer's, per docs/DESIGN.md section 3.
+            //
             // The caller applied section 12.4's Table 3 before dispatching, so
             // an ACK cannot arrive at a level that forbids one.
             assert(frame.Type.ack.allowedIn(level));
@@ -2296,6 +2404,23 @@ pub fn Connection(comptime config: Config) type {
         /// it would be a second reassembler on the send side, and a handshake is
         /// a few kilobytes.
         fn onPacketsLost(self: *Self, contexts: []const PacketContext) void {
+            // The congestion action is `Recovery`'s and happens before this is called:
+            // this function only rebuilds what the lost packets carried. Section 13.3's
+            // list of what is re-sent and what is not is the switch below, and the
+            // close is deliberately not on it.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-13.3
+            //# Upon detecting losses, a sender MUST take appropriate congestion
+            //# control action.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-13.3
+            //# The content of a RESET_STREAM frame MUST NOT change when it is sent
+            //# again. * Similarly, a request to cancel stream transmission, as
+            //# encoded in a STOP_SENDING frame, is sent until the receiving part of
+            //# the stream enters either a "Data Recvd" or "Reset Recvd" state; see
+            //# Section 3.5. * Connection close signals, including packets that
+            //# contain CONNECTION_CLOSE frames, are not sent again when packet loss
+            //# is detected.
+            //
             // Bounded by the caller's array rather than by anything the peer
             // chose; `receiveAck` clamps the count to it before calling here.
             assert(contexts.len <= lost_report_max);
@@ -2997,6 +3122,55 @@ pub fn Connection(comptime config: Config) type {
             // connection that is over.
             if (self.state == .closing) return self.writeClose(payload, &result);
 
+            // Acknowledged as soon as there is a datagram to carry it, at every level:
+            // `wantsSend` answers true while this flag is set, so a consumer that polls
+            // it sends the ACK on the next turn of its loop. That is stricter than
+            // `max_ack_delay` asks for and needs no timer to be, which is what lets
+            // this package own no clock.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-13.2.1
+            //# An endpoint MUST acknowledge all ack-eliciting Initial and
+            //# Handshake packets immediately and all ack-eliciting 0-RTT and
+            //# 1-RTT packets within its advertised max_ack_delay, with the
+            //# following exception.
+            //
+            // The flag is the whole of the rate limit. It is set by an ack-eliciting
+            // packet and cleared by the write below, so one ACK goes out per
+            // ack-eliciting packet received and none at all for a packet that elicits
+            // nothing.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-13.2.1
+            //# Since packets containing only ACK frames are not congestion
+            //# controlled, an endpoint MUST NOT send more than one such packet
+            //# in response to receiving an ack-eliciting packet.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-13.2.1
+            //# An endpoint MUST NOT send a non-ack-eliciting packet in response
+            //# to a non-ack-eliciting packet, even if there are packet gaps
+            //# that precede the received packet.
+            //
+            // Nothing here ever adds a PING to make an ACK-only packet ack-eliciting.
+            // The only PING this package writes is section 6.2.4's probe, below, and a
+            // probe is owed by the timer rather than by a packet that arrived.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-13.2.1
+            //# An endpoint that is only sending non-ack-eliciting packets might
+            //# choose to occasionally add an ack-eliciting frame to those
+            //# packets to ensure that it receives an acknowledgment; see
+            //# Section 13.2.4. In that case, an endpoint MUST NOT send an
+            //# ack-eliciting frame in all packets that would otherwise be
+            //# non-ack-eliciting, to avoid an infinite feedback loop of
+            //# acknowledgments.
+            //
+            // `space` came from the level this packet is being built at, so the ranges
+            // written below can only ever be the ones recorded in that same space.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-13.2.6
+            //# ACK frames MUST only be carried in a packet that has the same
+            //# packet number space as the packet being acknowledged; see
+            //# Section 12.1. For instance, packets that are protected with
+            //# 1-RTT keys MUST be acknowledged in packets that are also
+            //# protected with 1-RTT keys.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-13.2.6
+            //# Packets that a client sends with 0-RTT packet protection MUST be
+            //# acknowledged by the server in packets protected by 1-RTT keys.
             if (space.received.ack_eliciting_pending) {
                 // Section 13.2.5's delay exponent is the peer's transport
                 // parameter; until this package decodes them it uses the
