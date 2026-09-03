@@ -873,6 +873,23 @@ pub fn Connection(comptime config: Config) type {
             // The three long-header kinds carry a source; `initial` has its own
             // struct because of the token field, so the identifier is pulled out
             // before the comparison rather than captured across arms.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.2
+            //# Initial packets sent by the server MUST set the Token Length field
+            //# to 0; clients that receive an Initial packet with a non-zero Token
+            //# Length field MUST either discard the packet or generate a
+            //# connection error of type PROTOCOL_VIOLATION.
+            //
+            // `parseInitial` reads the token at both roles and nothing asked
+            // about the role afterwards, so a client accepted one. Discarded
+            // rather than closed, which the sentence offers as the alternative
+            // and which is the safer of the two: an Initial is protected by keys
+            // anyone who watched the first flight can derive, so closing on its
+            // contents hands an off-path observer a way to end the connection —
+            // the same reasoning as the Source Connection ID rule below.
+            if (self.side == .client and header == .initial and header.initial.token.len > 0) {
+                return;
+            }
+
             const carried_source: ?ConnectionId = switch (header) {
                 .initial => |value| value.source,
                 .handshake, .zero_rtt => |value| value.source,
@@ -993,8 +1010,18 @@ pub fn Connection(comptime config: Config) type {
         /// Walk the frames of one payload, returning whether any was
         /// ack-eliciting.
         fn receiveFrames(self: *Self, level: Level, payload: []const u8, now_ns: u64) ReceiveError!bool {
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-12.4
+            //# An endpoint MUST treat receipt of a packet containing no frames as a
+            //# connection error of type PROTOCOL_VIOLATION.
+            //
+            // `frame.Iterator` answers `null` on an empty payload without an
+            // error, and this loop counted nothing — so a packet whose Length
+            // covered only the packet number and the AEAD tag was accepted.
+            // It authenticates, so it is the peer's, which is what makes the
+            // rule a connection error rather than a discard.
             var iterator: frame.Iterator = .init(payload);
             var eliciting = false;
+            var frames: u32 = 0;
             var count: u32 = 0;
             while (count <= payload.len) : (count += 1) {
                 //= https://www.rfc-editor.org/rfc/rfc9000#section-12.4
@@ -1010,8 +1037,10 @@ pub fn Connection(comptime config: Config) type {
                 //# connection error of type PROTOCOL_VIOLATION.
                 if (!value.frameType().allowedIn(level)) return error.Protocol;
                 if (value.ackEliciting()) eliciting = true;
+                frames += 1;
                 try self.receiveFrame(level, value, now_ns);
             }
+            if (frames == 0) return error.Protocol;
             return eliciting;
         }
 
@@ -1090,7 +1119,18 @@ pub fn Connection(comptime config: Config) type {
                 // the frame either — this package requests no token and stores
                 // none — but only the server's half is a rule, so only the
                 // server's half is enforced.
-                .new_token => if (self.side == .server) return error.Protocol,
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-19.7
+                //# The token MUST NOT be empty.  A client MUST treat receipt
+                //# of a NEW_TOKEN frame with an empty Token field as a connection
+                //# error of type FRAME_ENCODING_ERROR.
+                //
+                // Two rules on one frame, and each names the other role. The
+                // server's is above; the client's is that an empty token is
+                // malformed rather than merely useless.
+                .new_token => |value| {
+                    if (self.side == .server) return error.Protocol;
+                    if (value.token.len == 0) return error.Protocol;
+                },
                 // Both take `@max`, so a limit that moved backwards under loss
                 // or reordering leaves the send window where it was.
                 //= https://www.rfc-editor.org/rfc/rfc9000#section-4.1
@@ -3629,4 +3669,40 @@ test "section 19.5: STOP_SENDING may not create a stream or stop a read-only one
         error.StreamState,
         other.receiveFrames(.one_rtt, payload[0..written], 1000),
     );
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9000#section-12.4
+//# An endpoint MUST treat receipt of a packet containing no frames as a
+//# connection error of type PROTOCOL_VIOLATION.
+//= type=test
+test "section 12.4: a packet carrying no frames is a protocol violation" {
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+    // A payload whose Length covers only the packet number and the tag. It
+    // authenticates, so it is the peer's — which is what makes this a
+    // connection error rather than a discard.
+    try testing.expectError(error.Protocol, server.receiveFrames(.one_rtt, &.{}, 1000));
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9000#section-19.7
+//# The token MUST NOT be empty.  A client MUST treat receipt
+//# of a NEW_TOKEN frame with an empty Token field as a connection
+//# error of type FRAME_ENCODING_ERROR.
+//= type=test
+test "section 19.7: a client refuses a NEW_TOKEN with an empty token" {
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+
+    var payload: [16]u8 = @splat(0);
+    payload[0] = 0x07; // NEW_TOKEN
+    payload[1] = 0x00; // token length zero
+    try testing.expectError(error.Protocol, client.receiveFrames(.one_rtt, payload[0..2], 1000));
+
+    // A non-empty one is still merely ignored: this package requests no token
+    // and stores none, but the frame is legal.
+    const written = try frame.encode(&payload, .{ .new_token = .{ .token = "tok" } });
+    _ = try client.receiveFrames(.one_rtt, payload[0..written], 1000);
+    _ = &server;
 }
