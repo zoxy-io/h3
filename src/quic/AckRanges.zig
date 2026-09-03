@@ -155,7 +155,7 @@ pub fn AckRanges(comptime config: Config) type {
         //
         // Recording a number is what makes it acknowledgeable, so the ordering
         // below is a requirement rather than a convenience.
-        // `Connection.receiveDatagram` calls this only after `openPacket` has
+        // `Connection.receivePacket` calls this only after `openPacket` has
         // removed the protection and `receiveFrames` has returned — a frame
         // that fails to process closes the connection instead of landing here.
         //= https://www.rfc-editor.org/rfc/rfc9000#section-13.1
