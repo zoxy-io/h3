@@ -661,6 +661,15 @@ pub fn Connection(comptime config: Config) type {
         //# datagrams to unvalidated addresses in a given range is not safe.
         //= type=exception
         //= reason=this package opens no socket and never sees an address: the seam of docs/DESIGN.md section 3 hands over a datagram, so which IP and port carry a connection is the consumer's choice and not this slice's. See docs/DESIGN.md section 2 and section 6.
+        // The counterpart of the amplification budget below, addressed to the network
+        // rather than to the endpoint: the three-times limit is what this package can do
+        // about a spoofed source address, and ingress filtering is what it cannot.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-21.5
+        //# QUIC servers SHOULD NOT be deployed in networks that do not
+        //# deploy ingress filtering [BCP38] and also have inadequately
+        //# secured UDP endpoints.
+        //= type=exception
+        //= reason=a rule addressed to whoever runs the server rather than to the code it runs: ingress filtering is the network's, and the count of clients, the connections one address may open and how long any of them may stay are all decided above a single `Connection` — this type holds one connection, owns no socket and reads no clock. See docs/DESIGN.md section 2 and section 3.
         /// Section 8.1's accounting. A client validates its peer by construction
         /// — it chose the address — so this only ever restrains a server.
         address_validated: bool,
@@ -1066,6 +1075,16 @@ pub fn Connection(comptime config: Config) type {
         //# An endpoint MUST NOT send a parameter more than once in a given
         //# transport parameters extension.
         //
+        //
+        // The detection is `transport_parameters.parse`'s `seen` set, which answers a
+        // repeated identifier with `error.Malformed`; `transportParametersIn` returns it
+        // rather than closing, so which code goes on the wire is the consumer's call at
+        // the seam. It is a connection error either way — the extension is refused
+        // before any of it is kept.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-7.4
+        //# An endpoint SHOULD treat receipt of duplicate transport
+        //# parameters as a connection error of type
+        //# TRANSPORT_PARAMETER_ERROR.
         // And the other side of the same loop: an identifier outside the set section
         // 18.2 defines is skipped rather than refused, which is what lets a peer
         // carrying an extension's parameter still talk to this one.
@@ -1128,6 +1147,13 @@ pub fn Connection(comptime config: Config) type {
         //= https://www.rfc-editor.org/rfc/rfc9000#section-7.4.1
         //# A server MUST reject 0-RTT data if the restored values for transport
         //# parameters cannot be supported.
+        //= type=exception
+        //= reason=0-RTT is out of scope: this package remembers nothing between connections — a `Connection` is initialised from `Options` and holds the peer's parameters only as the octets that arrived — and no early-data key is ever installed. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-7.4.1
+        //# The applicable subset of transport parameters that permit the
+        //# sending of application data SHOULD be set to non-zero values for
+        //# 0-RTT.
         //= type=exception
         //= reason=0-RTT is out of scope: this package remembers nothing between connections — a `Connection` is initialised from `Options` and holds the peer's parameters only as the octets that arrived — and no early-data key is ever installed. See docs/DESIGN.md section 2 and section 6.
         //
@@ -2098,6 +2124,39 @@ pub fn Connection(comptime config: Config) type {
             // covered only the packet number and the AEAD tag was accepted.
             // It authenticates, so it is the peer's, which is what makes the
             // rule a connection error rather than a discard.
+            // Held, and by a bound rather than by a heuristic: `Reassembler` keeps at most
+            // `spans_max` disjoint ranges per stream, and a peer that sends a stream in more
+            // pieces than that gets `error.TooFragmented`, which this connection turns into
+            // a close. Nothing grows with how the peer chooses to cut the stream up.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-21.7
+            //# QUIC deployments SHOULD provide mitigations for stream
+            //# fragmentation attacks.
+            //
+            // Every mitigation this sentence lists is about the *set* of connections, or
+            // about how long one is allowed to live. This type is one connection and reads
+            // no clock, so none of the four has a place here.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-21.6
+            //# QUIC deployments SHOULD provide mitigations for the
+            //# Slowloris attacks, such as increasing the maximum number of
+            //# clients the server will allow, limiting the number of
+            //# connections a single IP address is allowed to make, imposing
+            //# restrictions on the minimum transfer speed a connection is
+            //# allowed to have, and restricting the length of time an
+            //# endpoint is allowed to stay connected.
+            //= type=exception
+            //= reason=a rule addressed to whoever runs the server rather than to the code it runs: ingress filtering is the network's, and the count of clients, the connections one address may open and how long any of them may stay are all decided above a single `Connection` — this type holds one connection, owns no socket and reads no clock. See docs/DESIGN.md section 2 and section 3.
+            //
+            // The loop below is bounded by the payload it was handed, so no single packet
+            // can cost more than its own length — but nothing counts across packets, so a
+            // peer that sends nothing but PADDING and PING for the life of the connection
+            // is indistinguishable here from one making progress. The counter this asks for
+            // would sit beside the AEAD ones, which are the only cross-packet totals here.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-21.9
+            //# While there are legitimate uses for all messages,
+            //# implementations SHOULD track cost of processing relative to
+            //# progress and treat excessive quantities of any
+            //# non-productive packets as indicative of an attack.
+            //= type=todo
             var iterator: frame.Iterator = .init(payload);
             var eliciting = false;
             var frames: u32 = 0;
@@ -2412,6 +2471,83 @@ pub fn Connection(comptime config: Config) type {
                 //# replay of tokens is prevented or limited.
                 //= type=exception
                 //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                // The advisory half of the same lifecycle. Every one of these describes a token
+                // this package neither builds, carries, nor checks, so each fails for the reason
+                // the mandatory ones above do rather than for a new one.
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.2
+                //# Instead, the server SHOULD immediately close (Section
+                //# 10.2) the connection with an INVALID_TOKEN error.
+                //= type=exception
+                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.3
+                //# Thus, a token SHOULD have an expiration time, which
+                //# could be either an explicit expiration time or an issued
+                //# timestamp that can be used to dynamically calculate the
+                //# expiration time.
+                //= type=exception
+                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.3
+                //# When connecting to a server for which the client retains
+                //# an applicable and unused token, it SHOULD include that
+                //# token in the Token field of its Initial packet.
+                //= type=exception
+                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.3
+                //# A client SHOULD NOT reuse a token from a NEW_TOKEN frame
+                //# for different connection attempts.
+                //= type=exception
+                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.3
+                //# If the token is invalid, then the server SHOULD proceed
+                //# as if the client did not have a validated address,
+                //# including potentially sending a Retry packet.
+                //= type=exception
+                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.3
+                //# If the validation succeeds, the server SHOULD then allow
+                //# the handshake to proceed. | Note: The rationale for
+                //# treating the client as unvalidated | rather than
+                //# discarding the packet is that the client might have |
+                //# received the token in a previous connection using the
+                //# NEW_TOKEN | frame, and if the server has lost state, it
+                //# might be unable to | validate the token at all, leading
+                //# to connection failure if the | packet is discarded.
+                //= type=exception
+                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.4
+                //# Tokens sent in Retry packets SHOULD include information
+                //# that allows the server to verify that the source IP
+                //# address and port in client packets remain constant.
+                //= type=exception
+                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.4
+                //# Servers SHOULD ensure that tokens sent in Retry packets
+                //# are only accepted for a short time, as they are returned
+                //# immediately by clients.
+                //= type=exception
+                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.4
+                //# Tokens that are provided in NEW_TOKEN frames (Section
+                //# 19.7) need to be valid for longer but SHOULD NOT be
+                //# accepted multiple times.
+                //= type=exception
+                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-21.3
+                //# Servers SHOULD provide mitigations for this attack by
+                //# limiting the usage and lifetime of address validation
+                //# tokens; see Section 8.1.3.
+                //= type=exception
+                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //
                 //= https://www.rfc-editor.org/rfc/rfc9000#section-19.7
                 //# The token MUST NOT be empty.  A client MUST treat receipt
                 //# of a NEW_TOKEN frame with an empty Token field as a connection
@@ -2930,6 +3066,22 @@ pub fn Connection(comptime config: Config) type {
             //# contain CONNECTION_CLOSE frames, are not sent again when packet loss
             //# is detected.
             //
+            // The rewind below is what holds this: a lost packet's octets go back in front
+            // of the cursor, so the next `send` frames them before it reaches anything new.
+            // Priority is not a policy here, it is the shape of the cursor.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-13.3
+            //# Endpoints SHOULD prioritize retransmission of data over
+            //# sending new data, unless priorities specified by the
+            //# application indicate otherwise; see Section 2.3. Even though
+            //# a sender is encouraged to assemble frames containing up-
+            //# to-date information every time it sends a packet, it is not
+            //# forbidden to retransmit copies of frames from lost packets.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-13.3
+            //# A sender SHOULD avoid retransmitting information from
+            //# packets once they are acknowledged.
+            //= type=exception
+            //= reason=declined deliberately, and the cost is bounded by design. Rewinding a level's send cursor to where the lost packet began re-frames every octet from there, including octets a later packet also carried and that may already be acknowledged. Avoiding that means tracking acknowledgement per range, which is a second reassembler on the send side; the duplicate is free to the peer, because section 2.2 guarantees the bytes are identical, and a handshake is a few kilobytes. See the note on `onPacketsLost`.
             // Bounded by the caller's array rather than by anything the peer
             // chose; `receiveAck` clamps the count to it before calling here.
             assert(contexts.len <= lost_report_max);
@@ -3828,6 +3980,17 @@ pub fn Connection(comptime config: Config) type {
                 // only thing standing between a stopped stream and the wire —
                 // and it tested `.reset` after it tested for unframed data, so
                 // it was not standing there either.
+                // The loop reads `send_state` and never `receive_state`, so a stream whose final
+                // size is known still earns a MAX_STREAM_DATA every time the application drains
+                // half a window of what is already buffered. The frames are wasted rather than
+                // wrong — the peer cannot send more — and `Streams.Stream` already carries the
+                // `.size_known` and `.reset` states the check needs.
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-13.3
+                //# An endpoint SHOULD stop sending MAX_STREAM_DATA frames
+                //# when the receiving part of the stream enters a "Size
+                //# Known" or "Reset Recvd" state. * The limit on streams of
+                //# a given type is sent in MAX_STREAMS frames.
+                //= type=todo
                 if (stream.send_state == .reset) continue;
                 if (offset >= target.len) break;
                 const stream_limit = stream.receiveLimit();
