@@ -236,6 +236,7 @@ pub fn main(init: std.process.Init) !u8 {
     assert(requirements.items.len > 0);
 
     var citations: std.ArrayList(Citation) = .empty;
+    var malformed: std.ArrayList(Malformed) = .empty;
     var list_uncited = false;
     var list_advisory = false;
     for (args[2..]) |root_path| {
@@ -255,10 +256,10 @@ pub fn main(init: std.process.Init) !u8 {
             list_advisory = true;
             continue;
         }
-        try collectCitations(arena, io, root_path, &citations);
+        try collectCitations(arena, io, root_path, &citations, &malformed);
     }
 
-    return report(arena, sections.items, requirements.items, citations.items, list_uncited, list_advisory);
+    return report(arena, sections.items, requirements.items, citations.items, malformed.items, list_uncited, list_advisory);
 }
 
 fn loadSpecs(
@@ -388,6 +389,7 @@ fn collectCitations(
     io: std.Io,
     root_path: []const u8,
     citations: *std.ArrayList(Citation),
+    malformed: *std.ArrayList(Malformed),
 ) !void {
     var root = try std.Io.Dir.cwd().openDir(io, root_path, .{ .iterate = true });
     defer root.close(io);
@@ -401,15 +403,20 @@ fn collectCitations(
         assert(file_count <= files_max);
         const contents = try root.readFileAlloc(io, entry.path, arena, .limited(file_bytes_max));
         const shown = try std.fmt.allocPrint(arena, "{s}/{s}", .{ root_path, entry.path });
-        try parseCitations(arena, shown, contents, citations);
+        try parseCitations(arena, shown, contents, citations, malformed);
     }
 }
+
+/// A `//=` URL line the parser could not read, so that it can be reported
+/// rather than dropped.
+const Malformed = struct { path: []const u8, line: u32 };
 
 fn parseCitations(
     arena: std.mem.Allocator,
     path: []const u8,
     contents: []const u8,
     citations: *std.ArrayList(Citation),
+    malformed: *std.ArrayList(Malformed),
 ) !void {
     var lines = std.mem.splitScalar(u8, contents, '\n');
     var number: u32 = 0;
@@ -425,7 +432,15 @@ fn parseCitations(
             const rest = std.mem.trim(u8, line["//=".len..], " ");
             if (std.mem.startsWith(u8, rest, "https://")) {
                 try close(arena, &open, &quote, &quote_lines, citations);
-                open = parseUrl(path, number, rest) orelse null;
+                // A URL this cannot read is a violation, not a shrug. Returning
+                // null here is what made the appendix bug invisible: the
+                // citation vanished, the count did not move, and nothing said
+                // so. A checker that silently ignores its input is worse than
+                // no checker, because it reports success either way.
+                open = parseUrl(path, number, rest) orelse blk: {
+                    try malformed.append(arena, .{ .path = path, .line = number });
+                    break :blk null;
+                };
                 continue;
             }
             // A `type=` line modifies the citation it follows.
@@ -470,7 +485,11 @@ fn parseUrl(path: []const u8, line: u32, url: []const u8) ?Citation {
     const hash = std.mem.indexOfScalar(u8, tail, '#') orelse return null;
     const rfc = tail[0..hash];
     const anchor = tail[hash + 1 ..];
-    const prefix = "section-";
+    // rfc-editor.org serves an appendix under `#appendix-A.7`, not
+    // `#section-A.7`, and this accepted only the latter — so six citations of
+    // RFC 9002's appendix A were dropped on the floor. Silently: the quote gate
+    // never ran on them, and a misquoted appendix would have passed CI.
+    const prefix = if (std.mem.startsWith(u8, anchor, "appendix-")) "appendix-" else "section-";
     if (!std.mem.startsWith(u8, anchor, prefix)) return null;
     return .{
         .path = path,
@@ -499,11 +518,20 @@ fn report(
     sections: []const Section,
     requirements: []Requirement,
     citations: []const Citation,
+    malformed: []const Malformed,
     list_uncited: bool,
     list_advisory: bool,
 ) !u8 {
     _ = arena;
     var violations: u32 = 0;
+
+    for (malformed) |one| {
+        std.debug.print(
+            "{s}:{d}: this `//=` line is not a URL this tool can read, so the citation under it was checked by nothing\n",
+            .{ one.path, one.line },
+        );
+        violations += 1;
+    }
 
     for (citations) |citation| {
         const section = findSection(sections, citation.rfc, citation.section);
@@ -735,13 +763,14 @@ test "a citation block parses into its url, quote and kind" {
     const arena = arena_state.allocator();
 
     var citations: std.ArrayList(Citation) = .empty;
+    var malformed: std.ArrayList(Malformed) = .empty;
     try parseCitations(arena, "x.zig",
         \\//= https://www.rfc-editor.org/rfc/rfc9002#section-7.6.1
         \\//# A sender establishes persistent congestion after the receipt of
         \\//# an acknowledgment if two packets are declared lost.
         \\//= type=test
         \\const x = 1;
-    , &citations);
+    , &citations, &malformed);
 
     try testing.expectEqual(@as(usize, 1), citations.items.len);
     const one = citations.items[0];
@@ -760,12 +789,13 @@ test "an exception keeps its reason" {
     const arena = arena_state.allocator();
 
     var citations: std.ArrayList(Citation) = .empty;
+    var malformed: std.ArrayList(Malformed) = .empty;
     try parseCitations(arena, "x.zig",
         \\//= https://www.rfc-editor.org/rfc/rfc9000#section-9
         \\//# An endpoint MUST validate a new path.
         \\//= type=exception
         \\//= reason=migration is out of scope; see docs/DESIGN.md section 2
-    , &citations);
+    , &citations, &malformed);
     try testing.expectEqual(@as(usize, 1), citations.items.len);
     try testing.expectEqual(Kind.exception, citations.items[0].kind);
     try testing.expect(citations.items[0].reason != null);
@@ -777,13 +807,14 @@ test "two citations in one file do not run together" {
     const arena = arena_state.allocator();
 
     var citations: std.ArrayList(Citation) = .empty;
+    var malformed: std.ArrayList(Malformed) = .empty;
     try parseCitations(arena, "x.zig",
         \\//= https://www.rfc-editor.org/rfc/rfc9000#section-1
         \\//# First requirement.
         \\const a = 1;
         \\//= https://www.rfc-editor.org/rfc/rfc9000#section-2
         \\//# Second requirement.
-    , &citations);
+    , &citations, &malformed);
     try testing.expectEqual(@as(usize, 2), citations.items.len);
     try testing.expectEqualStrings("First requirement.", citations.items[0].quote);
     try testing.expectEqualStrings("Second requirement.", citations.items[1].quote);
@@ -818,4 +849,44 @@ test "RFC 8174's keyword boilerplate is not a requirement" {
     try testing.expect(!isKeywordBoilerplate(
         "This is OPTIONAL and NOT RECOMMENDED for a sender.",
     ));
+}
+
+test "an appendix anchor is a citation, not a shrug" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // rfc-editor.org serves an appendix under `#appendix-A.8`. This parser
+    // accepted only `#section-`, so six citations of RFC 9002's appendices were
+    // dropped — and dropped *silently*, which is why nobody noticed that three
+    // of them named the wrong appendix. The quote gate found all three within a
+    // second of being allowed to see them.
+    var citations: std.ArrayList(Citation) = .empty;
+    var malformed: std.ArrayList(Malformed) = .empty;
+    try parseCitations(arena, "x.zig",
+        \\//= https://www.rfc-editor.org/rfc/rfc9002#appendix-A.8
+        \\//# PeerCompletedAddressValidation():
+    , &citations, &malformed);
+    try testing.expectEqual(@as(usize, 1), citations.items.len);
+    try testing.expectEqualStrings("A.8", citations.items[0].section);
+    try testing.expectEqual(@as(usize, 0), malformed.items.len);
+}
+
+test "a URL this cannot read is reported rather than dropped" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The property that would have surfaced the appendix bug on the day it was
+    // written. A checker that silently ignores its input reports success either
+    // way, which is worse than having no checker at all.
+    var citations: std.ArrayList(Citation) = .empty;
+    var malformed: std.ArrayList(Malformed) = .empty;
+    try parseCitations(arena, "x.zig",
+        \\//= https://example.com/not-an-rfc#whatever
+        \\//# Some requirement.
+    , &citations, &malformed);
+    try testing.expectEqual(@as(usize, 0), citations.items.len);
+    try testing.expectEqual(@as(usize, 1), malformed.items.len);
+    try testing.expectEqual(@as(u32, 1), malformed.items[0].line);
 }

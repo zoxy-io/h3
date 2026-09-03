@@ -505,7 +505,7 @@ pub fn Recovery(comptime config: Config) type {
         //# sample until the handshake is confirmed.
         //= type=exception
         //= reason=a packet whose keys are not yet installed is discarded rather than buffered, so no local delay of the kind section 5.3 describes is ever accumulated to subtract
-        //= https://www.rfc-editor.org/rfc/rfc9002#appendix-A.7
+        //= https://www.rfc-editor.org/rfc/rfc9002#appendix-A.8
         //# PeerCompletedAddressValidation():
         //#   // Assume clients validate the server's address implicitly.
         //#   if (endpoint is server):
@@ -686,7 +686,7 @@ pub fn Recovery(comptime config: Config) type {
                     if (largest_lost == null or packet.number > largest_lost.?.number) largest_lost = packet;
                 }
                 if (packet.ack_eliciting) {
-                    //= https://www.rfc-editor.org/rfc/rfc9002#appendix-A.10
+                    //= https://www.rfc-editor.org/rfc/rfc9002#appendix-B.8
                     //# // Only consider packets sent after getting an RTT sample.
                     //# if (first_rtt_sample == 0):
                     //#   return
@@ -1789,7 +1789,7 @@ test "section 7.6.2: something getting through is not a dead path" {
     try testing.expect(recovery.congestion_recovery_start_time != null);
 }
 
-//= https://www.rfc-editor.org/rfc/rfc9002#appendix-A.10
+//= https://www.rfc-editor.org/rfc/rfc9002#appendix-B.8
 //# // Only consider packets sent after getting an RTT sample.
 //# if (first_rtt_sample == 0):
 //#   return
