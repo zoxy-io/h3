@@ -367,8 +367,7 @@ pub fn Recovery(comptime config: Config) type {
             //# An RTT sample MUST NOT be generated on receiving an ACK frame that
             //# does not newly acknowledge at least one ack-eliciting packet.
             //= https://www.rfc-editor.org/rfc/rfc9002#section-5.1
-            //# *  at least one of the newly acknowledged packets was ack-
-            //#    eliciting.
+            //# *  at least one of the newly acknowledged packets was ack-eliciting.
             //
             // "At least one of the newly acknowledged packets", not "the
             // largest one". Requiring `largest` itself to be ack-eliciting
@@ -1524,8 +1523,7 @@ test "a single loss is congestion, not a dead path" {
 }
 
 //= https://www.rfc-editor.org/rfc/rfc9002#section-5.1
-//# *  at least one of the newly acknowledged packets was ack-
-//#    eliciting.
+//# *  at least one of the newly acknowledged packets was ack-eliciting.
 //= type=test
 test "section 5.1: any newly acknowledged ack-eliciting packet gives a sample" {
     // The condition used to be that the *largest* newly acknowledged packet

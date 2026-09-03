@@ -206,12 +206,28 @@ a requirement whose only citation is in a function the tests never enter. It
 comes before the simulator because a simulator finds only what an oracle
 states, and the ledger is where the oracles come from.
 
-**Status.** `specs/` holds RFC 9000, 9001, 9002, 9204 and 9114.
+**Status.** `specs/` holds RFC 9000, 9001, 9002, 9110, 9112, 9114 and 9204.
 `scripts/requirements.zig` runs as `zig build requirements` and is part of
-`zig build ci`. It reads 501 sections and finds **790 normative sentences, 571
-of them mandatory**. Seven are cited, four of those by a test — the seven are
-the requirements behind the defects in §1's table, cited first precisely so the
-ledger's premise can be checked rather than asserted.
+`zig build ci`. It reads 849 sections and finds **1206 normative sentences, 849
+of them mandatory**. **241 are cited: 87 with a test, 60 an exception with a
+stated reason, 25 a todo.**
+
+The annotation was done by three agents working on disjoint files, and the
+method is worth keeping. Every one of them generated its `//#` blocks by
+slicing the vendored text with a script rather than typing them, and between
+them they produced **292 citations with zero quote failures**. The two quote
+failures in this pass were both mine, both hand-typed, and both the same
+mistake: copying a requirement out of my own terminal output, which had wrapped
+`ack-eliciting` across a line the RFC does not wrap. The gate caught both. If
+you take one working rule from this document, it is *extract the quote, never
+retype it*.
+
+The exceptions are the product here as much as the citations. 60 requirements
+are now marked deliberately-out-of-scope with a reason naming the mechanism —
+migration, 0-RTT, version negotiation, stateless reset, NEW_TOKEN issuance,
+server push, the QPACK dynamic table and encoder streams, the HTTP/3 control
+stream, ECN and pacing. Before this pass, every one of those was
+indistinguishable from an oversight.
 
 Two of its checks are gates and the rest is a report, which is a deliberate
 split:
