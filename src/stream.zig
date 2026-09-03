@@ -26,6 +26,48 @@
 //! and `H3_CLOSED_CRITICAL_STREAM` — and both are the consumer's to detect,
 //! because they are facts about a connection rather than about a stream.
 
+// RFC 9114 section 3: everything that has to be true before a stream type
+// means anything. None of it is this package's — the TLS handshake, the ALPN
+// and SNI it carries, and the certificate that decides whether a server is
+// authoritative for an origin all sit on the consumer's side of the seam, per
+// docs/DESIGN.md sections 3 and 4.
+//= https://www.rfc-editor.org/rfc/rfc9114#section-3.1
+//# Upon receiving a
+//# server certificate in the TLS handshake, the client MUST verify that
+//# the certificate is an acceptable match for the URI's origin server
+//# using the process described in Section 4.3.4 of [HTTP].  If the
+//# certificate cannot be verified with respect to the URI's origin
+//# server, the client MUST NOT consider the server authoritative for
+//# that origin.
+//= type=exception
+//= reason=a certificate never crosses this package's seam: docs/DESIGN.md section 4 puts the TLS engine in the consumer, so nothing here sees a certificate, an origin, or the URI a request was made for
+//= https://www.rfc-editor.org/rfc/rfc9114#section-3.1.2
+//# Prior to making requests for an origin whose scheme is not "https",
+//# the client MUST ensure the server is willing to serve that scheme.
+//= type=exception
+//= reason=which schemes a server is willing to serve is learned from an Alt-Svc field or from a prior response, neither of which this package reads; it validates a field section and makes no request. See docs/DESIGN.md section 3
+//= https://www.rfc-editor.org/rfc/rfc9114#section-3.2
+//# HTTP/3 clients MUST support a mechanism to indicate the
+//# target host to the server during the TLS handshake.  If the server is
+//# identified by a domain name ([DNS-TERMS]), clients MUST send the
+//# Server Name Indication (SNI; [RFC6066]) TLS extension unless an
+//# alternative mechanism to indicate the target host is used.
+//= type=exception
+//= reason=SNI is a TLS extension and docs/DESIGN.md section 4 puts the TLS engine on the consumer's side of the seam; this package hands the handshake no bytes of its own
+//= https://www.rfc-editor.org/rfc/rfc9114#section-3.3
+//# To use an existing connection for a new origin, clients MUST validate
+//# the certificate presented by the server for the new origin server
+//# using the process described in Section 4.3.4 of [HTTP].  This implies
+//# that clients will need to retain the server certificate and any
+//# additional information needed to verify that certificate; clients
+//# that do not do so will be unable to reuse the connection for
+//# additional origins.
+//# If the certificate is not acceptable with regard to the new origin
+//# for any reason, the connection MUST NOT be reused and a new
+//# connection SHOULD be established for the new origin.
+//= type=exception
+//= reason=choosing which connection carries a request for which origin is the consumer's, and the certificate that decision rests on never crosses the seam of docs/DESIGN.md section 4
+
 const std = @import("std");
 
 const assert = @import("assert.zig").assert;
@@ -33,15 +75,42 @@ const varint = @import("varint.zig");
 
 /// RFC 9114 section 11.2.4's stream type registry, plus RFC 9204 section 4.2's
 /// two QPACK streams.
+//= https://www.rfc-editor.org/rfc/rfc9114#section-6.1
+//# Clients MUST treat
+//# receipt of a server-initiated bidirectional stream as a connection
+//# error of type H3_STREAM_CREATION_ERROR unless such an extension has
+//# been negotiated.
+//= type=exception
+//= reason=which endpoint opened a stream, and whether this one is the client, are facts about a connection; the HTTP/3 connection layer that would hold them is docs/DESIGN.md section 6's next slice, and this file reads the first octets of a stream it is handed
+//= https://www.rfc-editor.org/rfc/rfc9114#section-6.2
+//# Therefore, the transport parameters sent by both clients
+//# and servers MUST allow the peer to create at least three
+//# unidirectional streams.
+//= type=exception
+//= reason=QUIC transport parameters are the consumer's to advertise, per docs/DESIGN.md section 3's seam; this file classifies a stream type and opens no stream
+//= https://www.rfc-editor.org/rfc/rfc9114#section-11.2.4
+//# In addition to common fields as described in Section 11.2, permanent
+//# registrations in this registry MUST include the following fields:
+//# Stream Type:  A name or label for the stream type.
+//= type=exception
+//= reason=an instruction to IANA and to the author of a registration rather than to an implementation; Type transcribes the registry's contents, which is all an implementation can do with it
+//= https://www.rfc-editor.org/rfc/rfc9114#section-11.2.4
+//# Specifications for permanent registrations MUST include a description
+//# of the stream type, including the layout and semantics of the stream
+//# contents.
+//= type=exception
+//= reason=a requirement on the specification that registers a stream type, not on code; this package implements the two types Table 5 registers and names the two RFC 9204 section 4.2 adds
 pub const Type = enum(u64) {
     //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.1
+    //# A control stream is indicated by a stream type of 0x00.  Data on this
+    //# stream consists of HTTP/3 frames, as defined in Section 7.2.
     //# Each side MUST initiate a single control stream at the beginning of
     //# the connection and send its SETTINGS frame as the first frame on this
     //# stream.  If the first frame of the control stream is any other frame
     //# type, this MUST be treated as a connection error of type
     //# H3_MISSING_SETTINGS.
     //= type=exception
-    //= reason=the control stream and its SETTINGS exchange are the HTTP/3 connection layer docs/DESIGN.md section 6 lists as next rather than built; this file names the stream type and nothing sequences it yet
+    //= reason=initiating the control stream and sequencing SETTINGS onto it is the HTTP/3 connection layer's, which docs/DESIGN.md section 6 lists as next rather than built; Type.control is the number it will write first
     control = 0x00,
     //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.2
     //# Only servers can push; if a server receives a client-initiated push
@@ -49,6 +118,58 @@ pub const Type = enum(u64) {
     //# H3_STREAM_CREATION_ERROR.
     //= type=exception
     //= reason=server push is not implemented and is not on docs/DESIGN.md section 6's list; the type is named so an unknown-stream path can be told apart from a push one when it is
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.2
+    //# Each push ID MUST only be used once in a push stream header.  If a
+    //# client detects that a push stream header includes a push ID that was
+    //# used in another push stream header, the client MUST treat this as a
+    //# connection error of type H3_ID_ERROR.
+    //= type=exception
+    //= reason=server push is not implemented and remembering which push IDs have been seen is connection state; docs/DESIGN.md section 6 does not list push at all, and Type.push exists so an unknown stream can be told apart from a push one
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-4.6
+    //# A client MUST treat receipt of a push stream as a connection
+    //# error of type H3_ID_ERROR when no MAX_PUSH_ID frame has been sent or
+    //# when the stream references a push ID that is greater than the maximum
+    //# push ID.
+    //= type=exception
+    //= reason=server push is not implemented; the maximum push ID this endpoint sent is connection state the HTTP/3 layer docs/DESIGN.md section 6 lists as next would hold
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-4.6
+    //# When the
+    //# same push ID is promised on multiple request streams, the
+    //# decompressed request field sections MUST contain the same fields in
+    //# the same order, and both the name and the value in each field MUST be
+    //# identical.
+    //= type=exception
+    //= reason=server push is not implemented, and comparing two field sections would mean retaining one; fields.zig validates a section as it streams past and keeps no field, per its own header
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-4.6
+    //# The server MUST include a value in the :authority pseudo-header field
+    //# for which the server is authoritative.
+    //= type=exception
+    //= reason=server push is not implemented, and which origins a server is authoritative for is the consumer's knowledge: it holds the certificate, per docs/DESIGN.md section 4
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-4.6
+    //# If the client has not yet
+    //# validated the connection for the origin indicated by the pushed
+    //# request, it MUST perform the same verification process it would do
+    //# before sending a request for that origin on the connection; see
+    //# Section 3.3.  If this verification fails, the client MUST NOT
+    //# consider the server authoritative for that origin.
+    //= type=exception
+    //= reason=server push is not implemented, and the verification named here is section 3.3's certificate check, which docs/DESIGN.md section 4 leaves to the consumer's TLS engine
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-4.6
+    //# Any
+    //# corresponding responses MUST NOT be used or cached.
+    //= type=exception
+    //= reason=server push is not implemented and this package has no cache; storing a response is the consumer's, per docs/DESIGN.md section 3
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-4.6
+    //# Pushed responses that are not cacheable MUST NOT be stored by any
+    //# HTTP cache.
+    //= type=exception
+    //= reason=server push is not implemented and this package has no cache; cacheability is decided from response fields by the consumer that would store them
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-10.4
+    //# Where multiple tenants share space on the same server, that server
+    //# MUST ensure that tenants are not able to push representations of
+    //# resources that they do not have authority over.
+    //= type=exception
+    //= reason=server push is not implemented, so this package pushes nothing on any tenant's behalf; which resources a tenant has authority over is a deployment's question rather than a codec's
     push = 0x01,
     //= https://www.rfc-editor.org/rfc/rfc9204#section-4.2
     //# Each endpoint
@@ -99,6 +220,13 @@ pub const Type = enum(u64) {
     //# sent on connections where no data is currently being transferred.
     //# Endpoints MUST NOT consider these streams to have any meaning upon
     //# receipt.
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-11.2.4
+    //# Each code of the format 0x1f * N + 0x21 for non-negative integer
+    //# values of N (that is, 0x21, 0x40, ..., through 0x3ffffffffffffffe)
+    //# MUST NOT be assigned by IANA and MUST NOT appear in the listing of
+    //# assigned values.
+    //= type=exception
+    //= reason=an instruction to IANA rather than to an implementation; isReserved is what this package does with the family IANA is told to leave unassigned, and the test below walks it
     pub fn isReserved(stream_type: Type) bool {
         const value = @intFromEnum(stream_type);
         if (value < 0x21) return false;
