@@ -88,6 +88,9 @@ const quiet_ns: u64 = 10 * std.time.ns_per_s;
 /// spin. A loss detection timer that re-arms in the past without sending
 /// anything is a livelock, and this is where it is caught.
 const timers_per_step_max: u32 = 64;
+/// Events one endpoint may report at one instant before the harness calls it a
+/// runaway. Above `events_max` in the connection, so a full queue drains.
+const events_per_step_max: u32 = 256;
 /// Steps the pair may take after the transfer finishes before going quiet.
 /// Generous against a lossy path still retransmitting a FIN or a close, and far
 /// short of the step budget, so a genuine never-quiet shows up as this rather
@@ -120,6 +123,7 @@ const Census = struct {
     link_queue_dropped: u64 = 0,
     amplification_binding: u64 = 0,
     closes_observed: u64 = 0,
+    streams_delivered: u64 = 0,
 
     /// The counters that must move somewhere in a sweep. A zero here means the
     /// sweep did not reach the behaviour, so any confidence drawn from it about
@@ -133,6 +137,16 @@ const Census = struct {
         .{ .name = "transfers completed", .get = struct {
             fn get(c: *const Census) u64 {
                 return c.transfers_completed;
+            }
+        }.get },
+        .{ .name = "packets declared lost", .get = struct {
+            fn get(c: *const Census) u64 {
+                return c.packets_lost_declared;
+            }
+        }.get },
+        .{ .name = "streams fully delivered", .get = struct {
+            fn get(c: *const Census) u64 {
+                return c.streams_delivered;
             }
         }.get },
         .{ .name = "PTOs fired", .get = struct {
@@ -210,10 +224,6 @@ const World = struct {
     /// Steps taken since the transfer finished, which is the other half of that
     /// oracle's budget.
     drain_steps: u32 = 0,
-    /// Packets the loss detector declared lost across the run. `Recovery` keeps
-    /// no lifetime total — it reports per acknowledgement — so the census
-    /// accumulates what the link dropped and the detector then noticed.
-    lost_declared: u64 = 0,
 
     census: Census = .{},
     failure: ?Failure = null,
@@ -530,6 +540,7 @@ fn stepOnce(world: *World) bool {
         }
     }
 
+    drainEvents(world);
     checkInvariants(world);
     if (world.failure != null) return false;
 
@@ -576,6 +587,31 @@ fn stepOnce(world: *World) bool {
 /// A connection error ends the run's usefulness but is not itself a failure:
 /// a lossy path plus an adversarial schedule can legitimately produce one, and
 /// the oracles above are what decide whether the endpoint behaved.
+/// Take everything both endpoints have to report. This is the seam of
+/// docs/VERIFICATION.md section 5.3, and the census row it fills — "packets
+/// declared lost" — sat at zero for as long as it did not exist: `Recovery`
+/// reports losses per acknowledgement and keeps no total, so nothing outside
+/// the library could count them.
+fn drainEvents(world: *World) void {
+    inline for (.{ &world.client, &world.server }) |connection| {
+        var guard: u32 = 0;
+        while (guard < events_per_step_max) : (guard += 1) {
+            const event = connection.poll() orelse break;
+            switch (event) {
+                .packets_lost => |count| world.census.packets_lost_declared += count,
+                .key_updated => world.census.key_updates += 1,
+                .handshake_confirmed => {},
+                .stream_delivered => world.census.streams_delivered += 1,
+                .stream_readable, .stream_reset, .stream_stopped => {},
+                .closed => world.census.closes_observed += 1,
+                // A dropped event is the harness failing to poll, not the
+                // library failing to report — and it must never be silent.
+                .overflowed => |dropped| fail(world, "the simulator dropped connection events", dropped),
+            }
+        }
+    }
+}
+
 fn recordClose(world: *World, err: anyerror) void {
     std.debug.assert(@errorName(err).len > 0);
     world.census.closes_observed += 1;
@@ -629,7 +665,15 @@ fn runSeed(seed: u64, census: *Census) ?Failure {
     if (world.received == world.payload_len and world.payload_len > 0) {
         census.transfers_completed += 1;
     }
-    census.packets_lost_declared += world.lost_declared;
+    // From the event stream now, not from a field nothing ever wrote. This read
+    // `world.lost_declared`, which was added when the count was unobtainable and
+    // then never incremented — so the row was zero because the accumulator was
+    // reading a variable that stayed zero, not only because the library could
+    // not report it. Two reasons for one symptom, and the second outlived the
+    // first fix.
+    census.packets_lost_declared += world.census.packets_lost_declared;
+    census.streams_delivered += world.census.streams_delivered;
+    census.key_updates += world.census.key_updates;
     census.link_dropped += world.to_server.counters.dropped_loss + world.to_client.counters.dropped_loss;
     census.link_queue_dropped += world.to_server.counters.dropped_queue + world.to_client.counters.dropped_queue;
     census.link_reordered += world.to_server.counters.reordered + world.to_client.counters.reordered;
@@ -725,12 +769,10 @@ fn printCensus(census: *const Census) void {
         .{ .name = "datagrams duplicated", .value = census.link_duplicated },
         .{ .name = "amplification limit binding", .value = census.amplification_binding },
         .{ .name = "connection errors seen", .value = census.closes_observed },
+        .{ .name = "streams fully delivered", .value = census.streams_delivered },
     };
     for (rows) |row| std.debug.print("  {s:<32} {d}\n", .{ row.name, row.value });
-    std.debug.print("\n  \"packets declared lost\" stays at zero: `Recovery` reports losses per\n", .{});
-    std.debug.print("  acknowledgement and keeps no lifetime total, so nothing out here can\n", .{});
-    std.debug.print("  count them. That is what section 5.3's `poll` is for; until then the\n", .{});
-    std.debug.print("  halved-window count is the signal that loss was reached.\n", .{});
+
 }
 
 const testing = std.testing;

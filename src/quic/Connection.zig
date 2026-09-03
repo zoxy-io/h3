@@ -53,6 +53,7 @@ const frame = @import("frame.zig");
 const packet = @import("packet.zig");
 const packet_number = @import("packet_number.zig");
 const stream_id = @import("stream_id.zig");
+const streams = @import("Streams.zig");
 const transport_parameters = @import("transport_parameters.zig");
 const varint = @import("../varint.zig");
 
@@ -77,6 +78,15 @@ pub const initial_datagram_min: u32 = 1200;
 /// a cursor, which the *earliest* lost packet decides. Seeing the rest changes
 /// nothing.
 const lost_report_max: u32 = 32;
+
+/// Events held between polls. Sized so that one datagram's worth of frames
+/// cannot overflow it: a datagram carries at most `lost_report_max` losses plus
+/// a bounded number of stream events, and a consumer polls between datagrams.
+const events_max: u32 = 64;
+
+comptime {
+    assert(events_max > lost_report_max);
+}
 
 comptime {
     // A report array smaller than what one ACK can retire means the caller sees
@@ -734,6 +744,14 @@ pub fn Connection(comptime config: Config) type {
         handshake_done_pending: bool = false,
         handshake_done_framed: bool = false,
 
+        /// The event queue of `Event`. Fixed, like everything else here: a
+        /// consumer that polls after every `receive` and `send` never fills it,
+        /// and one that does not is told how much it missed.
+        events: [events_max]Event = undefined,
+        events_head: u32 = 0,
+        events_count: u32 = 0,
+        events_dropped: u32 = 0,
+
         /// Set by a CONNECTION_CLOSE in either direction.
         close_code: u64 = 0,
         close_is_application: bool = false,
@@ -759,6 +777,53 @@ pub fn Connection(comptime config: Config) type {
         //= https://www.rfc-editor.org/rfc/rfc9000#section-7.2
         //# This Destination Connection ID MUST be at least 8 bytes in length.
         //= type=todo
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-3.1
+        //# Once all stream data has been successfully acknowledged, the sending
+        //# part of the stream enters the "Data Recvd" state, which is a terminal
+        //# state.
+        ///
+        /// What a consumer learns about, beyond the accessors. Everything here
+        /// is something the connection already knows and had no way to say: an
+        /// acknowledgement that completed a stream, a loss the recovery
+        /// declared, a key update, the close.
+        ///
+        /// docs/VERIFICATION.md section 5.3 asks for this seam for three
+        /// reasons that look unrelated and are the same gap. The simulator's
+        /// census had a permanently-zero row because `Recovery` reports losses
+        /// per acknowledgement and keeps no total. Section 3.1's terminal
+        /// states are entered *on acknowledgement*, and nothing carried an
+        /// acknowledgement to `Streams`. And a qlog writer outside `src/` needs
+        /// a trace rather than a poll of accessors.
+        pub const Event = union(enum) {
+            /// RFC 9001 section 4.1.2's confirmation, from either side.
+            handshake_confirmed,
+            /// New data is readable on this stream.
+            stream_readable: u64,
+            /// Every octet this endpoint wrote on the stream, and its FIN, have
+            /// been acknowledged: section 3.1's "Data Recvd".
+            stream_delivered: u64,
+            /// The peer reset it.
+            stream_reset: struct { stream: u64, code: u64 },
+            /// The peer asked this endpoint to stop sending.
+            stream_stopped: struct { stream: u64, code: u64 },
+            /// RFC 9001 section 6: the 1-RTT keys moved a generation.
+            key_updated,
+            /// Packets the loss detector declared lost. Reported as a count
+            /// rather than per packet because that is what a census wants and
+            /// what `Recovery` can say without keeping a list.
+            packets_lost: u32,
+            /// A CONNECTION_CLOSE arrived, or this endpoint sent one.
+            closed: struct { code: u64, application: bool },
+            /// Events were produced faster than they were polled, and this many
+            /// were dropped.
+            ///
+            /// An explicit event rather than a silent overwrite. A queue that
+            /// drops the oldest and says nothing is the failure this package
+            /// has now hit six times in other guises: the checker that ignores
+            /// its input reports success either way.
+            overflowed: u32,
+        };
+
         pub const Options = struct {
             side: Side,
             /// The Destination Connection ID of the client's first Initial.
@@ -2872,6 +2937,9 @@ pub fn Connection(comptime config: Config) type {
                     self.streams.receive(value.stream, value.offset, value.data, value.fin) catch |err| {
                         return streamError(err);
                     };
+                    if (self.streams.find(value.stream)) |stream| {
+                        if (stream.readable().len > 0) self.emit(.{ .stream_readable = value.stream });
+                    }
                 },
                 //= https://www.rfc-editor.org/rfc/rfc9000#section-4.5
                 //# The receiver MUST use the final size of the stream to
@@ -3002,18 +3070,22 @@ pub fn Connection(comptime config: Config) type {
             assert(delay_ns <= ack_delay_ns_max);
 
             var lost: [lost_report_max]PacketContext = undefined;
+            var delivered: [lost_report_max]PacketContext = undefined;
             const result = self.recovery.onAckReceived(
                 level.space(),
                 value,
                 delay_ns,
                 now_ns,
                 &lost,
+                &delivered,
             ) catch return error.Protocol;
             // `onPacketsLost` indexes `lost`, so the count has to be clamped to
             // it rather than trusted — the clamp is the guard, and `result.lost`
             // counts what was detected rather than what was reported.
             assert(result.lost >= @min(result.lost, lost.len));
             self.onPacketsLost(lost[0..@min(result.lost, lost.len)]);
+            if (result.lost > 0) self.emit(.{ .packets_lost = result.lost });
+            self.onPacketsDelivered(delivered[0..@min(result.acked, delivered.len)]);
         }
 
         /// Section 19.6: CRYPTO carries the handshake, at its own offsets, in a
@@ -3182,6 +3254,31 @@ pub fn Connection(comptime config: Config) type {
         /// the bytes are identical. Tracking per-range acknowledgement to avoid
         /// it would be a second reassembler on the send side, and a handshake is
         /// a few kilobytes.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-3.1
+        //# Once all stream data has been successfully acknowledged, the sending
+        //# part of the stream enters the "Data Recvd" state, which is a terminal
+        //# state.
+        ///
+        /// The counterpart of `onPacketsLost`, and it did not exist. `Recovery`
+        /// reported losses here and acknowledgements to nobody, so the two
+        /// terminal states section 3.1 enters *on acknowledgement* had nothing
+        /// to enter them: a stream could be written, sent, acknowledged, and
+        /// still sit in "Data Sent" for the life of the connection.
+        fn onPacketsDelivered(self: *Self, contexts: []const PacketContext) void {
+            assert(contexts.len <= lost_report_max);
+            for (contexts) |context| {
+                if (!context.stream_fin) continue;
+                const stream = self.streams.find(context.stream) orelse continue;
+                if (stream.send_state != .data_sent) continue;
+                // The FIN is the last thing on the stream, so a packet carrying
+                // it being acknowledged means everything before it was too —
+                // `Recovery` only reports a packet once and only when the peer
+                // has it.
+                stream.send_state = .data_recvd;
+                self.emit(.{ .stream_delivered = context.stream });
+            }
+        }
+
         fn onPacketsLost(self: *Self, contexts: []const PacketContext) void {
             // The congestion action is `Recovery`'s and happens before this is called:
             // this function only rebuilds what the lost packets carried. Section 13.3's
@@ -4303,6 +4400,40 @@ pub fn Connection(comptime config: Config) type {
 
         /// Whether anything is waiting to go out. A caller with nothing else to
         /// do can skip building a datagram.
+        /// Record an event for the consumer. Never fails and never blocks: a
+        /// full queue counts the drop instead, and `poll` reports the count
+        /// before anything newer.
+        fn emit(self: *Self, event: Event) void {
+            if (self.events_count == events_max) {
+                self.events_dropped += 1;
+                return;
+            }
+            const at = (self.events_head + self.events_count) % events_max;
+            self.events[at] = event;
+            self.events_count += 1;
+            assert(self.events_count <= events_max);
+        }
+
+        /// Take the next event, or null when there is nothing to report.
+        ///
+        /// Drain it after `receive` and after `send`. The accessors —
+        /// `readable`, `state`, `timeout` — still answer the same questions;
+        /// this answers the ones about a *transition*, which polling an
+        /// accessor cannot see unless the consumer keeps its own shadow copy of
+        /// the answer.
+        pub fn poll(self: *Self) ?Event {
+            if (self.events_dropped > 0) {
+                const dropped = self.events_dropped;
+                self.events_dropped = 0;
+                return .{ .overflowed = dropped };
+            }
+            if (self.events_count == 0) return null;
+            const event = self.events[self.events_head];
+            self.events_head = (self.events_head + 1) % events_max;
+            self.events_count -= 1;
+            return event;
+        }
+
         pub fn wantsSend(self: *const Self) bool {
             if (self.state == .draining) return false;
             //= https://www.rfc-editor.org/rfc/rfc9000#section-10.2
@@ -5974,4 +6105,60 @@ test "section 10.2.3: after confirmation the close is 1-RTT only" {
     try testing.expect(octets > 0);
     _ = try client.receive(datagram[0..octets], 2001);
     try testing.expectEqual(State.draining, client.state);
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9000#section-3.1
+//# Once all stream data has been successfully acknowledged, the sending
+//# part of the stream enters the "Data Recvd" state, which is a terminal
+//# state.
+//= type=test
+test "section 3.1: a fully acknowledged stream reaches its terminal state" {
+    // The state existed in the RFC and not in the enum, because `Recovery`
+    // reported losses to `Streams` and acknowledgements to nobody. A stream
+    // could be written, sent, acknowledged, and sit in "Data Sent" for the life
+    // of the connection.
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+    const id = stream_id.make(.client_bidirectional, 0);
+
+    _ = try client.write(id, "the whole message", true);
+    try testing.expectEqual(streams.SendState.data_sent, client.findStream(id).?.send_state);
+
+    // Deliver it, then carry the server's acknowledgement back.
+    _ = try deliver(&client, &server, 1000);
+    _ = try deliver(&server, &client, 2000);
+
+    try testing.expectEqual(streams.SendState.data_recvd, client.findStream(id).?.send_state);
+
+    // And the consumer is told, which is the point of the seam: the transition
+    // is not visible by polling any accessor.
+    var delivered = false;
+    while (client.poll()) |event| {
+        switch (event) {
+            .stream_delivered => |stream| if (stream == id) {
+                delivered = true;
+            },
+            else => {},
+        }
+    }
+    try testing.expect(delivered);
+}
+
+test "poll reports a dropped event rather than losing it" {
+    // A queue that overwrites its oldest entry and says nothing is the failure
+    // this package has met six times in other guises — a check that ignores its
+    // input reports success either way. Overflow is an event.
+    var client = testClient();
+    for (0..events_max + 3) |_| client.emit(.key_updated);
+
+    const first = client.poll().?;
+    try testing.expectEqual(@as(u32, 3), first.overflowed);
+    // Then the events that did fit, and nothing invented.
+    var kept: u32 = 0;
+    while (client.poll()) |event| {
+        try testing.expectEqual(TestConnection.Event.key_updated, event);
+        kept += 1;
+    }
+    try testing.expectEqual(events_max, kept);
 }

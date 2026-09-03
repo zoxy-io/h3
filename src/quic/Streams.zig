@@ -112,6 +112,16 @@ pub const SendState = enum {
     //# code.
     //= type=todo
     reset,
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-3.1
+    //# Once all stream data has been successfully acknowledged, the sending
+    //# part of the stream enters the "Data Recvd" state, which is a terminal
+    //# state.
+    ///
+    /// Entered when the packet carrying the FIN is acknowledged, which is why
+    /// it could not exist until `Recovery` reported acknowledgements as well as
+    /// losses. Terminal: section 3.3 forbids sending anything more on a stream
+    /// that has reached it.
+    data_recvd,
 };
 
 pub const Config = struct {

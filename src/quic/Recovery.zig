@@ -196,6 +196,13 @@ pub fn Recovery(comptime config: Config) type {
             octets: u32,
             in_flight: bool,
             ack_eliciting: bool,
+            /// What the connection attached on send. Losses have carried this
+            /// since the beginning and acknowledgements did not, which is why
+            /// RFC 9000 section 3.1's terminal states — "Data Recvd" and
+            /// "Reset Recvd", both entered *on acknowledgement* — had nothing
+            /// to enter them. A stream could be written, sent, acknowledged and
+            /// still sit in "Data Sent" for the life of the connection.
+            context: Context,
         };
 
         const SpaceState = struct {
@@ -323,6 +330,10 @@ pub fn Recovery(comptime config: Config) type {
             if (sent.in_flight) self.bytes_in_flight += sent.octets;
         }
 
+        /// The acknowledged packets' contexts, in the order they were removed.
+        /// Filled by `onAckReceived` when the caller supplies somewhere to put
+        /// them; a caller that only wants the congestion accounting passes an
+        /// empty slice and pays nothing.
         pub const AckResult = struct {
             /// Packets newly acknowledged by this frame.
             acked: u32 = 0,
@@ -367,6 +378,9 @@ pub fn Recovery(comptime config: Config) type {
             ack_delay_ns: u64,
             now_ns: u64,
             lost: []Context,
+            /// Where to report the acknowledged packets' contexts. A caller
+            /// that only wants the congestion accounting passes `&.{}`.
+            delivered: []Context,
         ) AckError!AckResult {
             const state = &self.spaces[@intFromEnum(space)];
             if (state.largest_acked) |previous| {
@@ -428,6 +442,12 @@ pub fn Recovery(comptime config: Config) type {
             // detection so a packet sent before a recovery period does not grow
             // the window that loss just halved.
             for (acked[0..@min(result.acked, acked.len)]) |one| self.onPacketAcked(one);
+            // Section 3.1's terminal states are entered on acknowledgement, so
+            // the caller needs the same view of what was acknowledged that it
+            // has always had of what was lost.
+            for (acked[0..@min(result.acked, @min(acked.len, delivered.len))], 0..) |one, index| {
+                delivered[index] = one.context;
+            }
             // Section A.7: a delivery means the path is working, so the PTO
             // backoff resets.
             //= https://www.rfc-editor.org/rfc/rfc9002#appendix-A.7
@@ -477,6 +497,7 @@ pub fn Recovery(comptime config: Config) type {
                         .octets = packet.octets,
                         .in_flight = packet.in_flight,
                         .ack_eliciting = packet.ack_eliciting,
+                        .context = packet.context,
                     };
                     result.acked += 1;
                     remove(state, index);
@@ -1275,7 +1296,7 @@ test "the first sample sets the estimate rather than smoothing into it" {
 
     try recovery.onPacketSent(.initial, sentPacket(0, 0));
     var lost: [8]u64 = undefined;
-    const result = try recovery.onAckReceived(.initial, ackOf(0, 0), 0, 100 * ms, &lost);
+    const result = try recovery.onAckReceived(.initial, ackOf(0, 0), 0, 100 * ms, &lost, &.{});
     try testing.expect(result.rtt_sampled);
     try testing.expectEqual(@as(u32, 1), result.acked);
     // Section 5.3: the first sample *is* the estimate; smoothing it against the
@@ -1289,10 +1310,10 @@ test "a later sample moves the estimate by an eighth" {
     var recovery: TestRecovery = .{};
     var lost: [8]u64 = undefined;
     try recovery.onPacketSent(.initial, sentPacket(0, 0));
-    _ = try recovery.onAckReceived(.initial, ackOf(0, 0), 0, 100 * ms, &lost);
+    _ = try recovery.onAckReceived(.initial, ackOf(0, 0), 0, 100 * ms, &lost, &.{});
 
     try recovery.onPacketSent(.initial, sentPacket(1, 200 * ms));
-    _ = try recovery.onAckReceived(.initial, ackOf(1, 0), 0, 400 * ms, &lost);
+    _ = try recovery.onAckReceived(.initial, ackOf(1, 0), 0, 400 * ms, &lost, &.{});
     // 7/8 * 100 + 1/8 * 200 = 112.5ms.
     try testing.expectEqual(@as(u64, 112_500_000), recovery.smoothed_rtt);
     try testing.expectEqual(@as(u64, 100 * ms), recovery.min_rtt);
@@ -1306,13 +1327,13 @@ test "an inflated ack delay cannot shrink the estimate below the minimum" {
     var recovery: TestRecovery = .{};
     var lost: [8]u64 = undefined;
     try recovery.onPacketSent(.initial, sentPacket(0, 0));
-    _ = try recovery.onAckReceived(.initial, ackOf(0, 0), 0, 100 * ms, &lost);
+    _ = try recovery.onAckReceived(.initial, ackOf(0, 0), 0, 100 * ms, &lost, &.{});
 
     // A peer claiming a delay far past what it advertised. Section 5.3 caps it
     // at `max_ack_delay`; without the cap a peer could drive our RTT estimate
     // down and make us declare loss early — retransmitting into a healthy path.
     try recovery.onPacketSent(.initial, sentPacket(1, 200 * ms));
-    _ = try recovery.onAckReceived(.initial, ackOf(1, 0), 10_000 * ms, 300 * ms, &lost);
+    _ = try recovery.onAckReceived(.initial, ackOf(1, 0), 10_000 * ms, 300 * ms, &lost, &.{});
     try testing.expect(recovery.smoothed_rtt >= recovery.min_rtt);
 }
 
@@ -1330,7 +1351,7 @@ test "section 6.1.1: three packets past a delivery is lost" {
 
     // Packet 4 arrives; 0 and 1 are three or more behind it and are lost, while
     // 2 and 3 are still in doubt.
-    const result = try recovery.onAckReceived(.initial, ackOf(4, 0), 0, 1 * ms, &lost);
+    const result = try recovery.onAckReceived(.initial, ackOf(4, 0), 0, 1 * ms, &lost, &.{});
     try testing.expectEqual(@as(u32, 1), result.acked);
     try testing.expectEqual(@as(u32, 2), result.lost);
     try testing.expectEqual(@as(u64, 0), lost[0]);
@@ -1349,7 +1370,7 @@ test "section 6.1.2: a packet old enough is lost even without three behind it" {
     try recovery.onPacketSent(.initial, sentPacket(0, 0));
     try recovery.onPacketSent(.initial, sentPacket(1, 0));
     // A sample, so the loss delay is a real 9/8 of an RTT rather than the floor.
-    _ = try recovery.onAckReceived(.initial, ackOf(1, 0), 0, 100 * ms, &lost);
+    _ = try recovery.onAckReceived(.initial, ackOf(1, 0), 0, 100 * ms, &lost, &.{});
     try testing.expectEqual(@as(u32, 1), recovery.outstanding(.initial));
 
     // A later packet is acknowledged, which is what runs detection again.
@@ -1357,7 +1378,7 @@ test "section 6.1.2: a packet old enough is lost even without three behind it" {
     // only two packets were ever sent past it, one short of the packet
     // threshold, so nothing else could have declared it.
     try recovery.onPacketSent(.initial, sentPacket(2, 200 * ms));
-    const result = try recovery.onAckReceived(.initial, ackOf(2, 0), 0, 1000 * ms, &lost);
+    const result = try recovery.onAckReceived(.initial, ackOf(2, 0), 0, 1000 * ms, &lost, &.{});
     try testing.expectEqual(@as(u32, 1), result.lost);
     try testing.expectEqual(@as(u64, 0), lost[0]);
 }
@@ -1372,13 +1393,13 @@ test "an ACK that acknowledges nothing new does nothing" {
     var lost: [8]u64 = undefined;
     try recovery.onPacketSent(.initial, sentPacket(0, 0));
     try recovery.onPacketSent(.initial, sentPacket(1, 0));
-    _ = try recovery.onAckReceived(.initial, ackOf(1, 0), 0, 100 * ms, &lost);
+    _ = try recovery.onAckReceived(.initial, ackOf(1, 0), 0, 100 * ms, &lost, &.{});
     const smoothed = recovery.smoothed_rtt;
 
     // Section A.7 returns early when nothing was newly acknowledged. A
     // retransmitted ACK is ordinary, and taking an RTT sample from one would
     // measure the age of an acknowledgement rather than a round trip.
-    const again = try recovery.onAckReceived(.initial, ackOf(1, 0), 0, 5000 * ms, &lost);
+    const again = try recovery.onAckReceived(.initial, ackOf(1, 0), 0, 5000 * ms, &lost, &.{});
     try testing.expectEqual(@as(u32, 0), again.acked);
     try testing.expect(!again.rtt_sampled);
     try testing.expectEqual(smoothed, recovery.smoothed_rtt);
@@ -1393,7 +1414,7 @@ test "a packet still in doubt arms the timer rather than being declared lost" {
     var lost: [8]u64 = undefined;
     try recovery.onPacketSent(.initial, sentPacket(0, 0));
     try recovery.onPacketSent(.initial, sentPacket(1, 0));
-    _ = try recovery.onAckReceived(.initial, ackOf(1, 0), 0, 100 * ms, &lost);
+    _ = try recovery.onAckReceived(.initial, ackOf(1, 0), 0, 100 * ms, &lost, &.{});
 
     // Nothing lost yet, but the timer says when to look again.
     try testing.expectEqual(@as(u32, 1), recovery.outstanding(.initial));
@@ -1423,7 +1444,7 @@ test "the window halves once per round trip, not once per lost packet" {
     // Five packets sent together; four are lost at once. Reacting to each would
     // take the window down by a factor of sixteen.
     for (0..5) |number| try recovery.onPacketSent(.initial, sentPacket(number, 0));
-    _ = try recovery.onAckReceived(.initial, ackOf(4, 0), 0, 100 * ms, &lost);
+    _ = try recovery.onAckReceived(.initial, ackOf(4, 0), 0, 100 * ms, &lost, &.{});
 
     try testing.expect(recovery.congestion_window < before);
     try testing.expectEqual(@max(before / 2, 2 * @as(u64, 1200)), recovery.congestion_window);
@@ -1436,7 +1457,7 @@ test "the window never falls below two datagrams" {
     while (round < 20) : (round += 1) {
         const base = round * 10;
         for (0..5) |offset| try recovery.onPacketSent(.initial, sentPacket(base + offset, round * 100 * ms));
-        _ = try recovery.onAckReceived(.initial, ackOf(base + 4, 0), 0, (round + 1) * 100 * ms, &lost);
+        _ = try recovery.onAckReceived(.initial, ackOf(base + 4, 0), 0, (round + 1) * 100 * ms, &lost, &.{});
     }
     // Section B.6's floor: below two datagrams a sender cannot make progress at
     // all, so the collapse stops there.
@@ -1448,7 +1469,7 @@ test "slow start grows the window per delivery and stops at the threshold" {
     var lost: [8]u64 = undefined;
     const before = recovery.congestion_window;
     try recovery.onPacketSent(.initial, sentPacket(0, 0));
-    _ = try recovery.onAckReceived(.initial, ackOf(0, 0), 0, 10 * ms, &lost);
+    _ = try recovery.onAckReceived(.initial, ackOf(0, 0), 0, 10 * ms, &lost, &.{});
     try testing.expectEqual(before + 1200, recovery.congestion_window);
 }
 
@@ -1460,7 +1481,7 @@ test "bytes in flight follow what is outstanding" {
     try recovery.onPacketSent(.initial, sentPacket(1, 0));
     try testing.expectEqual(@as(u64, 2400), recovery.bytes_in_flight);
 
-    _ = try recovery.onAckReceived(.initial, ackOf(1, 1), 0, 10 * ms, &lost);
+    _ = try recovery.onAckReceived(.initial, ackOf(1, 1), 0, 10 * ms, &lost, &.{});
     try testing.expectEqual(@as(u64, 0), recovery.bytes_in_flight);
     try testing.expectEqual(@as(u32, 0), recovery.outstanding(.initial));
 }
@@ -1520,7 +1541,7 @@ test "a silent peer produces a probe, and the backoff is exponential" {
     // for both and was wrong for one.
     recovery.side = .server;
     try recovery.onPacketSent(.initial, sentPacket(1, 0));
-    _ = try recovery.onAckReceived(.initial, ackOf(1, 0), 0, 10 * ms, &lost);
+    _ = try recovery.onAckReceived(.initial, ackOf(1, 0), 0, 10 * ms, &lost, &.{});
     try testing.expectEqual(@as(u32, 0), recovery.pto_count);
 }
 
@@ -1542,7 +1563,7 @@ test "a zero RTT sample is degenerate, not dangerous" {
     // network, ordinary with a coarse clock, and not something RFC 9002
     // forbids — so the estimate really does become zero.
     try recovery.onPacketSent(.initial, sentPacket(0, 0));
-    _ = try recovery.onAckReceived(.initial, ackOf(0, 0), 0, 0, &lost);
+    _ = try recovery.onAckReceived(.initial, ackOf(0, 0), 0, 0, &lost, &.{});
     try testing.expectEqual(@as(u64, 0), recovery.smoothed_rtt);
 
     // What matters is that every timer derived from it still obeys its floor,
@@ -1599,7 +1620,7 @@ test "a caller's lost slice may be shorter than the truth" {
     var recovery: TestRecovery = .{};
     for (0..8) |number| try recovery.onPacketSent(.initial, sentPacket(number, 0));
     var lost: [2]u64 = undefined;
-    const result = try recovery.onAckReceived(.initial, ackOf(7, 0), 0, 10 * ms, &lost);
+    const result = try recovery.onAckReceived(.initial, ackOf(7, 0), 0, 10 * ms, &lost, &.{});
     // Five are lost; two fit. The count is the truth, so a caller can tell it
     // did not see everything rather than quietly retransmitting less.
     try testing.expectEqual(@as(u32, 5), result.lost);
@@ -1616,7 +1637,7 @@ test "appendix B.5: the window grows once per acknowledged packet" {
     // which this did — halves slow start against any peer acknowledging every
     // second packet, which is RFC 9000 section 13.2.2's default.
     for (0..4) |number| try recovery.onPacketSent(.initial, sentPacket(number, 0));
-    const result = try recovery.onAckReceived(.initial, ackOf(3, 3), 0, 1 * ms, &lost);
+    const result = try recovery.onAckReceived(.initial, ackOf(3, 3), 0, 1 * ms, &lost, &.{});
     try testing.expectEqual(@as(u32, 4), result.acked);
     try testing.expectEqual(@as(u32, 0), result.lost);
     try testing.expectEqual(before + 4 * 1200, recovery.congestion_window);
@@ -1632,7 +1653,7 @@ test "appendix B.5: an ACK-only packet grows nothing" {
     ack_only.in_flight = false;
     ack_only.ack_eliciting = false;
     try recovery.onPacketSent(.initial, ack_only);
-    _ = try recovery.onAckReceived(.initial, ackOf(0, 0), 0, 1 * ms, &lost);
+    _ = try recovery.onAckReceived(.initial, ackOf(0, 0), 0, 1 * ms, &lost, &.{});
     try testing.expectEqual(before, recovery.congestion_window);
 }
 
@@ -1649,7 +1670,7 @@ test "section 7.6: losing everything across several PTOs collapses the window" {
     // An RTT sample first: without one the estimate is the 333 ms default, and
     // section 7.6 declines to declare a path dead on a number nobody measured.
     try recovery.onPacketSent(.initial, sentPacket(0, 0));
-    _ = try recovery.onAckReceived(.initial, ackOf(0, 0), 0, 100 * ms, &lost);
+    _ = try recovery.onAckReceived(.initial, ackOf(0, 0), 0, 100 * ms, &lost, &.{});
     try testing.expect(recovery.has_rtt_sample);
 
     // pto = 100 + max(4*50, 1) + 25 = 325ms; the period is three of those.
@@ -1658,7 +1679,7 @@ test "section 7.6: losing everything across several PTOs collapses the window" {
     try recovery.onPacketSent(.initial, sentPacket(1, 200 * ms));
     try recovery.onPacketSent(.initial, sentPacket(2, 2000 * ms));
     try recovery.onPacketSent(.initial, sentPacket(3, 2100 * ms));
-    const result = try recovery.onAckReceived(.initial, ackOf(3, 0), 0, 2200 * ms, &lost);
+    const result = try recovery.onAckReceived(.initial, ackOf(3, 0), 0, 2200 * ms, &lost, &.{});
     try testing.expect(result.lost >= 2);
 
     // Section 7.6: the floor, not a halving — and then exactly one packet's
@@ -1678,10 +1699,10 @@ test "a single loss is congestion, not a dead path" {
     var recovery: TestRecovery = .{};
     var lost: [8]u64 = undefined;
     try recovery.onPacketSent(.initial, sentPacket(0, 0));
-    _ = try recovery.onAckReceived(.initial, ackOf(0, 0), 0, 100 * ms, &lost);
+    _ = try recovery.onAckReceived(.initial, ackOf(0, 0), 0, 100 * ms, &lost, &.{});
 
     for (1..6) |number| try recovery.onPacketSent(.initial, sentPacket(number, 200 * ms));
-    _ = try recovery.onAckReceived(.initial, ackOf(5, 0), 0, 250 * ms, &lost);
+    _ = try recovery.onAckReceived(.initial, ackOf(5, 0), 0, 250 * ms, &lost, &.{});
     // Halved, not collapsed: the lost packets were sent together, so no
     // duration passed between the first and last of them.
     try testing.expect(recovery.congestion_window > 2 * 1200);
@@ -1709,7 +1730,7 @@ test "section 5.1: any newly acknowledged ack-eliciting packet gives a sample" {
     try recovery.onPacketSent(.initial, ack_only);
 
     // Largest is packet 1, which is ACK-only; packet 0 below it is not.
-    _ = try recovery.onAckReceived(.initial, ackOf(1, 1), 0, 100 * ms, &lost);
+    _ = try recovery.onAckReceived(.initial, ackOf(1, 1), 0, 100 * ms, &lost, &.{});
     try testing.expect(recovery.has_rtt_sample);
     try testing.expectEqual(@as(u64, 100 * ms), recovery.latest_rtt);
 }
@@ -1727,20 +1748,20 @@ test "appendix A.7: a client keeps its PTO backoff until the server is validated
     var lost: [8]u64 = undefined;
     client.pto_count = 3;
     try client.onPacketSent(.initial, sentPacket(0, 0));
-    _ = try client.onAckReceived(.initial, ackOf(0, 0), 0, 100 * ms, &lost);
+    _ = try client.onAckReceived(.initial, ackOf(0, 0), 0, 100 * ms, &lost, &.{});
     try testing.expectEqual(@as(u32, 3), client.pto_count);
 
     // Confirmation is one of the two things that ends the doubt.
     client.handshake_confirmed = true;
     try client.onPacketSent(.initial, sentPacket(1, 0));
-    _ = try client.onAckReceived(.initial, ackOf(1, 1), 0, 200 * ms, &lost);
+    _ = try client.onAckReceived(.initial, ackOf(1, 1), 0, 200 * ms, &lost, &.{});
     try testing.expectEqual(@as(u32, 0), client.pto_count);
 
     // A server has nothing to wait for: the client chose the address.
     var server: TestRecovery = .{ .side = .server };
     server.pto_count = 3;
     try server.onPacketSent(.initial, sentPacket(0, 0));
-    _ = try server.onAckReceived(.initial, ackOf(0, 0), 0, 100 * ms, &lost);
+    _ = try server.onAckReceived(.initial, ackOf(0, 0), 0, 100 * ms, &lost, &.{});
     try testing.expectEqual(@as(u32, 0), server.pto_count);
 }
 
@@ -1753,7 +1774,7 @@ test "section 7.6.2: something getting through is not a dead path" {
     var lost: [16]u64 = undefined;
 
     try recovery.onPacketSent(.initial, sentPacket(0, 0));
-    _ = try recovery.onAckReceived(.initial, ackOf(0, 0), 0, 100 * ms, &lost);
+    _ = try recovery.onAckReceived(.initial, ackOf(0, 0), 0, 100 * ms, &lost, &.{});
 
     // Two ack-eliciting packets far enough apart to be persistent congestion,
     // and one *between* them that this very ACK acknowledges. Section 7.6.2's
@@ -1776,7 +1797,7 @@ test "section 7.6.2: something getting through is not a dead path" {
         .range_count = 1,
         .ranges = ranges[0..octets],
         .ecn = null,
-    }, 0, 2200 * ms, &lost);
+    }, 0, 2200 * ms, &lost, &.{});
 
     // Halved rather than collapsed: packet 2 landed between the two lost ones.
     //
@@ -1810,7 +1831,7 @@ test "appendix B.8: a packet sent before the first RTT sample cannot widen the s
     try recovery.onPacketSent(.initial, sentPacket(0, 0));
 
     try recovery.onPacketSent(.handshake, sentPacket(0, 2900 * ms));
-    _ = try recovery.onAckReceived(.handshake, ackOf(0, 0), 0, 3000 * ms, &lost);
+    _ = try recovery.onAckReceived(.handshake, ackOf(0, 0), 0, 3000 * ms, &lost, &.{});
     try testing.expect(recovery.has_rtt_sample);
     try testing.expectEqual(@as(u64, 3000 * ms), recovery.first_rtt_sample_ns);
 
@@ -1821,7 +1842,7 @@ test "appendix B.8: a packet sent before the first RTT sample cannot widen the s
     // the window on a period that predates every measurement.
     try recovery.onPacketSent(.initial, sentPacket(1, 3100 * ms));
     try recovery.onPacketSent(.initial, sentPacket(2, 3200 * ms));
-    const result = try recovery.onAckReceived(.initial, ackOf(2, 0), 0, 3300 * ms, &lost);
+    const result = try recovery.onAckReceived(.initial, ackOf(2, 0), 0, 3300 * ms, &lost, &.{});
     try testing.expect(result.lost >= 2);
     try testing.expect(recovery.congestion_recovery_start_time != null);
 }

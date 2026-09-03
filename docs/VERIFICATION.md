@@ -445,13 +445,41 @@ per acknowledgement and keeps no lifetime total, so nothing outside the library
 can count them. That is what §5.3 is for, and until then the halved-window
 count is the signal that loss was reached.
 
-### 5.3 Events out — with 5.2
+### 5.3 Events out — **done**
 
-Add a `poll` that yields an event alongside the accessors that exist:
-handshake done, stream readable, stream finished, stream reset, stream stopped,
-key updated, closed. The simulator's oracle becomes a trace; a qlog writer
-outside `src/` becomes a consumer of that trace; picoquic-style golden trace
-diffs become possible between seeds and between versions.
+`Connection.poll` yields an `Event` alongside the accessors: handshake
+confirmed, stream readable, stream delivered, stream reset, stream stopped, key
+updated, packets lost, closed — and `overflowed`, which is the queue saying it
+dropped something rather than dropping it quietly.
+
+Three gaps were waiting on this and did not look related:
+
+- **The simulator's census had a permanently-zero row.** `Recovery` reports
+  losses per acknowledgement and keeps no total, so nothing outside the library
+  could count them; the census printed an apology instead of a number. It now
+  counts 321 declared losses over 256 seeds, and the row is a *required*
+  behaviour rather than a footnote.
+- **RFC 9000 §3.1's terminal states are entered on acknowledgement**, and
+  `Recovery` reported losses to `Streams` and acknowledgements to nobody. So
+  `SendState` had no "Data Recvd": a stream could be written, sent, fully
+  acknowledged, and sit in "Data Sent" for the life of the connection. Fixing it
+  meant `AckedPacket` carrying the same `Context` a lost packet always had.
+- **A qlog writer** needs a trace rather than a poll of accessors, and so does
+  any consumer that wants to know about a *transition* without keeping its own
+  shadow copy of every answer.
+
+One design note worth keeping. The queue is fixed, like everything else here,
+and a full one **counts the drop and reports it as an event**. The alternative —
+overwrite the oldest, say nothing — is the failure this package met six times in
+other guises and is catalogued in §1: a component that ignores its input reports
+success either way.
+
+The bug found while wiring it is the one to remember. The census row stayed at
+zero after `poll` existed, because the sweep was accumulating a `lost_declared`
+field that had been added when the count was unobtainable and then never
+written. Two independent reasons for one symptom, and the second outlived the
+fix for the first — which is only visible because the census fails a sweep that
+leaves a required behaviour unreached.
 
 ### 5.4 Fuzz where it ships — partly done
 

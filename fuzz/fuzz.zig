@@ -759,7 +759,7 @@ fn fuzzRecovery(_: void, smith: *std.testing.Smith) !void {
                     .ranges = range_bytes[0..drawn.octets],
                     .ecn = null,
                 };
-                const result = recovery.onAckReceived(.initial, ack, smith.value(u16), now_ns, &lost) catch |err| switch (err) {
+                const result = recovery.onAckReceived(.initial, ack, smith.value(u16), now_ns, &lost, &.{}) catch |err| switch (err) {
                     // A malformed ACK is a FRAME_ENCODING_ERROR and the
                     // connection is torn down, so there is no "carry on" to
                     // model. Note that `removeAcked` has already applied every
@@ -1146,7 +1146,7 @@ test "recovery: the target's ACKs really do carry several ranges" {
         .range_count = 1,
         .ranges = ranges[0..octets],
         .ecn = null,
-    }, 0, 1_000_000, &lost);
+    }, 0, 1_000_000, &lost, &.{});
 
     // Four packets acknowledged across two ranges — which is the point: a
     // single range could cover at most 0-5 or 4-5, never both ends with a hole.
@@ -1186,5 +1186,5 @@ test "recovery: a range walking below zero is refused rather than wrapped" {
         .range_count = 1,
         .ranges = ranges[0..octets],
         .ecn = null,
-    }, 0, 1_000_000, &lost));
+    }, 0, 1_000_000, &lost, &.{}));
 }
