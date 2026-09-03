@@ -72,6 +72,20 @@ const keywords = [_][]const u8{
     "REQUIRED",
 };
 
+/// The documents this package implements, as opposed to the ones it borrows
+/// individual rules from. See specs/SCOPE.md for the argument; the short form
+/// is that an uncited requirement in RFC 9112 is not a gap, because nothing
+/// here is an HTTP/1.1 implementation, while an uncited requirement in RFC
+/// 9000 is exactly a gap.
+const implemented = [_][]const u8{ "9000", "9001", "9002", "9114", "9204" };
+
+fn isImplemented(rfc: []const u8) bool {
+    for (implemented) |one| {
+        if (std.mem.eql(u8, one, rfc)) return true;
+    }
+    return false;
+}
+
 /// Whether a keyword's absence is a defect rather than a choice.
 fn isMandatory(keyword: []const u8) bool {
     return std.mem.startsWith(u8, keyword, "MUST") or
@@ -540,9 +554,15 @@ fn printCoverage(sections: []const Section, requirements: []const Requirement) v
     var excepted: u32 = 0;
     var todo: u32 = 0;
 
+    var mandatory_implemented: u32 = 0;
+    var cited_implemented: u32 = 0;
     for (requirements) |requirement| {
         total += 1;
         if (isMandatory(requirement.keyword)) mandatory += 1;
+        if (isMandatory(requirement.keyword) and isImplemented(sections[requirement.section].rfc)) {
+            mandatory_implemented += 1;
+            if (requirement.cited) cited_implemented += 1;
+        }
         if (!requirement.cited) continue;
         cited += 1;
         switch (requirement.kind) {
@@ -553,10 +573,47 @@ fn printCoverage(sections: []const Section, requirements: []const Requirement) v
         }
     }
 
+    // Per-RFC, because the aggregate hides the shape of the work: a document
+    // this package implements a sliver of contributes hundreds of requirements
+    // that were never in scope, and a single "cited of mandatory" ratio reads
+    // as neglect rather than as scope.
     std.debug.print("requirement ledger — {d} sections across the vendored specs\n\n", .{sections.len});
+    std.debug.print("  {s:<10} {s:>10} {s:>10} {s:>10} {s:>10}\n", .{ "rfc", "normative", "mandatory", "cited", "uncited" });
+    var seen_rfc: [16][]const u8 = undefined;
+    var seen_count: usize = 0;
+    for (sections) |section| {
+        var known = false;
+        for (seen_rfc[0..seen_count]) |one| {
+            if (std.mem.eql(u8, one, section.rfc)) known = true;
+        }
+        if (known) continue;
+        if (seen_count == seen_rfc.len) break;
+        seen_rfc[seen_count] = section.rfc;
+        seen_count += 1;
+    }
+    for (seen_rfc[0..seen_count]) |rfc| {
+        var normative: u32 = 0;
+        var mandatory_here: u32 = 0;
+        var cited_here: u32 = 0;
+        for (requirements) |one| {
+            if (!std.mem.eql(u8, sections[one.section].rfc, rfc)) continue;
+            normative += 1;
+            if (!isMandatory(one.keyword)) continue;
+            mandatory_here += 1;
+            if (one.cited) cited_here += 1;
+        }
+        std.debug.print("  {s:<10} {d:>10} {d:>10} {d:>10} {d:>10}  {s}\n", .{
+            rfc,                         normative,                                               mandatory_here, cited_here,
+            mandatory_here - cited_here, if (isImplemented(rfc)) "implemented" else "referenced",
+        });
+    }
+    std.debug.print("\n", .{});
     std.debug.print("  {d} normative sentences (MUST/SHALL/SHOULD/REQUIRED)\n", .{total});
     std.debug.print("  {d} of them mandatory (MUST/SHALL/REQUIRED)\n", .{mandatory});
     std.debug.print("  {d} cited, of which {d} carry a test, {d} an exception, {d} a todo\n", .{ cited, tested, excepted, todo });
+    std.debug.print("\n  in the five documents this package implements: {d} of {d} mandatory cited,\n", .{ cited_implemented, mandatory_implemented });
+    std.debug.print("  leaving {d}. RFC 9110 and 9112 are referenced rather than implemented\n", .{mandatory_implemented - cited_implemented});
+    std.debug.print("  and are cited only where a rule is borrowed — see specs/SCOPE.md.\n", .{});
     std.debug.print("\nThe counts are a report: `splitSentences` is a heuristic and a gate\n", .{});
     std.debug.print("resting on one teaches everyone to work around it. The gates are that a\n", .{});
     std.debug.print("quote appears in the section it cites, and that an exception states why.\n", .{});
