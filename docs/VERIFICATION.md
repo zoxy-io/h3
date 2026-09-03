@@ -231,7 +231,18 @@ carry a test, 343 an exception with a stated reason, and the rest are an
 implementation a reader can check. The ledger's value is that the third
 category is now visible and finite.
 
-Of those citations, 123 carry a test and 329 an exception with a stated reason.
+The SHOULD-level sweep followed the mandatory one and reached the same place in
+four of the five documents: RFC 9001, 9002, 9114 and 9204 have no uncited
+SHOULD left, and RFC 9000 has four, all IANA registry policy.
+
+**The ratio is the finding.** RFC 9114's fifty-eight SHOULDs produced one
+implementation and fifty-seven exceptions. That is the correct answer, not a
+shortfall: a SHOULD is the specification saying a reasonable implementation
+might do otherwise, and the agents were told not to manufacture agreement. What
+the sweep produced is a list of every place this package knowingly declines
+advice, each with the mechanism that would have to change first.
+
+Of those citations, 129 carry a test and 452 an exception with a stated reason.
 **The exceptions are the product as much as the citations are**: migration,
 0-RTT, version negotiation, Retry, stateless reset, address-validation tokens,
 preferred address, PMTU discovery, server push, the QPACK dynamic table, ECN

@@ -737,7 +737,20 @@ pub fn Connection(comptime config: Config) type {
         /// Set by a CONNECTION_CLOSE in either direction.
         close_code: u64 = 0,
         close_is_application: bool = false,
-        close_pending: bool = false,
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-10.2.3
+        //# Under these
+        //# circumstances, a server SHOULD send a CONNECTION_CLOSE frame in
+        //# both Handshake and Initial packets to ensure that at least one of
+        //# them is processable by the client.
+        ///
+        /// One flag per encryption level, not one per connection. It was one
+        /// per connection, cleared by whichever level framed the close first —
+        /// which is the Initial, because `send` walks the levels oldest first.
+        /// The Handshake and 1-RTT packets in the same datagram then carried
+        /// nothing, and a peer that could not read the level the close landed
+        /// at never learned the connection had ended: it waited out its idle
+        /// timeout instead.
+        close_pending: [Level.count]bool = @splat(false),
 
         // The client's first Destination Connection ID arrives here already chosen,
         // and its length is never checked against section 7.2's floor: an eight-octet
@@ -3584,7 +3597,7 @@ pub fn Connection(comptime config: Config) type {
             const undo: Undo = .{
                 .ack_eliciting_pending = space.received.ack_eliciting_pending,
                 .probes_pending = space.probes_pending,
-                .close_pending = self.close_pending,
+                .close_pending = self.close_pending[index],
                 .crypto_framed = self.levels[index].framed,
                 .handshake_done_framed = self.handshake_done_framed,
             };
@@ -3819,7 +3832,7 @@ pub fn Connection(comptime config: Config) type {
             const space = &self.spaces[@intFromEnum(level.space())];
             space.received.ack_eliciting_pending = undo.ack_eliciting_pending;
             space.probes_pending = undo.probes_pending;
-            self.close_pending = undo.close_pending;
+            self.close_pending[@intFromEnum(level)] = undo.close_pending;
             self.levels[@intFromEnum(level)].framed = undo.crypto_framed;
             self.handshake_done_framed = undo.handshake_done_framed;
             if (written.stream_end > written.stream_start or written.stream_fin) {
@@ -3856,7 +3869,7 @@ pub fn Connection(comptime config: Config) type {
         /// "nothing else" is the whole content of the rule and a reader should
         /// be able to see that this function cannot reach the ACK, CRYPTO or
         /// STREAM paths at all.
-        fn writeClose(self: *Self, payload: []u8, result: *Payload) Payload {
+        fn writeClose(self: *Self, payload: []u8, level: Level, result: *Payload) Payload {
             assert(self.state == .closing);
             // One close and then silence: `close_pending` is cleared below and
             // is never set again, so a closing endpoint does not answer every
@@ -3867,7 +3880,7 @@ pub fn Connection(comptime config: Config) type {
             //# An endpoint SHOULD limit the rate at which it generates packets in
             //# the closing state.
             //= type=todo
-            if (!self.close_pending) return result.*;
+            if (!self.close_pending[@intFromEnum(level)]) return result.*;
             // Section 19.19: a transport close carries the frame type that
             // triggered it and an application close does not. Writing `null`
             // for both makes a type 0x1c frame that omits a field the peer's
@@ -3944,7 +3957,7 @@ pub fn Connection(comptime config: Config) type {
                 .triggered_by = if (self.close_is_application) null else 0,
                 .reason = &.{},
             } }) catch return result.*;
-            self.close_pending = false;
+            self.close_pending[@intFromEnum(level)] = false;
             result.octets = written;
             result.ack_eliciting = false;
             assert(result.octets <= payload.len);
@@ -3964,7 +3977,7 @@ pub fn Connection(comptime config: Config) type {
             // `.draining`, so a closing endpoint kept doing all three, which is
             // both wasted work and a peer being told about progress on a
             // connection that is over.
-            if (self.state == .closing) return self.writeClose(payload, &result);
+            if (self.state == .closing) return self.writeClose(payload, level, &result);
 
             // Acknowledged as soon as there is a datagram to carry it, at every level:
             // `wantsSend` answers true while this flag is set, so a consumer that polls
@@ -4071,14 +4084,14 @@ pub fn Connection(comptime config: Config) type {
                 if (framed > 0) result.ack_eliciting = true;
             }
 
-            if (self.close_pending and offset < payload.len) {
+            if (self.close_pending[@intFromEnum(level)] and offset < payload.len) {
                 offset += frame.encode(payload[offset..], .{ .connection_close = .{
                     .application = self.close_is_application,
                     .code = self.close_code,
                     .triggered_by = if (self.close_is_application) null else 0,
                     .reason = "",
                 } }) catch 0;
-                self.close_pending = false;
+                self.close_pending[@intFromEnum(level)] = false;
             }
             result.octets = offset;
             return result;
@@ -4271,16 +4284,47 @@ pub fn Connection(comptime config: Config) type {
         pub fn close(self: *Self, code: error_code.Transport) void {
             if (self.state == .draining or self.state == .closing) return;
             self.state = .closing;
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-10.2.3
+            //# After the handshake is confirmed (see
+            //# Section 4.1.2 of [QUIC-TLS]), an endpoint MUST send any
+            //# CONNECTION_CLOSE frames in a 1-RTT packet.
+            //
+            // Owed at every level this endpoint can still seal at, which after
+            // confirmation is 1-RTT alone — the others have had their keys
+            // discarded, and `sendPacket` refuses a level with none. Before
+            // confirmation a server owes it at both Handshake and Initial,
+            // because it cannot know which the client can read.
             self.close_code = @intFromEnum(code);
             self.close_is_application = false;
-            self.close_pending = true;
+            for (0..Level.count) |index| {
+                self.close_pending[index] = self.send_keys[index] != null;
+            }
         }
 
         /// Whether anything is waiting to go out. A caller with nothing else to
         /// do can skip building a datagram.
         pub fn wantsSend(self: *const Self) bool {
             if (self.state == .draining) return false;
-            if (self.close_pending) return true;
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-10.2
+            //# After sending a CONNECTION_CLOSE frame, an endpoint immediately
+            //# enters the closing state;
+            //
+            // A closing endpoint emits a CONNECTION_CLOSE and nothing else —
+            // `writePayload` returns `writeClose` before it reaches the ACK,
+            // CRYPTO or STREAM paths. So `wantsSend` has to answer the same
+            // question `send` will: while closing, the only thing owed is the
+            // close itself.
+            //
+            // It did not, and the two disagreeing is a spin: an endpoint that
+            // had framed its close still answered true because it owed an
+            // acknowledgement, and `send` then produced nothing, for ever. An
+            // event loop polling `wantsSend` never sleeps.
+            var owes_close = false;
+            for (0..Level.count) |index| {
+                if (self.close_pending[index] and self.send_keys[index] != null) owes_close = true;
+            }
+            if (self.state == .closing) return owes_close;
+            if (owes_close) return true;
             if (self.handshake_done_pending and !self.handshake_done_framed) return true;
             for (self.spaces) |space| {
                 if (space.probes_pending > 0 and !space.discarded) return true;
@@ -5864,4 +5908,70 @@ test "section 19.13: STREAM_DATA_BLOCKED may not name a stream the peer cannot s
         .limit = 100,
     } });
     _ = try client.receiveFrames(.one_rtt, payload[0..written], 1000);
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9000#section-10.2.3
+//# Under these
+//# circumstances, a server SHOULD send a CONNECTION_CLOSE frame in
+//# both Handshake and Initial packets to ensure that at least one of
+//# them is processable by the client.
+//= type=test
+test "section 10.2.3: a close is owed at every level that can still seal" {
+    // `close_pending` was one connection-level flag, cleared by whichever level
+    // framed the close first — the Initial, because `send` walks levels oldest
+    // first. Any later level in the same datagram carried nothing, so a peer
+    // that could not read the level the close landed at never learned the
+    // connection had ended and waited out its idle timeout.
+    //
+    // Note what this test cannot show, and why. Section 10.2.3 asks a server
+    // for the close in *both* Handshake and Initial packets, and that case is
+    // unreachable here: `installSecret` discards Initial keys the moment
+    // Handshake keys arrive, which is earlier than RFC 9001 section 4.9.1's
+    // "when it first sends a Handshake packet", so the two never coexist. The
+    // per-level flag is still the right shape — it owes the close wherever the
+    // endpoint can seal — but the specific two-level datagram the RFC describes
+    // would need the discard moved to match section 4.9.1 exactly.
+    var client = testClient();
+    var server = testServer();
+    try client.cryptoIn(.initial, "ClientHello");
+    _ = try deliver(&client, &server, 0);
+
+    // Only Initial keys so far, so that is where the close is owed.
+    server.close(.protocol_violation);
+    try testing.expect(server.close_pending[@intFromEnum(Level.initial)]);
+    try testing.expect(!server.close_pending[@intFromEnum(Level.handshake)]);
+
+    var datagram: [TestConnection.datagram_octets]u8 = @splat(0);
+    const octets = try server.send(&datagram, 1000);
+    try testing.expect(octets > 0);
+    try testing.expect(!server.close_pending[@intFromEnum(Level.initial)]);
+    // One close per level, then silence.
+    try testing.expect(!server.wantsSend());
+    _ = try client.receive(datagram[0..octets], 1001);
+    try testing.expectEqual(State.draining, client.state);
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9000#section-10.2.3
+//# After the handshake is confirmed (see
+//# Section 4.1.2 of [QUIC-TLS]), an endpoint MUST send any
+//# CONNECTION_CLOSE frames in a 1-RTT packet.
+//= type=test
+test "section 10.2.3: after confirmation the close is 1-RTT only" {
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+    // Confirmation discards the Initial and Handshake keys, so the only level
+    // that can seal is the one the RFC requires.
+    server.confirmHandshake();
+
+    server.close(.protocol_violation);
+    try testing.expect(!server.close_pending[@intFromEnum(Level.initial)]);
+    try testing.expect(!server.close_pending[@intFromEnum(Level.handshake)]);
+    try testing.expect(server.close_pending[@intFromEnum(Level.one_rtt)]);
+
+    var datagram: [TestConnection.datagram_octets]u8 = @splat(0);
+    const octets = try server.send(&datagram, 2000);
+    try testing.expect(octets > 0);
+    _ = try client.receive(datagram[0..octets], 2001);
+    try testing.expectEqual(State.draining, client.state);
 }
