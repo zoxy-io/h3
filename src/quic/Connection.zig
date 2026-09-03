@@ -989,6 +989,66 @@ pub fn Connection(comptime config: Config) type {
         //# A client MUST NOT request the use of the TLS 1.3 compatibility mode.
         //= type=exception
         //= reason=the TLS handshake is the consumer's engine and not this package's: docs/DESIGN.md section 4 puts ztls and zssl on the other side of the seam, and what crosses it is handshake bytes and traffic secrets. Nothing here builds a TLS extension, chooses a transport for one, or sends an alert. See docs/DESIGN.md section 2 and section 6.
+        // The advisory rules that sit on the far side of the seam with the ALPN ones
+        // above: a ticket, a ClientHello field and a HelloRetryRequest are all things
+        // only the consumer's engine ever sees.
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-4.5
+        //# Clients SHOULD NOT reuse tickets as that allows entities other
+        //# than the server to correlate connections; see Appendix C.4 of
+        //# [TLS13].
+        //= type=exception
+        //= reason=session tickets and address validation tokens are out of scope: this package sends no Retry, issues no NEW_TOKEN and resumes no session, so it neither writes nor reads either kind of token. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-8.4
+        //# A server SHOULD treat the receipt of a TLS ClientHello with a
+        //# non-empty legacy_session_id field as a connection error of type
+        //# PROTOCOL_VIOLATION.
+        //= type=exception
+        //= reason=the TLS handshake is the consumer's engine and not this package's: docs/DESIGN.md section 4 puts ztls and zssl on the other side of the seam, and what crosses it is handshake bytes and traffic secrets. Nothing here sees a TLS version, a certificate, an alert or a handshake message, so none of these rules has a place to be checked. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-4.7
+        //# Although it is in principle possible to use this feature for
+        //# address verification, QUIC implementations SHOULD instead use
+        //# the Retry feature; see Section 8.1 of [QUIC-TRANSPORT].
+        //= type=exception
+        //= reason=neither mechanism this sentence weighs is available here: HelloRetryRequest is a TLS handshake message the consumer's engine owns, and Retry needs a token with a server key and a clock behind it, which is why section 8.1.4 is excused elsewhere in this file. A server here validates an address the third way section 8.1 allows, by opening a Handshake packet, and holds the amplification limit until it can. See docs/DESIGN.md section 2 and section 4.
+        //
+        // The 0-RTT pair, on the same footing as every other 0-RTT rule here: no
+        // early-data key is installed, so there is no 0-RTT packet to have sent, to stop
+        // sending, or to see acknowledged.
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-4.6.2
+        //# When 0-RTT was rejected, a client SHOULD treat receipt of an
+        //# acknowledgment for a 0-RTT packet as a connection error of type
+        //# PROTOCOL_VIOLATION, if it is able to detect the condition.
+        //= type=exception
+        //= reason=0-RTT is out of scope: no early-data key is ever installed in either direction, so this endpoint can neither protect a packet with one nor open a packet that was. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-5.6
+        //# A client SHOULD stop sending 0-RTT data if it receives an
+        //# indication that 0-RTT data has been rejected.
+        //= type=exception
+        //= reason=0-RTT is out of scope: no early-data key is ever installed in either direction, so this endpoint can neither protect a packet with one nor open a packet that was. See docs/DESIGN.md section 2 and section 6.
+        //
+        // And the three rules addressed to whoever writes the next version of QUIC
+        // rather than to an implementation of this one.
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-5.2
+        //# Future versions of QUIC SHOULD generate a new salt value, thus
+        //# ensuring that the keys are different for each version of QUIC.
+        //= type=exception
+        //= reason=version negotiation is out of scope; a connection here speaks QUIC version 1 and the packet types that would begin a different one are the consumer's, per docs/DESIGN.md section 2. The rule is in any case addressed to a future version of QUIC rather than to an implementation of this one.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-9.6
+        //# To preserve this separation, a new version of QUIC SHOULD define
+        //# new labels for key derivation for packet protection key and IV,
+        //# plus the header protection keys.
+        //= type=exception
+        //= reason=version negotiation is out of scope; a connection here speaks QUIC version 1 and the packet types that would begin a different one are the consumer's, per docs/DESIGN.md section 2. The rule is in any case addressed to a future version of QUIC rather than to an implementation of this one.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-9.6
+        //# New QUIC versions SHOULD define a new salt value used in
+        //# calculating initial secrets.
+        //= type=exception
+        //= reason=version negotiation is out of scope; a connection here speaks QUIC version 1 and the packet types that would begin a different one are the consumer's, per docs/DESIGN.md section 2. The rule is in any case addressed to a future version of QUIC rather than to an implementation of this one.
         /// Queue handshake bytes for sending at `level`.
         pub fn cryptoIn(self: *Self, level: Level, data: []const u8) error{CryptoBufferExceeded}!void {
             assert(@intFromEnum(level) < self.levels.len);
@@ -1426,6 +1486,31 @@ pub fn Connection(comptime config: Config) type {
             //# After this period, old read keys and their corresponding secrets
             //# SHOULD be discarded.
             //= type=todo
+            // The advisory half of the retention rule, and it is held rather than excused:
+            // `previous_receive` below takes the outgoing generation and is replaced only by
+            // the *next* update, so the old keys outlive the first packet opened with the
+            // new ones by a whole key phase. What is missing is the ceiling on that, which
+            // is the todo above.
+            //= https://www.rfc-editor.org/rfc/rfc9001#section-6.1
+            //# An endpoint SHOULD retain old keys for some time after
+            //# unprotecting a packet sent using the new keys.
+            //
+            // And the generation after it. `next_receive` is derived here, before any packet
+            // of the next phase arrives, and is kept in the field rather than recomputed —
+            // which is what section 9.5 asks for and why the Key Phase branch in
+            // `openPacket` costs the same either way.
+            //= https://www.rfc-editor.org/rfc/rfc9001#section-6.3
+            //# This allows endpoints to retain only two sets of receive
+            //# keys; see Section 6.5. Once generated, the next set of
+            //# packet protection keys SHOULD be retained, even if the
+            //# packet that was received was subsequently discarded.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9001#section-9.5
+            //# After receiving a key update, an endpoint SHOULD generate
+            //# and save the next set of receive packet protection keys, as
+            //# described in Section 6.3. By generating new keys before a
+            //# key update is received, receipt of packets will not create
+            //# timing signals that leak the value of the Key Phase.
             const current_send = self.send_keys[@intFromEnum(Level.one_rtt)] orelse return;
             const current_receive = self.receive_keys[@intFromEnum(Level.one_rtt)] orelse return;
 
@@ -1454,6 +1539,15 @@ pub fn Connection(comptime config: Config) type {
         //# subsequent key update unless it has received an acknowledgment for a
         //# packet that was sent protected with keys from the current key phase.
         //
+        // `phase_acknowledged` is the acknowledgement half of this and is checked below.
+        // The wait is the half that is missing, and missing for the reason the retention
+        // ceiling is: nothing in this package reads a clock, so there is no PTO to
+        // multiply and nowhere to hang the delay.
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-6.5
+        //# Endpoints SHOULD wait three times the PTO before initiating a
+        //# key update after receiving an acknowledgment that confirms that
+        //# the previous key update was received.
+        //= type=todo
         /// Whether section 6.1 permits this endpoint to start an update.
         pub fn canUpdateKeys(self: *const Self) bool {
             if (self.state != .established) return false; // Section 6.1: not before the handshake is confirmed.
@@ -1857,6 +1951,33 @@ pub fn Connection(comptime config: Config) type {
             //# be used to carry QUIC frames that do not carry application data.
             //= type=exception
             //= reason=0-RTT is out of scope: no early-data key is ever installed in either direction, so this endpoint can neither protect a packet with one nor open a packet that was. See docs/DESIGN.md section 2 and section 6.
+            // The line below is where section 4.1.4's two sentences part company. A packet
+            // whose level has no key yet is dropped rather than held; a packet whose level
+            // does have one is processed, and dropping its neighbour costs it nothing,
+            // because `receivePacket` returns rather than failing and `receive`'s loop goes
+            // on to the rest of the datagram.
+            //= https://www.rfc-editor.org/rfc/rfc9001#section-4.1.4
+            //# While waiting for TLS processing to complete, an endpoint
+            //# SHOULD buffer received packets if they might be processed
+            //# using keys that are not yet available.
+            //= type=exception
+            //= reason=declined, and the buffer is the reason. A datagram whose keys have not arrived cannot be authenticated, so holding one means a queue of unauthenticated octets sized for the worst case, per connection, that an off-path attacker chooses the contents of — and this package has no allocator, so that queue would be a comptime array every connection pays for. The packet is discarded instead and the peer's probe timeout re-sends it, which is the cost this sentence is weighing. See docs/DESIGN.md section 2.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9001#section-4.1.4
+            //# An endpoint SHOULD continue to respond to packets that can
+            //# be processed during this time.
+            //
+            // Caution about Initial packets is not one check but a habit this file keeps,
+            // and the three places it shows are all reachable from an off-path observer who
+            // watched the first flight: a server pins the client's Source Connection ID on
+            // the first Initial and refuses a later one, a client discards an Initial that
+            // carries a token, and an undersized Initial datagram is dropped before its
+            // octets are credited to the amplification budget. Every one of them discards
+            // rather than closes, for the same reason — an Initial authenticates nobody.
+            //= https://www.rfc-editor.org/rfc/rfc9001#section-7
+            //# Implementations SHOULD use caution in relying on any data
+            //# that is contained in Initial packets that is not otherwise
+            //# authenticated.
             const keys = self.receive_keys[index] orelse return; // No keys yet: discard.
 
             const space = &self.spaces[@intFromEnum(level.space())];
@@ -3223,6 +3344,12 @@ pub fn Connection(comptime config: Config) type {
             //# An endpoint SHOULD include multiple frames in a single packet if they
             //# are to be sent at the same encryption level, instead of coalescing
             //# multiple packets at the same encryption level.
+            // RFC 9001's half of the same rule, and the loop below is the whole answer: one
+            // datagram carries whatever each of the three levels has to say, oldest first.
+            //= https://www.rfc-editor.org/rfc/rfc9001#section-4
+            //# When packets of different types need to be sent, endpoints
+            //# SHOULD use coalesced packets to send them in the same UDP
+            //# datagram.
             var initial_ack_eliciting = false;
             for ([_]Level{ .initial, .handshake, .one_rtt }) |level| {
                 var eliciting = false;
