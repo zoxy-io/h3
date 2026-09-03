@@ -316,6 +316,68 @@ pub fn Connection(comptime config: Config) type {
         side: Side,
         state: State = .handshaking,
 
+        // Section 5.1: a connection here carries one identifier in each direction and
+        // never a second. The four fields below are the whole set — what this endpoint
+        // answers to, what it addresses the peer as, the identifier the Initial keys
+        // came from, and the peer's — so every rule about *issuing* more of them, and
+        // about the unlinkability that having more is for, is somebody else's.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-5.1
+        //# Connection IDs MUST NOT contain any information that can be used by
+        //# an external observer (that is, one that does not cooperate with the
+        //# issuer) to correlate them with other connection IDs for the same
+        //# connection.
+        //= type=exception
+        //= reason=the identifiers are the consumer's: a client draws its own and a server takes the client's off the wire, so whether one correlates with another is decided where they are chosen. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-5.1
+        //# As a trivial example, this means the same connection ID MUST NOT be
+        //# issued more than once on the same connection.
+        //= type=exception
+        //= reason=connection-ID issuance beyond Options.source is out of scope: this endpoint issues exactly one identifier and generates no NEW_CONNECTION_ID or RETIRE_CONNECTION_ID frame, so there is no second identifier to number, retire or count. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-5.1
+        //# An endpoint MUST NOT use the same IP address and port for multiple
+        //# concurrent connections with zero-length connection IDs, unless it is
+        //# certain that those protocol features are not in use.
+        //= type=exception
+        //= reason=this package opens no socket and never sees an address: the seam of docs/DESIGN.md section 3 hands over a datagram, so which IP and port carry a connection is the consumer's choice and not this slice's. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-5.1.1
+        //# The sequence number on each newly issued connection ID MUST increase
+        //# by 1.
+        //= type=exception
+        //= reason=connection-ID issuance beyond Options.source is out of scope: this endpoint issues exactly one identifier and generates no NEW_CONNECTION_ID or RETIRE_CONNECTION_ID frame, so there is no second identifier to number, retire or count. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-5.1.1
+        //# An endpoint MUST NOT provide more connection IDs than the peer's
+        //# limit.
+        //= type=exception
+        //= reason=connection-ID issuance beyond Options.source is out of scope: this endpoint issues exactly one identifier and generates no NEW_CONNECTION_ID or RETIRE_CONNECTION_ID frame, so there is no second identifier to number, retire or count. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-5.1.1
+        //# After processing a NEW_CONNECTION_ID frame and adding and retiring
+        //# active connection IDs, if the number of active connection IDs
+        //# exceeds the value advertised in its active_connection_id_limit
+        //# transport parameter, an endpoint MUST close the connection with an
+        //# error of type CONNECTION_ID_LIMIT_ERROR.
+        //= type=exception
+        //= reason=connection-ID issuance beyond Options.source is out of scope: this endpoint issues exactly one identifier and generates no NEW_CONNECTION_ID or RETIRE_CONNECTION_ID frame, so there is no second identifier to number, retire or count. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-5.1.2
+        //# Upon receipt of an increased Retire Prior To field, the peer MUST
+        //# stop using the corresponding connection IDs and retire them with
+        //# RETIRE_CONNECTION_ID frames before adding the newly provided
+        //# connection ID to the set of active connection IDs.
+        //= type=exception
+        //= reason=connection-ID issuance beyond Options.source is out of scope: this endpoint issues exactly one identifier and generates no NEW_CONNECTION_ID or RETIRE_CONNECTION_ID frame, so there is no second identifier to number, retire or count. See docs/DESIGN.md section 2 and section 6.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-5.1.2
+        //# An endpoint MUST NOT forget a connection ID without retiring it,
+        //# though it MAY choose to treat having connection IDs in need of
+        //# retirement that exceed this limit as a connection error of type
+        //# CONNECTION_ID_LIMIT_ERROR.
+        //= type=exception
+        //= reason=connection-ID issuance beyond Options.source is out of scope: this endpoint issues exactly one identifier and generates no NEW_CONNECTION_ID or RETIRE_CONNECTION_ID frame, so there is no second identifier to number, retire or count. See docs/DESIGN.md section 2 and section 6.
         /// What this endpoint puts in the Destination field of what it sends.
         /// A server replaces it with the client's source identifier; a client
         /// replaces it when the server's first packet names a new one.
@@ -390,6 +452,13 @@ pub fn Connection(comptime config: Config) type {
         close_is_application: bool = false,
         close_pending: bool = false,
 
+        // The client's first Destination Connection ID arrives here already chosen,
+        // and its length is never checked against section 7.2's floor: an eight-octet
+        // minimum is what makes the identifier hard to guess for an off-path attacker
+        // who wants to forge an Initial, and `ConnectionId.octets_min` is zero.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-7.2
+        //# This Destination Connection ID MUST be at least 8 bytes in length.
+        //= type=todo
         pub const Options = struct {
             side: Side,
             /// The Destination Connection ID of the client's first Initial.
@@ -560,6 +629,43 @@ pub fn Connection(comptime config: Config) type {
             //# invalid value as a connection error of type
             //# TRANSPORT_PARAMETER_ERROR.
             const parsed = try transport_parameters.parse(octets);
+            // Section 7.3 is what ties the parameters to the identifiers that carried
+            // the handshake, and it is absent: `transport_parameters.validate` exists,
+            // checks exactly the presence half, and has no caller anywhere in the tree.
+            // Nothing compares `initial_source_connection_id` against `peer_source`, so
+            // an attacker who could tamper with the cleartext connection identifiers of
+            // the first flight would not be caught by the check designed to catch it.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-7.3
+            //# Endpoints MUST validate that received transport parameters match
+            //# received connection ID values.
+            //= type=todo
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-7.3
+            //# The values provided by a peer for these transport parameters
+            //# MUST match the values that an endpoint used in the Destination
+            //# and Source Connection ID fields of Initial packets that it sent
+            //# (and received, for servers).
+            //= type=todo
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-7.3
+            //# An endpoint MUST treat the absence of the
+            //# initial_source_connection_id transport parameter from either
+            //# endpoint or the absence of the
+            //# original_destination_connection_id transport parameter from the
+            //# server as a connection error of type TRANSPORT_PARAMETER_ERROR.
+            //= type=todo
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-7.3
+            //# An endpoint MUST treat the following as a connection error of
+            //# type TRANSPORT_PARAMETER_ERROR or PROTOCOL_VIOLATION: * absence
+            //# of the retry_source_connection_id transport parameter from the
+            //# server after receiving a Retry packet, * presence of the
+            //# retry_source_connection_id transport parameter when no Retry
+            //# packet was received, or * a mismatch between values received
+            //# from a peer in these transport parameters and the value sent in
+            //# the corresponding Destination or Source Connection ID fields of
+            //# Initial packets.
+            //= type=todo
 
             // Section 4.6: the peer's initial stream limits are limits on *us*,
             // and until this they were parsed by nobody. The data limits are
@@ -781,6 +887,32 @@ pub fn Connection(comptime config: Config) type {
             //# A client MUST accept and process at most one Retry packet for each
             //# connection attempt.
             //= type=todo
+            //
+            // A long header in a version this package does not implement parses to
+            // `unsupported_version`, which has no encryption level, so it leaves here
+            // discarded rather than processed. Section 5.2.2's Version Negotiation reply
+            // is the consumer's, and is excused at the top of `receivePacket`.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-5.2.1
+            //# If a client receives a packet that uses a different version than
+            //# it initially selected, it MUST discard that packet.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-5.2.2
+            //# Servers MUST drop smaller packets that specify unsupported
+            //# versions.
+            //
+            // The sweep of the same rule: every path below that cannot proceed returns
+            // rather than closing, so a packet this connection cannot account for is
+            // dropped and the connection survives it.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-5.2.2
+            //# Servers MUST drop incoming packets under all other
+            //# circumstances.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-5.2.3
+            //# Server deployments that use this simple form of load balancing
+            //# MUST avoid the creation of a stateless reset oracle; see Section
+            //# 21.11.
+            //= type=exception
+            //= reason=stateless reset is out of scope; nothing here holds a reset token or recognises one, and a load balancer's addressing is outside the seam of docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
             const level = header.level() orelse return; // Retry, Version Negotiation: not this slice.
             const offset = header.packetNumberOffset() orelse return;
             const index = @intFromEnum(level);
@@ -824,6 +956,15 @@ pub fn Connection(comptime config: Config) type {
             //# A packet MUST NOT be acknowledged until packet protection has been
             //# successfully removed and all frames contained in the packet have been
             //# processed.
+            //
+            // Section 5.2's other half: an Initial packet's contents are processed before
+            // anything about the peer is proven, so a frame this endpoint refuses has to
+            // raise a connection error rather than leave the connection half-changed.
+            // `receiveFrames` returns the error and `record` below never runs.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-5.2
+            //# An endpoint MUST generate a connection error if processing the
+            //# contents of these packets prior to discovering an error, or
+            //# fully revert any changes made during that processing.
             const eliciting = try self.receiveFrames(level, opened.payload, now_ns);
             space.received.record(opened.number, now_ns, eliciting);
 
@@ -878,6 +1019,18 @@ pub fn Connection(comptime config: Config) type {
                 .handshake, .zero_rtt => |value| value.source,
                 else => null,
             };
+            // The client half of the same rule, from the other side: `destination` moves
+            // exactly once, when the first long header this client can open names a
+            // Source Connection ID, and never again.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-7.2
+            //# Until a packet is received from the server, the client MUST use
+            //# the same Destination Connection ID value on all packets in this
+            //# connection.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-7.2
+            //# A client MUST change the Destination Connection ID it uses for
+            //# sending packets in response to only the first received Initial
+            //# or Retry packet.
             if (carried_source) |source| {
                 if (self.peer_source) |known| {
                     if (!known.eql(&source)) return;
