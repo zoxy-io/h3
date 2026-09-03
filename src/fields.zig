@@ -99,6 +99,9 @@ pub const Error = error{
 //# converted to lowercase prior to their encoding.  A request or
 //# response containing uppercase characters in field names MUST be
 //# treated as malformed.
+//= https://www.rfc-editor.org/rfc/rfc9114#section-10.3
+//# Requests or responses containing invalid field names MUST be treated
+//# as malformed.
 fn nameOctetValid(octet: u8) bool {
     return switch (octet) {
         'a'...'z', '0'...'9' => true,
@@ -110,6 +113,10 @@ fn nameOctetValid(octet: u8) bool {
 /// RFC 9110's `field-value`: visible characters, spaces and tabs, and obs-text.
 /// Notably *not* CR, LF or NUL, which are the octets that split a message when
 /// it is written out as HTTP/1.1.
+//= https://www.rfc-editor.org/rfc/rfc9114#section-10.3
+//# Any request or response that contains a
+//# character not permitted in a field value MUST be treated as
+//# malformed.
 fn valueOctetValid(octet: u8) bool {
     return switch (octet) {
         0x21...0x7e => true, // VCHAR
@@ -179,6 +186,9 @@ pub fn pseudo(name: []const u8) bool {
 //# an HTTP/3 field section containing connection-specific fields; any
 //# message containing connection-specific fields MUST be treated as
 //# malformed.
+//= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
+//# Transfer codings (see Section 7 of [HTTP/1.1]) are not defined for
+//# HTTP/3; the Transfer-Encoding header field MUST NOT be used.
 fn connectionSpecific(name: []const u8) bool {
     const forbidden = [_][]const u8{
         "connection",
@@ -247,6 +257,10 @@ pub const Kind = enum {
     trailer,
 };
 
+//= https://www.rfc-editor.org/rfc/rfc9114#section-9
+//# If a setting is used for extension negotiation, the default
+//# value MUST be defined in such a fashion that the extension is
+//# disabled if the setting is omitted.
 pub const Options = struct {
     kind: Kind,
     /// Whether `SETTINGS_ENABLE_CONNECT_PROTOCOL` is in force (RFC 9220
@@ -285,12 +299,16 @@ const te_permitted_value = "trailers";
 //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3.1
 //# Clients that
 //# generate HTTP/3 requests directly SHOULD use the :authority
-//# pseudo-header field instead of the Host header field.  An
+//# pseudo-header field instead of the Host header field.
+//= type=exception
+//= reason=generating a request is the consumer's, per docs/DESIGN.md section 3; fields.zig checks a field section it is handed and writes none
+//= https://www.rfc-editor.org/rfc/rfc9114#section-4.3.1
+//# An
 //# intermediary that converts an HTTP/3 request to HTTP/1.1 MUST
 //# create a Host field if one is not present in a request by copying
 //# the value of the :authority pseudo-header field.
 //= type=exception
-//= reason=generating a request and converting one to HTTP/1.1 are both the consumer's, per docs/DESIGN.md section 3; fields.zig checks a field section it is handed and creates no field
+//= reason=this package never converts a message, so it creates no Host field; docs/DESIGN.md section 3 leaves the HTTP/1.1 side to the consumer, and checkHost is how this side refuses a pair that would make the conversion ambiguous
 const host_field_name = "host";
 const content_length_field_name = "content-length";
 
@@ -331,6 +349,40 @@ comptime {
 /// Nothing here retains a caller's slice: where a later rule needs an earlier
 /// field's value, either a bit is derived while the value is in hand, or the
 /// octets are copied into this struct's own storage.
+//= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
+//# A
+//# client MUST send only a single request on a given stream.
+//= type=exception
+//= reason=one stream carries one request, and this validator is handed one field section at a time by a consumer that owns the stream; docs/DESIGN.md section 3 puts the QUIC stream on the consumer's side of the seam
+//= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
+//# On a given stream, receipt of multiple requests or receipt of an
+//# additional HTTP response following a final HTTP response MUST be
+//# treated as malformed.
+//= type=exception
+//= reason=counting the messages that have crossed one stream is per-stream state, and MessageValidator is constructed per field section and keeps none of the last one; the request/response state machine is the consumer's, per docs/DESIGN.md section 3
+//= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
+//# After sending a request, a client MUST
+//# close the stream for sending.  Unless using the CONNECT method (see
+//# Section 4.4), clients MUST NOT make stream closure dependent on
+//# receiving a response to their request.  After sending a final
+//# response, the server MUST close the stream for sending.
+//= type=exception
+//= reason=closing a QUIC stream for sending is an action on a stream, which docs/DESIGN.md section 3 leaves to the consumer; nothing here sends a message, ends one, or decides which response is final
+//= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
+//# Clients MUST NOT discard complete responses as a
+//# result of having their request terminated abruptly, though clients
+//# can always discard responses at their discretion for other reasons.
+//= type=exception
+//= reason=what to do with a response that arrived is the consumer's decision, as this file's header says: zoxy must reject a malformed one and zrk may want to record what it got, and neither is a rule about a field section
+//= https://www.rfc-editor.org/rfc/rfc9114#section-4.2.1
+//# If a decompressed field
+//# section contains multiple cookie field lines, these MUST be
+//# concatenated into a single byte string using the two-byte delimiter
+//# of "; " (ASCII 0x3b, 0x20) before being passed into a context other
+//# than HTTP/2 or HTTP/3, such as an HTTP/1.1 connection, or a generic
+//# HTTP server application.
+//= type=exception
+//= reason=joining cookie field lines happens on the way into another context, and this package never translates a message: docs/DESIGN.md section 3 leaves the HTTP/1.1 side to the consumer, which is the party holding the joined string's destination
 pub const MessageValidator = struct {
     kind: Kind,
     extended_connect: bool,
@@ -633,6 +685,13 @@ pub const MessageValidator = struct {
     //# *  The :authority pseudo-header field contains the host and port to
     //# connect to (equivalent to the authority-form of the request-target
     //# of CONNECT requests; see Section 7.1 of [HTTP]).
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-4.4
+    //# Correspondingly, if a proxy detects an error with the stream or the
+    //# QUIC connection, it MUST close the TCP connection.  If the proxy
+    //# detects that the client has reset the stream or aborted reading from
+    //# the stream, it MUST close the TCP connection.
+    //= type=exception
+    //= reason=the TCP connection a CONNECT tunnel carries is the proxy's, and this package opens no socket at all: docs/DESIGN.md section 3's seam takes datagrams, so finishConnect checks the request's shape and owns nothing to close
     fn finishConnect(self: *const MessageValidator) Error!void {
         assert(self.method_is_connect);
         assert(!self.seen.contains(.protocol));

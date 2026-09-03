@@ -26,6 +26,15 @@
 //! and `H3_CLOSED_CRITICAL_STREAM` — and both are the consumer's to detect,
 //! because they are facts about a connection rather than about a stream.
 
+//= https://www.rfc-editor.org/rfc/rfc9114#section-2.2
+//# The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
+//# "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and
+//# "OPTIONAL" in this document are to be interpreted as described in
+//# BCP 14 [RFC2119] [RFC8174] when, and only when, they appear in all
+//# capitals, as shown here.
+//= type=exception
+//= reason=RFC 8174's boilerplate: it says how the keywords in the rest of the document are to be read and requires no behaviour of an implementation. It is here because the ledger's sentence-splitter counts any sentence carrying a keyword, and an uncited line in the report should mean a rule nobody looked at
+
 // RFC 9114 section 3: everything that has to be true before a stream type
 // means anything. None of it is this package's — the TLS handshake, the ALPN
 // and SNI it carries, and the certificate that decides whether a server is
