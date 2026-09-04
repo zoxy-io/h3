@@ -33,11 +33,11 @@ its own throwaway CA per run and configures every client in it to trust
 anything; that is the test bed's contract, not a shortcut taken here. Pointing
 this binary at a real server would be pointing an unauthenticated client at it.
 
-**Client-only, as far as the runner is concerned.** `ROLE=server` exits 127:
-the runner's server role needs a Retry token and address validation this
-package does not issue. There *is* a server — `server.zig`, built as
-`h3-server` — and it exists for h3spec, which tests HTTP/3 servers and is the
-other half of this directory's argument. See "h3spec" below.
+**Both roles.** `ROLE=client` is the runner's client; `ROLE=server` runs
+`server.zig` under the runner's server contract — port 443, `/www` for the
+files, `/certs` for the key — and issues a Retry when the `retry` case asks for
+one. `h3-server` is the same code as a standalone binary, for h3spec; see
+"h3spec" below.
 
 ## What it covers
 
@@ -52,6 +52,7 @@ stream and the response until the FIN:
 | `keyupdate` | RFC 9001 §6's key update, initiated by this client |
 | `multiconnect` | one connection per request, sequentially |
 | `retry` | the server's Retry: a new identifier, new Initial keys, a token |
+| *(server)* | `handshake`, `transfer`, `chacha20`, `multiplexing`, `retry`, `http3`, `amplificationlimit`, the loss and corruption cases, `multiconnect`, `longrtt`, `blackhole`, `ipv6`, `goodput`, `crosstraffic` |
 | `http3` | HTTP/3 proper: the control stream, SETTINGS, HEADERS and DATA |
 | `handshakeloss`, `transferloss` | the same, through the runner's lossy path |
 
@@ -137,6 +138,41 @@ server comes up misconfigured and answers nothing. It costs an hour to find
 from the client side, where it is indistinguishable from a handshake the client
 got wrong.
 
+## The server, by hand
+
+The runner drives the server through its own compose file; pointing a
+third-party *client* at it needs two workarounds and is worth the trouble,
+because it is the only way to find out what a real client thinks of the
+handshake this package produces.
+
+```sh
+ROLE=server TESTCASE=transfer CERT=/tmp/qi/certs/cert.pem \
+  KEY=/tmp/qi/certs/priv.key WWW=/tmp/qi/www PORT=4453 \
+  ./zig-out/bin/h3-interop &
+
+# The client images wait for the network simulator before they start, so
+# something has to be listening on 57832; and they resolve `server4`.
+python3 -c "import socket;s=socket.socket();s.bind(('0.0.0.0',57832));s.listen(64)
+while True: s.accept()[0].close()" &
+
+docker run --rm --network host --add-host sim:127.0.0.1 --add-host server4:127.0.0.1 \
+  -v /tmp/qi/certs:/certs:ro -v /tmp/qi/cdown:/downloads -v /tmp/qi/logs:/logs \
+  -e ROLE=client -e TESTCASE=transfer \
+  -e REQUESTS="https://server4:4453/file.bin" \
+  martenseemann/quic-go-interop:latest
+```
+
+Set `TESTCASE=retry` on the *server* for the Retry path. ngtcp2's client image
+does not run this way — its endpoint script derives an address from routes it
+cannot set outside the simulator — so the third-party client evidence here is
+quic-go's and aioquic's.
+
+A client that fails with `expected initial_source_connection_id to equal X, is
+Y` is telling you the server answered two datagrams of one flight as two
+connections. It is worth knowing that message on sight: it is what a
+multi-datagram ClientHello does to a server that keys its table only on the
+identifier it chose.
+
 ## h3spec
 
 [h3spec](https://github.com/kazu-yamamoto/h3spec) is a conformance tester for
@@ -166,6 +202,41 @@ to tell "the server did not detect this" from "the server answered nothing
 because something earlier went wrong". Both mistakes look identical in the
 summary, and the second one accounted for eleven of the failures in the first
 full run.
+
+## The server, by hand
+
+The runner drives the server through its own compose file; pointing a
+third-party *client* at it needs two workarounds and is worth the trouble,
+because it is the only way to find out what a real client thinks of the
+handshake this package produces.
+
+```sh
+ROLE=server TESTCASE=transfer CERT=/tmp/qi/certs/cert.pem \
+  KEY=/tmp/qi/certs/priv.key WWW=/tmp/qi/www PORT=4453 \
+  ./zig-out/bin/h3-interop &
+
+# The client images wait for the network simulator before they start, so
+# something has to be listening on 57832; and they resolve `server4`.
+python3 -c "import socket;s=socket.socket();s.bind(('0.0.0.0',57832));s.listen(64)
+while True: s.accept()[0].close()" &
+
+docker run --rm --network host --add-host sim:127.0.0.1 --add-host server4:127.0.0.1 \
+  -v /tmp/qi/certs:/certs:ro -v /tmp/qi/cdown:/downloads -v /tmp/qi/logs:/logs \
+  -e ROLE=client -e TESTCASE=transfer \
+  -e REQUESTS="https://server4:4453/file.bin" \
+  martenseemann/quic-go-interop:latest
+```
+
+Set `TESTCASE=retry` on the *server* for the Retry path. ngtcp2's client image
+does not run this way — its endpoint script derives an address from routes it
+cannot set outside the simulator — so the third-party client evidence here is
+quic-go's and aioquic's.
+
+A client that fails with `expected initial_source_connection_id to equal X, is
+Y` is telling you the server answered two datagrams of one flight as two
+connections. It is worth knowing that message on sight: it is what a
+multi-datagram ClientHello does to a server that keys its table only on the
+identifier it chose.
 
 ## h3spec
 

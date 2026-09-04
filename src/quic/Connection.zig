@@ -292,9 +292,13 @@ pub fn Connection(comptime config: Config) type {
         crypto_end: u32 = 0,
         /// The stream range this packet carried, if any. Same arrangement as
         /// the CRYPTO one: losing it rewinds the stream's send cursor.
+        ///
+        /// **Absolute stream offsets**, not indices into the send buffer. The
+        /// two were the same number while the buffer was never reclaimed, and
+        /// they stop being the same the moment it is.
         stream: u64 = 0,
-        stream_start: u32 = 0,
-        stream_end: u32 = 0,
+        stream_start: u64 = 0,
+        stream_end: u64 = 0,
         /// Whether the packet carried a FIN, which no byte range can express.
         stream_fin: bool = false,
         /// Whether the packet carried HANDSHAKE_DONE, which likewise has no
@@ -2051,13 +2055,9 @@ pub fn Connection(comptime config: Config) type {
             //= type=exception
             //= reason=version negotiation is out of scope; a connection here speaks QUIC version 1, and a Version Negotiation packet has no encryption level, so it leaves `receivePacket` discarded. Deciding to try another version means beginning a different connection, which is the consumer's, per docs/DESIGN.md section 2 and section 6.
             //
-            // Retry is refused here for the same reason and is not excused: the
-            // integrity tag and the key re-derivation it implies are written
-            // (`original_destination` exists for it) and nothing calls them.
-            //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.5.2
-            //# A client MUST accept and process at most one Retry packet for each
-            //# connection attempt.
-            //= type=todo
+            // Retry is no longer refused here — `receiveRetry` above is the whole
+            // of section 17.2.5's client half, and this comment claimed the
+            // opposite for as long as it was true.
             //
             // A long header in a version this package does not implement parses to
             // `unsupported_version`, which has no encryption level, so it leaves here
@@ -3638,6 +3638,15 @@ pub fn Connection(comptime config: Config) type {
         fn onPacketsDelivered(self: *Self, contexts: []const PacketContext) void {
             assert(contexts.len <= lost_report_max);
             for (contexts) |context| {
+                // The octets are the peer's now, so the buffer they sit in can
+                // be reused. Without this a stream could send `send_octets` in
+                // total and then nothing — which is not a limit anyone chose,
+                // and which `interop/server.zig` met the first time it served a
+                // file larger than one buffer: the transfer stopped at 64 KiB
+                // with both endpoints idle and neither wrong.
+                if (context.stream_end > context.stream_start) {
+                    self.streams.reclaim(context.stream, context.stream_start, context.stream_end);
+                }
                 if (!context.stream_fin) continue;
                 const stream = self.streams.find(context.stream) orelse continue;
                 if (stream.send_state != .data_sent) continue;
@@ -4352,8 +4361,9 @@ pub fn Connection(comptime config: Config) type {
             crypto_end: u32 = 0,
             /// And the stream range, likewise.
             stream: u64 = 0,
-            stream_start: u32 = 0,
-            stream_end: u32 = 0,
+            /// Absolute stream offsets, matching `PacketContext`.
+            stream_start: u64 = 0,
+            stream_end: u64 = 0,
             /// Whether this packet carried the stream's FIN. Tracked apart from
             /// the range because a FIN carries no octets, so a lost one has no
             /// byte range to rewind.
@@ -4700,9 +4710,9 @@ pub fn Connection(comptime config: Config) type {
 
                 const carries_fin = stream.send_fin and stream.framed + take == stream.send_len;
                 result.stream = stream.id;
-                result.stream_start = stream.framed;
+                result.stream_start = stream.send_offset + stream.framed;
                 stream.framed += @intCast(take);
-                result.stream_end = stream.framed;
+                result.stream_end = stream.send_offset + stream.framed;
                 result.stream_fin = carries_fin;
                 if (carries_fin) stream.fin_framed = true;
                 return written;
@@ -7448,4 +7458,114 @@ test "section 19.8: a STREAM frame has to name a stream the peer may send on" {
     } });
     _ = try other.receiveFrames(.one_rtt, payload[0..written], 2001);
     try testing.expectEqualStrings("the peer's own", other.readable(4));
+}
+
+test "a stream can send more than its buffer holds" {
+    // The send buffer is reclaimed as the peer acknowledges it, so
+    // `stream_send_octets` bounds what is *in flight and unacknowledged*, not
+    // what a stream can carry. It used to bound the total: `send_offset`
+    // existed, was added to every STREAM frame's Offset field, and was never
+    // advanced — so a stream filled its buffer once and then refused every
+    // further write for the life of the connection.
+    //
+    // Found by `interop/server.zig` the first time it served a file larger
+    // than one buffer. The transfer stopped at 64 KiB with both endpoints idle
+    // and neither of them wrong.
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+
+    const buffer_octets: usize = 8 * 1024; // `TestConnection`'s stream_send_octets.
+    const total = buffer_octets * 3;
+    client.streams.setConnectionSendLimit(total);
+    try client.streams.setSendLimit(0, total);
+    server.streams.setConnectionSendLimit(total);
+
+    var body: [8 * 1024 * 3]u8 = undefined;
+    for (&body, 0..) |*octet, index| octet.* = @truncate(index *% 31);
+    try testing.expectEqual(total, body.len);
+
+    var queued: usize = 0;
+    var received: [8 * 1024 * 3]u8 = undefined;
+    var received_len: usize = 0;
+    var now: u64 = 1000;
+    // Bounded: each round either queues octets, moves a datagram, or neither —
+    // and the loop stops when everything has arrived.
+    var rounds: u32 = 0;
+    while (rounds < 4096 and received_len < body.len) : (rounds += 1) {
+        now += 1000;
+        if (queued < body.len) {
+            queued += try client.write(0, body[queued..], queued == body.len);
+        }
+        _ = try deliver(&client, &server, now);
+        const readable = server.readable(0);
+        if (readable.len > 0) {
+            @memcpy(received[received_len..][0..readable.len], readable);
+            received_len += readable.len;
+            try server.consume(0, readable.len);
+        }
+        // The server's acknowledgements are what free the client's buffer.
+        _ = try deliver(&server, &client, now + 1);
+    }
+
+    try testing.expectEqual(body.len, queued);
+    try testing.expectEqual(body.len, received_len);
+    try testing.expectEqualSlices(u8, &body, received[0..received_len]);
+
+    // And the buffer really did move: the octets the peer has are gone from it.
+    const stream = client.findStream(0).?;
+    try testing.expect(stream.send_offset > 0);
+    try testing.expect(stream.send_len <= buffer_octets);
+}
+
+test "a spuriously lost packet that is acknowledged anyway still reclaims" {
+    // RFC 9002's loss detection is a heuristic: a packet declared lost — which
+    // rewinds the framing watermark behind it — can be acknowledged afterwards,
+    // because it was only late. Reclamation asserted that acknowledged implied
+    // framed, which is the claim that never happens. The simulator found it on
+    // the first sweep after reclamation landed; this is the same sequence
+    // without the network.
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+
+    const total = 4096;
+    client.streams.setConnectionSendLimit(total);
+    try client.streams.setSendLimit(0, total);
+
+    var body: [1024]u8 = @splat(0x5a);
+    _ = try client.write(0, &body, false);
+
+    // Framed and sent, so there is a range to lose.
+    var datagram: [TestConnection.datagram_octets]u8 = @splat(0);
+    const octets = try client.send(&datagram, 1000);
+    try testing.expect(octets > 0);
+    const stream = client.findStream(0).?;
+    const framed = stream.framed;
+    try testing.expect(framed > 0);
+
+    // Declared lost: the watermark goes back to the start of the range.
+    client.onPacketsLost(&.{.{
+        .level = .one_rtt,
+        .stream = 0,
+        .stream_start = 0,
+        .stream_end = framed,
+    }});
+    try testing.expectEqual(@as(u32, 0), client.findStream(0).?.framed);
+
+    // And then acknowledged, because it arrived after all.
+    client.onPacketsDelivered(&.{.{
+        .level = .one_rtt,
+        .stream = 0,
+        .stream_start = 0,
+        .stream_end = framed,
+    }});
+
+    // The octets are the peer's, so they are gone from the buffer and will not
+    // be sent again — which is the point of reclaiming them rather than only
+    // not crashing.
+    const after = client.findStream(0).?;
+    try testing.expectEqual(@as(u64, framed), after.send_offset);
+    try testing.expectEqual(@as(u32, 0), after.framed);
+    try testing.expectEqual(@as(u32, @intCast(body.len)) - framed, after.send_len);
 }

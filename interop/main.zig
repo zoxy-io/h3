@@ -18,10 +18,11 @@
 //! socket, a clock, an allocator, an entropy draw and a TLS handshake, all in
 //! one binary, all on the far side of the seam docs/DESIGN.md section 3 draws.
 //!
-//! It is also **client-only**. The runner's server side needs a certificate, a
-//! Retry token and address validation this package's server half does not
-//! issue, and the honest form of that is an exit code the runner understands
-//! rather than a server that fails every test.
+//! It answers **both roles**. `ROLE=server` runs `server.zig` under the
+//! runner's contract — port 443, `/www` for the files, `/certs` for the key —
+//! and issues a Retry when the `retry` case asks for one. The server's list of
+//! supported cases is shorter than the client's, and `ServerTestcase` says why
+//! each absence is an absence.
 //!
 //! ## What it covers, and the two it cannot
 //!
@@ -52,6 +53,7 @@ const std = @import("std");
 
 const h3 = @import("h3");
 
+const server_role = @import("server.zig");
 const tls = @import("tls.zig");
 
 const Io = std.Io;
@@ -206,14 +208,22 @@ pub fn main(init: std.process.Init) !u8 {
     defer log.flush() catch {};
 
     // The runner runs the same image as client and as server and picks with
-    // `ROLE`. This one is a client; see the module comment.
+    // `ROLE`.
     const role = environ.get("ROLE") orelse "client";
+    const testcase_name = environ.get("TESTCASE") orelse "transfer";
+
+    if (std.mem.eql(u8, role, "server")) {
+        const supported = ServerTestcase.parse(testcase_name) orelse {
+            try log.print("h3-interop: server test case '{s}' is not implemented\n", .{testcase_name});
+            return exit_unsupported;
+        };
+        return runServer(init, log, supported);
+    }
     if (!std.mem.eql(u8, role, "client")) {
         try log.print("h3-interop: role '{s}' is not implemented\n", .{role});
         return exit_unsupported;
     }
 
-    const testcase_name = environ.get("TESTCASE") orelse "transfer";
     const testcase = Testcase.parse(testcase_name) orelse {
         try log.print("h3-interop: test case '{s}' is not implemented\n", .{testcase_name});
         return exit_unsupported;
@@ -281,6 +291,91 @@ pub fn main(init: std.process.Init) !u8 {
     }
 
     return if (failed) 1 else 0;
+}
+
+/// What the server role answers to.
+///
+/// A shorter list than the client's, and the difference is not accidental. A
+/// client can be pointed at a conforming server and either work or not; a
+/// server has to *provoke* the behaviour each case tests, and the ones absent
+/// here need something this package does not build: a NEW_TOKEN frame for
+/// `resumption`, an early-data key for `zerortt`, a second connection ID for
+/// `connectionmigration`, ECN for `ecn`, a second version for `v2`.
+const ServerTestcase = enum {
+    handshake,
+    transfer,
+    chacha20,
+    multiplexing,
+    retry,
+    http3,
+    amplificationlimit,
+    handshakeloss,
+    transferloss,
+    handshakecorruption,
+    transfercorruption,
+    multiconnect,
+    longrtt,
+    blackhole,
+    ipv6,
+    goodput,
+    crosstraffic,
+
+    fn parse(name: []const u8) ?ServerTestcase {
+        return std.meta.stringToEnum(ServerTestcase, name);
+    }
+
+    /// Whether to answer every first flight with a Retry. RFC 9000 section
+    /// 8.1.2 leaves *when* to a server, and the runner's `retry` case is the
+    /// answer "always".
+    fn retries(self: ServerTestcase) bool {
+        return self == .retry;
+    }
+};
+
+/// The runner's server contract: port 443, `/www` for the files, `/certs` for
+/// the key, and everything else from the environment.
+fn runServer(init: std.process.Init, log: *Io.Writer, testcase: ServerTestcase) !u8 {
+    const io = init.io;
+    const gpa = init.gpa;
+    const environ = init.environ_map;
+
+    const certificate_path = environ.get("CERT") orelse "/certs/cert.pem";
+    const key_path = environ.get("KEY") orelse "/certs/priv.key";
+    const www_path = environ.get("WWW") orelse "/www";
+    const port_text = environ.get("PORT") orelse "443";
+    const port = std.fmt.parseInt(u16, port_text, 10) catch {
+        try log.print("h3-interop: PORT '{s}' is not a number\n", .{port_text});
+        return 1;
+    };
+
+    const certificate_pem = try readAll(io, gpa, certificate_path);
+    defer gpa.free(certificate_pem);
+    const key_pem = try readAll(io, gpa, key_path);
+    defer gpa.free(key_pem);
+
+    var www = Io.Dir.cwd().openDir(io, www_path, .{}) catch |err| {
+        try log.print("h3-interop: {s}: {s}\n", .{ www_path, @errorName(err) });
+        return 1;
+    };
+    defer www.close(io);
+
+    try server_role.run(io, gpa, log, .{
+        .port = port,
+        .certificate_pem = certificate_pem,
+        .private_key_pem = key_pem,
+        .www = www,
+        .retry = testcase.retries(),
+        .verbose = environ.get("VERBOSE") != null,
+    });
+    return 0;
+}
+
+fn readAll(io: Io, gpa: std.mem.Allocator, path: []const u8) ![]u8 {
+    var file = try Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    var buffer: [64 * 1024]u8 = undefined;
+    var reader = file.reader(io, &buffer);
+    return try reader.interface.allocRemaining(gpa, .unlimited);
 }
 
 /// A URL split into the three parts this client needs. `hq-interop` has no

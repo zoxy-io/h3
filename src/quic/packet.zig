@@ -170,7 +170,7 @@ pub const Header = union(Kind) {
     //# A server MUST NOT send more than one Retry packet in response to a
     //# single UDP datagram.
     //= type=exception
-    //= reason=a server here sends no Retry packet at all; issuing one needs a token, which needs randomness and a clock that docs/DESIGN.md section 3 keeps outside the seam. See docs/DESIGN.md section 2 and section 6.
+    //= reason=`writeRetry` builds the packet and `Connection` never calls it: deciding to retry is address validation policy, and how many Retries answer one datagram is a question about that policy rather than about the encoding. The token needs the randomness and the clock docs/DESIGN.md section 3 keeps outside the seam, so the decision is the consumer's — `interop/server.zig` is the consumer that makes it.
     //
     /// Section 17.2.5. No packet number and no length: the rest of the datagram
     /// is the token followed by the 16-octet integrity tag.
@@ -590,6 +590,75 @@ pub const WriteError = error{
     /// variable-length integer can describe.
     ValueTooLarge,
 };
+
+/// What `writeRetry` needs, which is everything a Retry packet carries plus the
+/// identifier its integrity tag is computed over.
+pub const RetryOptions = struct {
+    version: u32 = version_1,
+    /// The client's Source Connection ID, which the Retry is addressed to.
+    destination: ConnectionId,
+    /// The identifier the server wants to be addressed as from now on. Section
+    /// 17.2.5.1 forbids it being equal to `original_destination`, and a client
+    /// discards a Retry that breaks the rule.
+    source: ConnectionId,
+    /// Opaque to this function. What is in it, and how it is checked when it
+    /// comes back, is the server's business — RFC 9000 section 8.1.3 does not
+    /// say, and the choice needs randomness and a clock that docs/DESIGN.md
+    /// section 3 keeps outside this package.
+    token: []const u8,
+    /// The Destination Connection ID of the client's first Initial. RFC 9001
+    /// section 5.8 puts it in front of the pseudo-packet, which is what makes
+    /// the tag unforgeable by anyone who did not see that packet.
+    original_destination: ConnectionId,
+};
+
+pub const RetryError = WriteError || error{
+    /// `scratch` is smaller than `crypto.retry.pseudoPacketOctets` needs.
+    ScratchTooSmall,
+};
+
+/// Write a Retry packet, integrity tag included.
+///
+/// The one long-header packet with no length, no packet number and no
+/// protection: the rest of the datagram is the token and then the tag. It is
+/// also the only packet this package writes whose contents are decided
+/// entirely by the caller — `Connection` never produces one, because *deciding*
+/// to retry is address validation policy and needs state this package does not
+/// keep. Building the packet correctly is a different job, and it is this one.
+//= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.5
+//# A Retry packet does not contain any protected fields.
+//= type=test
+pub fn writeRetry(target: []u8, scratch: []u8, options: RetryOptions) RetryError!usize {
+    var cursor: usize = 0;
+    try put(target, &cursor, 1);
+    // Section 17.2.5: the four Unused bits are the server's to choose, and a
+    // client ignores them. Zero is a choice.
+    target[0] = header_form_long | fixed_bit |
+        (@as(u8, @intFromEnum(LongType.retry)) << long_type_shift);
+    try put(target, &cursor, 4);
+    std.mem.writeInt(u32, target[1..5], options.version, .big);
+
+    try writeConnectionId(target, &cursor, options.destination);
+    try writeConnectionId(target, &cursor, options.source);
+
+    try put(target, &cursor, options.token.len);
+    @memcpy(target[cursor - options.token.len ..][0..options.token.len], options.token);
+
+    const total = cursor + crypto.tag_octets;
+    if (total > target.len) return error.OutputTooLong;
+    const needed = crypto.retry.pseudoPacketOctets(
+        options.original_destination.bytes().len,
+        total,
+    );
+    if (scratch.len < needed) return error.ScratchTooSmall;
+    const tag = crypto.retry.tag(
+        scratch[0..needed],
+        options.original_destination.bytes(),
+        target[0..total],
+    ) catch return error.ScratchTooSmall;
+    @memcpy(target[cursor..][0..crypto.tag_octets], &tag);
+    return total;
+}
 
 pub const LongOptions = struct {
     long_type: LongType,
@@ -1046,4 +1115,59 @@ test "a coalesced datagram advances by each packet's octets" {
     const two = try parse(datagram[one.octets..end], 1);
     try testing.expectEqual(Kind.short, @as(Kind, two.header));
     try testing.expectEqual(end - cursor, two.octets);
+}
+
+test "a Retry this module writes is one it parses, and one a client accepts" {
+    const original: [8]u8 = .{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    const client_source: [4]u8 = .{ 0x01, 0x02, 0x03, 0x04 };
+    const server_source: [8]u8 = .{ 0xf0, 0x67, 0xa5, 0x50, 0x2a, 0x42, 0x62, 0xb5 };
+
+    var target: [256]u8 = @splat(0);
+    var scratch: [512]u8 = undefined;
+    const written = try writeRetry(&target, &scratch, .{
+        .destination = try ConnectionId.init(&client_source),
+        .source = try ConnectionId.init(&server_source),
+        .token = "an opaque token",
+        .original_destination = try ConnectionId.init(&original),
+    });
+
+    const parsed = try parse(target[0..written], 8);
+    const retry = parsed.header.retry;
+    try testing.expectEqualSlices(u8, &client_source, retry.destination.bytes());
+    try testing.expectEqualSlices(u8, &server_source, retry.source.bytes());
+    try testing.expectEqualStrings("an opaque token", retry.token);
+
+    // And the tag verifies against the original identifier, which is the whole
+    // of what makes a Retry credible: only an endpoint that saw the client's
+    // first Initial can compute it.
+    try crypto.retry.verify(&scratch, &original, target[0..written]);
+
+    // Against any other identifier it does not.
+    const other: [8]u8 = .{ 0xde, 0xad, 0xbe, 0xef, 0xde, 0xad, 0xbe, 0xef };
+    try testing.expectError(
+        error.IntegrityFailed,
+        crypto.retry.verify(&scratch, &other, target[0..written]),
+    );
+}
+
+test "a Retry that does not fit is refused rather than truncated" {
+    var scratch: [512]u8 = undefined;
+    var small: [16]u8 = @splat(0);
+    try testing.expectError(error.OutputTooLong, writeRetry(&small, &scratch, .{
+        .destination = try ConnectionId.init(&.{ 1, 2, 3, 4 }),
+        .source = try ConnectionId.init(&.{ 5, 6, 7, 8 }),
+        .token = "a token that leaves no room for the tag",
+        .original_destination = try ConnectionId.init(&.{ 9, 10, 11, 12 }),
+    }));
+
+    // And scratch too small for the pseudo-packet is its own answer, because a
+    // tag computed over less than the whole thing would verify nowhere.
+    var target: [256]u8 = @splat(0);
+    var tiny: [8]u8 = undefined;
+    try testing.expectError(error.ScratchTooSmall, writeRetry(&target, &tiny, .{
+        .destination = try ConnectionId.init(&.{ 1, 2, 3, 4 }),
+        .source = try ConnectionId.init(&.{ 5, 6, 7, 8 }),
+        .token = "a token",
+        .original_destination = try ConnectionId.init(&.{ 9, 10, 11, 12 }),
+    }));
 }

@@ -84,14 +84,22 @@ requirement list extracted from the specification.
 | Five of `Event`'s eight variants — `handshake_confirmed`, `stream_reset`, `stream_stopped`, `key_updated`, `closed` — were declared, documented, and emitted by nothing | the interop shim needing a close code | The tests called `emit` directly, so they proved the queue worked and never that anything filled it |
 | MAX_STREAM_DATA was offered for every stream in the table, including this endpoint's own send-only ones, which RFC 9000 section 19.10 makes a connection error at the peer | interop shim, first HTTP/3 connection | `hq-interop` never opens a unidirectional stream, so for the life of the package the loop was only ever asked about bidirectional ones |
 | The HTTP/3 layer buffered a whole DATA frame before delivering any of it, and a one-megabyte frame is larger than a stream's receive window — which only moves when octets are consumed | interop shim, against ngtcp2 | quic-go and aioquic chunk their DATA frames, so two implementations out of three hid it |
+| A server marked the connection `established` and the handshake confirmed on installing its 1-RTT *send* keys — one flight before the client's Finished was verified | h3spec | Both endpoints are individually correct, and a client that speaks first never notices |
+| A packet whose reserved bits survived protection was counted as a forgery and discarded, so RFC 9000 §17.2's violation was both unreported and charged against the AEAD integrity limit | h3spec | Only a peer holding the keys can produce one, so no fuzz input and no simulator seed can |
+| A STREAM frame naming a stream in *this* endpoint's number space that it never opened created that stream and accepted the data | h3spec | `Streams.open` creates whatever identifier it is handed, and every test handed it one the peer was entitled to |
+| The QPACK encoder and decoder streams were read and thrown away, so an instruction no zero-capacity endpoint can honour was accepted in silence | h3spec | A stream read by nobody looks exactly like a stream with nothing wrong on it |
+| A stream could send `stream_send_octets` in *total*: the send buffer was never reclaimed, so it filled once and refused every write after | the interop server, serving a file larger than one buffer | Nothing here had ever sent more than a request line, and a buffer that fills silently looks like a peer that stopped reading |
+| "Acknowledged implies framed" — false, because RFC 9002's loss detection is a heuristic and a packet declared lost can be acknowledged anyway | the simulator, first sweep after reclamation landed | It needs a spurious loss, which is a property of a connection over time and of nothing smaller |
 
 Two things about that table.
 
 **Each gate found what the others could not, and no gate found what another
 did.** The simulator finds properties of a connection over time; the ledger
 finds requirements nobody implemented and claims nobody checked; `poll` found
-the transitions no accessor reports; the interop shim found the four things
-that only a peer written by somebody else can see. A defect is usually visible
+the transitions no accessor reports; the interop shim and h3spec found the
+things only a peer written by somebody else can see — and then the simulator
+found the bug the shim's own fix introduced, which is the argument for keeping
+all of them. A defect is usually visible
 to exactly one of them, which is the argument against ever calling any one of
 them sufficient.
 
@@ -680,9 +688,43 @@ document has enough of those in its history.
 
 What is left here:
 
-- **A server role in the interop runner**, which needs the Retry token and the
-  address validation `interop/server.zig` still does not issue — so `ROLE=server`
-  there is exit 127 while h3spec's server is a separate binary.
+**The interop runner's server role is done too.** `ROLE=server` runs under the
+runner's contract — port 443, `/www` for the files, `/certs` for the key — and
+answers `hq-interop` as well as `h3`. RFC 9000 §8.1.2's address validation came
+with it: `packet.writeRetry` builds the packet, and the token is
+`odcid || HMAC(key, odcid || address)`, which is what lets a server recover the
+identifier §7.3 has it repeat after the packet stops carrying it.
+
+Two more defects, and the first is the largest single limitation this document
+has recorded:
+
+1. **A stream could send `stream_send_octets` in total.** `send_offset` existed,
+   was added to every STREAM frame's Offset field, and was never advanced — so
+   the buffer filled once and every write after it returned zero, for the life
+   of the connection. Nothing here had ever sent more than a request line. The
+   server met it the first time it served a file larger than one buffer: the
+   transfer stopped at 64 KiB with both endpoints idle and neither of them
+   wrong.
+2. **"Acknowledged implies framed" is false**, and reclamation asserted it. RFC
+   9002's loss detection is a heuristic: a packet declared lost — which rewinds
+   the framing watermark behind it — can be acknowledged afterwards, because it
+   was only late. The simulator found it on the first sweep after reclamation
+   landed, which is the case it exists for and the one no unit test reached.
+
+A third was the shim's own and worth the same attention. **The server matched
+connections only by the identifier it had chosen**, so a client whose first
+flight spans several datagrams — a ClientHello past 1200 octets does — looked
+like a new connection on the second one and got a *different* Source Connection
+ID. quic-go's client said exactly what was wrong: "expected
+initial_source_connection_id to equal 82864cea7e23bd49, is fe5493141d0ef85f".
+Our own client sends its first flight in one datagram, so nothing here could
+have found it.
+
+Verified with **third-party clients against our server**: quic-go and aioquic
+complete `handshake`, `transfer`, `chacha20`, `multiconnect`, `http3` and
+`retry`, a megabyte byte for byte each time. ngtcp2's *client* image does not
+run outside the runner's simulator network, which is its scaffolding rather
+than a result.
 - **Server push and QPACK's dynamic table**, which `Http3.zig` refuses and
   declines rather than implements — correctly, and they are the two places its
   module comment says it stops.

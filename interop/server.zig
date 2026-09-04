@@ -98,6 +98,45 @@ pub const Options = struct {
     certificate_pem: []const u8,
     /// PEM of the leaf's P-256 private key, in SEC1 or PKCS#8 form.
     private_key_pem: []const u8,
+    /// Where a request's path is resolved. The interop runner mounts `/www`
+    /// read-only and compares what the client downloaded against it byte for
+    /// byte, so a server that answered with anything else would pass its own
+    /// tests and fail the runner's.
+    www: ?Io.Dir = null,
+    /// Answer every new connection with a Retry, which is the runner's `retry`
+    /// test case. Address validation policy, and therefore this file's: RFC
+    /// 9000 section 8.1.2 leaves *when* to retry entirely to the server.
+    retry: bool = false,
+    verbose: bool,
+};
+
+/// The largest response body this server will read out of `www`. The runner's
+/// files are a few kilobytes to a megabyte; a request for something larger is
+/// answered with what fits rather than refused, because the runner compares
+/// what it asked for against what it got and a short answer fails visibly.
+const body_octets_max: usize = 2 * 1024 * 1024;
+
+/// RFC 9000 section 8.1.3's token, as this server chooses to build one.
+///
+/// `odcid_len || odcid || HMAC(key, odcid || address)`. The identifier is in
+/// the clear because the server needs it back — section 7.3 has it repeated in
+/// `original_destination_connection_id`, and after a Retry the packet no longer
+/// carries it — and the MAC is what stops a client inventing one. Binding the
+/// address is what stops a token being replayed from somewhere else.
+///
+/// No expiry, because that needs a clock and this file has one only for the
+/// connection loop; the runner's tokens live for one test case.
+const token_mac_octets: usize = 16;
+const Hmac = std.crypto.auth.hmac.sha2.HmacSha256;
+
+/// Everything the loop needs that is not one connection's.
+const Shared = struct {
+    certificates: []const []const u8,
+    private_key: [32]u8,
+    /// The key the Retry tokens are authenticated with, drawn once per process.
+    token_key: [32]u8,
+    www: ?Io.Dir,
+    retry: bool,
     verbose: bool,
 };
 
@@ -106,9 +145,17 @@ const Peer = struct {
     connection: Connection,
     server: tls.Server,
     http3: Http3,
-    /// The identifier this endpoint chose, which is how a datagram is matched
-    /// to a connection.
+    /// The identifier this endpoint chose, which is what a client addresses
+    /// once it has seen a packet from here.
     local: quic.ConnectionId,
+    /// And the one the client chose for its first Initial, which it keeps using
+    /// until then. A client's first flight can span several datagrams — a
+    /// ClientHello past 1200 octets does — and every one of them is addressed
+    /// to this identifier, not to `local`. Matching on `local` alone made the
+    /// second datagram look like a new connection, so the server answered it
+    /// with a *different* Source Connection ID and quic-go refused the
+    /// handshake: "expected initial_source_connection_id to equal ..., is ...".
+    original: quic.ConnectionId,
     address: Io.net.IpAddress,
     started_ns: u64,
     last_ns: u64,
@@ -125,10 +172,22 @@ const Peer = struct {
     /// Streams the connection has reported data on.
     readable: [streams_max]u64,
     readable_len: usize,
-    /// Requests answered, so that a stream is answered once.
-    answered: [requests_max]u64,
-    answered_len: usize,
+    /// Answers in flight. A megabyte does not fit in one `write` — the send
+    /// buffer is `stream_send_octets` — so a response is pushed as the peer's
+    /// flow control window opens, and this is what is left of it.
+    answers: [requests_max]Answer,
+    answers_len: usize,
     live: bool,
+};
+
+/// One response being written out.
+const Answer = struct {
+    stream: u64,
+    /// The file the path resolved to, or null for the built-in body.
+    file: ?Io.File,
+    /// Octets handed to `write` so far, and how many there are.
+    offset: u64,
+    total: u64,
 };
 
 pub fn run(io: Io, gpa: std.mem.Allocator, log: *Io.Writer, options: Options) !void {
@@ -137,7 +196,18 @@ pub fn run(io: Io, gpa: std.mem.Allocator, log: *Io.Writer, options: Options) !v
     const certificates = [_][]const u8{certificate};
 
     var key_storage: [1024]u8 = undefined;
-    const private_key = try privateKey(&key_storage, options.private_key_pem);
+    var shared: Shared = .{
+        .certificates = &certificates,
+        .private_key = try privateKey(&key_storage, options.private_key_pem),
+        .token_key = undefined,
+        .www = options.www,
+        .retry = options.retry,
+        .verbose = options.verbose,
+    };
+    // Drawn once per process: a Retry token is only as good as the key that
+    // authenticates it, and a key a client can predict is a token a client can
+    // mint for an address it does not own.
+    try io.randomSecure(&shared.token_key);
 
     var parameters_buffer: [512]u8 = undefined;
 
@@ -149,6 +219,12 @@ pub fn run(io: Io, gpa: std.mem.Allocator, log: *Io.Writer, options: Options) !v
     const peers = try gpa.alloc(Peer, connections_max);
     defer gpa.free(peers);
     for (peers) |*peer| peer.live = false;
+
+    // One response chunk, shared by every connection: a body is read out of
+    // `www` in pieces as the peer's window opens, and holding a megabyte per
+    // request would be holding sixteen of them.
+    const scratch = try gpa.alloc(u8, 64 * 1024);
+    defer gpa.free(scratch);
 
     const origin = Io.Timestamp.now(io, .awake);
     var receive_buffer: [receive_octets]u8 = undefined;
@@ -169,8 +245,8 @@ pub fn run(io: Io, gpa: std.mem.Allocator, log: *Io.Writer, options: Options) !v
         };
         const now = elapsed(io, origin);
 
-        const peer = find(peers, message.data) orelse
-            accept(io, log, peers, message, now, &parameters_buffer, &certificates, private_key) catch |err| {
+        const peer = find(peers, message.data, message.from) orelse
+            accept(io, log, &socket, peers, message, now, &parameters_buffer, &shared) catch |err| {
             if (options.verbose) try note(log, "refused a datagram: {s}", .{@errorName(err)});
             continue;
         } orelse continue;
@@ -184,7 +260,7 @@ pub fn run(io: Io, gpa: std.mem.Allocator, log: *Io.Writer, options: Options) !v
             continue;
         };
 
-        drive(io, log, peer, now, options.verbose) catch |err| {
+        drive(io, log, peer, now, &shared, scratch) catch |err| {
             if (options.verbose) try note(log, "drive: {s}", .{@errorName(err)});
         };
         _ = flush(io, &socket, peer, now) catch {};
@@ -215,7 +291,7 @@ fn alertFor(err: tls.Error) u8 {
 }
 
 /// Match a datagram to a connection by the Destination Connection ID it names.
-fn find(peers: []Peer, data: []const u8) ?*Peer {
+fn find(peers: []Peer, data: []const u8, from: Io.net.IpAddress) ?*Peer {
     const parsed = quic.packet.parse(data, connection_id_octets) catch return null;
     const destination = switch (parsed.header) {
         .initial => |value| value.destination,
@@ -226,7 +302,14 @@ fn find(peers: []Peer, data: []const u8) ?*Peer {
     };
     // Bounded by the table.
     for (peers) |*peer| {
-        if (peer.live and peer.local.eql(&destination)) return peer;
+        if (!peer.live) continue;
+        if (peer.local.eql(&destination)) return peer;
+        // The client's first flight, still addressed to the identifier it drew
+        // before it had seen anything from here. Matched with the address too,
+        // because two clients drawing the same identifier is possible and
+        // giving one of them the other's connection is not a failure anyone
+        // would find twice.
+        if (peer.original.eql(&destination) and peer.address.eql(&from)) return peer;
     }
     return null;
 }
@@ -235,12 +318,12 @@ fn find(peers: []Peer, data: []const u8) ?*Peer {
 fn accept(
     io: Io,
     log: *Io.Writer,
+    socket: *Io.net.Socket,
     peers: []Peer,
     message: Io.net.IncomingMessage,
     now_ns: u64,
     parameters_buffer: []u8,
-    certificates: []const []const u8,
-    private_key: [32]u8,
+    shared: *const Shared,
 ) !?*Peer {
     const parsed = quic.packet.parse(message.data, connection_id_octets) catch return null;
     // Only an Initial starts a connection. Everything else addressed to an
@@ -250,6 +333,26 @@ fn accept(
     if (parsed.header != .initial) return null;
     const initial = parsed.header.initial;
 
+    var seed: [96]u8 = undefined;
+    try io.randomSecure(&seed);
+    const source = try quic.ConnectionId.init(seed[64..][0..connection_id_octets]);
+
+    // Section 8.1.2's address validation, as the runner's `retry` case asks
+    // for it. The identifier the transport parameters must repeat is the one
+    // from *before* the Retry, and after a Retry the packet no longer carries
+    // it — so it travels inside the token and comes back here.
+    var original = initial.destination;
+    if (shared.retry) {
+        if (initial.token.len == 0) {
+            try sendRetry(io, log, socket, message, initial, source, shared);
+            return null;
+        }
+        original = validateToken(initial.token, message.from, shared) orelse {
+            if (shared.verbose) try note(log, "a token that does not authenticate", .{});
+            return null;
+        };
+    }
+
     const slot = free: {
         for (peers) |*peer| {
             if (!peer.live) break :free peer;
@@ -257,31 +360,35 @@ fn accept(
         return error.TooManyConnections;
     };
 
-    var seed: [96]u8 = undefined;
-    try io.randomSecure(&seed);
-    const source = try quic.ConnectionId.init(seed[64..][0..connection_id_octets]);
-
     slot.* = .{
         .connection = .init(.{
             .side = .server,
-            // RFC 9001 section 5.2: the Initial keys come from the identifier
-            // the *client* chose, which is the Destination Connection ID of the
-            // packet that just arrived.
+            // RFC 9001 section 5.2: the Initial keys come from the Destination
+            // Connection ID of the packet that just arrived — the client's own
+            // choice on a first flight, and *this server's* Retry Source
+            // Connection ID on a retried one. `original` above is the other
+            // value, the one section 7.3 has the transport parameters repeat.
             .original_destination = initial.destination,
             .source = source,
         }),
         .server = .init(.{
-            .certificates = certificates,
-            .private_key = private_key,
+            .certificates = shared.certificates,
+            .private_key = shared.private_key,
             // `h3` for h3spec, and `hq-interop` so the same binary answers the
             // interop runner's HTTP/0.9 cases.
             .protocols = &.{ "h3", "hq-interop" },
-            .transport_parameters = try transportParameters(parameters_buffer, source, initial.destination),
+            .transport_parameters = try transportParameters(
+                parameters_buffer,
+                source,
+                original,
+                if (shared.retry) initial.destination else null,
+            ),
             .random = seed[0..32].*,
             .key_seed = seed[32..64].*,
         }),
         .http3 = .init(.server),
         .local = source,
+        .original = initial.destination,
         .address = message.from,
         .started_ns = now_ns,
         .last_ns = now_ns,
@@ -291,12 +398,115 @@ fn accept(
         .uni_sent = @splat(0),
         .readable = undefined,
         .readable_len = 0,
-        .answered = undefined,
-        .answered_len = 0,
+        .answers = undefined,
+        .answers_len = 0,
         .live = true,
     };
     try note(log, "accepted a connection as {x}", .{source.bytes()});
     return slot;
+}
+
+/// Answer a first flight with a Retry, and forget about it.
+///
+/// No connection state is created: RFC 9000 section 8.1.2's whole point is that
+/// a server retries *before* committing anything, so that an address it has not
+/// validated cannot make it hold memory. The client comes back with the token
+/// and `accept` starts from there.
+fn sendRetry(
+    io: Io,
+    log: *Io.Writer,
+    socket: *Io.net.Socket,
+    message: Io.net.IncomingMessage,
+    initial: @FieldType(quic.packet.Header, "initial"),
+    source: quic.ConnectionId,
+    shared: *const Shared,
+) !void {
+    // Section 17.2.5.1: the Source Connection ID a Retry carries must differ
+    // from the one the client addressed, and a client discards a Retry that
+    // breaks the rule. `source` is drawn fresh per datagram, so the only way
+    // they collide is chance at 2^-64 — and answering nothing is better than
+    // answering a packet the client will throw away.
+    if (source.eql(&initial.destination)) return;
+
+    var token: [1 + quic.ConnectionId.octets_max + token_mac_octets]u8 = undefined;
+    const octets = makeToken(&token, initial.destination, message.from, shared);
+
+    var datagram: [512]u8 = @splat(0);
+    var scratch: [1024]u8 = undefined;
+    const written = try quic.packet.writeRetry(&datagram, &scratch, .{
+        .destination = initial.source,
+        .source = source,
+        .token = octets,
+        .original_destination = initial.destination,
+    });
+    try socket.send(io, &message.from, datagram[0..written]);
+    if (shared.verbose) try note(log, "retried {x} as {x}", .{ initial.destination.bytes(), source.bytes() });
+}
+
+/// `odcid_len || odcid || HMAC(key, odcid || address)`.
+fn makeToken(
+    target: []u8,
+    original: quic.ConnectionId,
+    address: Io.net.IpAddress,
+    shared: *const Shared,
+) []const u8 {
+    const bytes = original.bytes();
+    target[0] = @intCast(bytes.len);
+    @memcpy(target[1..][0..bytes.len], bytes);
+    var mac: [Hmac.mac_length]u8 = undefined;
+    tokenMac(&mac, bytes, address, shared);
+    @memcpy(target[1 + bytes.len ..][0..token_mac_octets], mac[0..token_mac_octets]);
+    return target[0 .. 1 + bytes.len + token_mac_octets];
+}
+
+/// The identifier a token vouches for, or null if it vouches for nothing.
+fn validateToken(
+    token: []const u8,
+    address: Io.net.IpAddress,
+    shared: *const Shared,
+) ?quic.ConnectionId {
+    if (token.len < 1) return null;
+    const length = token[0];
+    if (length > quic.ConnectionId.octets_max) return null;
+    if (token.len != 1 + @as(usize, length) + token_mac_octets) return null;
+
+    const bytes = token[1..][0..length];
+    var expected: [Hmac.mac_length]u8 = undefined;
+    tokenMac(&expected, bytes, address, shared);
+    // Constant-time, because a token that can be probed a byte at a time is a
+    // token an off-path attacker can forge — and forging one is forging an
+    // address validation.
+    if (!std.crypto.timing_safe.eql(
+        [token_mac_octets]u8,
+        expected[0..token_mac_octets].*,
+        token[1 + length ..][0..token_mac_octets].*,
+    )) return null;
+    return quic.ConnectionId.init(bytes) catch null;
+}
+
+fn tokenMac(
+    out: *[Hmac.mac_length]u8,
+    original: []const u8,
+    address: Io.net.IpAddress,
+    shared: *const Shared,
+) void {
+    var mac: Hmac = .init(&shared.token_key);
+    mac.update(original);
+    // The family goes in too, so that an IPv4 address and the IPv6 one that
+    // embeds it cannot share a token.
+    switch (address) {
+        .ip4 => |one| {
+            mac.update(&[_]u8{4});
+            mac.update(&one.bytes);
+            mac.update(std.mem.asBytes(&one.port));
+        },
+        .ip6 => |one| {
+            mac.update(&[_]u8{6});
+            mac.update(&one.bytes);
+            mac.update(std.mem.asBytes(&one.port));
+        },
+    }
+    mac.final(out);
 }
 
 /// This endpoint's transport parameters. RFC 9000 section 7.3 has the client
@@ -305,8 +515,14 @@ fn transportParameters(
     target: []u8,
     source: quic.ConnectionId,
     original: quic.ConnectionId,
+    retry_source: ?quic.ConnectionId,
 ) ![]const u8 {
     const written = try quic.transport_parameters.encode(target, &.{
+        // Section 7.3: present exactly when a Retry was sent, and equal to the
+        // Retry's Source Connection ID. A client refuses the connection if
+        // either half is wrong, which is what makes the identifier an attacker
+        // injected during the handshake detectable.
+        .retry_source_connection_id = retry_source,
         .initial_max_data = connection_receive_octets,
         .initial_max_stream_data_bidi_local = stream_receive_octets,
         .initial_max_stream_data_bidi_remote = stream_receive_octets,
@@ -323,9 +539,9 @@ fn transportParameters(
 
 /// Everything that happens between datagrams: the handshake, the HTTP/3
 /// streams, and the responses.
-fn drive(io: Io, log: *Io.Writer, peer: *Peer, now_ns: u64, verbose: bool) !void {
-    _ = io;
+fn drive(io: Io, log: *Io.Writer, peer: *Peer, now_ns: u64, shared: *const Shared, scratch: []u8) !void {
     _ = now_ns;
+    const verbose = shared.verbose;
 
     // The handshake, in the same shape as the client's.
     for ([_]quic.crypto.Level{ .initial, .handshake, .one_rtt }) |level| {
@@ -384,10 +600,20 @@ fn drive(io: Io, log: *Io.Writer, peer: *Peer, now_ns: u64, verbose: bool) !void
     }
 
     if (peer.connection.state != .established) return;
-    if (!peer.http3_started and std.mem.eql(u8, peer.server.alpn(), "h3")) {
-        try startHttp3(peer);
+
+    // `hq-interop` has no framing and no unidirectional streams: the request is
+    // a line and the response is the file. Everything below it is HTTP/3's.
+    if (std.mem.eql(u8, peer.server.alpn(), "hq-interop")) {
+        var index: usize = 0;
+        // Bounded by `readable_len`.
+        while (index < peer.readable_len) : (index += 1) {
+            respondHq(io, peer, shared, peer.readable[index]) catch {};
+        }
+        try pushAnswers(io, peer, scratch);
+        return;
     }
-    if (!peer.http3_started) return;
+
+    if (!peer.http3_started) try startHttp3(peer);
     try pushUnidirectional(peer);
 
     var index: usize = 0;
@@ -415,7 +641,7 @@ fn drive(io: Io, log: *Io.Writer, peer: *Peer, now_ns: u64, verbose: bool) !void
             return;
         };
         for (events[0..result.events]) |event| {
-            respond(log, peer, event) catch |err| {
+            respond(io, peer, shared, event) catch |err| {
                 const application = respondCode(err);
                 try note(log, "response on stream {d}: {s} (0x{x})", .{
                     id,
@@ -428,6 +654,7 @@ fn drive(io: Io, log: *Io.Writer, peer: *Peer, now_ns: u64, verbose: bool) !void
         }
         if (result.consumed > 0) try peer.connection.consume(id, result.consumed);
     }
+    try pushAnswers(io, peer, scratch);
 }
 
 const unidirectional_streams = [3]u64{ control_stream, qpack_encoder_stream, qpack_decoder_stream };
@@ -467,7 +694,7 @@ fn respondCode(err: RespondError) h3.quic.error_code.Application {
     return h3.http3.code(narrowed);
 }
 
-fn respond(log: *Io.Writer, peer: *Peer, event: h3.http3.Event) RespondError!void {
+fn respond(io: Io, peer: *Peer, shared: *const Shared, event: h3.http3.Event) RespondError!void {
     switch (event) {
         .headers => |value| {
             // Validated before it is answered: RFC 9114 section 4.3 is what
@@ -480,43 +707,143 @@ fn respond(log: *Io.Writer, peer: *Peer, event: h3.http3.Event) RespondError!voi
             var validator: h3.fields.MessageValidator = .init(.{
                 .kind = if (value.trailers) .trailer else .request,
             });
+            var path: [256]u8 = undefined;
+            var path_len: usize = 0;
             while (iterator.next() catch return error.GeneralProtocolError) |field| {
                 validator.field(&field) catch return error.MessageError;
+                if (std.mem.eql(u8, field.name, ":path") and field.value.len <= path.len) {
+                    @memcpy(path[0..field.value.len], field.value);
+                    path_len = field.value.len;
+                }
             }
             validator.finish() catch return error.MessageError;
             if (value.trailers) return;
 
             // Answered once. A second HEADERS on the same stream is trailers,
             // which is legal and is not a second request.
-            for (peer.answered[0..peer.answered_len]) |one| {
-                if (one == value.stream) return;
-            }
-            if (peer.answered_len < peer.answered.len) {
-                peer.answered[peer.answered_len] = value.stream;
-                peer.answered_len += 1;
-            }
+            if (findAnswer(peer, value.stream) != null) return;
+            const answer = openAnswer(io, peer, shared, value.stream, path[0..path_len]) orelse
+                return error.ExcessiveLoad;
 
             var out: [512]u8 = undefined;
+            var length: [24]u8 = undefined;
             var offset = try peer.http3.writeHeaders(&out, &.{
                 .{ .name = ":status", .value = "200" },
-                .{ .name = "content-length", .value = "7" },
+                .{
+                    .name = "content-length",
+                    .value = std.fmt.bufPrint(&length, "{d}", .{answer.total}) catch
+                        return error.GeneralProtocolError,
+                },
             });
-            offset += try Http3.writeData(out[offset..], body.len);
-            @memcpy(out[offset..][0..body.len], body);
-            offset += body.len;
-            // A short write would mean the peer's flow control window is
-            // smaller than one response, which for a seven-octet body means
-            // something is wrong with the connection rather than with the
-            // response.
-            _ = peer.connection.write(value.stream, out[0..offset], true) catch
+            offset += try Http3.writeData(out[offset..], answer.total);
+            // The frame header only. The body follows through `pushAnswers` as
+            // the peer's window opens — a megabyte does not fit in one write,
+            // and a server that assumed it did would truncate every large
+            // response and call it a success.
+            const written = peer.connection.write(value.stream, out[0..offset], false) catch
                 return error.GeneralProtocolError;
+            if (written != offset) return error.GeneralProtocolError;
         },
         .settings => {},
         .goaway => {},
         .data => {},
         .finished => |id| peer.http3.release(id),
     }
-    _ = log;
+}
+
+fn findAnswer(peer: *Peer, stream: u64) ?*Answer {
+    // Bounded by `answers_len`.
+    for (peer.answers[0..peer.answers_len]) |*answer| {
+        if (answer.stream == stream) return answer;
+    }
+    return null;
+}
+
+/// Resolve a request path against `www` and record what has to go out.
+///
+/// A path that names nothing gets the built-in body rather than a 404: the
+/// runner only ever asks for files it put there, and h3spec does not care what
+/// the body is — but a server that answered 404 to h3spec's control requests
+/// would fail every case that needs a working request first.
+fn openAnswer(
+    io: Io,
+    peer: *Peer,
+    shared: *const Shared,
+    stream: u64,
+    path: []const u8,
+) ?*Answer {
+    if (peer.answers_len == peer.answers.len) return null;
+    const answer = &peer.answers[peer.answers_len];
+    answer.* = .{ .stream = stream, .file = null, .offset = 0, .total = body.len };
+
+    open: {
+        const www = shared.www orelse break :open;
+        const name = std.mem.trimStart(u8, path, "/");
+        if (name.len == 0) break :open;
+        // No path this file resolves may leave the directory it was given. The
+        // runner never asks it to, which is exactly why the check has to be
+        // here rather than implied by the runner's good manners.
+        if (std.mem.indexOf(u8, name, "..") != null) break :open;
+        const file = www.openFile(io, name, .{}) catch break :open;
+        const size = file.stat(io) catch {
+            file.close(io);
+            break :open;
+        };
+        answer.file = file;
+        answer.total = @min(size.size, body_octets_max);
+    }
+
+    peer.answers_len += 1;
+    return answer;
+}
+
+/// Push what is left of every answer, as the peer's flow control allows.
+fn pushAnswers(io: Io, peer: *Peer, scratch: []u8) !void {
+    var index: usize = 0;
+    // Bounded by `answers_len`.
+    while (index < peer.answers_len) {
+        const answer = &peer.answers[index];
+        if (answer.offset < answer.total) {
+            const want = @min(scratch.len, answer.total - answer.offset);
+            const chunk = if (answer.file) |file|
+                scratch[0..(file.readPositionalAll(io, scratch[0..want], answer.offset) catch 0)]
+            else
+                body[@intCast(answer.offset)..@intCast(answer.total)];
+            if (chunk.len > 0) {
+                const fin = answer.offset + chunk.len == answer.total;
+                const taken = peer.connection.write(answer.stream, chunk, fin) catch 0;
+                answer.offset += taken;
+                // A short write is ordinary: it means the window closed, and
+                // the FIN went with the last octet only if all of them fit.
+                if (taken != chunk.len) {
+                    index += 1;
+                    continue;
+                }
+            }
+        }
+        if (answer.offset < answer.total) {
+            index += 1;
+            continue;
+        }
+        // Finished. The slot goes back, which for a `multiconnect` run is what
+        // keeps the table from filling.
+        if (answer.file) |file| file.close(io);
+        peer.answers[index] = peer.answers[peer.answers_len - 1];
+        peer.answers_len -= 1;
+    }
+}
+
+/// `hq-interop`: the request is `GET /path\r\n` and the response is the file,
+/// with no framing on either side.
+fn respondHq(io: Io, peer: *Peer, shared: *const Shared, stream: u64) !void {
+    if (findAnswer(peer, stream) != null) return;
+    const readable = peer.connection.readable(stream);
+    const end = std.mem.indexOf(u8, readable, "\r\n") orelse return;
+    const line = readable[0..end];
+    try peer.connection.consume(stream, end + 2);
+
+    const space = std.mem.indexOfScalar(u8, line, ' ') orelse return;
+    _ = openAnswer(io, peer, shared, stream, line[space + 1 ..]) orelse return;
 }
 
 fn noteReadable(peer: *Peer, id: u64) void {

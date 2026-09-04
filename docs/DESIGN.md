@@ -227,6 +227,10 @@ all three build legs):
   `:authority` and `Host` agree. Trailer sections are a `Kind` of their own,
   because section 4.3 forbids every pseudo-header in one.
 - `quic/Streams.zig` — streams, their states, and both levels of flow control.
+  The send buffer is reclaimed as the peer acknowledges it, so
+  `stream_send_octets` bounds what is *unacknowledged in flight* rather than
+  what a stream can carry; it bounded the total until `interop/server.zig`
+  served a file larger than one buffer.
   The connection-level window is the one that bounds memory; see the file. Also
   section 4.6's stream limit, which is the peer's cap on what *this* endpoint
   opens — the peer's own streams are bounded by `streams_max`, which is the

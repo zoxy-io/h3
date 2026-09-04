@@ -217,7 +217,15 @@ pub fn Streams(comptime config: Config) type {
             send: [config.send_octets]u8 = @splat(0),
             send_len: u32 = 0,
             framed: u32 = 0,
+            /// Octets already acknowledged and dropped from the front of
+            /// `send`, which is what a STREAM frame's Offset field is measured
+            /// from. It was here from the beginning and never advanced, so the
+            /// buffer only ever filled: a stream could send `send_octets` in
+            /// total and then nothing, for the life of the connection.
             send_offset: u64 = 0,
+            /// The contiguous prefix the peer has acknowledged, as an absolute
+            /// stream offset. `send_offset` follows it.
+            acked_to: u64 = 0,
             send_fin: bool = false,
             /// Whether the FIN has been put in a packet. Without it nothing
             /// records that the FIN went out, `wantsSend` stays true forever
@@ -867,10 +875,60 @@ pub fn Streams(comptime config: Config) type {
         //# Endpoints SHOULD prioritize retransmission of data over sending new
         //# data, unless priorities specified by the application indicate
         //# otherwise; see Section 2.3.
-        pub fn rewind(self: *Self, id: u64, from: u32, fin_lost: bool) void {
+        /// `from` is an absolute stream offset, not an index into `send`.
+        ///
+        /// It used to be an index, which was the same number while nothing was
+        /// ever reclaimed. Once the buffer can shift, a lost packet's range has
+        /// to be named in coordinates that survive the shift — and a range
+        /// entirely below `send_offset` is one the peer has already
+        /// acknowledged, so there is nothing to send again.
+        pub fn rewind(self: *Self, id: u64, from: u64, fin_lost: bool) void {
             const stream = self.find(id) orelse return;
-            stream.framed = @min(stream.framed, from);
+            if (from >= stream.send_offset) {
+                const index = from - stream.send_offset;
+                if (index < stream.framed) stream.framed = @intCast(index);
+            }
             if (fin_lost) stream.fin_framed = false;
+        }
+
+        /// Give back the octets a packet acknowledged.
+        ///
+        /// `start` and `end` are absolute stream offsets. Only a range that
+        /// begins exactly where the acknowledged prefix ends advances it: a
+        /// range past a gap is dropped, and comes back when the gap is filled.
+        /// That is not a heuristic — `rewind` moves the framing watermark back
+        /// to the *start* of a lost packet, so everything after it is framed
+        /// again and its acknowledgements arrive in order behind the
+        /// retransmission.
+        pub fn reclaim(self: *Self, id: u64, start: u64, end: u64) void {
+            const stream = self.find(id) orelse return;
+            if (start != stream.acked_to) return;
+            assert(end >= start);
+            stream.acked_to = end;
+
+            assert(stream.acked_to >= stream.send_offset);
+            const octets = stream.acked_to - stream.send_offset;
+            if (octets == 0) return;
+            // Acknowledged implies *buffered*. It does not imply framed:
+            // RFC 9002's loss detection is a heuristic, so a packet can be
+            // declared lost — which rewinds `framed` behind it — and then
+            // acknowledged anyway, because it was only late. The simulator
+            // found this on the first sweep after reclamation landed, and the
+            // assertion it broke was the claim that the two are the same.
+            assert(octets <= stream.send_len);
+            assert(stream.framed <= stream.send_len);
+            const width: u32 = @intCast(octets);
+            std.mem.copyForwards(
+                u8,
+                stream.send[0 .. stream.send_len - width],
+                stream.send[width..stream.send_len],
+            );
+            stream.send_len -= width;
+            // Octets the peer has do not need framing again, whatever a
+            // spurious loss did to the watermark.
+            stream.framed = if (stream.framed > width) stream.framed - width else 0;
+            stream.send_offset += width;
+            assert(stream.send_offset == stream.acked_to);
         }
     };
 }
