@@ -69,7 +69,7 @@ pub const static_table = @import("qpack/static_table.zig");
 //# An endpoint MUST allow its peer to create an encoder stream and a
 //# decoder stream even if the connection's settings prevent their use.
 //= type=exception
-//= reason=creating and accepting unidirectional streams is the HTTP/3 connection layer's, which docs/DESIGN.md section 6 lists as next rather than built; stream.zig names both QPACK types so it can
+//= reason=creating and accepting unidirectional streams is `Http3.zig`'s; stream.zig names both QPACK types so it can
 pub const field_line = @import("qpack/field_line.zig");
 
 /// A decoded field. RFC 9204 keeps RFC 7541's notion of one, so this is

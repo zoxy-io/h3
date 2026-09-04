@@ -31,17 +31,19 @@
 //! It is the runner's transport-only application protocol and it exercises
 //! exactly what this package implements.
 //!
+//! `http3` runs HTTP/3 proper — `Http3` opens the control stream, exchanges
+//! SETTINGS, and sequences HEADERS and DATA — while every other case uses
+//! `hq-interop`, which is HTTP/0.9 and exercises the transport without the
+//! framing on top of it.
+//!
 //! `retry` works too, and needs nothing from this file beyond asking for it:
 //! `Connection.receiveRetry` adopts the server's identifier, re-derives the
 //! Initial keys, carries the token into every subsequent Initial and checks
 //! `retry_source_connection_id` against the handshake. It was the first gap
 //! this directory named and it is closed.
 //!
-//! **`http3` is refused with exit 127**, which is the runner's "unsupported"
-//! and the reason the code is not 1: the control stream and the settings
-//! exchange are not built, so `h3` as an ALPN would be a lie told to a server.
-//!
-//! A test case this binary has never heard of is also 127. Reporting 1 for an
+//! A test case this binary has never heard of — `zerortt`, `amplificationlimit`,
+//! `resumption` — is exit 127, which is the runner's "unsupported". Reporting 1 for an
 //! unimplemented feature is how an implementation ends up with a red square
 //! that means "not attempted" and a red square that means "wrong" in the same
 //! colour.
@@ -73,14 +75,28 @@ const downloads_default = "/downloads";
 const stream_receive_octets: u32 = 128 * 1024;
 const connection_receive_octets: u64 = 1 << 20;
 
+/// Requests, plus this endpoint's three unidirectional streams and the peer's
+/// three. HTTP/3 spends streams the way `hq-interop` does not, and a limit that
+/// only counted requests would refuse the peer's control stream.
+const streams_max: u32 = requests_max + 2 * unidirectional_max;
+
 const Connection = quic.Connection(.{
     .crypto_octets = 32 * 1024,
     .ack_ranges_max = 64,
     .sent_max = 256,
-    .streams_max = requests_max,
+    .streams_max = streams_max,
     .stream_receive_octets = stream_receive_octets,
     .stream_send_octets = 4 * 1024,
     .connection_receive_octets = connection_receive_octets,
+});
+
+/// RFC 9114 section 6.2 and RFC 9204 section 4.2: a control stream, a QPACK
+/// encoder stream and a QPACK decoder stream, each way.
+const unidirectional_max: u32 = 4;
+
+const Http3 = h3.Http3(.{
+    .requests_max = requests_max,
+    .unidirectional_max = 2 * unidirectional_max,
 });
 
 /// Datagram buffers. The receive side takes anything the path delivers up to
@@ -102,7 +118,7 @@ const connection_deadline_ns: u64 = 60 * std.time.ns_per_s;
 /// wants to send is a bug this loop should not turn into a hang.
 const flush_datagrams_max: u32 = 64;
 
-/// Streams a single connection will open, which is one per request.
+/// Requests a single connection will carry, which is one per URL.
 const requests_max: u32 = 8;
 
 /// 1-RTT octets between key updates in the `keyupdate` test case. The runner
@@ -128,6 +144,13 @@ const key_update_interval_octets: u64 = 64 * 1024;
 /// whole directory, arriving as a bug in the directory itself.
 const key_update_interval_ns: u64 = 1 * std.time.ns_per_s;
 
+/// RFC 9000 section 2.1: client-initiated unidirectional streams are 2, 6, 10.
+/// Fixed rather than allocated, because there are exactly three of them and
+/// their order is this endpoint's choice.
+const control_stream: u64 = 2;
+const qpack_encoder_stream: u64 = 6;
+const qpack_decoder_stream: u64 = 10;
+
 /// Events taken from `Connection.poll` per pass. Larger than the connection's
 /// own queue, so a pass always empties it.
 const events_per_drain_max: u32 = 256;
@@ -141,6 +164,7 @@ const Testcase = enum {
     handshakeloss,
     transferloss,
     retry,
+    http3,
 
     fn parse(name: []const u8) ?Testcase {
         return std.meta.stringToEnum(Testcase, name);
@@ -151,6 +175,13 @@ const Testcase = enum {
     /// multiplexed onto one.
     fn oneConnectionPerRequest(self: Testcase) bool {
         return self == .multiconnect;
+    }
+
+    /// The application protocol. `http3` is the only case that runs HTTP/3
+    /// proper; everything else uses `hq-interop`, which is HTTP/0.9 and
+    /// exercises the transport without the framing on top of it.
+    fn alpn(self: Testcase) []const u8 {
+        return if (self == .http3) "h3" else "hq-interop";
     }
 
     /// `chacha20` asks the client to offer nothing but
@@ -305,6 +336,16 @@ const Request = struct {
 const Session = struct {
     connection: Connection = undefined,
     client: tls.Client = undefined,
+    /// RFC 9114's sequencing, used only by the `http3` test case.
+    http3: Http3 = undefined,
+    /// Whether this endpoint's control and QPACK streams have gone out.
+    http3_started: bool = false,
+    /// Streams the connection has reported data on, so that a pass can drain
+    /// each of them once. HTTP/3 needs this and `hq-interop` does not: a
+    /// response arrives on a stream this endpoint opened, but the peer's
+    /// control stream is one only an event can announce.
+    readable: [streams_max]u64 = undefined,
+    readable_len: usize = 0,
     requests: [requests_max]Request = undefined,
     requests_len: usize = 0,
     /// A scratch datagram, held here rather than on the stack for the same
@@ -369,6 +410,9 @@ const Session = struct {
         self.since_key_update = 0;
         self.key_updated_ns = 0;
         self.key_updates = 0;
+        self.http3 = .init(.client);
+        self.http3_started = false;
+        self.readable_len = 0;
 
         // The transport parameters this endpoint advertises. They are its
         // comptime limits and not a policy: a `Connection` enforces what it was
@@ -383,7 +427,11 @@ const Session = struct {
             .initial_max_stream_data_bidi_remote = stream_receive_octets,
             .initial_max_stream_data_uni = stream_receive_octets,
             .initial_max_streams_bidi = requests_max,
-            .initial_max_streams_uni = 0,
+            // Zero here refused the peer's control stream, which is how an
+            // `http3` run fails before it starts: a server that cannot open one
+            // cannot send SETTINGS, and a client that never sees SETTINGS is
+            // talking to nobody.
+            .initial_max_streams_uni = unidirectional_max,
             .max_udp_payload_size = Connection.datagram_octets,
             .active_connection_id_limit = 2,
             .initial_source_connection_id = source,
@@ -391,7 +439,7 @@ const Session = struct {
 
         self.client = .init(.{
             .server_name = first.host,
-            .alpn = "hq-interop",
+            .alpn = testcase.alpn(),
             .transport_parameters = parameters_buffer[0..parameters_octets],
             .offer = testcase.offer(),
             .random = seed[0..32].*,
@@ -437,18 +485,25 @@ const Session = struct {
             try self.pumpCrypto(log, key_log);
             if (self.verbose) try note(log, "state {s} at {d}ms", .{ @tagName(self.connection.state), now / std.time.ns_per_ms });
 
+            if (self.connection.state == .established and !self.http3_started and testcase == .http3) {
+                try self.startHttp3();
+            }
             if (!requests_sent and self.connection.state == .established) {
                 for (self.requests[0..self.requests_len]) |*request| {
-                    var line_buffer: [512]u8 = undefined;
-                    // HTTP/0.9, which is the whole of `hq-interop`'s request.
-                    const line = try std.fmt.bufPrint(&line_buffer, "GET {s}\r\n", .{request.url.path});
+                    var line_buffer: [1024]u8 = undefined;
+                    const line = if (testcase == .http3)
+                        try self.writeRequest(&line_buffer, request.url)
+                    else
+                        // HTTP/0.9, which is the whole of `hq-interop`'s request.
+                        try std.fmt.bufPrint(&line_buffer, "GET {s}\r\n", .{request.url.path});
                     const written = try self.connection.write(request.stream, line, true);
                     if (written != line.len) return error.RequestTooLarge;
                 }
                 requests_sent = true;
             }
 
-            try self.drainStreams(testcase, now);
+            if (testcase == .http3) try self.drainHttp3(log) else try self.drainStreams(now);
+            try self.keyUpdate(testcase, now);
             try self.drainEvents(log);
 
             try self.flush(io, log, &socket, &peer, now);
@@ -527,8 +582,135 @@ const Session = struct {
         if (finished.len > 0) try self.connection.cryptoIn(.handshake, finished);
     }
 
-    /// Take whatever is readable on each request's stream and write it out.
-    fn drainStreams(self: *Session, testcase: Testcase, now_ns: u64) !void {
+    /// RFC 9114 section 6.2: this endpoint's three unidirectional streams, sent
+    /// as soon as there are 1-RTT keys to send them under.
+    ///
+    /// The QPACK streams carry their type octet and nothing else, ever. This
+    /// endpoint advertises `SETTINGS_QPACK_MAX_TABLE_CAPACITY = 0`, so it will
+    /// never encode a dynamic table instruction — but section 4.2 of RFC 9204
+    /// still expects the streams to exist, and a server that waits for them
+    /// before sending its own response is a server this client would hang on.
+    fn startHttp3(self: *Session) !void {
+        var buffer: [256]u8 = undefined;
+        const control = try self.http3.writeControl(&buffer);
+        if (try self.connection.write(control_stream, buffer[0..control], false) != control) {
+            return error.RequestTooLarge;
+        }
+        const encoder = try h3.stream.write(&buffer, .qpack_encoder);
+        _ = try self.connection.write(qpack_encoder_stream, buffer[0..encoder], false);
+        const decoder = try h3.stream.write(&buffer, .qpack_decoder);
+        _ = try self.connection.write(qpack_decoder_stream, buffer[0..decoder], false);
+        self.http3_started = true;
+    }
+
+    /// One request, as a HEADERS frame. RFC 9114 section 4.3.1's four
+    /// pseudo-headers and nothing else: `hq-interop`'s request line, spelled
+    /// the way HTTP/3 spells it.
+    fn writeRequest(self: *Session, target: []u8, url: Url) ![]const u8 {
+        var authority: [256]u8 = undefined;
+        const host = try std.fmt.bufPrint(&authority, "{s}:{d}", .{ url.host, url.port });
+        const written = try self.http3.writeHeaders(target, &.{
+            .{ .name = ":method", .value = "GET" },
+            .{ .name = ":scheme", .value = "https" },
+            .{ .name = ":authority", .value = host },
+            .{ .name = ":path", .value = url.path },
+        });
+        return target[0..written];
+    }
+
+    /// Drive `Http3` over every stream the connection has reported data on.
+    fn drainHttp3(self: *Session, log: *Io.Writer) !void {
+        var index: usize = 0;
+        // Bounded by `readable_len`, which is bounded by the stream table.
+        while (index < self.readable_len) : (index += 1) {
+            const id = self.readable[index];
+            const stream = self.connection.findStream(id) orelse continue;
+            if (stream.receive_state == .reset) return error.StreamReset;
+            const data = self.connection.readable(id);
+            // Whether the FIN sits at the end of what is readable now. A
+            // half-arrived frame followed by a FIN is a truncated message, and
+            // `Http3` has to be told which it is looking at.
+            const fin = if (stream.received.final_size) |size|
+                size == stream.consumed + data.len
+            else
+                false;
+            if (data.len == 0 and !fin) continue;
+
+            var events: [16]h3.http3.Event = undefined;
+            const result = self.http3.receive(id, data, fin, &events) catch |err| {
+                try note(log, "http3 on stream {d}: {s} (0x{x})", .{
+                    id,
+                    @errorName(err),
+                    @intFromEnum(h3.http3.code(err)),
+                });
+                return err;
+            };
+            for (events[0..result.events]) |event| try self.applyHttp3(log, event);
+            if (result.consumed > 0) try self.connection.consume(id, result.consumed);
+            self.since_key_update += result.consumed;
+        }
+    }
+
+    fn applyHttp3(self: *Session, log: *Io.Writer, event: h3.http3.Event) !void {
+        switch (event) {
+            .settings => |value| try note(log, "peer settings: table {d}, blocked {d}, section {d}", .{
+                value.qpack_max_table_capacity,
+                value.qpack_blocked_streams,
+                value.max_field_section_size,
+            }),
+            .headers => |value| {
+                // Decoded and validated here rather than in `Http3`: a decoded
+                // field list is far larger than the section it came from, and
+                // the buffer it needs is the caller's.
+                var buffer: [16 * 1024]u8 = undefined;
+                var iterator = try h3.qpack.field_line.iterate(value.section, &buffer, 1 << 20);
+                var validator: h3.fields.MessageValidator = .init(.{
+                    .kind = if (value.trailers) .trailer else .response,
+                });
+                while (try iterator.next()) |field| {
+                    try validator.field(&field);
+                    if (std.mem.eql(u8, field.name, ":status")) {
+                        try note(log, "stream {d}: status {s}", .{ value.stream, field.value });
+                    }
+                }
+                try validator.finish();
+            },
+            .data => |value| {
+                const request = self.requestFor(value.stream) orelse return;
+                try request.writer.interface.writeAll(value.payload);
+                request.octets += value.payload.len;
+            },
+            .finished => |id| {
+                const request = self.requestFor(id) orelse return;
+                request.complete = true;
+                self.http3.release(id);
+            },
+            .goaway => |id| try note(log, "peer is going away at {d}", .{id}),
+        }
+    }
+
+    fn requestFor(self: *Session, id: u64) ?*Request {
+        // Bounded by `requests_len`.
+        for (self.requests[0..self.requests_len]) |*request| {
+            if (request.stream == id) return request;
+        }
+        return null;
+    }
+
+    /// Remember that a stream has data, once.
+    fn noteReadable(self: *Session, id: u64) void {
+        // Bounded by `readable_len`.
+        for (self.readable[0..self.readable_len]) |one| {
+            if (one == id) return;
+        }
+        if (self.readable_len == self.readable.len) return;
+        self.readable[self.readable_len] = id;
+        self.readable_len += 1;
+    }
+
+    /// `hq-interop`: the response body is the stream, with no framing at all.
+    fn drainStreams(self: *Session, now_ns: u64) !void {
+        _ = now_ns;
         for (self.requests[0..self.requests_len]) |*request| {
             if (request.complete) continue;
             const readable = self.connection.readable(request.stream);
@@ -545,7 +727,10 @@ const Session = struct {
             if (stream.receive_state == .data_read) request.complete = true;
             if (stream.receive_state == .reset) return error.StreamReset;
         }
+    }
 
+    /// RFC 9001 section 6's key update, for the test case that asks for one.
+    fn keyUpdate(self: *Session, testcase: Testcase, now_ns: u64) !void {
         if (testcase != .keyupdate) return;
         // Three conditions, and only one of them is the library's. RFC 9001
         // section 6.1's "the current phase has been acknowledged" is
@@ -582,6 +767,10 @@ const Session = struct {
                 .closed => |value| try note(log, "peer closed: code 0x{x} application={any}", .{ value.code, value.application }),
                 .stream_reset => |value| try note(log, "stream {d} reset: code 0x{x}", .{ value.stream, value.code }),
                 .overflowed => |count| try note(log, "{d} events dropped", .{count}),
+                // Which stream, so that `drainHttp3` can find the peer's
+                // control stream — a stream this endpoint never opened and
+                // could not otherwise know the identifier of.
+                .stream_readable => |id| self.noteReadable(id),
                 else => {},
             }
         }
@@ -672,8 +861,10 @@ test "an unknown test case is unsupported rather than a failure" {
     // The distinction the runner draws, and the reason `main` returns 127 for
     // one and 1 for the other: a red square meaning "not attempted" and a red
     // square meaning "wrong" are not the same result.
-    try testing.expectEqual(@as(?Testcase, null), Testcase.parse("http3"));
+    try testing.expectEqual(@as(?Testcase, null), Testcase.parse("zerortt"));
+    try testing.expectEqual(@as(?Testcase, null), Testcase.parse("amplificationlimit"));
     try testing.expectEqual(@as(?Testcase, .retry), Testcase.parse("retry"));
+    try testing.expectEqual(@as(?Testcase, .http3), Testcase.parse("http3"));
     try testing.expectEqual(@as(?Testcase, .transfer), Testcase.parse("transfer"));
 }
 

@@ -195,7 +195,7 @@ pub const Error = error{
 //# MUST treat this as a connection error of type
 //# QPACK_ENCODER_STREAM_ERROR.
 //= type=exception
-//= reason=eviction is the dynamic table's, which docs/DESIGN.md section 6 lists as next rather than built; with a capacity of zero there is no entry to evict
+//= reason=eviction is the dynamic table's, which `Http3.zig` now does; with a capacity of zero there is no entry to evict
 //= https://www.rfc-editor.org/rfc/rfc9204#section-3.2.3
 //# The encoder MUST NOT set a dynamic table capacity that exceeds this
 //# maximum, but it can choose to use a lower dynamic table capacity; see

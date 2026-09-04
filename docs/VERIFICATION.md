@@ -81,6 +81,9 @@ requirement list extracted from the specification.
 | The server half of the same rule was absent entirely | interop shim | Nothing tested a server's Initial keys after the handshake moved on |
 | §14.1's padding asked whether the client *had* Initial keys rather than whether the datagram *carried* an Initial packet — a proxy that held only because of the bug above, and that corrupted every 1-RTT packet once it was fixed | interop shim, immediately after fixing the first | One bug was holding another one up; and reverting this fix broke no test until one was written for it |
 | The peer's four flow control limits were parsed and applied to nothing, so a stream opened with a send limit of zero and the first request could never be written | interop shim | `sim/` sends explicit MAX_DATA and MAX_STREAM_DATA, which is what a peer sends *after* the initial limit rather than instead of it |
+| Five of `Event`'s eight variants — `handshake_confirmed`, `stream_reset`, `stream_stopped`, `key_updated`, `closed` — were declared, documented, and emitted by nothing | the interop shim needing a close code | The tests called `emit` directly, so they proved the queue worked and never that anything filled it |
+| MAX_STREAM_DATA was offered for every stream in the table, including this endpoint's own send-only ones, which RFC 9000 section 19.10 makes a connection error at the peer | interop shim, first HTTP/3 connection | `hq-interop` never opens a unidirectional stream, so for the life of the package the loop was only ever asked about bidirectional ones |
+| The HTTP/3 layer buffered a whole DATA frame before delivering any of it, and a one-megabyte frame is larger than a stream's receive window — which only moves when octets are consumed | interop shim, against ngtcp2 | quic-go and aioquic chunk their DATA frames, so two implementations out of three hid it |
 
 Two things about that table.
 
@@ -576,11 +579,43 @@ afterwards, and it is the one that asserts a datagram carrying no Initial
 packet stays under 1200 octets.
 
 Verified against three independent implementations — quic-go, ngtcp2 and
-aioquic — at six test cases each, twice over: once against servers in their
+aioquic — at seven test cases each, including HTTP/3 proper, twice over: once against servers in their
 normal mode and once against servers configured to answer every connection with
 a Retry, so that all six run the Retry path as well. A megabyte byte for byte
 each time, with all four TLS secrets matching each server's own key log
 exactly.
+
+**`http3` is covered**, which needed the connection layer `frame.zig` and
+`stream.zig` had been waiting for: `src/Http3.zig` opens the control stream,
+exchanges SETTINGS, sequences HEADERS and DATA under RFC 9114 section 4.1,
+refuses a push stream, and holds GOAWAY in both directions. Thirty-three
+exception reasons across `frame.zig`, `stream.zig` and `qpack.zig` had said
+"the HTTP/3 connection layer, which docs/DESIGN.md section 6 lists as next
+rather than built" — every one was rewritten, because a reason describing a gap
+that has closed is worse than no reason at all.
+
+It found three more defects, and the first two are the same shape as everything
+above:
+
+1. **Five of `Connection.Event`'s eight variants were emitted by nothing.**
+   `handshake_confirmed`, `stream_reset`, `stream_stopped`, `key_updated` and
+   `closed` were declared, documented and dead. The commit that added them said
+   they were wired; three of seven were. The tests called `emit` directly, so
+   they proved the queue worked and never that anything filled it — section 1's
+   recurring failure mode, arriving inside the code written to answer section
+   1's recurring failure mode. Found because a server closed the HTTP/3
+   connection and the shim could not say with what code.
+2. **MAX_STREAM_DATA was offered for every stream in the table**, this
+   endpoint's own send-only ones included, which RFC 9000 section 19.10 makes a
+   connection error at the peer. `hq-interop` never opens a unidirectional
+   stream, so the loop had only ever been asked about bidirectional ones.
+   quic-go named it exactly: "invalid frame for send stream 2".
+3. **A whole DATA frame was buffered before any of it was delivered.** ngtcp2
+   sends a megabyte body as one DATA frame; a stream's receive window is
+   smaller than that, and the window only moves when octets are consumed. Both
+   endpoints correct, neither able to proceed. quic-go and aioquic chunk their
+   DATA frames, so **two implementations out of three hid it** — the same
+   lesson the key-update spacing taught, in a different place.
 
 **`retry` is now covered too**, and closing it was the first thing the shim's
 existence paid for a second time. RFC 9000 section 17.2.5 was nine `type=todo`
@@ -600,10 +635,13 @@ showed it.
 
 What is left here:
 
-- **`http3`**, which needs the control stream and the settings exchange, and
-  then h3spec pointed at the same binary.
+- **h3spec**, pointed at the same binary, now that `h3` is an ALPN this package
+  can honestly offer.
 - **A server role**, which needs a certificate, a Retry token and address
   validation.
+- **Server push and QPACK's dynamic table**, which `Http3.zig` refuses and
+  declines rather than implements — correctly, and they are the two places its
+  module comment says it stops.
 - **Running it in the real runner**, inside the network simulator, so that
   `handshakeloss` and `transferloss` are run against the loss the runner
   injects rather than against a loopback that drops nothing.

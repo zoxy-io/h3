@@ -56,7 +56,7 @@ const varint = @import("varint.zig");
 //# Extensions that could change the semantics of existing protocol
 //# components MUST be negotiated before being used.
 //= type=exception
-//= reason=negotiating an extension needs the SETTINGS exchange and the control stream, which docs/DESIGN.md section 6 lists as next rather than built; Type.known and allowedOn*Stream are what an extension would have to widen
+//= reason=negotiating an extension needs the SETTINGS exchange and the control stream, which `Http3.zig` now does; Type.known and allowedOn*Stream are what an extension would have to widen
 pub const Type = enum(u64) {
     data = 0x00,
     headers = 0x01,
@@ -66,18 +66,18 @@ pub const Type = enum(u64) {
     //# connection, this MUST be treated as a connection error of type
     //# H3_ID_ERROR.
     //= type=exception
-    //= reason=server push is not implemented and the push ID a connection currently allows is connection state the HTTP/3 layer docs/DESIGN.md section 6 lists as next would hold
+    //= reason=server push is not implemented and the push ID a connection currently allows is connection state `Http3.zig` would hold if server push were implemented; it is not, and `Http3.zig` refuses a push stream rather than tracking one
     //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.3
     //# If a server receives a CANCEL_PUSH frame for a push
     //# ID that has not yet been mentioned by a PUSH_PROMISE frame, this MUST
     //# be treated as a connection error of type H3_ID_ERROR.
     //= type=exception
-    //= reason=server push is not implemented; which push IDs a PUSH_PROMISE has mentioned is connection state the HTTP/3 layer docs/DESIGN.md section 6 lists as next would hold
+    //= reason=server push is not implemented; which push IDs a PUSH_PROMISE has mentioned is connection state `Http3.zig` would hold if server push were implemented; it is not, and `Http3.zig` refuses a push stream rather than tracking one
     //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.3
     //# The server SHOULD abort sending the resource, but the mechanism to do
     //# so depends on the state of the corresponding push stream.
     //= type=exception
-    //= reason=server push is not implemented, so no resource is ever pushed and no push stream ever opened; whether one is open is connection state the HTTP/3 layer docs/DESIGN.md section 6 lists as next would hold
+    //= reason=server push is not implemented, so no resource is ever pushed and no push stream ever opened; whether one is open is connection state `Http3.zig` would hold if server push were implemented; it is not, and `Http3.zig` refuses a push stream rather than tracking one
     //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.3
     //# If the push stream is open, the server SHOULD abruptly terminate that
     //# stream.
@@ -93,7 +93,7 @@ pub const Type = enum(u64) {
     //# A client SHOULD NOT send a CANCEL_PUSH frame when it has already
     //# received a corresponding push stream.
     //= type=exception
-    //= reason=server push is not implemented, and remembering which push streams have arrived is connection state the HTTP/3 layer docs/DESIGN.md section 6 lists as next would hold
+    //= reason=server push is not implemented, and remembering which push streams have arrived is connection state `Http3.zig` would hold if server push were implemented; it is not, and `Http3.zig` refuses a push stream rather than tracking one
     //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.3
     //# The client SHOULD abort reading the stream with an error code of
     //# H3_REQUEST_CANCELLED.
@@ -107,7 +107,7 @@ pub const Type = enum(u64) {
     //# receipt of a PUSH_PROMISE frame that contains a larger push ID than
     //# the client has advertised as a connection error of H3_ID_ERROR.
     //= type=exception
-    //= reason=server push is not implemented; the advertised maximum push ID is connection state the HTTP/3 layer docs/DESIGN.md section 6 lists as next would hold, and this file decodes one frame at a time
+    //= reason=server push is not implemented; the advertised maximum push ID is connection state `Http3.zig` would hold if server push were implemented; it is not, and `Http3.zig` refuses a push stream rather than tracking one, and this file decodes one frame at a time
     //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.5
     //# If so, the decompressed request header sets MUST contain the same
     //# fields in the same order, and both the name and the value in each
@@ -122,13 +122,13 @@ pub const Type = enum(u64) {
     //# If a PUSH_PROMISE frame is received on the control stream, the client
     //# MUST respond with a connection error of type H3_FRAME_UNEXPECTED.
     //= type=exception
-    //= reason=allowedOnControlStream already answers false for push_promise; raising H3_FRAME_UNEXPECTED on it is the connection layer's, which docs/DESIGN.md section 6 lists as next rather than built
+    //= reason=allowedOnControlStream already answers false for push_promise; raising H3_FRAME_UNEXPECTED on it is the connection layer's, which `Http3.zig` now does
     //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.5
     //# A client MUST NOT send a PUSH_PROMISE frame.  A server MUST treat the
     //# receipt of a PUSH_PROMISE frame as a connection error of type
     //# H3_FRAME_UNEXPECTED.
     //= type=exception
-    //= reason=which endpoint this is decides both halves of the rule, and this file encodes and decodes frames without knowing; the HTTP/3 connection layer docs/DESIGN.md section 6 lists as next is what knows
+    //= reason=which endpoint this is decides both halves of the rule, and this file encodes and decodes frames without knowing; `Http3.zig`, the connection layer, is what knows
     //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
     //# PUSH_PROMISE frames are not permitted on push streams;
     //# a pushed response that includes PUSH_PROMISE frames MUST be treated
@@ -138,7 +138,7 @@ pub const Type = enum(u64) {
     //= https://www.rfc-editor.org/rfc/rfc9114#section-4.6
     //# A server SHOULD use push IDs sequentially, beginning from zero.
     //= type=exception
-    //= reason=server push is not implemented, so this endpoint issues no push ID; the counter that would run sequentially is connection state the HTTP/3 layer docs/DESIGN.md section 6 lists as next would hold
+    //= reason=server push is not implemented, so this endpoint issues no push ID; the counter that would run sequentially is connection state `Http3.zig` would hold if server push were implemented; it is not, and `Http3.zig` refuses a push stream rather than tracking one
     //= https://www.rfc-editor.org/rfc/rfc9114#section-4.6
     //# The server SHOULD send PUSH_PROMISE frames prior to sending HEADERS or
     //# DATA frames that reference the promised responses.
@@ -166,12 +166,12 @@ pub const Type = enum(u64) {
     //# A client MUST treat receipt of a GOAWAY frame containing a stream ID
     //# of any other type as a connection error of type H3_ID_ERROR.
     //= type=exception
-    //= reason=whether GOAWAY's single integer is a stream ID or a push ID depends on the direction, which parseSingleVarint cannot see; the HTTP/3 connection layer docs/DESIGN.md section 6 lists as next is what knows which end it is
+    //= reason=whether GOAWAY's single integer is a stream ID or a push ID depends on the direction, which parseSingleVarint cannot see; `Http3.zig`, the connection layer, is what knows which end it is
     //= https://www.rfc-editor.org/rfc/rfc9114#section-5.2
     //# Endpoints MUST NOT initiate new requests or promise new pushes on the
     //# connection after receipt of a GOAWAY frame from the peer.
     //= type=exception
-    //= reason=whether a GOAWAY has arrived, and refusing to open a request stream after it, is connection state the HTTP/3 layer docs/DESIGN.md section 6 lists as next would hold; this file parses the frame's one integer
+    //= reason=`Http3.zig` holds whether a GOAWAY has arrived and reports it through goaway(), but refusing to *initiate* a request afterwards is the consumer's: it chooses the stream identifiers and decides what to send on them, per docs/DESIGN.md section 3. This file parses the frame's one integer
     //= https://www.rfc-editor.org/rfc/rfc9114#section-5.2
     //# An endpoint MAY send multiple GOAWAY frames indicating different
     //# identifiers, but the identifier in each frame MUST NOT be greater
@@ -179,8 +179,11 @@ pub const Type = enum(u64) {
     //# already have retried unprocessed requests on another HTTP connection.
     //# Receiving a GOAWAY containing a larger identifier than previously
     //# received MUST be treated as a connection error of type H3_ID_ERROR.
-    //= type=exception
-    //= reason=comparing a GOAWAY identifier against the one before it needs the previous value, which is connection state the HTTP/3 layer docs/DESIGN.md section 6 lists as next would hold; parseSingleVarint sees one frame at a time
+    // Both halves are `Http3.zig`'s and both are implemented there:
+    // `receiveControl` refuses an identifier larger than the last, and
+    // `writeGoaway` refuses to produce one. `parseSingleVarint` sees a frame at
+    // a time and holds nothing between calls, which is why neither could live
+    // here.
     //= https://www.rfc-editor.org/rfc/rfc9114#section-5.4
     //# If a connection terminates without a GOAWAY frame, clients MUST
     //# assume that any request that was sent, whether in whole or in part,
@@ -194,21 +197,21 @@ pub const Type = enum(u64) {
     //# frames have been processed and gracefully complete or terminate any
     //# necessary remaining tasks.
     //= type=exception
-    //= reason=deciding to close a connection and sequencing a frame onto the control stream before doing so are both the HTTP/3 connection layer's, which docs/DESIGN.md section 6 lists as next rather than built; writeHeader and parseSingleVarint are the codec for the frame it will send
+    //= reason=deciding to close a connection and sequencing a frame onto the control stream before doing so are both `Http3.zig`'s; writeHeader and parseSingleVarint are the codec for the frame it will send
     //= https://www.rfc-editor.org/rfc/rfc9114#section-5.2
     //# Servers SHOULD send a GOAWAY frame when the closing of a connection is
     //# known in advance, even if the advance notice is small, so that the
     //# remote peer can know whether or not a request has been partially
     //# processed.
     //= type=exception
-    //= reason=knowing a close is coming is the consumer's — it owns the socket and the shutdown that prompts one — and the control stream a GOAWAY rides on is docs/DESIGN.md section 6's next slice rather than a built one
+    //= reason=knowing a close is coming is the consumer's — it owns the socket and the shutdown that prompts one — and the control stream a GOAWAY rides on is `Http3.zig`'s
     //= https://www.rfc-editor.org/rfc/rfc9114#section-5.2
     //# Upon sending a GOAWAY frame, the endpoint SHOULD explicitly cancel
     //# (see Sections 4.1.1 and 7.2.3) any requests or pushes that have
     //# identifiers greater than or equal to the one indicated, in order to
     //# clean up transport state for the affected streams.
     //= type=exception
-    //= reason=which requests are outstanding is connection state the HTTP/3 layer docs/DESIGN.md section 6 lists as next would hold, and cancelling one is a QUIC RESET_STREAM on the consumer's side of the seam; this file writes the identifier and reads it back
+    //= reason=which requests are outstanding is connection state `Http3.zig` would hold if server push were implemented; it is not, and `Http3.zig` refuses a push stream rather than tracking one, and cancelling one is a QUIC RESET_STREAM on the consumer's side of the seam; this file writes the identifier and reads it back
     //= https://www.rfc-editor.org/rfc/rfc9114#section-5.2
     //# The endpoint SHOULD continue to do so as more requests or pushes
     //# arrive.
@@ -238,7 +241,7 @@ pub const Type = enum(u64) {
     //# previously received MUST be treated as a connection error of type
     //# H3_ID_ERROR.
     //= type=exception
-    //= reason=comparing a MAX_PUSH_ID against the one before it needs the previous value, which is connection state the HTTP/3 layer docs/DESIGN.md section 6 lists as next would hold
+    //= reason=comparing a MAX_PUSH_ID against the one before it needs the previous value, which is connection state `Http3.zig` would hold if server push were implemented; it is not, and `Http3.zig` refuses a push stream rather than tracking one
     //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.7
     //# A server MUST NOT send a MAX_PUSH_ID frame.  A client MUST treat the
     //# receipt of a MAX_PUSH_ID frame as a connection error of type
@@ -249,7 +252,7 @@ pub const Type = enum(u64) {
     //# A client that accepts server push SHOULD limit the number of push IDs
     //# it issues at a time.
     //= type=exception
-    //= reason=this endpoint accepts no server push, so the limit MAX_PUSH_ID carries is never raised above its absent default; the count of outstanding push IDs is connection state the HTTP/3 layer docs/DESIGN.md section 6 lists as next would hold
+    //= reason=this endpoint accepts no server push, so the limit MAX_PUSH_ID carries is never raised above its absent default; the count of outstanding push IDs is connection state `Http3.zig` would hold if server push were implemented; it is not, and `Http3.zig` refuses a push stream rather than tracking one
     max_push_id = 0x0d,
     _,
 
@@ -288,7 +291,7 @@ pub const Type = enum(u64) {
     //# Implementations SHOULD track the use of these features and set limits
     //# on their use.
     //= type=exception
-    //= reason=the features section 10.5 names are server push, which is not implemented, unknown protocol elements, and field compression. Counting how many unknown frame types, settings or stream types a peer has sent is per-connection accounting the HTTP/3 layer docs/DESIGN.md section 6 lists as next would keep; isReserved and known are the classification it would count with. Field compression's limit is the one this package does enforce — qpack.field_line.iterate refuses a section past the advertised SETTINGS_MAX_FIELD_SECTION_SIZE
+    //= reason=the features section 10.5 names are server push, which is not implemented, unknown protocol elements, and field compression. Counting how many unknown frame types, settings or stream types a peer has sent is per-connection accounting `Http3.zig` would keep; isReserved and known are the classification it would count with. Field compression's limit is the one this package does enforce — qpack.field_line.iterate refuses a section past the advertised SETTINGS_MAX_FIELD_SECTION_SIZE
     pub fn isReserved(frame_type: Type) bool {
         const value = @intFromEnum(frame_type);
         if (value < 0x21) return false;
@@ -322,7 +325,7 @@ pub const Type = enum(u64) {
     //# stream (see Section 6.2.1), an unknown frame type does not satisfy
     //# that requirement and SHOULD be treated as an error.
     //= type=exception
-    //= reason=the one location RFC 9114 fixes is the first frame of the control stream, and the control stream is docs/DESIGN.md section 6's next slice rather than a built one. Position on a stream is not something a per-frame classifier can see: allowedOnControlStream answers `true` for an unknown type because it is right everywhere except the first position, and it is the connection layer holding "have I seen SETTINGS yet" that turns that into H3_MISSING_SETTINGS
+    //= reason=the one location RFC 9114 fixes is the first frame of the control stream, and position on a stream is not something a per-frame classifier can see. Position on a stream is not something a per-frame classifier can see: allowedOnControlStream answers `true` for an unknown type because it is right everywhere except the first position, and it is the connection layer holding "have I seen SETTINGS yet" that turns that into H3_MISSING_SETTINGS
     pub fn allowedOnControlStream(frame_type: Type) bool {
         return switch (frame_type) {
             .cancel_push, .settings, .goaway, .max_push_id => true,
@@ -354,7 +357,7 @@ pub const Type = enum(u64) {
     //# of any other known frame type MUST be treated as a connection error
     //# of type H3_FRAME_UNEXPECTED.
     //= type=exception
-    //= reason=whether a CONNECT tunnel has been established is per-stream state, and the request/response state machine that would hold it is the HTTP/3 connection layer docs/DESIGN.md section 6 lists as next; this decides by frame type alone
+    //= reason=whether a CONNECT tunnel has been established is per-stream state, and the request/response state machine that holds it is `Http3.zig`, which sequences frames and does not track a CONNECT tunnel; this decides by frame type alone
     pub fn allowedOnRequestStream(frame_type: Type) bool {
         return switch (frame_type) {
             .data, .headers, .push_promise => true,
@@ -382,8 +385,6 @@ pub const Header = struct {
 //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
 //# Receipt of an invalid sequence of frames MUST be treated as a
 //# connection error of type H3_FRAME_UNEXPECTED.
-//= type=exception
-//= reason=a sequence is more than one frame, and this file reads one header at a time; which frame may follow which is per-stream state the HTTP/3 connection layer docs/DESIGN.md section 6 lists as next would hold
 //= https://www.rfc-editor.org/rfc/rfc9114#section-8
 //# Because new error codes can be defined without negotiation (see
 //# Section 9), use of an error code in an unexpected context or receipt
@@ -490,13 +491,13 @@ pub fn writeHeader(target: []u8, frame_type: Type, length: u64) EncodeError!u8 {
 //# frame on the control stream, the endpoint MUST respond with a
 //# connection error of type H3_FRAME_UNEXPECTED.
 //= type=exception
-//= reason=the SETTINGS exchange needs the control stream, which is the HTTP/3 connection layer docs/DESIGN.md section 6 lists as next rather than built; this file is the codec for the frame, not the sequencer
+//= reason=the SETTINGS exchange needs the control stream, which is `Http3.zig`; this file is the codec for the frame, not the sequencer
 //= https://www.rfc-editor.org/rfc/rfc9114#section-3.2
 //# After the QUIC connection is
 //# established, a SETTINGS frame MUST be sent by each endpoint as the
 //# initial frame of their respective HTTP control stream.
 //= type=exception
-//= reason=sending SETTINGS as the first frame of the control stream needs the control stream, which docs/DESIGN.md section 6 lists as next rather than built; this file is the codec for the frame and sequences nothing
+//= reason=sending SETTINGS as the first frame of the control stream needs the control stream, which `Http3.zig` now does; this file is the codec for the frame and sequences nothing
 //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4.2
 //# An HTTP implementation MUST NOT send frames or requests that would be
 //# invalid based on its current understanding of the peer's settings.
@@ -507,14 +508,14 @@ pub fn writeHeader(target: []u8, frame_type: Type, length: u64) EncodeError!u8 {
 //# the peer's SETTINGS frame has arrived, as packets carrying the
 //# settings can be lost or delayed.
 //= type=exception
-//= reason=the initial values are the defaults an endpoint assumes until SETTINGS arrives, and holding them is connection state the HTTP/3 layer docs/DESIGN.md section 6 lists as next would keep; SettingsIterator decodes the frame that replaces them and remembers nothing between calls
+//= reason=the initial values are the defaults an endpoint assumes until SETTINGS arrives, and holding them is connection state `Http3.zig` would keep; SettingsIterator decodes the frame that replaces them and remembers nothing between calls
 //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4.2
 //# Clients SHOULD NOT wait indefinitely for SETTINGS to arrive before
 //# sending requests, but they SHOULD process received datagrams in order
 //# to increase the likelihood of processing SETTINGS before sending the
 //# first request.
 //= type=exception
-//= reason=waiting, and reading datagrams while waiting, are both about when to act; docs/DESIGN.md section 3's seam takes datagrams from the consumer and this file decides no moment. The SETTINGS exchange itself needs the control stream, which section 6 lists as next rather than built
+//= reason=waiting, and reading datagrams while waiting, are both about when to act; docs/DESIGN.md section 3's seam takes datagrams from the consumer and this file decides no moment. The SETTINGS exchange itself is `Http3.zig`'s, and it sends its own SETTINGS without waiting for the peer's — which is what this rule asks for
 //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4.2
 //# Clients SHOULD store the settings the server provided in the HTTP/3
 //# connection where resumption information was provided, but they MAY opt
@@ -527,7 +528,7 @@ pub fn writeHeader(target: []u8, frame_type: Type, length: u64) EncodeError!u8 {
 //# the peer prior to sending the SETTINGS frame; settings MUST be sent
 //# as soon as the transport is ready to send data.
 //= type=exception
-//= reason=when to send a frame is the HTTP/3 connection layer's, which docs/DESIGN.md section 6 lists as next rather than built; writeSetting encodes one pair into a caller's buffer and decides no moment
+//= reason=when to send a frame is `Http3.zig`'s; writeSetting encodes one pair into a caller's buffer and decides no moment
 //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4.2
 //# A client MUST comply
 //# with stored settings -- or default values if no values are stored --
@@ -616,7 +617,7 @@ pub const Setting = enum(u64) {
     //# Endpoints SHOULD include at least one such setting in their SETTINGS
     //# frame.
     //= type=exception
-    //= reason=greasing a SETTINGS frame means choosing a reserved identifier and putting it in a frame this package does not assemble: the SETTINGS exchange needs the control stream, which docs/DESIGN.md section 6 lists as next rather than built. isReserved is how a connection layer would pick one, and writeSetting is what would encode it
+    //= reason=greasing a SETTINGS frame means choosing a reserved identifier and putting it in a frame this package does not assemble: the SETTINGS exchange needs the control stream, which `Http3.zig` now does. isReserved is how a connection layer would pick one, and writeSetting is what would encode it
     pub fn isReserved(setting: Setting) bool {
         const value = @intFromEnum(setting);
         if (value < 0x21) return false;

@@ -40,7 +40,7 @@ The full ledger is in [docs/DESIGN.md §6](docs/DESIGN.md#6-what-is-built-and-wh
 | [9001](https://www.rfc-editor.org/rfc/rfc9001) QUIC TLS | Initial secrets, AEAD packet protection, header protection, Retry integrity tag, key update, AEAD confidentiality and integrity limits. AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305 via `std.crypto` |
 | [9002](https://www.rfc-editor.org/rfc/rfc9002) Loss detection | RTT estimation, packet- and time-threshold loss detection, probe timeout with backoff, NewReno with persistent congestion |
 | [9204](https://www.rfc-editor.org/rfc/rfc9204) QPACK | Static table, field line representations in both directions. Prefixed integers and Huffman coding come from [hpack](https://github.com/zoxy-io/hpack) |
-| [9114](https://www.rfc-editor.org/rfc/rfc9114) HTTP/3 | Frame layer, unidirectional stream types, settings, request and response validation per §4.2 and §4.3, including RFC 9220 extended CONNECT and RFC 9110 `content-length` syntax |
+| [9114](https://www.rfc-editor.org/rfc/rfc9114) HTTP/3 | Frame layer, unidirectional stream types, the connection layer — control stream, SETTINGS exchange, GOAWAY and §4.1's frame sequence — and request and response validation per §4.2 and §4.3, including RFC 9220 extended CONNECT and RFC 9110 `content-length` syntax. No server push and no QPACK dynamic table |
 
 Key derivation, packet protection and packet number coding are checked
 against the test vectors in RFC 9000 appendix A and RFC 9001 appendix A,
@@ -49,8 +49,8 @@ including the complete worked packets in `corpus/`.
 Evidence that does not come from this package: `corpus/qifs.zig` decodes 144
 QPACK field sections produced by four other implementations, and `interop/` is
 a [QUIC Interop Runner](https://github.com/quic-interop/quic-interop-runner)
-client that completes a real handshake and transfer against quic-go, ngtcp2 and
-aioquic. The second found four defects on the first connection it made; see
+client that completes a real handshake, Retry, and HTTP/3 transfer against
+quic-go, ngtcp2 and aioquic. The second found seven defects; see
 [docs/VERIFICATION.md](docs/VERIFICATION.md) §5.5 for what they were and
 [interop/README.md](interop/README.md) for how to run it.
 

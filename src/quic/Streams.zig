@@ -384,6 +384,10 @@ pub fn Streams(comptime config: Config) type {
             return stream_id.sendable(id, self.side);
         }
 
+        pub fn weMayReceive(self: *const Self, id: u64) bool {
+            return stream_id.receivable(id, self.side);
+        }
+
         pub fn find(self: *Self, id: u64) ?*Stream {
             for (self.streams[0..self.count]) |*stream| {
                 if (stream.id == id) return stream;

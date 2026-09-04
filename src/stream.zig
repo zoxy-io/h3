@@ -116,7 +116,7 @@ const varint = @import("varint.zig");
 //# error of type H3_STREAM_CREATION_ERROR unless such an extension has
 //# been negotiated.
 //= type=exception
-//= reason=which endpoint opened a stream, and whether this one is the client, are facts about a connection; the HTTP/3 connection layer that would hold them is docs/DESIGN.md section 6's next slice, and this file reads the first octets of a stream it is handed
+//= reason=which endpoint opened a stream, and whether this one is the client, are facts about a connection; the connection layer that holds them is `Http3.zig`, and this file reads the first octets of a stream it is handed
 //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2
 //# Therefore, the transport parameters sent by both clients
 //# and servers MUST allow the peer to create at least three
@@ -168,21 +168,19 @@ pub const Type = enum(u64) {
     //# type, this MUST be treated as a connection error of type
     //# H3_MISSING_SETTINGS.
     //= type=exception
-    //= reason=initiating the control stream and sequencing SETTINGS onto it is the HTTP/3 connection layer's, which docs/DESIGN.md section 6 lists as next rather than built; Type.control is the number it will write first
+    //= reason=initiating the control stream and sequencing SETTINGS onto it is `Http3.zig`'s; Type.control is the number it will write first
     //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.1
     //# Because the contents of the control stream are used to manage the
     //# behavior of other streams, endpoints SHOULD provide enough flow-
     //# control credit to keep the peer's control stream from becoming
     //# blocked.
     //= type=exception
-    //= reason=flow-control credit for a stream is granted by quic/Connection out of a comptime limit the consumer parameterises it with (docs/DESIGN.md section 5), and the control stream that would need it is not built (section 6). Type.control is the number by which the connection layer will recognise the stream to credit
+    //= reason=flow-control credit for a stream is granted by quic/Connection out of a comptime limit the consumer parameterises it with (docs/DESIGN.md section 5), and the control stream that needs it is opened by the consumer on `Http3.zig`'s behalf. Type.control is the number by which the connection layer will recognise the stream to credit
     control = 0x00,
     //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.2
     //# Only servers can push; if a server receives a client-initiated push
     //# stream, this MUST be treated as a connection error of type
     //# H3_STREAM_CREATION_ERROR.
-    //= type=exception
-    //= reason=server push is not implemented and is not on docs/DESIGN.md section 6's list; the type is named so an unknown-stream path can be told apart from a push one when it is
     //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.2
     //# Each push ID MUST only be used once in a push stream header.  If a
     //# client detects that a push stream header includes a push ID that was
@@ -195,8 +193,6 @@ pub const Type = enum(u64) {
     //# error of type H3_ID_ERROR when no MAX_PUSH_ID frame has been sent or
     //# when the stream references a push ID that is greater than the maximum
     //# push ID.
-    //= type=exception
-    //= reason=server push is not implemented; the maximum push ID this endpoint sent is connection state the HTTP/3 layer docs/DESIGN.md section 6 lists as next would hold
     //= https://www.rfc-editor.org/rfc/rfc9114#section-4.6
     //# When the
     //# same push ID is promised on multiple request streams, the
@@ -270,8 +266,6 @@ pub const Type = enum(u64) {
     //# Recipients of unknown stream types MUST
     //# either abort reading of the stream or discard incoming data without
     //# further processing.
-    //= type=exception
-    //= reason=aborting a read or discarding a stream's data is an action on a QUIC stream, which docs/DESIGN.md section 3 puts on the consumer's side of the seam; Type.known is what tells it which streams those are
     //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2
     //# The recipient MUST NOT consider unknown stream types
     //# to be a connection error of any kind.
@@ -388,7 +382,7 @@ pub const WriteError = error{
 //# semantics of existing protocol components, including QPACK or other
 //# extensions, MUST NOT be sent until the peer is known to support them.
 //= type=exception
-//= reason=knowing whether a peer supports a stream type needs its SETTINGS, which the connection layer docs/DESIGN.md section 6 lists as next holds; write() encodes a type and decides nothing about when to send it
+//= reason=knowing whether a peer supports a stream type needs its SETTINGS, which `Http3.zig` holds; write() encodes a type and decides nothing about when to send it
 pub fn write(target: []u8, stream_type: Type) WriteError!u8 {
     return varint.encode(target, @intFromEnum(stream_type)) catch |err| switch (err) {
         error.OutputTooLong => error.OutputTooLong,

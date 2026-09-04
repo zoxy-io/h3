@@ -98,7 +98,32 @@ pub fn sendable(id: u64, side: Side) bool {
     return stream_kind.bidirectional() or stream_kind.initiator() == side;
 }
 
+/// True when `side` can *receive* on this stream: either the peer opened it, or
+/// the stream is bidirectional.
+///
+/// The mirror of `sendable`, and worth stating here rather than at the one call
+/// site that needs it: a unidirectional stream is send-only at one end and
+/// receive-only at the other, and half of RFC 9000 section 19's frames are
+/// errors when they arrive at the wrong end.
+pub fn receivable(id: u64, side: Side) bool {
+    const stream_kind = kindOf(id);
+    return stream_kind.bidirectional() or stream_kind.initiator() != side;
+}
+
 const testing = std.testing;
+
+test "a unidirectional stream is send-only at one end and receive-only at the other" {
+    // The two functions are not each other's negation: a bidirectional stream
+    // is both, which is the case that makes a single `direction` boolean wrong.
+    try testing.expect(sendable(0, .client) and receivable(0, .client));
+    try testing.expect(sendable(0, .server) and receivable(0, .server));
+    // Client-initiated unidirectional: the client sends and cannot receive.
+    try testing.expect(sendable(2, .client) and !receivable(2, .client));
+    try testing.expect(!sendable(2, .server) and receivable(2, .server));
+    // And the server's own, the other way round.
+    try testing.expect(sendable(3, .server) and !receivable(3, .server));
+    try testing.expect(!sendable(3, .client) and receivable(3, .client));
+}
 
 test "the low two bits are the whole addressing scheme" {
     try testing.expectEqual(Kind.client_bidirectional, kindOf(0));

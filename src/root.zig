@@ -34,6 +34,12 @@ pub const frame = @import("frame.zig");
 /// RFC 9114 section 6.2: what the first octets of a unidirectional stream mean.
 pub const stream = @import("stream.zig");
 
+/// RFC 9114's connection layer: the control stream, the SETTINGS exchange,
+/// GOAWAY, and section 4.1's frame sequence on a request stream. `frame.zig`
+/// and `stream.zig` say what a thing is; this says whether it may be here.
+pub const http3 = @import("Http3.zig");
+pub const Http3 = http3.Http3;
+
 test {
     _ = assertions;
     _ = varint;
@@ -42,4 +48,5 @@ test {
     _ = fields;
     _ = frame;
     _ = stream;
+    _ = http3;
 }

@@ -11,10 +11,11 @@ that "the `AckRanges` tests asserted the bug". `corpus/qifs.zig` was the cheap
 half of the answer and reaches only QPACK's representation choices. This is the
 other half.
 
-It found four defects on the first connection it completed, and paid for itself
-a second time by closing `retry` — nine RFC 9000 §17.2.5 rules that `packet.zig`
-had recorded as out of scope, plus §7.3's connection-ID authentication. All of
-it is summarised in docs/VERIFICATION.md §5.5.
+It found four defects on the first connection it completed, three more on the
+first HTTP/3 one, and paid for itself twice over by closing `retry` and
+`http3` — nine RFC 9000 §17.2.5 rules and §7.3's connection-ID authentication,
+then the whole of RFC 9114's connection layer. All of it is summarised in
+docs/VERIFICATION.md §5.5.
 
 Set `TESTCASE=retry` on a server container and every case in the table below
 runs the Retry path as well, which is the cheapest way to exercise it.
@@ -48,15 +49,19 @@ stream and the response until the FIN:
 | `keyupdate` | RFC 9001 §6's key update, initiated by this client |
 | `multiconnect` | one connection per request, sequentially |
 | `retry` | the server's Retry: a new identifier, new Initial keys, a token |
+| `http3` | HTTP/3 proper: the control stream, SETTINGS, HEADERS and DATA |
 | `handshakeloss`, `transferloss` | the same, through the runner's lossy path |
 
-**`http3` is refused with exit 127**, which is the runner's "unsupported" and
-the reason the code is not 1: the control stream and the settings exchange are
-not built, so `h3` as an ALPN would be a lie told to a server.
+Everything except `http3` runs over `hq-interop`, which is HTTP/0.9 and
+exercises the transport without the framing on top of it. `http3` is the one
+case that offers `h3` as an ALPN, and it does so honestly: `src/Http3.zig` is
+the connection layer.
 
-A test case this binary has never heard of is also 127. Reporting 1 for an
-unimplemented feature is how an implementation ends up with a red square meaning
-"not attempted" and a red square meaning "wrong" in the same colour.
+A test case this binary has never heard of — `zerortt`, `resumption`,
+`amplificationlimit` — is exit 127, which is the runner's "unsupported".
+Reporting 1 for an unimplemented feature is how an implementation ends up with
+a red square meaning "not attempted" and a red square meaning "wrong" in the
+same colour.
 
 ## Running it against a real server
 

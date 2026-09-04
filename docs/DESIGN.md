@@ -196,6 +196,11 @@ all three build legs):
   against RFC 9001 appendix A.1's known-answer vectors**: both Initial secrets
   and all six key/IV/header-key values.
 - `frame.zig`, `stream.zig` — RFC 9114 §6.2, §7.1, §7.2.4, §11.2.
+- `Http3.zig` — RFC 9114's connection layer: §6.2.1's control stream, §7.2.4's
+  SETTINGS exchange, §5.2's GOAWAY in both directions, §4.1's frame sequence,
+  and §4.6's refusal of a push stream. Sans-I/O like everything else: the
+  caller passes `quic.readable(id)` and is told how many octets were consumed
+  and what they were.
 - `corpus/` — RFC 9001 appendix A's four worked packets, octet for octet.
 - `quic/Reassembler.zig` — ordered byte reassembly, for the CRYPTO stream and
   for every request and response stream. Section 2.2's "data at an offset never
@@ -311,9 +316,17 @@ all three build legs):
      streams. Not needed by a consumer advertising
      `SETTINGS_QPACK_MAX_TABLE_CAPACITY = 0`, which is the choice zrk already
      makes for HPACK; needed to compress as well as a browser does.
-   * **The HTTP/3 connection layer** — the control stream, SETTINGS exchange,
-     GOAWAY, and the request/response state machine over `Streams`. The frames
-     and stream types are built; what is missing is the sequencing.
+   * ~~**The HTTP/3 connection layer**~~ — done, in `src/Http3.zig`: the
+     control stream, the SETTINGS exchange, GOAWAY in both directions, and
+     section 4.1's frame sequence on a request stream. `frame.zig` and
+     `stream.zig` answer "what is this?"; `Http3.zig` answers "may it be here,
+     now?", and thirty-three exception reasons that pointed at this line were
+     rewritten when it landed.
+
+     What it still refuses rather than implements: **server push** (a push
+     stream is `H3_ID_ERROR`, which is the correct answer for an endpoint that
+     sends no MAX_PUSH_ID) and **QPACK's dynamic table** (capacity zero is
+     advertised, and the peer's encoder stream is read and discarded).
    * **Migration, stateless reset, 0-RTT, and ECN.**
    * **A second corpus**: encodings captured from other implementations, the
      way hpack vendors http2jp/hpack-test-case. RFC 9001 appendix A proves

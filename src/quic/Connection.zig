@@ -1053,6 +1053,7 @@ pub fn Connection(comptime config: Config) type {
             //# confirmed (Section 4.1.2).
             //= type=todo
             if (level == .one_rtt and direction == .send and self.side == .server) {
+                if (self.state != .established) self.emit(.handshake_confirmed);
                 self.state = .established;
                 self.recovery.handshake_confirmed = true;
                 self.handshake_done_pending = true;
@@ -1630,6 +1631,7 @@ pub fn Connection(comptime config: Config) type {
         /// Idempotent: a consumer that calls it twice, or a client that has
         /// already discarded, must not discard a space twice.
         pub fn confirmHandshake(self: *Self) void {
+            if (self.state != .established) self.emit(.handshake_confirmed);
             self.state = .established;
             self.recovery.handshake_confirmed = true;
             if (self.spaces[@intFromEnum(Space.handshake)].discarded) return;
@@ -1723,6 +1725,7 @@ pub fn Connection(comptime config: Config) type {
             one.phase = !one.phase;
             one.sealed = 0;
             one.phase_acknowledged = false;
+            self.emit(.key_updated);
         }
 
         //= https://www.rfc-editor.org/rfc/rfc9001#section-6.1
@@ -2671,6 +2674,10 @@ pub fn Connection(comptime config: Config) type {
                 .connection_close => |value| {
                     self.close_code = value.code;
                     self.close_is_application = value.application;
+                    self.emit(.{ .closed = .{
+                        .code = value.code,
+                        .application = value.application,
+                    } });
                     // Section 10.2.2: a receiver enters draining and sends
                     // nothing further but a single close of its own.
                     //= https://www.rfc-editor.org/rfc/rfc9000#section-10.2.2
@@ -3223,6 +3230,10 @@ pub fn Connection(comptime config: Config) type {
                     self.streams.reset(value.stream, @intFromEnum(value.code), value.final_size) catch |err| {
                         return streamError(err);
                     };
+                    self.emit(.{ .stream_reset = .{
+                        .stream = value.stream,
+                        .code = @intFromEnum(value.code),
+                    } });
                 },
                 // Section 3.5: the peer wants us to stop sending. Recorded as a
                 // reset of our send half; what to tell the application is the
@@ -3266,6 +3277,10 @@ pub fn Connection(comptime config: Config) type {
                     const stream = self.streams.open(value.stream) catch |err| return streamError(err);
                     stream.send_state = .reset;
                     stream.reset_code = @intFromEnum(value.code);
+                    self.emit(.{ .stream_stopped = .{
+                        .stream = value.stream,
+                        .code = @intFromEnum(value.code),
+                    } });
                 },
             }
         }
@@ -4537,6 +4552,20 @@ pub fn Connection(comptime config: Config) type {
                 //# a given type is sent in MAX_STREAMS frames.
                 //= type=todo
                 if (stream.send_state == .reset) continue;
+                // A stream this endpoint cannot receive on has no receive
+                // window to raise, and section 19.10 makes offering one a
+                // connection error at the peer. `hq-interop` never opens a
+                // unidirectional stream, so this loop credited every stream in
+                // the table for the life of the package — and the first HTTP/3
+                // connection it made was closed with STREAM_STATE_ERROR by
+                // quic-go, naming the control stream this endpoint had just
+                // opened.
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-19.10
+                //# An endpoint that
+                //# receives a MAX_STREAM_DATA frame for a receive-only stream MUST
+                //# terminate the connection with error STREAM_STATE_ERROR.
+                //= type=test
+                if (!self.streams.weMayReceive(stream.id)) continue;
                 if (offset >= target.len) break;
                 const stream_limit = stream.receiveLimit();
                 if (stream_limit < stream.max_data_sent + config.stream_receive_octets / 2) continue;
@@ -4703,6 +4732,10 @@ pub fn Connection(comptime config: Config) type {
             for (0..Level.count) |index| {
                 self.close_pending[index] = self.send_keys[index] != null;
             }
+            // Reported in both directions, because a consumer draining events
+            // wants one place to learn the connection is over — and the code it
+            // ends with is the same question whichever side chose it.
+            self.emit(.{ .closed = .{ .code = @intFromEnum(code), .application = false } });
         }
 
         /// Whether anything is waiting to go out. A caller with nothing else to
@@ -6972,4 +7005,112 @@ test "a Retry resets loss recovery and congestion control" {
     // state rather than from the discarded flight — which is what `pto_count`
     // going back to zero says.
     try testing.expect(client.timeout() != null);
+}
+
+/// Drain the queue and return the first event of the wanted tag, or null.
+///
+/// A helper rather than an `expectEqual` on `poll()` directly, because the
+/// question these tests ask is "was this reported at all" and a queue that also
+/// holds an ACK-driven event should not make the answer depend on ordering.
+fn firstEvent(
+    connection: *TestConnection,
+    comptime tag: @typeInfo(TestConnection.Event).@"union".tag_type.?,
+) ?@FieldType(TestConnection.Event, @tagName(tag)) {
+    // Bounded: `poll` removes what it returns, and the queue is fixed.
+    for (0..64) |_| {
+        const event = connection.poll() orelse return null;
+        if (event == tag) return @field(event, @tagName(tag));
+    }
+    return null;
+}
+
+test "every event the connection declares is one the connection produces" {
+    // Five of the eight were declared, documented and emitted by nothing:
+    // `handshake_confirmed`, `stream_reset`, `stream_stopped`, `key_updated`
+    // and `closed`. The tests that existed called `emit` directly and so
+    // proved the queue worked, which is the shape docs/VERIFICATION.md section
+    // 1 lists more than once — a component tested through the seam it is
+    // supposed to be wired into, rather than through the wiring.
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+
+    // `established` confirms the handshake for the client by delivering
+    // HANDSHAKE_DONE, and installs the server's 1-RTT send keys, which is
+    // confirmation for the server.
+    try testing.expect(firstEvent(&client, .handshake_confirmed) != null);
+    try testing.expect(firstEvent(&server, .handshake_confirmed) != null);
+
+    // A peer's RESET_STREAM.
+    _ = try client.write(0, "partial", false);
+    _ = try deliver(&client, &server, 1000);
+    var payload: [64]u8 = @splat(0);
+    var written = try frame.encode(&payload, .{ .reset_stream = .{
+        .stream = 0,
+        .code = .request_cancelled,
+        .final_size = 7,
+    } });
+    _ = try server.receiveFrames(.one_rtt, payload[0..written], 2000);
+    const reset = firstEvent(&server, .stream_reset) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u64, 0), reset.stream);
+    try testing.expectEqual(@intFromEnum(error_code.Application.request_cancelled), reset.code);
+
+    // And a peer's STOP_SENDING, which is the same question about the other
+    // half of the stream.
+    written = try frame.encode(&payload, .{ .stop_sending = .{
+        .stream = 0,
+        .code = .request_rejected,
+    } });
+    _ = try client.receiveFrames(.one_rtt, payload[0..written], 3000);
+    const stopped = firstEvent(&client, .stream_stopped) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u64, 0), stopped.stream);
+    try testing.expectEqual(@intFromEnum(error_code.Application.request_rejected), stopped.code);
+
+    // A key update this endpoint starts.
+    try testing.expect(client.canUpdateKeys());
+    client.updateKeys();
+    try testing.expect(firstEvent(&client, .key_updated) != null);
+
+    // And the close, from both directions: the peer's, and this endpoint's own.
+    written = try frame.encode(&payload, .{ .connection_close = .{
+        .code = @intFromEnum(error_code.Transport.no_error),
+        .application = false,
+        .triggered_by = 0,
+        .reason = "",
+    } });
+    _ = try server.receiveFrames(.one_rtt, payload[0..written], 4000);
+    const closed = firstEvent(&server, .closed) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u64, 0), closed.code);
+    try testing.expect(!closed.application);
+
+    client.close(.internal_error);
+    const ours = firstEvent(&client, .closed) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@intFromEnum(error_code.Transport.internal_error), ours.code);
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9000#section-19.10
+//# A MAX_STREAM_DATA frame can be sent for streams in the "Recv" state;
+//# see Section 3.2.
+//= type=test
+test "section 19.10: no MAX_STREAM_DATA for a stream this endpoint cannot receive on" {
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+
+    // A client-initiated unidirectional stream: send-only here, receive-only at
+    // the peer. HTTP/3's control stream is exactly this, and `hq-interop` never
+    // opens one — which is why the flow control loop credited every stream in
+    // the table for the life of the package without anything noticing.
+    // `established` grants credit on stream 0 and nothing else, because until
+    // now nothing else was ever opened.
+    try client.streams.setSendLimit(2, 1 << 16);
+    const queued = try client.write(2, "the control stream's octets", false);
+    try testing.expectEqual(@as(usize, 27), queued);
+
+    // The peer refuses a MAX_STREAM_DATA for a stream it cannot send on, so
+    // this delivery is the assertion: with the frame in it, `receive` returns
+    // `error.StreamState` and the connection is over. quic-go said the same
+    // thing in more words — "invalid frame for send stream 2".
+    _ = try deliver(&client, &server, 1000);
+    try testing.expectEqualStrings("the control stream's octets", server.readable(2));
 }
