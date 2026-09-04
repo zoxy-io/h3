@@ -110,12 +110,6 @@ pub const Options = struct {
     verbose: bool,
 };
 
-/// The largest response body this server will read out of `www`. The runner's
-/// files are a few kilobytes to a megabyte; a request for something larger is
-/// answered with what fits rather than refused, because the runner compares
-/// what it asked for against what it got and a short answer fails visibly.
-const body_octets_max: usize = 2 * 1024 * 1024;
-
 /// RFC 9000 section 8.1.3's token, as this server chooses to build one.
 ///
 /// `odcid_len || odcid || HMAC(key, odcid || address)`. The identifier is in
@@ -238,7 +232,7 @@ pub fn run(io: Io, gpa: std.mem.Allocator, log: *Io.Writer, options: Options) !v
         } };
         const message = socket.receiveTimeout(io, &receive_buffer, timeout) catch |err| switch (err) {
             error.Timeout => {
-                try flushAll(io, log, &socket, peers, elapsed(io, origin));
+                try flushAll(io, log, &socket, peers, elapsed(io, origin), scratch);
                 continue;
             },
             else => return err,
@@ -834,8 +828,15 @@ fn openAnswer(
             file.close(io);
             break :open;
         };
+        // The whole file, whatever its size. There was a two-megabyte cap here
+        // and it was answered with a *prefix* — the runner's `transfer` case
+        // asks for five megabytes and compares byte for byte, so the response
+        // was wrong in the one way a test bed is built to catch. Nothing needs
+        // the cap: the body is read in `scratch`-sized pieces as the peer's
+        // window opens, so what bounds memory is the scratch buffer and not
+        // the file.
         answer.file = file;
-        answer.total = @min(size.size, body_octets_max);
+        answer.total = size.size;
     }
 
     peer.answers_len += 1;
@@ -911,13 +912,28 @@ fn flush(io: Io, socket: *Io.net.Socket, peer: *Peer, now_ns: u64) !void {
     }
 }
 
-fn flushAll(io: Io, log: *Io.Writer, socket: *Io.net.Socket, peers: []Peer, now_ns: u64) !void {
+fn flushAll(
+    io: Io,
+    log: *Io.Writer,
+    socket: *Io.net.Socket,
+    peers: []Peer,
+    now_ns: u64,
+    scratch: []u8,
+) !void {
     _ = log;
     for (peers) |*peer| {
         if (!peer.live) continue;
         if (peer.connection.timeout()) |at| {
             if (at <= now_ns) peer.connection.onTimeout(now_ns);
         }
+        // A response is pushed as the peer's window opens, and the window opens
+        // when an acknowledgement arrives — but it also opens when a *timer*
+        // frees congestion window, and nothing here was pushing then. A server
+        // that only refills its send buffer on inbound datagrams stops sending
+        // the moment the client has nothing to say, which for a client waiting
+        // on a download is immediately: both endpoints then wait, and the
+        // client's idle timer is what ends it.
+        pushAnswers(io, peer, scratch) catch {};
         flush(io, socket, peer, now_ns) catch {};
     }
     retire(peers, now_ns);

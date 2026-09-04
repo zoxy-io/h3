@@ -143,22 +143,29 @@ pub const Config = struct {
     connection_receive_octets: u64 = 1 << 20,
 };
 
-/// Distinct received spans a *request* stream tolerates, against
-/// `Reassembler`'s own default of sixteen.
+/// Distinct received spans a *request* stream tolerates.
 ///
-/// Lower on purpose, and the reason is arithmetic rather than taste: a
-/// connection holds `streams_max` of these at once, so a span budget is paid
-/// `streams_max` times over where the CRYPTO stream pays it once. Eight still
-/// covers ordinary reordering — a real path reorders within a few packets — and
-/// halves what a peer manufacturing gaps can pin down across every stream it
-/// opens at the same time.
-const receive_spans_max: u32 = 8;
+/// This was eight, on the argument that a connection holds `streams_max` of
+/// these at once so a span budget is paid `streams_max` times over — and that
+/// "a real path reorders within a few packets". The first half is true and the
+/// second is not. The interop runner's ordinary transfer path — 15 ms of delay,
+/// 10 Mbps, a 25-packet queue — put more than eight gaps in a single stream,
+/// and a receiver that runs out of spans closes the connection with
+/// `INTERNAL_ERROR`. A 5 MiB download failed at about a third of the way
+/// through, every time.
+///
+/// The multiplier argument survives; the magnitude did not. A span is two
+/// offsets, so this table is 512 octets beside a receive buffer measured in
+/// tens of kilobytes — a fifth of one percent of what it indexes. Paying that
+/// `streams_max` times is not a cost worth closing connections over.
+const receive_spans_max: u32 = 32;
 
 comptime {
-    // Below the general default because of the multiplier above; a value at or
-    // over it would mean this override has no reason to exist.
-    assert(receive_spans_max < Reassembler(.{ .capacity = 1 }).spans_max);
+    // Two is the least that can describe a gap at all.
     assert(receive_spans_max >= 2);
+    // And the table stays small beside the buffer it indexes, which is the
+    // relation the number above is chosen against rather than a round figure.
+    assert(receive_spans_max * @sizeOf(u64) * 2 <= 1024);
 }
 
 pub fn Streams(comptime config: Config) type {
@@ -1238,12 +1245,24 @@ test "a resource limit is not reported as the peer's fault" {
     // gaps are what a lossy path produces — and this endpoint is the one out of
     // room, so the two answers have to be distinguishable to a consumer
     // choosing a close code.
-    var set = testSet();
+    // Its own type rather than `Set`: the window has to be wide enough for more
+    // spans than the table holds, or `BeyondWindow` fires first and this test
+    // passes without reaching the limit it is about.
+    const Wide = Streams(.{
+        .streams_max = 1,
+        .receive_octets = 4 * receive_spans_max,
+        .send_octets = 32,
+        .connection_receive_octets = 4 * receive_spans_max,
+    });
+    comptime assert(Wide.receive_octets / 2 > receive_spans_max);
+
+    var set: Wide = .{ .side = .server };
+    set.setPeerStreamLimit(true, 4);
     var offset: u64 = 0;
     var refused: ?anyerror = null;
     // Every other octet, which is the cheapest way for a peer to manufacture
-    // spans. Bounded by the window so `BeyondWindow` cannot be what fires.
-    for (0..Set.receive_octets / 2) |_| {
+    // spans.
+    for (0..Wide.receive_octets / 2) |_| {
         set.receive(0, offset, "x", false) catch |err| {
             refused = err;
             break;
@@ -1348,4 +1367,29 @@ test "section 4.6: a stream identifier past our advertised limit is refused" {
     const highest = stream_id.make(.server_bidirectional, Set.streams_max - 1);
     try set.receive(highest, 0, "x", false);
     try testing.expectEqualStrings("x", set.find(highest).?.readable());
+}
+
+test "a stream tolerates more gaps than a quiet path produces" {
+    // This was eight, on the reasoning that "a real path reorders within a few
+    // packets". The interop runner's ordinary transfer path — 15 ms of delay,
+    // 10 Mbps, a 25-packet queue — put more than eight gaps in one stream, and
+    // a receiver out of spans closes the connection with INTERNAL_ERROR. The
+    // literal below is the number that was wrong, so this test fails if it
+    // comes back.
+    const Wide = Streams(.{
+        .streams_max = 1,
+        .receive_octets = 256,
+        .send_octets = 32,
+        .connection_receive_octets = 256,
+    });
+    var set: Wide = .{ .side = .server };
+    set.setPeerStreamLimit(true, 1);
+
+    // Sixteen disjoint spans, which the old bound refused at nine.
+    var offset: u64 = 0;
+    for (0..16) |_| {
+        try set.receive(0, offset, "x", false);
+        offset += 2;
+    }
+    try testing.expect(set.find(0).?.received.span_count > 8);
 }

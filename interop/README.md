@@ -227,6 +227,15 @@ nix-shell -p openssl wireshark-cli --run \
   './.venv/bin/python run.py -s h3 -c quic-go -t handshake,transfer'
 ```
 
+As of the last run: **as a client, seven of eight** — `handshake`, `transfer`,
+`chacha20`, `retry`, `http3`, `transferloss`, `keyupdate` — with
+`handshakeloss` short of the runner's budget. **As a server, five of eight**,
+with multi-stream transfers of several megabytes still stalling. See
+docs/VERIFICATION.md §5.5.
+
+```sh
+```
+
 ### Before believing a failure, run the control
 
 ```sh
@@ -236,13 +245,30 @@ nix-shell -p openssl wireshark-cli --run \
 If that fails too, the simulator is not passing packets on this host and no
 result about this package means anything.
 
-That is what happened here. ns-3 re-emits frames with raw sockets, and on a
-host with `bridge-nf-call-iptables=1` those bridged frames traverse iptables
-and meet docker's `DOCKER` chain, which ends in `DROP`. A narrow `DOCKER-USER`
-accept for `193.167.0.0/16` is hit — the counters move — and is not sufficient.
-The simulator's own documentation suggests
-`sysctl net.bridge.bridge-nf-call-iptables=0`, which is a host-wide change and
-was not made here.
+That is what happened here, twice over.
+
+**The bridge filter.** ns-3 re-emits frames with raw sockets, and on a host
+with `bridge-nf-call-iptables=1` those bridged frames traverse iptables and
+meet docker's `DOCKER` chain, which ends in `DROP`. A narrow `DOCKER-USER`
+accept for `193.167.0.0/16` *is hit* — the counters move — and is not
+sufficient. What works is the host-wide setting the simulator's own
+documentation names:
+
+```sh
+sudo sysctl -w net.bridge.bridge-nf-call-iptables=0
+sudo sysctl -w net.bridge.bridge-nf-call-ip6tables=0
+# and to put it back:
+sudo sysctl -w net.bridge.bridge-nf-call-iptables=1
+sudo sysctl -w net.bridge.bridge-nf-call-ip6tables=1
+```
+
+It changes how *all* bridged traffic on the machine is filtered, so it is a
+decision rather than a step.
+
+**The Python.** pyshark still calls `asyncio.set_child_watcher`, removed in
+3.14, so the venv needs an older interpreter — `nix-shell -p python312` and
+`python3 -m venv` from that. The symptom is a traceback out of `trace.py`
+*after* a test has already run, which reads like a failed test and is not one.
 
 The control is the only thing that separates "the runner does not pass" from
 "the runner does not run", and it is one command.

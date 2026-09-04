@@ -249,7 +249,12 @@ pub fn Connection(comptime config: Config) type {
 
     const CryptoLevel = struct {
         /// Handshake bytes from the peer, reassembled in order.
-        received: Reassembler(.{ .capacity = config.crypto_octets, .spans_max = 8 }) = .{},
+        /// Sixteen rather than eight, for the reason `Streams`'
+        /// `receive_spans_max` gives: a lossy path makes more gaps than "a few"
+        /// and there is exactly one of these per level, so the table costs
+        /// nothing worth counting. A handshake that ran out of spans would
+        /// close the connection with `INTERNAL_ERROR` before it completed.
+        received: Reassembler(.{ .capacity = config.crypto_octets, .spans_max = 16 }) = .{},
         /// Handshake bytes to send. They stay after being framed because the
         /// data a retransmission needs is this buffer; see the module comment
         /// on what is missing beside it.
@@ -3596,6 +3601,14 @@ pub fn Connection(comptime config: Config) type {
             self.send_keys[@intFromEnum(level)] = null;
             self.receive_keys[@intFromEnum(level)] = null;
             self.spaces[@intFromEnum(level.space())].discarded = true;
+            // A probe owed by a space that no longer exists is a number nothing
+            // will ever act on: `wantsSend` skips a discarded space and
+            // `sendPacket` refuses one. Left set, it is a fact about the
+            // connection that is not true, and the interop runner's
+            // `handshakeloss` case is where that turned up — a stalled
+            // connection reporting probes owed on two spaces it had discarded,
+            // which cost an hour of looking at the wrong thing.
+            self.spaces[@intFromEnum(level.space())].probes_pending = 0;
             // Section 6.2.3 of RFC 9002: what was outstanding there is neither
             // lost nor acknowledged, and leaving its octets in flight would
             // hold the congestion window down for the rest of the connection.
@@ -7568,4 +7581,78 @@ test "a spuriously lost packet that is acknowledged anyway still reclaims" {
     try testing.expectEqual(@as(u64, framed), after.send_offset);
     try testing.expectEqual(@as(u32, 0), after.framed);
     try testing.expectEqual(@as(u32, @intCast(body.len)) - framed, after.send_len);
+}
+
+test "a probe timeout with data in flight actually sends something" {
+    // `wantsSend` and `send` disagreeing is a stall: a consumer that sleeps on
+    // `timeout` and sends on `send` has nothing to wake for and nothing to
+    // send, while the peer waits for data it never receives. The interop
+    // runner's `handshakeloss` case found it — a connection established, sent
+    // its request, lost it, and then sat with `wantsSend=true`, two probes
+    // owed on the application space, and no packet leaving.
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+
+    _ = try client.write(0, "GET /a-file", true);
+    var datagram: [TestConnection.datagram_octets]u8 = @splat(0);
+    const sent = try client.send(&datagram, 1000);
+    try testing.expect(sent > 0);
+    // Dropped: the server never sees it, so it is never acknowledged.
+    try testing.expect(client.recovery.bytes_in_flight > 0);
+
+    // The probe timeout fires.
+    const at = client.timeout() orelse return error.TestUnexpectedResult;
+    client.onTimeout(at + 1);
+    try testing.expect(client.wantsSend());
+
+    // And something has to leave. Anything ack-eliciting will do — the
+    // retransmitted request, or the PING section 6.2.4 falls back to.
+    const probe = try client.send(&datagram, at + 2);
+    try testing.expect(probe > 0);
+
+    // Again, and again: on a lossy path every probe can be lost too, and the
+    // interop runner's 30% loss means several in a row. Each timeout owes
+    // another packet, and a connection that stops answering its own timer is
+    // one that waits for a peer that is waiting for it.
+    var now: u64 = at + 2;
+    for (0..8) |_| {
+        const next = client.timeout() orelse return error.TestUnexpectedResult;
+        now = @max(now, next) + 1;
+        client.onTimeout(now);
+        try testing.expect(client.wantsSend());
+        try testing.expect(try client.send(&datagram, now) > 0);
+    }
+}
+
+test "a probe owed on a discarded space does not silence the connection" {
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+    const initial = @intFromEnum(Space.initial);
+    const handshake = @intFromEnum(Space.handshake);
+    const application = @intFromEnum(Space.application);
+    try testing.expect(client.spaces[initial].discarded);
+    try testing.expect(client.spaces[handshake].discarded);
+
+    // The state the interop runner's `handshakeloss` case produced: probes owed
+    // on two spaces that no longer exist and two on the one that does. A
+    // discarded space cannot answer its own probe, and `discard` never cleared
+    // the count.
+    client.spaces[initial].probes_pending = 1;
+    client.spaces[handshake].probes_pending = 1;
+    client.spaces[application].probes_pending = 2;
+
+    // The space that still exists answers its own probe, which is what keeps
+    // the connection from going quiet.
+    try testing.expect(client.wantsSend());
+    var datagram: [TestConnection.datagram_octets]u8 = @splat(0);
+    try testing.expect(try client.send(&datagram, 1000) > 0);
+
+    // And discarding a space clears what it owed, rather than leaving a count
+    // that outlives the space it belongs to. Re-discarding is how a test can
+    // ask: `discard` is the only writer.
+    client.spaces[initial].probes_pending = 3;
+    client.discard(.initial);
+    try testing.expectEqual(@as(u8, 0), client.spaces[initial].probes_pending);
 }

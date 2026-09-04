@@ -92,6 +92,10 @@ requirement list extracted from the specification.
 | "Acknowledged implies framed" — false, because RFC 9002's loss detection is a heuristic and a packet declared lost can be acknowledged anyway | the simulator, first sweep after reclamation landed | It needs a spurious loss, which is a property of a connection over time and of nothing smaller |
 | No Version Negotiation packet was ever written, so a server answered an unknown version with silence | the interop runner's network simulator, which will not start a test until the server answers exactly that probe | It is a rule about a packet this package had decided not to send, which is indistinguishable from a rule it had decided not to obey |
 | The interop client resolved host names with `IpAddress.resolve`, which parses a literal and then goes to DNS — never `/etc/hosts`, which is where the runner puts every name | the interop runner | Every test until then used an address literal, so the resolver was never asked a question it could get wrong |
+| A request stream tolerated eight disjoint received ranges, on the reasoning that "a real path reorders within a few packets" — the runner's ordinary path makes more, and a receiver out of spans closes with INTERNAL_ERROR | the runner, on a 5 MiB transfer | `sim/` reorders, but not the way a 10 Mbps link with a 25-packet queue does |
+| A probe owed by a discarded packet number space was never cleared, so a stalled connection reported probes outstanding on two spaces that no longer existed | reading a stall the runner produced | Nothing acts on the count, so nothing could notice it was wrong — it cost an hour of looking at the wrong thing |
+| The server refilled its send buffer only when a datagram arrived, so a client waiting for a download and a server waiting for a datagram waited for each other | the runner, `transfer` against quic-go's client | Every earlier test had a peer that kept talking |
+| The server truncated any response over two megabytes and served the prefix as if it were the file | the runner, which compares byte for byte | A cap chosen for memory that was never about memory: the body is streamed in scratch-sized pieces |
 
 Two things about that table.
 
@@ -758,26 +762,50 @@ other way:
    an address literal, so the resolver had never been asked a question it could
    get wrong.
 
-**The end-to-end run is blocked by the host, not by this package.** On the
-machine this was attempted on, ns-3's re-emitted frames are filtered away
-before they reach the far endpoint: `bridge-nf-call-iptables` is 1, so bridged
-frames traverse iptables and meet docker's `DOCKER` chain, which ends in DROP.
-A narrow `DOCKER-USER` accept for the runner's `193.167.0.0/16` was tried and
-is hit — 26 packets — and is not sufficient.
+**Getting the simulator to pass packets at all was a host question**, and the
+control is what settled it. ns-3 re-emits frames with raw sockets; with
+`bridge-nf-call-iptables=1` those bridged frames traverse iptables and meet
+docker's `DOCKER` chain, which ends in DROP. **quic-go against quic-go failed
+identically** until `net.bridge.bridge-nf-call-iptables` was set to 0. A narrow
+`DOCKER-USER` accept for `193.167.0.0/16` is *hit* and is not sufficient, which
+is worth knowing before spending an evening on it. The runner's own Python
+needs an interpreter older than 3.14, because pyshark still calls
+`asyncio.set_child_watcher`.
 
-The control is the part worth keeping: **quic-go against quic-go fails
-identically**, with the same "timeout: no recent network activity". Recording
-that is the difference between "the runner does not pass" and "the runner does
-not run here", and only the control tells them apart. Nothing about the result
-is a claim about this package, and the two defects above are real whatever the
-host does.
+Run the control first, always. A red matrix that is really a host problem is
+the most expensive wrong answer this document can produce, and one command
+tells them apart.
+
+### The result
+
+**As a client, against quic-go's server: seven of eight.** `handshake`,
+`transfer`, `chacha20`, `retry`, `http3`, `transferloss` and `keyupdate` pass.
+`handshakeloss` does not: it is fifty connections through 30% loss in three
+hundred seconds, and about thirty-eight finish. Nothing is wrong with any one
+of them — the median handshake is half a second — but the tail is RFC 9002's
+PTO backoff at 1, 2, 4, 8, 16 seconds, and enough connections reach the far end
+of it to run out the budget. That is a performance property rather than a
+defect, and it is the honest place to leave it: not a rule broken, a recovery
+slower than quic-go's.
+
+**As a server, against quic-go's client: five of eight** on the last run —
+`handshake`, `chacha20`, `retry`, `http3` and `transferloss` — with `transfer`,
+`multiplexing` and `handshakeloss` failing on multi-stream transfers of several
+megabytes at once. Two defects in that path were found and fixed and a third is
+still there; the runs also vary, because the runner draws new file sizes each
+time. Written down as five of eight rather than rounded up.
+
+Four more defects fell out of the attempt, all in the table in §1: the
+eight-span reassembly limit, a probe count that outlived its space, a server
+that refilled its send buffer only on inbound datagrams, and a server that
+truncated responses over two megabytes and served the prefix.
 
 What is left here:
 
-- **Finishing the runner on a host whose bridge filtering allows it**, which is
-  a machine question rather than a code one. Everything else is in place: the
-  endpoint image builds, `run.py` drives it, and the server answers the
-  simulator's probe.
+- **The server's multi-stream transfer path**, which stalls on three
+  simultaneous streams carrying ten megabytes between them. The client side of
+  the same path is fine, and so is the server on one stream.
+- **Recovery under heavy loss**, which is what `handshakeloss` measures.
 
 #### The other outside evidence: `corpus/qifs.zig` — **done**
 

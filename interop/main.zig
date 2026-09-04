@@ -110,10 +110,23 @@ const receive_octets: usize = 2048;
 /// section 17.2's twenty.
 const connection_id_octets: usize = 8;
 
-/// How long a single connection is given before it is abandoned. The runner's
-/// own per-test timeout is a minute or more; failing first with a message
-/// beats being killed with none.
-const connection_deadline_ns: u64 = 60 * std.time.ns_per_s;
+/// How long a single connection is given before it is abandoned, when it is one
+/// of many.
+///
+/// The runner's arithmetic rather than taste. `handshakeloss` is fifty
+/// connections in three hundred seconds — it sets `TESTCASE=multiconnect` on
+/// the endpoints — so a connection that stalls and holds a sixty-second
+/// deadline is not one failure but ten: the ones that never got their turn.
+const connection_deadline_short_ns: u64 = 10 * std.time.ns_per_s;
+
+/// And when it is the only one. `transferloss` is a single connection carrying
+/// a large file through a lossy path, where the same ten seconds is the
+/// difference between slow and failed.
+///
+/// One constant would have to be wrong for one of the two, which is why there
+/// are two: the shim knows which case it is running, and the runner's own
+/// budgets differ by case for the same reason.
+const connection_deadline_long_ns: u64 = 60 * std.time.ns_per_s;
 
 /// Datagrams built per flush before the loop goes back to the socket. A bound
 /// rather than "until `wantsSend` is false", because a connection that always
@@ -177,6 +190,14 @@ const Testcase = enum {
     /// multiplexed onto one.
     fn oneConnectionPerRequest(self: Testcase) bool {
         return self == .multiconnect;
+    }
+
+    /// How long one connection may take. See the two constants.
+    fn deadlineNs(self: Testcase) u64 {
+        return if (self.oneConnectionPerRequest())
+            connection_deadline_short_ns
+        else
+            connection_deadline_long_ns;
     }
 
     /// The application protocol. `http3` is the only case that runs HTTP/3
@@ -274,17 +295,30 @@ pub fn main(init: std.process.Init) !u8 {
     const session = try gpa.create(Session);
     defer gpa.destroy(session);
 
+    // Resolved once, not once per connection. `multiconnect` and
+    // `handshakeloss` open fifty connections to the same authority, and a name
+    // lookup that costs seconds — as it does inside the interop runner, where
+    // the only answer is in `/etc/hosts` and the resolver still consults the
+    // network — turns fifty fast connections into a test that times out. The
+    // measurement said so plainly: every connection finished in under two
+    // seconds and seventeen of fifty finished at all.
+    const first = try Url.parse(requests.items[0]);
+    const resolve_start = Io.Timestamp.now(io, .awake);
+    const peer = try resolve(io, first.host, first.port);
+    const resolve_ms = @divTrunc(resolve_start.durationTo(Io.Timestamp.now(io, .awake)).nanoseconds, std.time.ns_per_ms);
+    if (verbose) try note(log, "resolved {s} in {d}ms", .{ first.host, resolve_ms });
+
     var failed = false;
     if (testcase.oneConnectionPerRequest()) {
         for (requests.items) |one| {
             const only = [_][]const u8{one};
-            session.run(io, log, testcase, downloads, key_log, &only, verbose) catch |err| {
+            session.run(io, log, testcase, downloads, key_log, &only, verbose, peer) catch |err| {
                 try log.print("h3-interop: {s}: {s}\n", .{ one, @errorName(err) });
                 failed = true;
             };
         }
     } else {
-        session.run(io, log, testcase, downloads, key_log, requests.items, verbose) catch |err| {
+        session.run(io, log, testcase, downloads, key_log, requests.items, verbose, peer) catch |err| {
             try log.print("h3-interop: {s}\n", .{@errorName(err)});
             failed = true;
         };
@@ -500,13 +534,13 @@ const Session = struct {
         key_log: ?*Io.Writer,
         urls: []const []const u8,
         verbose: bool,
+        peer: Io.net.IpAddress,
     ) !void {
         self.verbose = verbose;
         std.debug.assert(urls.len > 0);
         if (urls.len > requests_max) return error.TooManyRequests;
 
         const first = try Url.parse(urls[0]);
-        const peer = try resolve(io, first.host, first.port);
 
         const any: Io.net.IpAddress = switch (peer) {
             .ip4 => .{ .ip4 = .unspecified(0) },
@@ -606,7 +640,7 @@ const Session = struct {
         // and the wait is capped by `deadlineFor`.
         while (true) {
             const now = elapsed(io, origin);
-            if (now > connection_deadline_ns) return error.Timeout;
+            if (now > testcase.deadlineNs()) return error.Timeout;
 
             try self.pumpCrypto(log, key_log);
             if (self.verbose) try note(log, "state {s} at {d}ms", .{ @tagName(self.connection.state), now / std.time.ns_per_ms });
@@ -640,7 +674,12 @@ const Session = struct {
             const wait = self.deadlineFor(io, origin);
             const message = socket.receiveTimeout(io, &receive_buffer, wait) catch |err| switch (err) {
                 error.Timeout => {
-                    self.connection.onTimeout(elapsed(io, origin));
+                    const at = elapsed(io, origin);
+                    self.connection.onTimeout(at);
+                    if (self.verbose) try note(log, "timer at {d}ms: wantsSend={any}", .{
+                        at / std.time.ns_per_ms,
+                        self.connection.wantsSend(),
+                    });
                     continue;
                 },
                 else => return err,
@@ -667,7 +706,11 @@ const Session = struct {
 
         for (self.requests[0..self.requests_len]) |*request| {
             try request.writer.interface.flush();
-            try log.print("h3-interop: {s} {d} octets\n", .{ request.url.path, request.octets });
+            try log.print("h3-interop: {s} {d} octets in {d}ms\n", .{
+                request.url.path,
+                request.octets,
+                elapsed(io, origin) / std.time.ns_per_ms,
+            });
         }
         if (testcase == .keyupdate) {
             try log.print("h3-interop: {d} key updates\n", .{self.key_updates});
@@ -916,7 +959,7 @@ const Session = struct {
     /// is one, and the connection's own deadline otherwise.
     fn deadlineFor(self: *Session, io: Io, origin: Io.Timestamp) Io.Timeout {
         const now = elapsed(io, origin);
-        const at = self.connection.timeout() orelse connection_deadline_ns;
+        const at = self.connection.timeout() orelse connection_deadline_long_ns;
         const wait = if (at > now) at - now else 0;
         return .{ .duration = .{ .raw = .{ .nanoseconds = @intCast(wait) }, .clock = .awake } };
     }
