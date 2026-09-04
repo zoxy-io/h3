@@ -50,7 +50,9 @@ Evidence that does not come from this package: `corpus/qifs.zig` decodes 144
 QPACK field sections produced by four other implementations, and `interop/` is
 a [QUIC Interop Runner](https://github.com/quic-interop/quic-interop-runner)
 client that completes a real handshake, Retry, and HTTP/3 transfer against
-quic-go, ngtcp2 and aioquic. The second found seven defects; see
+quic-go, ngtcp2 and aioquic — and a server that passes all 49 of
+[h3spec](https://github.com/kazu-yamamoto/h3spec)'s conformance cases. Between
+them they found eleven defects; see
 [docs/VERIFICATION.md](docs/VERIFICATION.md) §5.5 for what they were and
 [interop/README.md](interop/README.md) for how to run it.
 

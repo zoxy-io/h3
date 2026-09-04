@@ -230,6 +230,31 @@ pub fn build(b: *std.Build) void {
     const interop_step = b.step("interop", "Build the QUIC Interop Runner client");
     interop_step.dependOn(&interop_install.step);
 
+    // The server role, for h3spec. Its own binary rather than a mode of the
+    // client: the runner's contract and h3spec's are different enough that one
+    // `main` reading both would be a `main` doing neither clearly.
+    const server_exe = b.addExecutable(.{
+        .name = "h3-server",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("interop/server.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "h3", .module = h3_module }},
+        }),
+    });
+    const server_install = b.addInstallArtifact(server_exe, .{});
+    interop_step.dependOn(&server_install.step);
+
+    const server_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("interop/server.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "h3", .module = h3_module }},
+        }),
+    });
+    const server_tests_run = b.addRunArtifact(server_tests);
+
     // Its unit tests are the parts that can be checked without a peer: the
     // ClientHello's shape, the transcript boundaries, the URL and test case
     // parsing. The handshake itself is only checked by a server, which is the
@@ -284,6 +309,7 @@ pub fn build(b: *std.Build) void {
     // rather than the one the interop runner runs a week later.
     test_step.dependOn(&interop_tests_run.step);
     test_step.dependOn(&interop_tls_tests_run.step);
+    test_step.dependOn(&server_tests_run.step);
 
     // The format gate. A build step rather than a documented `zig fmt --check`
     // incantation, so that the list of formatted paths lives in exactly one

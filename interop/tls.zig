@@ -141,6 +141,14 @@ pub const Error = error{
     /// Something exceeded a fixed bound: the peer's transport parameters, or
     /// the ClientHello's own buffer.
     TooLarge,
+    /// RFC 9001 section 8.1: the client offered no protocol this endpoint
+    /// speaks. Its own error because the alert has its own number, and h3spec
+    /// asserts on it — a handshake that failed for this reason and said
+    /// `unexpected_message` is a handshake whose peer learns nothing.
+    NoApplicationProtocol,
+    /// RFC 9001 section 8.2: no `quic_transport_parameters` extension. Likewise
+    /// its own alert.
+    MissingExtension,
 };
 
 /// A traffic secret to hand to `Connection.installSecret`, held until the
@@ -916,4 +924,467 @@ test "expandLabel reproduces RFC 8448's derived secret" {
         0xeb, 0xea, 0xc3, 0x57, 0x6c, 0x36, 0x11, 0xba,
     };
     try testing.expectEqualSlices(u8, &derived_expected, &derived);
+}
+
+/// The other half: a TLS 1.3 server handshake, for the interop shim's server
+/// role and for h3spec.
+///
+/// The same disclaimers as `Client`, and one more. It signs with the key it was
+/// given and never asks who is connecting: there is no client authentication,
+/// no session resumption and no ticket. It offers X25519 and the two SHA-256
+/// suites, and refuses anything else rather than negotiating around it — which
+/// for a conformance target is the right answer, because a test that fails
+/// because the handshake quietly downgraded tells you nothing.
+pub const Server = struct {
+    state: enum { wait_client_hello, wait_finished, established } = .wait_client_hello,
+
+    random: [32]u8,
+    key_pair: X25519.KeyPair,
+    /// The leaf certificate and its chain, in DER, leaf first. Sent verbatim.
+    certificates: []const []const u8,
+    /// The leaf's P-256 private key, as the 32-octet scalar.
+    private_key: [32]u8,
+    /// The application protocols this server will accept, in preference order.
+    protocols: []const []const u8,
+    /// This endpoint's QUIC transport parameters extension body.
+    transport_parameters: []const u8,
+
+    transcript: Hash = Hash.init(.{}),
+    shared: [share_octets]u8 = @splat(0),
+    suite: CipherSuite = .aes_128_gcm_sha256,
+    /// The protocol chosen from the client's list, or empty if it offered none
+    /// this server knows.
+    selected: []const u8 = &.{},
+
+    handshake_secret: [secret_octets]u8 = @splat(0),
+    client_handshake_traffic: [secret_octets]u8 = @splat(0),
+    server_handshake_traffic: [secret_octets]u8 = @splat(0),
+
+    installs: [4]Install = undefined,
+    installs_len: u8 = 0,
+
+    /// The flight to send, split by the encryption level it goes out at:
+    /// ServerHello at Initial, everything else at Handshake. One buffer with a
+    /// boundary rather than two, because the two are produced together and the
+    /// split is a fact about the wire rather than about the code.
+    out: [16 * 1024]u8 = @splat(0),
+    out_initial: usize = 0,
+    out_handshake: usize = 0,
+    out_initial_taken: usize = 0,
+    out_handshake_taken: usize = 0,
+
+    peer_parameters: [1024]u8 = @splat(0),
+    peer_parameters_len: u16 = 0,
+    peer_parameters_seen: bool = false,
+
+    pub const Options = struct {
+        certificates: []const []const u8,
+        private_key: [32]u8,
+        protocols: []const []const u8,
+        transport_parameters: []const u8,
+        random: [32]u8,
+        key_seed: [32]u8,
+    };
+
+    pub fn init(options: Server.Options) Server {
+        return .{
+            .random = options.random,
+            .key_pair = X25519.KeyPair.generateDeterministic(options.key_seed) catch unreachable, // Any 32 octets are a private key.
+            .certificates = options.certificates,
+            .private_key = options.private_key,
+            .protocols = options.protocols,
+            .transport_parameters = options.transport_parameters,
+        };
+    }
+
+    /// Consume whole handshake messages, as `Client.read` does.
+    pub fn read(self: *Server, level: Level, source: []const u8) Error!usize {
+        var offset: usize = 0;
+        // Bounded by `source`, as in `Client.read`.
+        while (source.len - offset >= 4) {
+            const length = readInt(u24, source[offset + 1 ..][0..3]);
+            const total = 4 + @as(usize, length);
+            if (source.len - offset < total) break;
+            try self.message(level, source[offset..][0..total]);
+            offset += total;
+        }
+        return offset;
+    }
+
+    fn message(self: *Server, level: Level, whole: []const u8) Error!void {
+        std.debug.assert(whole.len >= 4);
+        const kind: MessageType = @enumFromInt(whole[0]);
+        switch (kind) {
+            .client_hello => {
+                if (level != .initial) return error.Unsupported;
+                if (self.state != .wait_client_hello) return error.Unsupported;
+                try self.clientHello(whole[4..]);
+                self.transcript.update(whole);
+                try self.flight();
+                self.state = .wait_finished;
+            },
+            .finished => {
+                if (level != .handshake) return error.Unsupported;
+                if (self.state != .wait_finished) return error.Unsupported;
+                try self.verifyFinished(whole[4..]);
+                self.transcript.update(whole);
+                self.state = .established;
+            },
+            else => return error.Unsupported,
+        }
+    }
+
+    fn clientHello(self: *Server, body: []const u8) Error!void {
+        var in: Reader = .{ .buffer = body };
+        if (try in.int(u16) != 0x0303) return error.Unsupported;
+        _ = try in.take(32); // The client's Random, which a server only hashes.
+        // RFC 9001 section 8.4: empty over QUIC, and a client that sends one
+        // anyway is not talking QUIC.
+        if (try in.byte() != 0) return error.Unsupported;
+
+        const suites = try in.lengthPrefixed(2);
+        if (suites.len % 2 != 0) return error.Malformed;
+        self.suite = suite: {
+            // Our preference, not the client's: the server chooses.
+            for ([_]CipherSuite{ .aes_128_gcm_sha256, .chacha20_poly1305_sha256 }) |wanted| {
+                var index: usize = 0;
+                while (index < suites.len) : (index += 2) {
+                    if (readInt(u16, suites[index..][0..2]) == @intFromEnum(wanted)) break :suite wanted;
+                }
+            }
+            return error.Unsupported;
+        };
+
+        _ = try in.lengthPrefixed(1); // Compression methods, all of them null.
+
+        var version_seen = false;
+        var share: ?[]const u8 = null;
+        var extensions: Reader = .{ .buffer = try in.lengthPrefixed(2) };
+        // Bounded by the extensions block.
+        while (!extensions.done()) {
+            const id: Extension = @enumFromInt(try extensions.int(u16));
+            const value = try extensions.lengthPrefixed(2);
+            switch (id) {
+                .supported_versions => {
+                    var list: Reader = .{ .buffer = try (Reader{ .buffer = value }).lengthPrefixedOf(1) };
+                    // Bounded by the list.
+                    while (!list.done()) {
+                        if (try list.int(u16) == 0x0304) version_seen = true;
+                    }
+                },
+                .key_share => {
+                    var list: Reader = .{ .buffer = try (Reader{ .buffer = value }).lengthPrefixedOf(2) };
+                    // Bounded by the list: each entry consumes its own length.
+                    while (!list.done()) {
+                        const group = try list.int(u16);
+                        const key = try list.lengthPrefixed(2);
+                        if (group == group_x25519 and key.len == share_octets) share = key;
+                    }
+                },
+                .alpn => {
+                    var list: Reader = .{ .buffer = try (Reader{ .buffer = value }).lengthPrefixedOf(2) };
+                    // Bounded by the list.
+                    while (!list.done()) {
+                        const offered = try list.lengthPrefixed(1);
+                        for (self.protocols) |known| {
+                            if (self.selected.len == 0 and std.mem.eql(u8, offered, known)) {
+                                self.selected = known;
+                            }
+                        }
+                    }
+                },
+                .quic_transport_parameters => {
+                    if (value.len > self.peer_parameters.len) return error.TooLarge;
+                    @memcpy(self.peer_parameters[0..value.len], value);
+                    self.peer_parameters_len = @intCast(value.len);
+                    self.peer_parameters_seen = true;
+                },
+                else => {},
+            }
+        }
+        if (!version_seen) return error.Unsupported;
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-8.1
+        //# The server MUST treat the inability to select a compatible
+        //# application protocol as a connection error of type 0x0178
+        //# (no_application_protocol).
+        //= type=test
+        if (self.selected.len == 0) return error.NoApplicationProtocol;
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-8.2
+        //# Endpoints MUST send the quic_transport_parameters extension;
+        //# endpoints that receive ClientHello or EncryptedExtensions messages
+        //# without the quic_transport_parameters extension MUST close the
+        //# connection with an error of type 0x016d (equivalent to a fatal TLS
+        //# missing_extension alert, see Section 4.8).
+        //= type=test
+        if (!self.peer_parameters_seen) return error.MissingExtension;
+
+        const public = share orelse return error.Unsupported; // No HelloRetryRequest; see the module comment.
+        self.shared = X25519.scalarmult(self.key_pair.secret_key, public[0..share_octets].*) catch
+            return error.Unsupported;
+    }
+
+    /// Everything the server sends in answer, in one go: ServerHello at
+    /// Initial, then EncryptedExtensions, Certificate, CertificateVerify and
+    /// Finished at Handshake.
+    fn flight(self: *Server) Error!void {
+        var out: Writer = .{ .buffer = &self.out };
+
+        try self.writeServerHello(&out);
+        self.out_initial = out.offset;
+        self.transcript.update(out.written());
+        self.deriveHandshake();
+
+        // Each message joins the transcript *before* the next one is built,
+        // because the next one's signature or MAC is over everything ahead of
+        // it. Batching the three and hashing them afterwards signs a transcript
+        // that stops at the ServerHello — which is a signature the peer
+        // computes differently and rejects, and it says so with
+        // "cannot verify CertificateVerify" and nothing about why.
+        var start = out.offset;
+        try self.writeEncryptedExtensions(&out);
+        try self.writeCertificate(&out);
+        self.transcript.update(out.buffer[start..out.offset]);
+
+        // RFC 8446 section 4.4.3: signed over `ClientHello .. Certificate`.
+        start = out.offset;
+        try self.writeCertificateVerify(&out);
+        self.transcript.update(out.buffer[start..out.offset]);
+
+        // And section 4.4.4: the MAC is over `ClientHello .. CertificateVerify`.
+        start = out.offset;
+        try self.writeFinished(&out);
+        self.transcript.update(out.buffer[start..out.offset]);
+        self.out_handshake = out.offset;
+
+        // Section 7.1 of RFC 8446: the application secrets read the transcript
+        // at `ClientHello .. server Finished`, which is exactly here.
+        self.deriveApplication();
+    }
+
+    fn writeServerHello(self: *Server, out: *Writer) Error!void {
+        try out.byte(@intFromEnum(MessageType.server_hello));
+        const body = try out.beginLength(3);
+        try out.int(u16, 0x0303);
+        try out.bytes(&self.random);
+        try out.byte(0); // The echoed session ID, empty over QUIC.
+        try out.int(u16, @intFromEnum(self.suite));
+        try out.byte(0); // Compression.
+
+        const extensions = try out.beginLength(2);
+        try out.int(u16, @intFromEnum(Extension.supported_versions));
+        var extension = try out.beginLength(2);
+        try out.int(u16, 0x0304);
+        try out.endLength(extension);
+
+        try out.int(u16, @intFromEnum(Extension.key_share));
+        extension = try out.beginLength(2);
+        try out.int(u16, group_x25519);
+        const key = try out.beginLength(2);
+        try out.bytes(&self.key_pair.public_key);
+        try out.endLength(key);
+        try out.endLength(extension);
+        try out.endLength(extensions);
+        try out.endLength(body);
+    }
+
+    fn writeEncryptedExtensions(self: *Server, out: *Writer) Error!void {
+        try out.byte(@intFromEnum(MessageType.encrypted_extensions));
+        const body = try out.beginLength(3);
+        const extensions = try out.beginLength(2);
+
+        try out.int(u16, @intFromEnum(Extension.alpn));
+        var extension = try out.beginLength(2);
+        const list = try out.beginLength(2);
+        const protocol = try out.beginLength(1);
+        try out.bytes(self.selected);
+        try out.endLength(protocol);
+        try out.endLength(list);
+        try out.endLength(extension);
+
+        try out.int(u16, @intFromEnum(Extension.quic_transport_parameters));
+        extension = try out.beginLength(2);
+        try out.bytes(self.transport_parameters);
+        try out.endLength(extension);
+
+        try out.endLength(extensions);
+        try out.endLength(body);
+    }
+
+    fn writeCertificate(self: *Server, out: *Writer) Error!void {
+        try out.byte(@intFromEnum(MessageType.certificate));
+        const body = try out.beginLength(3);
+        try out.byte(0); // certificate_request_context, empty outside client auth.
+        const list = try out.beginLength(3);
+        for (self.certificates) |der| {
+            const entry = try out.beginLength(3);
+            try out.bytes(der);
+            try out.endLength(entry);
+            const extensions = try out.beginLength(2);
+            try out.endLength(extensions);
+        }
+        try out.endLength(list);
+        try out.endLength(body);
+    }
+
+    /// RFC 8446 section 4.4.3. The signature is over a fixed prefix rather than
+    /// over the transcript alone, which is what stops a signature made for one
+    /// role or one protocol from being replayed into another.
+    fn writeCertificateVerify(self: *Server, out: *Writer) Error!void {
+        const Ecdsa = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+
+        var content: [64 + 33 + 1 + Hash.digest_length]u8 = undefined;
+        @memset(content[0..64], 0x20);
+        const label = "TLS 1.3, server CertificateVerify";
+        @memcpy(content[64..][0..label.len], label);
+        content[64 + label.len] = 0;
+        var digest: [Hash.digest_length]u8 = undefined;
+        var copy = self.transcript;
+        copy.final(&digest);
+        @memcpy(content[64 + label.len + 1 ..][0..digest.len], &digest);
+        const total = 64 + label.len + 1 + digest.len;
+
+        const secret = Ecdsa.SecretKey.fromBytes(self.private_key) catch return error.Unsupported;
+        const pair = Ecdsa.KeyPair.fromSecretKey(secret) catch return error.Unsupported;
+        const signature = pair.sign(content[0..total], null) catch return error.Unsupported;
+        var der: [Ecdsa.Signature.der_encoded_length_max]u8 = undefined;
+        const encoded = signature.toDer(&der);
+
+        try out.byte(@intFromEnum(MessageType.certificate_verify));
+        const body = try out.beginLength(3);
+        try out.int(u16, 0x0403); // ecdsa_secp256r1_sha256
+        const bytes = try out.beginLength(2);
+        try out.bytes(encoded);
+        try out.endLength(bytes);
+        try out.endLength(body);
+    }
+
+    fn writeFinished(self: *Server, out: *Writer) Error!void {
+        var verify: [Hmac.mac_length]u8 = undefined;
+        finishedData(&self.transcript, &self.server_handshake_traffic, &verify);
+        try out.byte(@intFromEnum(MessageType.finished));
+        const body = try out.beginLength(3);
+        try out.bytes(&verify);
+        try out.endLength(body);
+    }
+
+    fn verifyFinished(self: *Server, body: []const u8) Error!void {
+        var expected: [Hmac.mac_length]u8 = undefined;
+        finishedData(&self.transcript, &self.client_handshake_traffic, &expected);
+        if (body.len != expected.len) return error.BadFinished;
+        if (!std.crypto.timing_safe.eql([Hmac.mac_length]u8, expected, body[0..Hmac.mac_length].*)) {
+            return error.BadFinished;
+        }
+    }
+
+    fn deriveHandshake(self: *Server) void {
+        const zero: [secret_octets]u8 = @splat(0);
+        const early = Hkdf.extract(&.{}, &zero);
+        var derived: [secret_octets]u8 = undefined;
+        deriveSecretEmpty(&derived, &early, "derived");
+
+        self.handshake_secret = Hkdf.extract(&derived, &self.shared);
+        deriveSecret(&self.transcript, &self.client_handshake_traffic, &self.handshake_secret, "c hs traffic");
+        deriveSecret(&self.transcript, &self.server_handshake_traffic, &self.handshake_secret, "s hs traffic");
+
+        // The mirror of the client's: this endpoint sends under the server
+        // secret and receives under the client's.
+        self.install(.handshake, .send, &self.server_handshake_traffic, "SERVER_HANDSHAKE_TRAFFIC_SECRET");
+        self.install(.handshake, .receive, &self.client_handshake_traffic, "CLIENT_HANDSHAKE_TRAFFIC_SECRET");
+    }
+
+    fn deriveApplication(self: *Server) void {
+        const zero: [secret_octets]u8 = @splat(0);
+        var derived: [secret_octets]u8 = undefined;
+        deriveSecretEmpty(&derived, &self.handshake_secret, "derived");
+        const master = Hkdf.extract(&derived, &zero);
+
+        var client_traffic: [secret_octets]u8 = undefined;
+        var server_traffic: [secret_octets]u8 = undefined;
+        deriveSecret(&self.transcript, &client_traffic, &master, "c ap traffic");
+        deriveSecret(&self.transcript, &server_traffic, &master, "s ap traffic");
+
+        self.install(.one_rtt, .send, &server_traffic, "SERVER_TRAFFIC_SECRET_0");
+        self.install(.one_rtt, .receive, &client_traffic, "CLIENT_TRAFFIC_SECRET_0");
+    }
+
+    fn install(self: *Server, level: Level, direction: @FieldType(Install, "direction"), secret: *const [secret_octets]u8, label: []const u8) void {
+        std.debug.assert(self.installs_len < self.installs.len); // Four is the whole handshake.
+        self.installs[self.installs_len] = .{
+            .level = level,
+            .direction = direction,
+            .secret = secret.*,
+            .suite = self.suite.quic(),
+            .label = label,
+        };
+        self.installs_len += 1;
+    }
+
+    pub fn drainInstalls(self: *Server) []const Install {
+        const out = self.installs[0..self.installs_len];
+        self.installs_len = 0;
+        return out;
+    }
+
+    /// Handshake octets still owed at this level, or an empty slice.
+    pub fn drainOut(self: *Server, level: Level) []const u8 {
+        switch (level) {
+            .initial => {
+                const out = self.out[self.out_initial_taken..self.out_initial];
+                self.out_initial_taken = self.out_initial;
+                return out;
+            },
+            .handshake => {
+                const start = @max(self.out_initial, self.out_handshake_taken);
+                const out = self.out[start..self.out_handshake];
+                self.out_handshake_taken = self.out_handshake;
+                return out;
+            },
+            else => return &.{},
+        }
+    }
+
+    pub fn drainTransportParameters(self: *Server) ?[]const u8 {
+        if (!self.peer_parameters_seen) return null;
+        self.peer_parameters_seen = false;
+        return self.peer_parameters[0..self.peer_parameters_len];
+    }
+
+    pub fn alpn(self: *const Server) []const u8 {
+        return self.selected;
+    }
+};
+
+/// `Derive-Secret(secret, label, Messages)` over a transcript, shared by both
+/// roles. A free function rather than a method, because `Client` and `Server`
+/// hold the same schedule and only differ in which secret goes which way.
+fn deriveSecret(
+    transcript: *const Hash,
+    out: *[secret_octets]u8,
+    secret: *const [secret_octets]u8,
+    label: []const u8,
+) void {
+    var digest: [Hash.digest_length]u8 = undefined;
+    var copy = transcript.*;
+    copy.final(&digest);
+    expandLabel(out, secret, label, &digest);
+}
+
+fn deriveSecretEmpty(out: *[secret_octets]u8, secret: *const [secret_octets]u8, label: []const u8) void {
+    var digest: [Hash.digest_length]u8 = undefined;
+    Hash.hash("", &digest, .{});
+    expandLabel(out, secret, label, &digest);
+}
+
+/// RFC 8446 section 4.4.4's `verify_data`, over a transcript.
+fn finishedData(
+    transcript: *const Hash,
+    traffic: *const [secret_octets]u8,
+    out: *[Hmac.mac_length]u8,
+) void {
+    var key: [secret_octets]u8 = undefined;
+    expandLabel(&key, traffic, "finished", "");
+    var digest: [Hash.digest_length]u8 = undefined;
+    var copy = transcript.*;
+    copy.final(&digest);
+    Hmac.create(out, &digest, &key);
 }

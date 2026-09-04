@@ -1038,26 +1038,31 @@ pub fn Connection(comptime config: Config) type {
             // in `send`, once a Handshake packet has gone into a datagram, and in
             // `receivePacket`, once a server has opened one.
 
-            // RFC 9001 section 4.1.2: the handshake is confirmed at the *server*
-            // when the handshake completes, which is when it can send 1-RTT — a
-            // client waits for HANDSHAKE_DONE instead. This matters to RFC 9002
-            // rather than to anything here: section 6.2.1 declines to arm an
-            // application-data PTO before it, because 1-RTT keys may not exist
-            // on both sides yet, and a connection that never confirms is a
-            // connection whose 1-RTT packets are never retransmitted.
+            // A server used to confirm the handshake here, on installing its
+            // 1-RTT send keys, and that is a flight too early. RFC 9001 section
+            // 4.1.1 says the handshake completes when the TLS stack has *both*
+            // sent its Finished and verified the peer's; a server installing
+            // 1-RTT keys has only done the first. Between the two it had marked
+            // the connection `established`, which invites a consumer to send
+            // application data to a peer that has not been authenticated, and
+            // it had set `recovery.handshake_confirmed`, which sends a
+            // CONNECTION_CLOSE at 1-RTT to a peer holding no 1-RTT keys.
             //
-            // The Handshake keys are *not* dropped here, and by section 4.9.2
-            // they should be: for a server, "confirmed" is this line.
-            //= https://www.rfc-editor.org/rfc/rfc9001#section-4.9.2
-            //# An endpoint MUST discard its Handshake keys when the TLS handshake is
-            //# confirmed (Section 4.1.2).
-            //= type=todo
-            if (level == .one_rtt and direction == .send and self.side == .server) {
-                if (self.state != .established) self.emit(.handshake_confirmed);
-                self.state = .established;
-                self.recovery.handshake_confirmed = true;
-                self.handshake_done_pending = true;
-            }
+            // h3spec found the second: a server rejecting the client's
+            // transport parameters closed in a packet the client could not
+            // read, so every one of section 18.2's rules looked unimplemented
+            // from the outside while being implemented and tested inside.
+            //
+            // `confirmHandshake` is the entry point, and it always was: only
+            // the consumer's TLS engine knows that the peer's Finished
+            // verified. Same seam as `installSecret`, used for the one fact
+            // `installSecret` cannot carry — and it is where section 4.9.2's
+            // key discarding happens too, which is why that rule is a test
+            // there and was a todo here.
+            //= https://www.rfc-editor.org/rfc/rfc9001#section-4.1.2
+            //# the TLS handshake is considered confirmed at the server when the
+            //# handshake completes
+            //= type=test
 
             // Section 6 needs the secret, not just the keys: the next
             // generation is `HKDF-Expand-Label(secret, "quic ku", "", len)`, so
@@ -1630,10 +1635,19 @@ pub fn Connection(comptime config: Config) type {
         ///
         /// Idempotent: a consumer that calls it twice, or a client that has
         /// already discarded, must not discard a space twice.
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-4.9.2
+        //# An endpoint MUST discard its Handshake keys when the TLS handshake is
+        //# confirmed (Section 4.1.2).
+        //= type=test
         pub fn confirmHandshake(self: *Self) void {
             if (self.state != .established) self.emit(.handshake_confirmed);
             self.state = .established;
             self.recovery.handshake_confirmed = true;
+            // Section 4.1.2 from the other side: a server tells the client the
+            // handshake is confirmed, and HANDSHAKE_DONE is how. Owed from here
+            // rather than from `installSecret`, because this is the moment the
+            // rule names.
+            if (self.side == .server) self.handshake_done_pending = true;
             if (self.spaces[@intFromEnum(Space.handshake)].discarded) return;
             self.discard(.handshake);
             assert(self.spaces[@intFromEnum(Space.handshake)].discarded);
@@ -1780,6 +1794,31 @@ pub fn Connection(comptime config: Config) type {
             /// the peer of something.
             TooFragmented,
         };
+
+        /// The code a peer is told, for every error `receive` can return.
+        ///
+        /// The doc comments above already named these; this is the same table
+        /// as code, so that a consumer closing a connection does not have to
+        /// read them and choose. A server needs it on every datagram, which is
+        /// why it arrived with `interop/`'s server role and not before.
+        ///
+        /// `Protocol` collapses `PROTOCOL_VIOLATION` and
+        /// `FRAME_ENCODING_ERROR` into one, and this returns the first: the two
+        /// are raised from the same places here, and telling them apart would
+        /// mean splitting the error rather than guessing at the call site.
+        pub fn errorCode(err: ReceiveError) error_code.Transport {
+            return switch (err) {
+                error.Protocol => .protocol_violation,
+                error.CryptoBufferExceeded => .crypto_buffer_exceeded,
+                error.FlowControl => .flow_control_error,
+                error.FinalSize => .final_size_error,
+                error.StreamLimit => .stream_limit_error,
+                error.StreamState => .stream_state_error,
+                error.AeadLimitReached => .aead_limit_reached,
+                // The peer broke no rule and this endpoint ran out of room.
+                error.TooFragmented => .internal_error,
+            };
+        }
 
         /// Take one UDP datagram.
         ///
@@ -2191,6 +2230,20 @@ pub fn Connection(comptime config: Config) type {
                 // defence. The counter is what bounds how long that can go on.
                 error.Discard => return,
                 error.AeadLimitReached => return error.AeadLimitReached,
+                // Sections 17.2 and 17.3: a reserved bit that survives header
+                // *and* packet protection is the peer's, not an attacker's, and
+                // is a connection error rather than a discard. It used to go
+                // through `countForgery` with every other decryption failure,
+                // which both swallowed the violation and charged it against
+                // section 6.6's integrity limit — a peer breaking this rule was
+                // spending the connection's AEAD budget.
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2
+                //# An endpoint MUST treat receipt of a packet that has a
+                //# non-zero value for these bits after removing both packet and
+                //# header protection as a connection error of type
+                //# PROTOCOL_VIOLATION.
+                //= type=test
+                error.ReservedBits => return error.Protocol,
             };
 
             // Section 12.3: a duplicate is discarded rather than reprocessed,
@@ -2501,7 +2554,7 @@ pub fn Connection(comptime config: Config) type {
             bytes: []u8,
             offset: usize,
             largest: ?u64,
-        ) error{ Discard, AeadLimitReached }!crypto.Keys.Opened {
+        ) error{ Discard, AeadLimitReached, ReservedBits }!crypto.Keys.Opened {
             // Header protection first and on its own: RFC 9001 section 6.1
             // keeps the header protection key across an update, so this works
             // whichever generation protected the payload.
@@ -2514,7 +2567,10 @@ pub fn Connection(comptime config: Config) type {
             assert(header.header_octets <= bytes.len);
 
             if (level != .one_rtt) {
-                return keys.decrypt(bytes, header) catch return self.countForgery();
+                return keys.decrypt(bytes, header) catch |err| switch (err) {
+                    error.ReservedBitsSet => error.ReservedBits,
+                    else => self.countForgery(),
+                };
             }
 
             const one = &self.one_rtt;
@@ -2523,7 +2579,10 @@ pub fn Connection(comptime config: Config) type {
             // the payload. Getting this wrong once produced `ReservedBitsSet`.
             assert(level == .one_rtt);
             if (header.key_phase == one.phase) {
-                return keys.decrypt(bytes, header) catch return self.countForgery();
+                return keys.decrypt(bytes, header) catch |err| switch (err) {
+                    error.ReservedBitsSet => error.ReservedBits,
+                    else => self.countForgery(),
+                };
             }
 
             // A phase that is not ours is either the peer starting an update or
@@ -3215,6 +3274,29 @@ pub fn Connection(comptime config: Config) type {
                     //= type=exception
                     //= reason=session tickets and address validation tokens are out of scope: this package sends no Retry, issues no NEW_TOKEN and resumes no session, so it neither writes nor reads either kind of token. See docs/DESIGN.md section 2 and section 6.
                     if (level != .one_rtt and level != .zero_rtt) return error.Protocol;
+                    // Section 19.8's two state rules, which nothing checked: a
+                    // STREAM frame for a stream this endpoint cannot receive on
+                    // is either the peer sending on its own receive-only half,
+                    // or the peer inventing a stream in *our* number space. The
+                    // second is the one h3spec asks about, and `Streams.receive`
+                    // would have created the stream and accepted the data.
+                    // The send-only half of this rule is `Streams.peerMaySend`,
+                    // inside `receive` below; this is the other half, which
+                    // nothing checked. `Streams.receive` would have *created*
+                    // the stream — `open` makes whatever identifier it is
+                    // handed — so a peer could invent streams in this
+                    // endpoint's own number space and fill the table with them.
+                    //= https://www.rfc-editor.org/rfc/rfc9000#section-19.8
+                    //# An endpoint MUST terminate the connection with error
+                    //# STREAM_STATE_ERROR if it receives a STREAM frame for a
+                    //# locally initiated stream that has not yet been created,
+                    //# or for a send-only stream.
+                    //= type=test
+                    if (self.streams.find(value.stream) == null and
+                        stream_id.kindOf(value.stream).initiator() == self.side)
+                    {
+                        return error.StreamState;
+                    }
                     self.streams.receive(value.stream, value.offset, value.data, value.fin) catch |err| {
                         return streamError(err);
                     };
@@ -4370,12 +4452,7 @@ pub fn Connection(comptime config: Config) type {
             //# packets on a terminated connection.
             //= type=exception
             //= reason=one close and then silence is deliberate. `close_pending` is cleared when the CONNECTION_CLOSE is framed and is never set again, so a closing endpoint answers further packets with nothing rather than with a repeat — stricter than section 10.2.1's rate limit and needing no timer to be, which is what lets this package own no clock. A peer that loses the one close falls back to its own idle timeout.
-            const written = frame.encode(payload, .{ .connection_close = .{
-                .application = self.close_is_application,
-                .code = self.close_code,
-                .triggered_by = if (self.close_is_application) null else 0,
-                .reason = &.{},
-            } }) catch return result.*;
+            const written = frame.encode(payload, self.closeFrameFor(level)) catch return result.*;
             self.close_pending[@intFromEnum(level)] = false;
             result.octets = written;
             result.ack_eliciting = false;
@@ -4504,12 +4581,7 @@ pub fn Connection(comptime config: Config) type {
             }
 
             if (self.close_pending[@intFromEnum(level)] and offset < payload.len) {
-                offset += frame.encode(payload[offset..], .{ .connection_close = .{
-                    .application = self.close_is_application,
-                    .code = self.close_code,
-                    .triggered_by = if (self.close_is_application) null else 0,
-                    .reason = "",
-                } }) catch 0;
+                offset += frame.encode(payload[offset..], self.closeFrameFor(level)) catch 0;
                 self.close_pending[@intFromEnum(level)] = false;
             }
             result.octets = offset;
@@ -4714,6 +4786,50 @@ pub fn Connection(comptime config: Config) type {
         //= reason=a requirement on the specification of an application protocol that uses QUIC rather than on an implementation of the transport. This package carries no application protocol: what a consumer does with a stream, and how long it is willing to hold an idle connection, are decided above the seam of docs/DESIGN.md section 3. See docs/DESIGN.md section 2.
         /// Begin closing (section 10.2). The close frame goes out on the next
         /// `send`.
+        /// Section 10.2.3's conversion, as one function both close writers call.
+        ///
+        /// An application close is a type 0x1d frame, which carries no
+        /// triggering frame type and whose code comes from the application's
+        /// registry. Neither is legible at Initial or Handshake — a peer there
+        /// has no application yet — so the frame becomes a transport close with
+        /// `APPLICATION_ERROR` and an empty reason.
+        ///
+        /// Held by construction until `closeApplication` existed: `close` wrote
+        /// a transport code, so the 0x1d form was never built and the rule had
+        /// nothing to convert. Adding a way to send one is what turned it into
+        /// code.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-10.2.3
+        //# A CONNECTION_CLOSE of type 0x1d MUST be replaced by a
+        //# CONNECTION_CLOSE of type 0x1c when sending the frame in Initial
+        //# or Handshake packets.
+        //= type=test
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-10.2.3
+        //# Endpoints MUST clear the value of the Reason Phrase field and
+        //# SHOULD use the APPLICATION_ERROR code when converting to a
+        //# CONNECTION_CLOSE of type 0x1c.
+        //= type=test
+        fn closeFrameFor(self: *const Self, level: Level) frame.Frame {
+            const convert = self.close_is_application and level != .one_rtt;
+            const application = self.close_is_application and !convert;
+            return .{
+                .connection_close = .{
+                    .application = application,
+                    .code = if (convert)
+                        @intFromEnum(error_code.Transport.application_error)
+                    else
+                        self.close_code,
+                    // Section 19.19: a transport close carries the frame type that
+                    // triggered it and an application close does not. Writing
+                    // `null` for both makes a type 0x1c frame that omits a field
+                    // the peer's parser requires, which is a close the peer cannot
+                    // read.
+                    .triggered_by = if (application) null else 0,
+                    .reason = &.{},
+                },
+            };
+        }
+
         pub fn close(self: *Self, code: error_code.Transport) void {
             if (self.state == .draining or self.state == .closing) return;
             self.state = .closing;
@@ -4727,15 +4843,49 @@ pub fn Connection(comptime config: Config) type {
             // discarded, and `sendPacket` refuses a level with none. Before
             // confirmation a server owes it at both Handshake and Initial,
             // because it cannot know which the client can read.
-            self.close_code = @intFromEnum(code);
-            self.close_is_application = false;
+            self.closeWith(@intFromEnum(code), false);
+        }
+
+        /// Section 10.2's close, with a code from the *application's* registry:
+        /// RFC 9114 section 8.1's `H3_*` values, or RFC 9204 section 6's.
+        ///
+        /// Separate from `close` rather than a flag on it, because the two
+        /// registries share numbers and mean different things by them — 0x0103
+        /// is `H3_STREAM_CREATION_ERROR` in one and nothing at all in the
+        /// other. A caller that picked the wrong function would be telling the
+        /// peer something it did not mean, and a `bool` parameter at the call
+        /// site is exactly how that happens.
+        pub fn closeApplication(self: *Self, code: u64) void {
+            if (self.state == .draining or self.state == .closing) return;
+            self.state = .closing;
+            self.closeWith(code, true);
+        }
+
+        fn closeWith(self: *Self, code: u64, application: bool) void {
+            self.state = .closing;
+            self.close_code = code;
+            self.close_is_application = application;
+            // Section 10.2.3's third rule, and it does hold by construction —
+            // but only since `confirmHandshake` became the one place a
+            // handshake is confirmed. Before that a *server* confirmed inside
+            // `installSecret` and nothing discarded its Handshake keys, so it
+            // framed its close at Handshake first, where the conversion above
+            // turns an application close into `APPLICATION_ERROR` and throws
+            // the code away.
+            //
+            // h3spec found it: seven cases asking for a specific `H3_*` code
+            // got a transport close with an empty reason. The test that covered
+            // this rule called `confirmHandshake` by hand, which is the
+            // *client's* path — a server never called it.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-10.2.3
+            //# After the handshake is confirmed (see
+            //# Section 4.1.2 of [QUIC-TLS]), an endpoint MUST send any
+            //# CONNECTION_CLOSE frames in a 1-RTT packet.
+            //= type=test
             for (0..Level.count) |index| {
                 self.close_pending[index] = self.send_keys[index] != null;
             }
-            // Reported in both directions, because a consumer draining events
-            // wants one place to learn the connection is over — and the code it
-            // ends with is the same question whichever side chose it.
-            self.emit(.{ .closed = .{ .code = @intFromEnum(code), .application = false } });
+            self.emit(.{ .closed = .{ .code = code, .application = application } });
         }
 
         /// Whether anything is waiting to go out. A caller with nothing else to
@@ -5338,6 +5488,12 @@ fn established(client: *TestConnection, server: *TestConnection) !void {
     var payload: [16]u8 = @splat(0);
     const written = try frame.encode(&payload, .handshake_done);
     _ = try client.receiveFrames(.one_rtt, payload[0..written], 0);
+
+    // RFC 9001 section 4.1.1: the handshake completes when the TLS stack has
+    // both sent its Finished and verified the peer's, and only the consumer's
+    // engine knows the second. A server's `confirmHandshake` is that report,
+    // and it used to happen inside `installSecret` a flight too early.
+    server.confirmHandshake();
 
     // Section 18.2 defaults every stream limit to zero, so a peer that never
     // says otherwise has permitted nothing. A real handshake carries these in
@@ -6089,7 +6245,15 @@ test "RFC 9001 section 4.1.2: the server sends HANDSHAKE_DONE" {
     try installBoth(&server, &client, .one_rtt, 0x33);
     try installBoth(&client, &server, .one_rtt, 0x44);
 
-    // Installing a 1-RTT send key is this seam's "the handshake is complete".
+    // Not yet: a server that has installed its 1-RTT send keys has sent its
+    // Finished and not verified the client's, and RFC 9001 section 4.1.1 needs
+    // both. Owing HANDSHAKE_DONE here would be telling the client the
+    // handshake is confirmed before it is.
+    try testing.expect(!server.handshake_done_pending);
+
+    // `confirmHandshake` is the consumer's report that the client's Finished
+    // verified, and it is what owes the frame.
+    server.confirmHandshake();
     try testing.expect(server.handshake_done_pending);
     try testing.expect(server.wantsSend());
 
@@ -6115,6 +6279,7 @@ test "a lost HANDSHAKE_DONE is sent again" {
     try installBoth(&client, &server, .handshake, 0x22);
     try installBoth(&server, &client, .one_rtt, 0x33);
     try installBoth(&client, &server, .one_rtt, 0x44);
+    server.confirmHandshake();
 
     // Send it into the void, then declare the packet lost.
     var datagram: [TestConnection.datagram_octets]u8 = @splat(0);
@@ -7113,4 +7278,174 @@ test "section 19.10: no MAX_STREAM_DATA for a stream this endpoint cannot receiv
     // thing in more words — "invalid frame for send stream 2".
     _ = try deliver(&client, &server, 1000);
     try testing.expectEqualStrings("the control stream's octets", server.readable(2));
+}
+
+test "section 10.2.3: an application close becomes a transport close below 1-RTT" {
+    var client = testClient();
+    client.closeApplication(@intFromEnum(error_code.Application.frame_unexpected));
+
+    // Below 1-RTT the peer has no application to attribute a code to, and a
+    // type 0x1d frame omits a field its parser requires.
+    const initial = client.closeFrameFor(.initial).connection_close;
+    try testing.expect(!initial.application);
+    try testing.expectEqual(@intFromEnum(error_code.Transport.application_error), initial.code);
+    try testing.expectEqual(@as(?u64, 0), initial.triggered_by);
+    try testing.expectEqual(@as(usize, 0), initial.reason.len);
+
+    // At 1-RTT it goes out as itself.
+    const one_rtt = client.closeFrameFor(.one_rtt).connection_close;
+    try testing.expect(one_rtt.application);
+    try testing.expectEqual(@intFromEnum(error_code.Application.frame_unexpected), one_rtt.code);
+    try testing.expectEqual(@as(?u64, null), one_rtt.triggered_by);
+
+    // And a transport close is the same frame at every level.
+    var other = testClient();
+    other.close(.protocol_violation);
+    for ([_]Level{ .initial, .handshake, .one_rtt }) |level| {
+        const converted = other.closeFrameFor(level).connection_close;
+        try testing.expect(!converted.application);
+        try testing.expectEqual(@intFromEnum(error_code.Transport.protocol_violation), converted.code);
+    }
+}
+
+test "every error `receive` returns names the code a peer is told" {
+    try testing.expectEqual(error_code.Transport.flow_control_error, TestConnection.errorCode(error.FlowControl));
+    try testing.expectEqual(error_code.Transport.stream_state_error, TestConnection.errorCode(error.StreamState));
+    try testing.expectEqual(error_code.Transport.final_size_error, TestConnection.errorCode(error.FinalSize));
+    try testing.expectEqual(error_code.Transport.crypto_buffer_exceeded, TestConnection.errorCode(error.CryptoBufferExceeded));
+    // The one that does not accuse the peer of anything.
+    try testing.expectEqual(error_code.Transport.internal_error, TestConnection.errorCode(error.TooFragmented));
+}
+
+test "section 10.2.3: a server that confirmed the handshake closes at 1-RTT only" {
+    // The same rule as the test above, reached the way a server reaches it.
+    // `confirmHandshake` is the *client's* path — a server confirms by
+    // installing its 1-RTT send keys, and nothing discards its Handshake keys
+    // when it does. So the level the close goes out at has to be chosen rather
+    // than inferred from which keys survive.
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+    try testing.expect(server.recovery.handshake_confirmed);
+    // Confirmation discarded the Handshake keys — RFC 9001 section 4.9.2, which
+    // `confirmHandshake` now does for a server too. The level choice below is
+    // therefore belt and braces, and it is worth having: the two rules are
+    // independent, and one holding is not a reason to leave the other implicit.
+    try testing.expect(server.send_keys[@intFromEnum(Level.handshake)] == null);
+
+    server.closeApplication(@intFromEnum(error_code.Application.frame_unexpected));
+    try testing.expect(!server.close_pending[@intFromEnum(Level.initial)]);
+    try testing.expect(server.close_pending[@intFromEnum(Level.one_rtt)]);
+    try testing.expect(!server.close_pending[@intFromEnum(Level.handshake)]);
+    try testing.expect(server.close_pending[@intFromEnum(Level.one_rtt)]);
+
+    // And the code survives, because a 1-RTT close is the only one that can
+    // carry an application code at all.
+    var datagram: [TestConnection.datagram_octets]u8 = @splat(0);
+    const octets = try server.send(&datagram, 2000);
+    try testing.expect(octets > 0);
+    _ = try client.receive(datagram[0..octets], 2001);
+    try testing.expectEqual(State.draining, client.state);
+    try testing.expectEqual(@intFromEnum(error_code.Application.frame_unexpected), client.close_code);
+    try testing.expect(client.close_is_application);
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9000#section-17.3.1
+//# An endpoint MUST treat receipt of a packet that has a non-zero value for
+//# these bits, after removing both packet and header protection, as a
+//# connection error of type PROTOCOL_VIOLATION.
+//= type=test
+test "section 17.3: a reserved bit that survives protection is a violation" {
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+
+    // Built by hand under the client's own 1-RTT keys, because the reserved
+    // bits are inside the AEAD's associated data: an attacker cannot set them
+    // and have the packet authenticate, which is precisely why a packet that
+    // *does* authenticate with them set is the peer's own violation and a
+    // connection error rather than something to discard.
+    const raw: [32]u8 = @splat(0x44); // The secret `established` installs.
+    const secret = try crypto.secrets.Secret.init(&raw);
+    const keys: crypto.Keys = .fromSecret(.aes_128_gcm_sha256, &secret);
+
+    var datagram: [128]u8 = @splat(0);
+    const written = try packet.writeShort(&datagram, .{
+        .destination = ConnectionId.init(&server_source) catch unreachable, // Eight octets.
+        .number = 100,
+        .number_octets = 4,
+        .key_phase = false,
+    });
+    var payload: [16]u8 = @splat(0);
+    const payload_octets = try frame.encode(&payload, .ping);
+    @memcpy(datagram[written.header_octets..][0..payload_octets], payload[0..payload_octets]);
+    datagram[0] |= 0x18; // Section 17.3's two reserved bits, before protection.
+    const total = try keys.seal(
+        &datagram,
+        written.packet_number_offset,
+        written.header_octets,
+        payload_octets,
+        100,
+    );
+
+    // Before this, the failure went through `countForgery` with every other
+    // decryption error: the violation was swallowed *and* charged against RFC
+    // 9001 section 6.6's integrity limit, so a peer breaking this rule spent
+    // the connection's AEAD budget instead of being told about it.
+    const forgeries = server.forgeries;
+    try testing.expectError(error.Protocol, server.receive(datagram[0..total], 1001));
+    try testing.expectEqual(forgeries, server.forgeries);
+}
+
+test "section 19.8: a STREAM frame has to name a stream the peer may send on" {
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+
+    var payload: [64]u8 = @splat(0);
+
+    // A stream the *server* opened unidirectionally: send-only at this end, so
+    // a STREAM frame naming it is the peer writing into its own receive half.
+    // Refused by `Streams.peerMaySend`, which is where that half of section
+    // 19.8 lives; opened first so the "not yet created" rule cannot be what
+    // refuses it.
+    try server.streams.setSendLimit(3, 1 << 16);
+    _ = try server.write(3, "ours", false);
+    var written = try frame.encode(&payload, .{ .stream = .{
+        .stream = 3,
+        .offset = 0,
+        .data = "not the peer's to send",
+        .fin = false,
+    } });
+    try testing.expectError(
+        error.StreamState,
+        server.receiveFrames(.one_rtt, payload[0..written], 2000),
+    );
+
+    // And a bidirectional stream in the server's own number space that it never
+    // opened. Receivable in principle; not yet created in fact.
+    var other = testServer();
+    var client_two = testClient();
+    try established(&client_two, &other);
+    written = try frame.encode(&payload, .{ .stream = .{
+        .stream = 1,
+        .offset = 0,
+        .data = "a stream the server never opened",
+        .fin = false,
+    } });
+    try testing.expectError(
+        error.StreamState,
+        other.receiveFrames(.one_rtt, payload[0..written], 2000),
+    );
+
+    // A stream the client opened is ordinary, which is what makes the two
+    // refusals above about direction rather than about strictness.
+    written = try frame.encode(&payload, .{ .stream = .{
+        .stream = 4,
+        .offset = 0,
+        .data = "the peer's own",
+        .fin = false,
+    } });
+    _ = try other.receiveFrames(.one_rtt, payload[0..written], 2001);
+    try testing.expectEqualStrings("the peer's own", other.readable(4));
 }

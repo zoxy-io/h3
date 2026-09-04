@@ -196,7 +196,8 @@ all three build legs):
   against RFC 9001 appendix A.1's known-answer vectors**: both Initial secrets
   and all six key/IV/header-key values.
 - `frame.zig`, `stream.zig` — RFC 9114 §6.2, §7.1, §7.2.4, §11.2.
-- `Http3.zig` — RFC 9114's connection layer: §6.2.1's control stream, §7.2.4's
+- `Http3.zig` — RFC 9114's connection layer, and the RFC 9204 encoder and
+  decoder stream instructions a zero-capacity endpoint has to refuse: §6.2.1's control stream, §7.2.4's
   SETTINGS exchange, §5.2's GOAWAY in both directions, §4.1's frame sequence,
   and §4.6's refusal of a push stream. Sans-I/O like everything else: the
   caller passes `quic.readable(id)` and is told how many octets were consumed

@@ -223,11 +223,13 @@ should_activate |= !is_largest;
   reads `ROLE`, `TESTCASE`, `REQUESTS`, writes `SSLKEYLOGFILE` and `QLOGDIR`,
   serves `/www`, exits 127 for a test case it does not support. Verdicts are
   byte-exact file comparison plus pcap analysis with the key log.
-- **[h3spec](https://github.com/kazu-yamamoto/h3spec)** — active, 50 negative
-  cases against a listening server: 34 transport and TLS, 16 HTTP/3 and QPACK.
-  Each mutates a frame, a transport parameter or a TLS extension and expects a
+- **[h3spec](https://github.com/kazu-yamamoto/h3spec)** — **run, and passing
+  49 of 49** against `interop/server.zig`; see §5.5. Forty-nine negative cases
+  against a listening server: 33 transport and TLS, 16 HTTP/3 and QPACK. Each
+  mutates a frame, a transport parameter or a TLS extension and expects a
   specific error code. Its case list is the closest thing to a public MUST
-  catalogue for the surfaces `fields.zig` and the connection guard.
+  catalogue for the surfaces `fields.zig` and the connection guard, and it
+  found four defects in `src/` that nothing else here could reach.
 - **[qifs](https://github.com/qpackers/qifs)** — QPACK field sections encoded by
   ten implementations, in the
   [offline interop format](https://github.com/quicwg/base-drafts/wiki/QPACK-Offline-Interop):
@@ -633,18 +635,60 @@ by that point is the identifier the client is already addressing — so section
 test was ever consulted. It passed, it proved nothing, and only the revert
 showed it.
 
+**h3spec passes 49 of 49**, which needed the server role: h3spec is a
+conformance tester for HTTP/3 *servers*, so it tests the one half `interop/`
+did not have. `interop/server.zig` is that half — `tls.Server` signs a
+transcript with a P-256 key, and `Connection.closeApplication` sends the `H3_*`
+codes h3spec asserts on.
+
+The score went 48 failures → 27 → 25 → 19 → 8 → 2 → 0, and almost every step
+was a defect rather than a missing feature:
+
+1. **The CertificateVerify signature covered the wrong transcript.** The three
+   handshake messages were hashed as a batch *after* being built, so the
+   signature was over `ClientHello .. ServerHello` instead of
+   `ClientHello .. Certificate`. The peer says "cannot verify
+   CertificateVerify" and nothing about why. 48 → 27.
+2. **A server confirmed the handshake a flight early.** RFC 9001 §4.1.1: the
+   handshake completes when the TLS stack has *both* sent its Finished and
+   verified the peer's. `installSecret` had done it on the first alone — so a
+   server marked the connection `established` before the client was
+   authenticated, and, because `recovery.handshake_confirmed` was set with it,
+   sent every CONNECTION_CLOSE at 1-RTT to a peer holding no 1-RTT keys. Eight
+   transport-parameter rules that *were* implemented and tested looked
+   unimplemented from the outside. 27 → 19.
+3. **Closed connections were never retired from the server's table.** Sixteen
+   slots, 49 test cases, and a connection this endpoint closed stayed `live`:
+   after sixteen cases the server answered nothing, which to h3spec is
+   indistinguishable from failing to detect the error under test. Every one of
+   those cases passed when run alone. 19 → 8.
+4. **Reserved bits, and a STREAM frame for a stream this endpoint never
+   opened.** Both real, both in `src/`, both invisible to a fuzzer: the first
+   because only a peer holding the keys can produce one, the second because
+   every test handed `Streams` an identifier the peer was entitled to. 8 → 2.
+5. **The QPACK encoder and decoder streams were read and discarded.** A
+   zero-capacity endpoint makes those rules short rather than absent: no
+   capacity above zero, no insert, and nothing acknowledged that was never
+   sent. 2 → 0.
+
+Two changes made while chasing these turned out to be **redundant**, and the
+revert-check is what said so: a second send-only test in the STREAM arm that
+`Streams.peerMaySend` already made, and an explicit close-level choice that
+became unnecessary once confirmation started discarding Handshake keys on both
+sides. Both were removed. A fix no test can distinguish is a claim, and this
+document has enough of those in its history.
+
 What is left here:
 
-- **h3spec**, pointed at the same binary, now that `h3` is an ALPN this package
-  can honestly offer.
-- **A server role**, which needs a certificate, a Retry token and address
-  validation.
+- **A server role in the interop runner**, which needs the Retry token and the
+  address validation `interop/server.zig` still does not issue — so `ROLE=server`
+  there is exit 127 while h3spec's server is a separate binary.
 - **Server push and QPACK's dynamic table**, which `Http3.zig` refuses and
   declines rather than implements — correctly, and they are the two places its
   module comment says it stops.
-- **Running it in the real runner**, inside the network simulator, so that
-  `handshakeloss` and `transferloss` are run against the loss the runner
-  injects rather than against a loopback that drops nothing.
+- **Running the client in the real runner**, inside the network simulator, so
+  that `handshakeloss` and `transferloss` meet the loss the runner injects
+  rather than a loopback that drops nothing.
 
 #### The other outside evidence: `corpus/qifs.zig` — **done**
 

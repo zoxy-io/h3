@@ -33,8 +33,11 @@ its own throwaway CA per run and configures every client in it to trust
 anything; that is the test bed's contract, not a shortcut taken here. Pointing
 this binary at a real server would be pointing an unauthenticated client at it.
 
-**Client-only.** The server side needs a certificate, a Retry token and address
-validation this package does not issue, so `ROLE=server` exits 127.
+**Client-only, as far as the runner is concerned.** `ROLE=server` exits 127:
+the runner's server role needs a Retry token and address validation this
+package does not issue. There *is* a server — `server.zig`, built as
+`h3-server` — and it exists for h3spec, which tests HTTP/3 servers and is the
+other half of this directory's argument. See "h3spec" below.
 
 ## What it covers
 
@@ -134,6 +137,69 @@ server comes up misconfigured and answers nothing. It costs an hour to find
 from the client side, where it is indistinguishable from a handshake the client
 got wrong.
 
+## h3spec
+
+[h3spec](https://github.com/kazu-yamamoto/h3spec) is a conformance tester for
+HTTP/3 **servers**: it connects as a client and checks what the server does
+with input a client should never send. `h3-server` passes **49 of 49**.
+
+```sh
+# The binary, and the same certificates as above.
+zig build interop            # zig-out/bin/h3-server
+CERT=/tmp/qi/certs/cert.pem KEY=/tmp/qi/certs/priv.key PORT=4443 \
+  ./zig-out/bin/h3-server &
+
+# h3spec ships a dynamically linked release binary, which NixOS will not run
+# directly; a two-line Debian image is the shortest way round it.
+curl -sLO https://github.com/kazu-yamamoto/h3spec/releases/download/v0.1.13/h3spec-linux-x86_64
+printf 'FROM debian:bookworm-slim\nRUN apt-get update && apt-get install -y --no-install-recommends libgmp10 libnuma1\nCOPY h3spec-linux-x86_64 /usr/local/bin/h3spec\nRUN chmod +x /usr/local/bin/h3spec\nENTRYPOINT ["/usr/local/bin/h3spec"]\n' > Dockerfile
+docker build -q -t h3spec:local .
+docker run --rm --network host h3spec:local -n 127.0.0.1 4443
+```
+
+`-n` skips chain validation, which the throwaway CA needs; it does **not** skip
+the CertificateVerify signature, so a server whose transcript is wrong fails
+every case with "cannot verify CertificateVerify" and no further explanation.
+
+`-m "<substring>"` runs one case and `-d` adds a trace, which is the only way
+to tell "the server did not detect this" from "the server answered nothing
+because something earlier went wrong". Both mistakes look identical in the
+summary, and the second one accounted for eleven of the failures in the first
+full run.
+
+## h3spec
+
+[h3spec](https://github.com/kazu-yamamoto/h3spec) is a conformance tester for
+HTTP/3 **servers**: it connects as a client and checks what the server does
+with input a client should never send. `h3-server` passes **49 of 49**.
+
+```sh
+zig build interop            # zig-out/bin/h3-server, beside h3-interop
+CERT=/tmp/qi/certs/cert.pem KEY=/tmp/qi/certs/priv.key PORT=4443 \
+  ./zig-out/bin/h3-server &
+
+# h3spec ships a dynamically linked release binary, which NixOS will not run
+# directly; a four-line Debian image is the shortest way round it.
+cd /tmp/qi
+curl -sLO https://github.com/kazu-yamamoto/h3spec/releases/download/v0.1.13/h3spec-linux-x86_64
+printf 'FROM debian:bookworm-slim\nRUN apt-get update && apt-get install -y --no-install-recommends libgmp10 libnuma1\nCOPY h3spec-linux-x86_64 /usr/local/bin/h3spec\nRUN chmod +x /usr/local/bin/h3spec\nENTRYPOINT ["/usr/local/bin/h3spec"]\n' > Dockerfile
+docker build -q -t h3spec:local .
+docker run --rm --network host h3spec:local -n 127.0.0.1 4443
+```
+
+`-n` skips *chain* validation, which the throwaway CA needs. It does **not**
+skip the CertificateVerify signature, so a server whose transcript is wrong
+fails every case with "cannot verify CertificateVerify" and no further
+explanation — which is what the first run of this server did.
+
+`-m "<substring>"` runs one case and `-d` adds a trace. That combination is the
+only way to tell "the server did not detect this" from "the server answered
+nothing because something earlier went wrong": both read as
+`did not get expected exception` in the summary, and the second accounted for
+eleven of the failures in the first full run. If a case fails in the suite and
+passes alone, the server is running out of something — connection slots, most
+likely.
+
 ## Environment
 
 | variable | meaning |
@@ -144,6 +210,24 @@ got wrong.
 | `DOWNLOADS` | where bodies are written, `/downloads` by default |
 | `SSLKEYLOGFILE` | NSS key log, written if set |
 | `VERBOSE` | narrate the loop on stderr if set |
+
+And `h3-server`'s, which are its whole configuration:
+
+| variable | meaning |
+| --- | --- |
+| `CERT` | PEM certificate, leaf first; `/certs/cert.pem` by default |
+| `KEY` | PEM P-256 private key, SEC1 or PKCS#8; `/certs/priv.key` by default |
+| `PORT` | UDP port; 4433 by default |
+| `VERBOSE` | narrate on stderr if set |
+
+And `h3-server`'s own, which are its whole configuration:
+
+| variable | meaning |
+| --- | --- |
+| `CERT` | PEM certificate, leaf first; `/certs/cert.pem` by default |
+| `KEY` | PEM P-256 private key, SEC1 or PKCS#8; `/certs/priv.key` by default |
+| `PORT` | UDP port; 4433 by default |
+| `VERBOSE` | narrate on stderr if set |
 
 `QLOGDIR` is accepted by the runner and ignored here: a qlog writer wants the
 event trace `Connection.poll` now produces, and writing one is

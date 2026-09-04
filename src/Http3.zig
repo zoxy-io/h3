@@ -62,7 +62,7 @@ const fields = @import("fields.zig");
 const frame = @import("frame.zig");
 const qpack = @import("qpack.zig");
 const Side = @import("quic/crypto.zig").Side;
-const stream = @import("stream.zig");
+const h3stream = @import("stream.zig");
 const stream_id = @import("quic/stream_id.zig");
 const varint = @import("varint.zig");
 
@@ -104,6 +104,12 @@ pub const Error = error{
     GeneralProtocolError,
     /// More streams than this endpoint tracks.
     ExcessiveLoad,
+    /// RFC 9204 section 4.3: an encoder instruction this endpoint's advertised
+    /// capacity does not permit.
+    QpackEncoderStreamError,
+    /// RFC 9204 section 4.4: a decoder instruction that acknowledges more than
+    /// was ever sent.
+    QpackDecoderStreamError,
     /// The caller's buffer is too small for what it asked to be written. Not a
     /// protocol error and not on the wire: the caller passes a bigger one.
     OutputTooSmall,
@@ -121,6 +127,8 @@ pub fn code(err: Error) error_code.Application {
         error.SettingsError => .settings_error,
         error.GeneralProtocolError => .general_protocol_error,
         error.ExcessiveLoad => .excessive_load,
+        error.QpackEncoderStreamError => .qpack_encoder_stream_error,
+        error.QpackDecoderStreamError => .qpack_decoder_stream_error,
         // Nothing was received and nothing is wrong with the peer.
         error.OutputTooSmall => .internal_error,
     };
@@ -270,7 +278,7 @@ pub fn Http3(comptime config: Config) type {
         pub fn writeControl(self: *Self, target: []u8) Error!usize {
             assert(!self.control_written);
             var offset: usize = 0;
-            offset += stream.write(target, .control) catch return error.OutputTooSmall;
+            offset += h3stream.write(target, .control) catch return error.OutputTooSmall;
 
             // The payload is built after the header, because the header's
             // Length has to name it and a SETTINGS payload's size is not known
@@ -395,7 +403,7 @@ pub fn Http3(comptime config: Config) type {
             var consumed: usize = 0;
 
             if (entry.kind == .unread) {
-                const parsed = stream.parse(data) catch |err| switch (err) {
+                const parsed = h3stream.parse(data) catch |err| switch (err) {
                     // Section 6.2: the type is a varint and may be split like
                     // anything else. Nothing is consumed and it arrives again.
                     error.Incomplete => return .{ .consumed = 0, .events = 0 },
@@ -415,20 +423,30 @@ pub fn Http3(comptime config: Config) type {
                     return .{ .consumed = consumed + rest.consumed, .events = rest.events };
                 },
                 // Section 4.2 of RFC 9204: this endpoint advertised a zero
-                // capacity, so a conforming peer sends nothing on these — and
-                // an endpoint that stopped reading them would stall a peer
-                // waiting for the window to move. Read and discarded.
-                .qpack_encoder, .qpack_decoder, .discard => {
-                    if (fin and entry.kind != .discard) {
-                        //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.1
-                        //# If either control stream is closed at any point, this MUST be
-                        //# treated as a connection error of type
-                        //# H3_CLOSED_CRITICAL_STREAM.
-                        //= type=test
-                        return error.ClosedCriticalStream;
-                    }
-                    return .{ .consumed = data.len, .events = 0 };
+                // capacity, so a conforming peer sends nothing meaningful on
+                // these — and an endpoint that stopped reading them would stall
+                // a peer waiting for the window to move.
+                //
+                // Read *and checked*, not discarded. A zero capacity makes the
+                // rules short rather than absent: no entry can be inserted, no
+                // capacity above zero can be set, and nothing can be
+                // acknowledged that was never sent. Discarding instead was two
+                // of h3spec's forty-nine, and the shape of the miss is the one
+                // this package keeps finding — a stream read by nobody looks
+                // exactly like a stream with nothing wrong on it.
+                .qpack_encoder => {
+                    if (fin) return error.ClosedCriticalStream;
+                    const octets = try encoderStream(data[consumed..]);
+                    return .{ .consumed = consumed + octets, .events = 0 };
                 },
+                .qpack_decoder => {
+                    if (fin) return error.ClosedCriticalStream;
+                    const octets = try decoderStream(data[consumed..]);
+                    return .{ .consumed = consumed + octets, .events = 0 };
+                },
+                // Section 6.2: a type this endpoint does not implement is read
+                // and thrown away, and closing it is the peer's business.
+                .discard => return .{ .consumed = data.len, .events = 0 },
                 .unread => unreachable, // `classify` leaves no stream unread.
             }
         }
@@ -445,7 +463,7 @@ pub fn Http3(comptime config: Config) type {
         //# Recipients of unknown stream types MUST either abort reading of the
         //# stream or discard incoming data without further processing.
         //= type=test
-        fn classify(self: *Self, entry: *Unidirectional, stream_type: stream.Type) Error!void {
+        fn classify(self: *Self, entry: *Unidirectional, stream_type: h3stream.Type) Error!void {
             switch (stream_type) {
                 .control => {
                     if (self.peer_control != null) return error.StreamCreationError;
@@ -482,11 +500,89 @@ pub fn Http3(comptime config: Config) type {
             }
         }
 
+        /// RFC 9204 section 4.3's encoder instructions, against a table this
+        /// endpoint advertised no room for.
+        //= https://www.rfc-editor.org/rfc/rfc9204#section-4.3.1
+        //# The decoder MUST treat a new dynamic table capacity
+        //# value that exceeds this limit as a connection error of type
+        //# QPACK_ENCODER_STREAM_ERROR.
+        //= type=test
+        fn encoderStream(data: []const u8) Error!usize {
+            var consumed: usize = 0;
+            // Bounded by `data`: every instruction consumes at least one octet.
+            while (consumed < data.len) {
+                const first = data[consumed];
+                if (first & 0b1110_0000 == 0b0010_0000) {
+                    // Set Dynamic Table Capacity, a 5-bit prefix integer. This
+                    // endpoint advertised `SETTINGS_QPACK_MAX_TABLE_CAPACITY =
+                    // 0`, so the only capacity it can be set to is zero.
+                    const decoded = qpack.integer.decode(data[consumed..], 5) catch |err| switch (err) {
+                        error.Incomplete => break,
+                        else => return error.QpackEncoderStreamError,
+                    };
+                    if (decoded.value != 0) return error.QpackEncoderStreamError;
+                    consumed += decoded.octets;
+                    continue;
+                }
+                // Insert With Name Reference, Insert With Literal Name and
+                // Duplicate are the other three, and every one of them adds an
+                // entry to a table with no room for it.
+                return error.QpackEncoderStreamError;
+            }
+            return consumed;
+        }
+
+        /// RFC 9204 section 4.4's decoder instructions, against a section count
+        /// that is always zero.
+        //= https://www.rfc-editor.org/rfc/rfc9204#section-4.4.3
+        //# An encoder that receives an Increment field equal to zero, or one
+        //# that increases the Known Received Count beyond what the encoder has
+        //# sent, MUST treat this as a connection error of type
+        //# QPACK_DECODER_STREAM_ERROR.
+        //= type=test
+        fn decoderStream(data: []const u8) Error!usize {
+            var consumed: usize = 0;
+            // Bounded by `data`, as above.
+            while (consumed < data.len) {
+                const first = data[consumed];
+                if (first & 0b1100_0000 == 0b0000_0000) {
+                    // Insert Count Increment, a 6-bit prefix integer. Zero is
+                    // an error by the rule above; anything else acknowledges
+                    // insertions this endpoint never made, which the same
+                    // sentence covers.
+                    const decoded = qpack.integer.decode(data[consumed..], 6) catch |err| switch (err) {
+                        error.Incomplete => break,
+                        else => return error.QpackDecoderStreamError,
+                    };
+                    _ = decoded;
+                    return error.QpackDecoderStreamError;
+                }
+                // Section Acknowledgment and Stream Cancellation both name a
+                // stream, and neither can be answered by an encoder that has
+                // sent no field section referencing the dynamic table — which
+                // this one never does. Read past rather than refused: a
+                // Section Acknowledgment for a section encoded entirely against
+                // the static table is section 4.4.1's ordinary case.
+                const prefix: u4 = if (first & 0b1000_0000 != 0) 7 else 6;
+                const decoded = qpack.integer.decode(data[consumed..], prefix) catch |err| switch (err) {
+                    error.Incomplete => break,
+                    else => return error.QpackDecoderStreamError,
+                };
+                consumed += decoded.octets;
+            }
+            return consumed;
+        }
+
         fn receiveControl(self: *Self, data: []const u8, fin: bool, events: []Event) Error!Received {
             // Checked before the frames rather than after: a datagram that both
             // carries a frame and ends the stream is still a closed critical
             // stream, and processing the frame first would report the wrong
             // thing when both are true.
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.1
+            //# If either control stream is closed at any point, this MUST be
+            //# treated as a connection error of type
+            //# H3_CLOSED_CRITICAL_STREAM.
+            //= type=test
             if (fin) return error.ClosedCriticalStream;
 
             var consumed: usize = 0;
@@ -804,8 +900,8 @@ test "the control stream opens with its type and a SETTINGS frame" {
     // Stream type 0x00, then a SETTINGS frame whose Length matches what
     // follows it. A control stream that opened with anything else would be
     // H3_MISSING_SETTINGS at the peer.
-    const parsed_type = try stream.parse(buffer[0..written]);
-    try testing.expectEqual(stream.Type.control, parsed_type.stream_type);
+    const parsed_type = try h3stream.parse(buffer[0..written]);
+    try testing.expectEqual(h3stream.Type.control, parsed_type.stream_type);
     const header = try frame.parseHeader(buffer[parsed_type.octets..written]);
     try testing.expectEqual(frame.Type.settings, header.frame_type);
     try testing.expectEqual(written - parsed_type.octets - header.octets, header.length);
@@ -850,7 +946,7 @@ test "a control stream whose first frame is not SETTINGS is missing them" {
     // A control stream that opens with GOAWAY. Well-formed, permitted on a
     // control stream, and not allowed to be first.
     var buffer: [16]u8 = undefined;
-    var offset = try stream.write(&buffer, .control);
+    var offset = try h3stream.write(&buffer, .control);
     offset += try frame.writeHeader(buffer[offset..], .goaway, 1);
     offset += try varint.encode(buffer[offset..], 0);
 
@@ -870,7 +966,7 @@ test "a second SETTINGS frame on the control stream is unexpected" {
     _ = try client.receive(peerUni(.client, 0), buffer[0..first], false, &events);
 
     // The same SETTINGS frame again, without the stream type this time.
-    const type_octets = (try stream.parse(buffer[0..first])).octets;
+    const type_octets = (try h3stream.parse(buffer[0..first])).octets;
     try testing.expectError(
         error.FrameUnexpected,
         client.receive(peerUni(.client, 0), buffer[type_octets..first], false, &events),
@@ -933,7 +1029,7 @@ test "a stream type split across two reads is not consumed until it is whole" {
 test "a push stream is refused, by the code the receiver's role gives it" {
     var events: [4]Event = undefined;
     var buffer: [8]u8 = undefined;
-    const octets = try varint.encode(&buffer, @intFromEnum(stream.Type.push));
+    const octets = try varint.encode(&buffer, @intFromEnum(h3stream.Type.push));
 
     // A client has sent no MAX_PUSH_ID, so any push stream is H3_ID_ERROR.
     var client: TestHttp3 = .init(.client);
@@ -1231,4 +1327,73 @@ test "a DATA frame that is exactly the octets given still reports the FIN" {
     try testing.expectEqual(@as(usize, 3), result.events);
     try testing.expectEqualStrings(body, events[1].data.payload);
     try testing.expectEqual(@as(u64, 0), events[2].finished);
+}
+
+test "the QPACK streams are checked against the capacity this endpoint advertised" {
+    var client: TestHttp3 = .init(.client);
+    var events: [4]Event = undefined;
+
+    // Set Dynamic Table Capacity to zero, which is the only capacity an
+    // endpoint advertising `SETTINGS_QPACK_MAX_TABLE_CAPACITY = 0` permits.
+    var buffer: [16]u8 = undefined;
+    var offset: usize = try h3stream.write(&buffer, .qpack_encoder);
+    offset += try qpack.integer.encode(buffer[offset..], 0, 5, 0b0010_0000);
+    const id = peerUni(.client, 0);
+    const result = try client.receive(id, buffer[0..offset], false, &events);
+    try testing.expectEqual(offset, result.consumed);
+
+    // Anything above it is section 4.3.1's connection error.
+    offset = try qpack.integer.encode(&buffer, 4096, 5, 0b0010_0000);
+    try testing.expectError(
+        error.QpackEncoderStreamError,
+        client.receive(id, buffer[0..offset], false, &events),
+    );
+}
+
+test "an insert on the encoder stream has no table to go into" {
+    var client: TestHttp3 = .init(.client);
+    var events: [4]Event = undefined;
+    var buffer: [16]u8 = undefined;
+    var offset: usize = try h3stream.write(&buffer, .qpack_encoder);
+    // Insert With Name Reference: the `1Txxxxxx` pattern.
+    offset += try qpack.integer.encode(buffer[offset..], 1, 6, 0b1100_0000);
+    try testing.expectError(
+        error.QpackEncoderStreamError,
+        client.receive(peerUni(.client, 0), buffer[0..offset], false, &events),
+    );
+}
+
+test "an Insert Count Increment acknowledges insertions that never happened" {
+    var events: [4]Event = undefined;
+    var buffer: [16]u8 = undefined;
+
+    // Zero is named by section 4.4.3 outright.
+    {
+        var client: TestHttp3 = .init(.client);
+        var offset: usize = try h3stream.write(&buffer, .qpack_decoder);
+        offset += try qpack.integer.encode(buffer[offset..], 0, 6, 0);
+        try testing.expectError(
+            error.QpackDecoderStreamError,
+            client.receive(peerUni(.client, 0), buffer[0..offset], false, &events),
+        );
+    }
+    // And so is any increment past what this encoder inserted, which is none.
+    {
+        var client: TestHttp3 = .init(.client);
+        var offset: usize = try h3stream.write(&buffer, .qpack_decoder);
+        offset += try qpack.integer.encode(buffer[offset..], 1, 6, 0);
+        try testing.expectError(
+            error.QpackDecoderStreamError,
+            client.receive(peerUni(.client, 0), buffer[0..offset], false, &events),
+        );
+    }
+    // A Section Acknowledgment names a stream and is ordinary: a field section
+    // encoded against the static table alone is still acknowledged.
+    {
+        var client: TestHttp3 = .init(.client);
+        var offset: usize = try h3stream.write(&buffer, .qpack_decoder);
+        offset += try qpack.integer.encode(buffer[offset..], 0, 7, 0b1000_0000);
+        const result = try client.receive(peerUni(.client, 0), buffer[0..offset], false, &events);
+        try testing.expectEqual(offset, result.consumed);
+    }
 }

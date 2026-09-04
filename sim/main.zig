@@ -343,6 +343,10 @@ fn driveHandshake(world: *World) void {
     // which read like a livelock in the library and was a gap in the harness.
     if (world.client_installed == 1 and world.client.cryptoOut(.handshake).len >= 8) {
         world.client.cryptoIn(.handshake, "ClientFinished") catch {};
+        // RFC 9001 section 4.1.1: the server's handshake completes when it has
+        // verified the client's Finished, and only a TLS engine knows that.
+        // This is where a real consumer would say so.
+        world.server.confirmHandshake();
         world.client_installed = 2;
         world.census.handshakes_completed += 1;
     }
