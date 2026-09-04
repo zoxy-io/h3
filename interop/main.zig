@@ -378,6 +378,37 @@ fn readAll(io: Io, gpa: std.mem.Allocator, path: []const u8) ![]u8 {
     return try reader.interface.allocRemaining(gpa, .unlimited);
 }
 
+/// An address for a host name.
+///
+/// `IpAddress.resolve` parses a literal and otherwise goes straight to DNS,
+/// which is not where the interop runner puts its names: `server4` lives in
+/// `/etc/hosts`, written by docker from the compose file's `extra_hosts`.
+/// `HostName.lookup` is the call that reads it — and reaching for the shorter
+/// function first is why this client worked against every server on loopback
+/// and could not find one inside the runner.
+fn resolve(io: Io, host: []const u8, port: u16) !Io.net.IpAddress {
+    if (Io.net.IpAddress.parse(host, port)) |literal| return literal else |_| {}
+
+    const name = try Io.net.HostName.init(host);
+    // Sixteen is what `lookup` needs to be guaranteed not to block, and more
+    // than any name here resolves to.
+    var results: [16]Io.net.HostName.LookupResult = undefined;
+    var queue: Io.Queue(Io.net.HostName.LookupResult) = .init(&results);
+    var task = io.async(Io.net.HostName.lookup, .{ name, io, &queue, .{ .port = port } });
+    defer task.cancel(io) catch {};
+
+    // The first address wins. A client that tried each in turn would be a
+    // client with a connection policy, and this one has a single connection.
+    while (queue.getOne(io)) |result| switch (result) {
+        .address => |address| return address,
+        .canonical_name => {},
+    } else |err| switch (err) {
+        error.Closed => {},
+        else => |e| return e,
+    }
+    return error.UnknownHostName;
+}
+
 /// A URL split into the three parts this client needs. `hq-interop` has no
 /// notion of a query or a fragment, and the runner never sends one.
 const Url = struct {
@@ -475,7 +506,7 @@ const Session = struct {
         if (urls.len > requests_max) return error.TooManyRequests;
 
         const first = try Url.parse(urls[0]);
-        const peer = try Io.net.IpAddress.resolve(io, first.host, first.port);
+        const peer = try resolve(io, first.host, first.port);
 
         const any: Io.net.IpAddress = switch (peer) {
             .ip4 => .{ .ip4 = .unspecified(0) },
@@ -970,4 +1001,20 @@ test "chacha20 offers exactly one cipher suite" {
     try testing.expectEqual(@as(usize, 1), offer.len);
     try testing.expectEqual(tls.CipherSuite.chacha20_poly1305_sha256, offer[0]);
     try testing.expect(Testcase.transfer.offer().len > 1);
+}
+
+test "an address literal resolves without a name server" {
+    // The other half — a name out of `/etc/hosts` — needs a host to have one,
+    // and the interop runner is where that is exercised: `server4` is written
+    // there by docker from the compose file's `extra_hosts`. This is the half
+    // that can be checked here, and it is the half `IpAddress.resolve` already
+    // did, which is why reaching for the shorter function looked right until
+    // the runner asked for a name.
+    var threaded: Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const address = try resolve(io, "127.0.0.1", 4433);
+    try testing.expectEqual(@as(u16, 4433), address.getPort());
+    try testing.expect(address == .ip4);
 }

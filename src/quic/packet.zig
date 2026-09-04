@@ -186,7 +186,7 @@ pub const Header = union(Kind) {
     //# field (0x40) to 1 so that Version Negotiation packets appear to have
     //# the Fixed Bit field.
     //= type=exception
-    //= reason=no Version Negotiation packet is written here, so there is no unused field of ours to set; version negotiation is out of scope per docs/DESIGN.md section 2 and section 6.
+    //= reason=superseded: `writeVersionNegotiation` writes one and sets this bit. The rule is cited as a test there; this line is the parser's side, which reads the field and ignores it as section 17.2.1 tells a client to.
     /// A Version Negotiation packet is parsed, so that a client can see one and
     /// a consumer can act on it. Sending one is a server's answer to a version
     /// it does not implement, and building that answer is out of scope here —
@@ -590,6 +590,65 @@ pub const WriteError = error{
     /// variable-length integer can describe.
     ValueTooLarge,
 };
+
+/// Write a Version Negotiation packet.
+///
+/// The other packet whose contents are entirely the caller's, and the other one
+/// `Connection` never produces: *deciding* to negotiate a version means
+/// deciding which versions this deployment speaks, which is above the seam. The
+/// encoding is not, and the two identifier rules below are the whole reason
+/// this is a function rather than four lines at a call site — they are crossed
+/// over, and getting them the wrong way round produces a packet the client
+/// silently ignores.
+//= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.1
+//# The server MUST include the value from the Source Connection ID field
+//# of the packet it receives in the Destination Connection ID field.
+//= type=test
+//
+//= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.1
+//# The value for Source Connection ID MUST be copied from the
+//# Destination Connection ID of the received packet, which is initially
+//# randomly selected by a client.
+//= type=test
+//
+//= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.1
+//# The Version field of a Version Negotiation packet MUST be set to
+//# 0x00000000.
+//= type=test
+//
+//= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.1
+//# Where QUIC
+//# might be multiplexed with other protocols (see [RFC7983]), servers
+//# SHOULD set the most significant bit of this field (0x40) to 1 so that
+//# Version Negotiation packets appear to have the Fixed Bit field.
+//= type=test
+pub fn writeVersionNegotiation(
+    target: []u8,
+    /// The Source Connection ID of the packet being answered. It becomes this
+    /// packet's *destination*.
+    destination: ConnectionId,
+    /// And the Destination Connection ID of that packet becomes the source.
+    source: ConnectionId,
+    versions: []const u32,
+) WriteError!usize {
+    var cursor: usize = 0;
+    try put(target, &cursor, 1);
+    // Section 17.2.1: the Unused bits are the server's to choose, and the one
+    // that matters is 0x40 — a middlebox demultiplexing QUIC from other
+    // protocols looks for the Fixed Bit, and this packet has none.
+    target[0] = header_form_long | fixed_bit;
+    try put(target, &cursor, 4);
+    std.mem.writeInt(u32, target[1..5], version_negotiation, .big);
+
+    try writeConnectionId(target, &cursor, destination);
+    try writeConnectionId(target, &cursor, source);
+
+    for (versions) |one| {
+        try put(target, &cursor, 4);
+        std.mem.writeInt(u32, target[cursor - 4 ..][0..4], one, .big);
+    }
+    return cursor;
+}
 
 /// What `writeRetry` needs, which is everything a Retry packet carries plus the
 /// identifier its integrity tag is computed over.
@@ -1170,4 +1229,46 @@ test "a Retry that does not fit is refused rather than truncated" {
         .token = "a token",
         .original_destination = try ConnectionId.init(&.{ 9, 10, 11, 12 }),
     }));
+}
+
+test "a Version Negotiation packet crosses the identifiers over" {
+    // The rule that is easy to state and easy to get backwards: what the client
+    // called its *source* becomes this packet's destination, and what it called
+    // its destination — the value it drew at random — comes back as the source.
+    // A packet with them the other way round is one the client ignores, and
+    // ignoring is silent.
+    const client_destination: [8]u8 = .{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    const client_source: [4]u8 = .{ 0x01, 0x02, 0x03, 0x04 };
+
+    var target: [64]u8 = @splat(0);
+    const written = try writeVersionNegotiation(
+        &target,
+        try ConnectionId.init(&client_source),
+        try ConnectionId.init(&client_destination),
+        &.{ version_1, 0x0a0a_0a0a },
+    );
+
+    // The simulator's readiness probe checks exactly this: octets one to four
+    // are the zero version.
+    try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, target[1..5], .big));
+    try testing.expect(target[0] & 0x80 != 0); // Long header.
+    try testing.expect(target[0] & 0x40 != 0); // And section 17.2.1's Fixed Bit.
+
+    const parsed = try parse(target[0..written], 8);
+    const negotiation = parsed.header.version_negotiation;
+    try testing.expectEqualSlices(u8, &client_source, negotiation.destination.bytes());
+    try testing.expectEqualSlices(u8, &client_destination, negotiation.source.bytes());
+    try testing.expectEqual(@as(usize, 8), negotiation.versions.len);
+    try testing.expectEqual(version_1, std.mem.readInt(u32, negotiation.versions[0..4], .big));
+    try testing.expectEqual(@as(u32, 0x0a0a_0a0a), std.mem.readInt(u32, negotiation.versions[4..8], .big));
+}
+
+test "a Version Negotiation packet that does not fit is refused" {
+    var small: [8]u8 = @splat(0);
+    try testing.expectError(error.OutputTooLong, writeVersionNegotiation(
+        &small,
+        try ConnectionId.init(&.{ 1, 2, 3, 4 }),
+        try ConnectionId.init(&.{ 5, 6, 7, 8 }),
+        &.{ version_1, 2, 3, 4 },
+    ));
 }

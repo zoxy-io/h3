@@ -90,6 +90,8 @@ requirement list extracted from the specification.
 | The QPACK encoder and decoder streams were read and thrown away, so an instruction no zero-capacity endpoint can honour was accepted in silence | h3spec | A stream read by nobody looks exactly like a stream with nothing wrong on it |
 | A stream could send `stream_send_octets` in *total*: the send buffer was never reclaimed, so it filled once and refused every write after | the interop server, serving a file larger than one buffer | Nothing here had ever sent more than a request line, and a buffer that fills silently looks like a peer that stopped reading |
 | "Acknowledged implies framed" — false, because RFC 9002's loss detection is a heuristic and a packet declared lost can be acknowledged anyway | the simulator, first sweep after reclamation landed | It needs a spurious loss, which is a property of a connection over time and of nothing smaller |
+| No Version Negotiation packet was ever written, so a server answered an unknown version with silence | the interop runner's network simulator, which will not start a test until the server answers exactly that probe | It is a rule about a packet this package had decided not to send, which is indistinguishable from a rule it had decided not to obey |
+| The interop client resolved host names with `IpAddress.resolve`, which parses a literal and then goes to DNS — never `/etc/hosts`, which is where the runner puts every name | the interop runner | Every test until then used an address literal, so the resolver was never asked a question it could get wrong |
 
 Two things about that table.
 
@@ -728,9 +730,54 @@ than a result.
 - **Server push and QPACK's dynamic table**, which `Http3.zig` refuses and
   declines rather than implements — correctly, and they are the two places its
   module comment says it stops.
-- **Running the client in the real runner**, inside the network simulator, so
-  that `handshakeloss` and `transferloss` meet the loss the runner injects
-  rather than a loopback that drops nothing.
+#### The real runner, inside the network simulator — **attempted, and two more defects**
+
+The runner drives both endpoints through ns-3 with `simple-p2p --delay=15ms
+--bandwidth=10Mbps --queue=25`, which is a path nothing on a loopback
+resembles. `interop/README.md` has the whole recipe: the endpoint image, the
+runner's Python environment, `tshark` and `openssl` from nix, and the entry to
+add to `implementations_quic.json`.
+
+Two defects fell out of getting that far, and neither could have been found any
+other way:
+
+1. **No Version Negotiation packet was ever written.** RFC 9000 §6.1 makes it a
+   server's answer to a version it does not implement, and this package had it
+   as an exception: "no Version Negotiation packet is written here". The
+   simulator does not care about the rule — it *depends* on it. Its readiness
+   probe is a long header carrying version `0x57414954` ("WAIT"), and it will
+   not start a test until the server answers with a packet whose version field
+   is zero. A server that ignores it fails every case before the first
+   handshake. `packet.writeVersionNegotiation` is now the writer, with the two
+   crossed-over identifier rules that are the whole reason it is a function.
+2. **The client could not resolve a host name.** It used
+   `IpAddress.resolve`, which parses an address literal and otherwise goes
+   straight to DNS. The runner puts every name — `server4`, `server6` — in
+   `/etc/hosts`, written by docker from the compose file's `extra_hosts`, and
+   `HostName.lookup` is the call that reads it. Every test until then had used
+   an address literal, so the resolver had never been asked a question it could
+   get wrong.
+
+**The end-to-end run is blocked by the host, not by this package.** On the
+machine this was attempted on, ns-3's re-emitted frames are filtered away
+before they reach the far endpoint: `bridge-nf-call-iptables` is 1, so bridged
+frames traverse iptables and meet docker's `DOCKER` chain, which ends in DROP.
+A narrow `DOCKER-USER` accept for the runner's `193.167.0.0/16` was tried and
+is hit — 26 packets — and is not sufficient.
+
+The control is the part worth keeping: **quic-go against quic-go fails
+identically**, with the same "timeout: no recent network activity". Recording
+that is the difference between "the runner does not pass" and "the runner does
+not run here", and only the control tells them apart. Nothing about the result
+is a claim about this package, and the two defects above are real whatever the
+host does.
+
+What is left here:
+
+- **Finishing the runner on a host whose bridge filtering allows it**, which is
+  a machine question rather than a code one. Everything else is in place: the
+  endpoint image builds, `run.py` drives it, and the server answers the
+  simulator's probe.
 
 #### The other outside evidence: `corpus/qifs.zig` — **done**
 

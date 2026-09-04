@@ -173,6 +173,80 @@ connections. It is worth knowing that message on sight: it is what a
 multi-datagram ClientHello does to a server that keys its table only on the
 identifier it chose.
 
+## The real runner, inside the network simulator
+
+The runner drives both endpoints through ns-3 — `simple-p2p --delay=15ms
+--bandwidth=10Mbps --queue=25` by default — which is a path no loopback
+resembles. Getting this far found two defects on its own; see
+docs/VERIFICATION.md section 5.5.
+
+**1. A statically linked endpoint binary**, so it runs in the runner's image:
+
+```sh
+zig build interop -Dtarget=x86_64-linux-musl -Doptimize=ReleaseFast
+```
+
+**2. The endpoint image.** `setup.sh` and `wait-for-it.sh` come from the base
+image; the entry point is `/run_endpoint.sh`, which the runner's contract
+names.
+
+```sh
+mkdir -p /tmp/qi/endpoint && cd /tmp/qi/endpoint
+cp ~/zoxy-io/h3/zig-out/bin/h3-interop .
+
+printf '%s\n' '#!/bin/bash' 'set -e' '/setup.sh' \
+  'if [ "$ROLE" == "client" ]; then /wait-for-it.sh sim:57832 -s -t 30; fi' \
+  'exec /usr/local/bin/h3-interop' > run_endpoint.sh
+chmod +x run_endpoint.sh
+
+printf '%s\n' 'FROM martenseemann/quic-network-simulator-endpoint:latest' \
+  'COPY h3-interop /usr/local/bin/h3-interop' \
+  'COPY run_endpoint.sh /run_endpoint.sh' \
+  'RUN chmod +x /usr/local/bin/h3-interop /run_endpoint.sh' \
+  'ENTRYPOINT [ "/run_endpoint.sh" ]' > Dockerfile
+
+docker build -t h3-interop:local .
+```
+
+**3. The runner**, its Python environment, and the two host tools it shells out
+to — `openssl` makes the certificates and `tshark` reads the pcaps:
+
+```sh
+cd /tmp/qi
+git clone --depth 1 https://github.com/quic-interop/quic-interop-runner runner
+cd runner
+python3 -m venv .venv && ./.venv/bin/pip install -r requirements.txt
+
+# Add this implementation to the list the runner chooses from.
+./.venv/bin/python -c "import json; \
+  d = json.load(open('implementations_quic.json')); \
+  d['h3'] = {'image': 'h3-interop:local', 'url': 'https://github.com/zoxy-io/h3', 'role': 'both'}; \
+  json.dump(d, open('implementations_quic.json','w'), indent=2)"
+
+nix-shell -p openssl wireshark-cli --run \
+  './.venv/bin/python run.py -s h3 -c quic-go -t handshake,transfer'
+```
+
+### Before believing a failure, run the control
+
+```sh
+./.venv/bin/python run.py -s quic-go -c quic-go -t handshake
+```
+
+If that fails too, the simulator is not passing packets on this host and no
+result about this package means anything.
+
+That is what happened here. ns-3 re-emits frames with raw sockets, and on a
+host with `bridge-nf-call-iptables=1` those bridged frames traverse iptables
+and meet docker's `DOCKER` chain, which ends in `DROP`. A narrow `DOCKER-USER`
+accept for `193.167.0.0/16` is hit — the counters move — and is not sufficient.
+The simulator's own documentation suggests
+`sysctl net.bridge.bridge-nf-call-iptables=0`, which is a host-wide change and
+was not made here.
+
+The control is the only thing that separates "the runner does not pass" from
+"the runner does not run", and it is one command.
+
 ## h3spec
 
 [h3spec](https://github.com/kazu-yamamoto/h3spec) is a conformance tester for

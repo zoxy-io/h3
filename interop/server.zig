@@ -325,7 +325,29 @@ fn accept(
     parameters_buffer: []u8,
     shared: *const Shared,
 ) !?*Peer {
-    const parsed = quic.packet.parse(message.data, connection_id_octets) catch return null;
+    const parsed = quic.packet.parse(message.data, connection_id_octets) catch |err| {
+        if (shared.verbose) try note(log, "parse of {d} octets: {s}", .{ message.data.len, @errorName(err) });
+        return null;
+    };
+
+    // RFC 9000 section 6.1: a long header in a version this endpoint does not
+    // implement is answered with the list of versions it does. Not optional for
+    // a server, and not only for politeness — the interop runner's network
+    // simulator will not start a test until the server answers exactly this
+    // probe, so a server that ignores it fails every case before the first
+    // packet of the first handshake.
+    //
+    // The datagram floor is section 14.1's, applied here for the reason section
+    // 6.1 gives: a Version Negotiation packet is larger than the packet that
+    // provokes it, so answering a small one is an amplification vector.
+    if (parsed.header == .unsupported_version) {
+        const unsupported = parsed.header.unsupported_version;
+        if (message.data.len >= 1200) {
+            try sendVersionNegotiation(io, log, socket, message, unsupported, shared);
+        }
+        return null;
+    }
+
     // Only an Initial starts a connection. Everything else addressed to an
     // identifier this endpoint does not hold is a packet for a connection that
     // is over, and section 10.3's stateless reset is the answer this package
@@ -404,6 +426,29 @@ fn accept(
     };
     try note(log, "accepted a connection as {x}", .{source.bytes()});
     return slot;
+}
+
+/// The versions this endpoint speaks, which is one.
+const versions = [_]u32{quic.packet.version_1};
+
+/// Answer an unknown version with the list of known ones.
+fn sendVersionNegotiation(
+    io: Io,
+    log: *Io.Writer,
+    socket: *Io.net.Socket,
+    message: Io.net.IncomingMessage,
+    unsupported: @FieldType(quic.packet.Header, "unsupported_version"),
+    shared: *const Shared,
+) !void {
+    var datagram: [256]u8 = @splat(0);
+    const written = try quic.packet.writeVersionNegotiation(
+        &datagram,
+        unsupported.source,
+        unsupported.destination,
+        &versions,
+    );
+    try socket.send(io, &message.from, datagram[0..written]);
+    if (shared.verbose) try note(log, "version 0x{x} is not one of ours", .{unsupported.version});
 }
 
 /// Answer a first flight with a Retry, and forget about it.
