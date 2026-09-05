@@ -505,27 +505,38 @@ pub fn Streams(comptime config: Config) type {
             assert(limit.* >= maximum);
         }
 
-        /// Open a stream, or return the one already open.
+        /// Open a stream, and every lower-numbered stream of its kind.
         ///
-        /// A stream is never removed: `count` only rises, and a finished or
-        /// reset stream keeps its slot and its identifier for the life of the
-        /// connection. That is what makes reuse impossible here — there is no
-        /// path that hands the same identifier to a second stream — and it is
-        /// also why `received_total` can go on counting a closed stream's
-        /// credit, which section 4.1 requires.
+        /// An identifier is used once. A stream leaves the table only by
+        /// retiring, which records it in `retired` and makes the identifier
+        /// unusable rather than free — so there is no path that hands the same
+        /// identifier to a second stream, which is what section 2.1 asks for.
         //= https://www.rfc-editor.org/rfc/rfc9000#section-2.1
         //# A QUIC endpoint MUST NOT reuse a stream ID within a connection.
         //
-        // Only the named stream is created. A peer that opens index 3 without
-        // ever having opened 0, 1 and 2 gets one stream here, not four, so the
-        // creation order the two endpoints see is not the same — and the count
-        // this endpoint bounds with `streams_max` is not the count a
-        // conforming peer believes it has opened. See `checkPeerStreamLimit`
-        // for what that costs on the receive side.
+        // Only the named stream used to be created, so a peer that opened index
+        // 3 without having opened 0, 1 and 2 got one stream here and four at the
+        // far end. The two endpoints then disagreed about which streams exist,
+        // and about how much of the limit had been spent.
+        //
+        // It became a live defect once streams could retire. The retirement
+        // watermark is contiguous — `retireOne` looks up the identifier at the
+        // watermark and stops if it is missing — so an identifier that was
+        // never created blocked it for ever, and the connection stopped issuing
+        // MAX_STREAMS for the rest of its life. Creating the lower-numbered
+        // streams is what makes a hole in that watermark impossible.
+        //
+        // The cost is that a peer holding index 7 open holds eight slots, and
+        // that is right rather than unfortunate: section 3.2 says it has opened
+        // eight streams, so it has spent eight of the identifiers this endpoint
+        // advertised. A consumer sizing `streams_max` has to fit what it
+        // advertises to the peer, plus what it opens itself; see
+        // `setAdvertisedStreamLimits`.
         //= https://www.rfc-editor.org/rfc/rfc9000#section-3.2
         //# Before a stream is created, all streams of the same type with lower-
-        //# numbered stream IDs MUST be created.
-        //= type=todo
+        //# numbered stream IDs MUST be created.  This ensures that the creation
+        //# order for streams is consistent on both endpoints.
+        //= type=test
         pub fn open(self: *Self, id: u64) Error!*Stream {
             assert(id <= varint.max);
             if (self.find(id)) |stream| return stream;
@@ -539,6 +550,29 @@ pub fn Streams(comptime config: Config) type {
             //# A QUIC endpoint MUST NOT reuse a stream ID within a connection.
             //= type=test
             if (self.isRetired(id)) return error.Retired;
+
+            const kind = stream_id.kindOf(id);
+            const position = stream_id.index(id);
+            // From the watermark rather than from zero: everything below it has
+            // been created already and then given up.
+            var lower = self.retired[@intFromEnum(kind)];
+            // Bounded by the advertised limit, which `checkAdvertisedStreamLimit`
+            // has already applied to `id` — and by `streams_max` in any case,
+            // because `create` refuses past it.
+            while (lower < position) : (lower += 1) {
+                const earlier = stream_id.make(kind, lower);
+                if (self.find(earlier) != null) continue;
+                _ = try self.create(earlier);
+            }
+            return try self.create(id);
+        }
+
+        /// One stream, in the next free slot.
+        ///
+        /// `create` appends, so a pointer handed out earlier stays valid across
+        /// it. `sweep` is the one that moves streams, and nothing may hold a
+        /// `*Stream` across that.
+        fn create(self: *Self, id: u64) Error!*Stream {
             if (self.count == streams_max) return error.TooManyStreams;
             self.streams[self.count] = .{ .id = id, .send_limit = self.initialSendLimit(id) };
             self.count += 1;
@@ -559,6 +593,14 @@ pub fn Streams(comptime config: Config) type {
         /// The two differ whenever a consumer offers the peer less than the
         /// table can hold, which it must do when one table is shared between
         /// four kinds of stream.
+        ///
+        /// **`streams_max` has to fit `bidi + uni` plus whatever this endpoint
+        /// opens itself.** Section 3.2 makes an identifier at index N mean N+1
+        /// streams of that kind, so a peer inside its limit can hold every
+        /// identifier that limit names, all at once. A table too small for what
+        /// was advertised answers a conforming peer with STREAM_LIMIT_ERROR,
+        /// which is this endpoint's sizing mistake reported as the peer's
+        /// protocol error.
         pub fn setAdvertisedStreamLimits(self: *Self, bidi: u64, uni: u64) void {
             assert(bidi <= streams_max);
             assert(uni <= streams_max);
@@ -738,20 +780,12 @@ pub fn Streams(comptime config: Config) type {
         //= https://www.rfc-editor.org/rfc/rfc9000#section-4.6
         //# Endpoints MUST NOT exceed the limit set by their peer.
         //
-        // And the mirror of it, which is not implemented. The rule below is
-        // about a stream *identifier*, and the only thing checked in that
-        // direction is a count: `open` refuses the `streams_max + 1`-th stream
-        // and nothing compares a peer-initiated identifier's index against the
-        // limit this endpoint advertised. A peer that sends on index 10_000
-        // while we advertised sixty-four gets a stream, because it is only the
-        // first one. The count is a sound proxy only if section 3.2's
-        // lower-numbered streams are created implicitly, and they are not —
-        // see `open`.
+        // And the mirror of it, which `checkAdvertisedStreamLimit` is.
         //= https://www.rfc-editor.org/rfc/rfc9000#section-4.6
         //# An endpoint that receives a frame with a stream ID exceeding the limit
         //# it has sent MUST treat this as a connection error of type
         //# STREAM_LIMIT_ERROR; see Section 11 for details on error handling.
-        //= type=todo
+        //= type=test
         fn checkPeerStreamLimit(self: *const Self, id: u64) Error!void {
             assert(id <= varint.max);
             const kind = stream_id.kindOf(id);
@@ -783,13 +817,12 @@ pub fn Streams(comptime config: Config) type {
         //# sent MUST treat this as a connection error of type
         //# STREAM_LIMIT_ERROR; see Section 11 for details on error handling.
         ///
-        /// The limit this endpoint advertised is `streams_max`, and the rule is
-        /// about the stream *identifier* rather than about how many streams
-        /// happen to be open. `open` refusing the `streams_max + 1`-th stream
-        /// is a count, and a count is a sound proxy only if section 3.2's
-        /// lower-numbered streams are implicitly created — which this package
-        /// does not do. So a peer sending on index 10 000 while sixty-four were
-        /// advertised used to get a stream, because it was only the first one.
+        /// The rule is about the stream *identifier* rather than about how many
+        /// streams happen to be open, and the two are now the same question:
+        /// section 3.2's lower-numbered streams are created, so an identifier
+        /// at index N means N+1 streams of that kind exist. A peer sending on
+        /// index 10 000 while sixty-four were advertised used to get a stream,
+        /// because it was only the first one.
         //= https://www.rfc-editor.org/rfc/rfc9000#section-19.11
         //# An endpoint MUST terminate a connection with an error of type
         //# STREAM_LIMIT_ERROR if a peer opens more streams than was permitted.

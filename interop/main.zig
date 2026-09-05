@@ -77,10 +77,15 @@ const downloads_default = "/downloads";
 const stream_receive_octets: u32 = 128 * 1024;
 const connection_receive_octets: u64 = 1 << 20;
 
-/// Requests, plus this endpoint's three unidirectional streams and the peer's
-/// three. HTTP/3 spends streams the way `hq-interop` does not, and a limit that
-/// only counted requests would refuse the peer's control stream.
-const streams_max: u32 = requests_max + 2 * unidirectional_max;
+/// Requests and unidirectional streams, both ways.
+///
+/// RFC 9000 section 3.2 makes an identifier at index N mean N+1 streams of that
+/// kind exist, so whatever this endpoint advertises is a claim the peer can
+/// make on the table all at once — and the same again for what it opens itself.
+/// A table smaller than that answers a conforming peer with STREAM_LIMIT_ERROR,
+/// which is this endpoint's sizing mistake reported as the peer's protocol
+/// error.
+const streams_max: u32 = 2 * (requests_max + unidirectional_max);
 
 const Connection = quic.Connection(.{
     .crypto_octets = 32 * 1024,
@@ -581,6 +586,12 @@ const Session = struct {
             .original_destination = destination,
             .source = source,
         });
+        // The same numbers the transport parameters below carry. Without this
+        // the stream layer enforces the table's size instead, which is larger
+        // than what was offered — so a peer opening past the advertised limit
+        // would be admitted, and section 3.2's implicit creation would then
+        // spend table slots this endpoint had promised to nobody.
+        self.connection.streams.setAdvertisedStreamLimits(requests_max, unidirectional_max);
         self.requests_len = 0;
         self.since_key_update = 0;
         self.key_updated_ns = 0;

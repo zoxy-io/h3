@@ -5951,6 +5951,91 @@ test "section 3.2: an abandoned stream still gives its credit back" {
     try testing.expectEqual(before + 1, server.streams.advertised_bidi);
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9000#section-3.2
+//# Before a stream is created, all streams of the same type with lower-
+//# numbered stream IDs MUST be created.  This ensures that the creation
+//# order for streams is consistent on both endpoints.
+//= type=test
+test "section 3.2: opening a stream creates the lower-numbered ones" {
+    // A peer's third request arriving first is ordinary on a path that
+    // reorders. Only the named stream used to be created, so the two endpoints
+    // then disagreed about which streams exist and about how much of the limit
+    // had been spent.
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+
+    var payload: [64]u8 = @splat(0);
+    var written = try frame.encode(&payload, .{ .stream = .{
+        .stream = 8,
+        .offset = 0,
+        .data = "GET /third",
+        .fin = true,
+    } });
+    _ = try server.receiveFrames(.one_rtt, payload[0..written], 0);
+
+    try testing.expect(server.findStream(0) != null);
+    try testing.expect(server.findStream(4) != null);
+    try testing.expect(server.findStream(8) != null);
+
+    // And the earlier ones still take their data when it arrives, which is the
+    // half that would be silent data loss if creating them had been faked by
+    // moving a watermark instead.
+    written = try frame.encode(&payload, .{ .stream = .{
+        .stream = 0,
+        .offset = 0,
+        .data = "GET /first",
+        .fin = true,
+    } });
+    _ = try server.receiveFrames(.one_rtt, payload[0..written], 0);
+    try testing.expectEqualStrings("GET /first", server.readable(0));
+}
+
+test "a stream opened out of order still runs to completion" {
+    // A regression test rather than a requirement's: it passes with and without
+    // section 3.2's implicit creation, and saying so is the point. The
+    // retirement watermark is contiguous, which looked like it made an
+    // out-of-order open freeze the stream credit for ever — and it does not,
+    // because an implicitly created stream that nobody uses blocks the
+    // watermark exactly as a missing one does. What section 3.2 buys is the two
+    // endpoints agreeing on which streams exist, which is the test above.
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+    client.streams.setPeerInitialLimits(1 << 16, 1 << 16, 1 << 16);
+    server.streams.setPeerInitialLimits(1 << 16, 1 << 16, 1 << 16);
+
+    const before = server.streams.advertised_bidi;
+    const ids = [_]u64{ 8, 0, 4 };
+    for (ids) |id| {
+        try testing.expectEqual(@as(usize, 5), try client.write(id, "GET /", true));
+    }
+
+    // Bounded: a pair that stops making progress fails the test rather than
+    // hanging it.
+    for (0..64) |_| {
+        _ = try deliver(&client, &server, 0);
+        for (ids) |id| {
+            const asked = server.readable(id);
+            if (asked.len > 0) try server.consume(id, asked.len);
+            if (server.findStream(id)) |stream| {
+                if (stream.receive_state == .data_read and stream.send_state == .sending) {
+                    _ = try server.write(id, "hello", true);
+                }
+            }
+        }
+        _ = try deliver(&server, &client, 0);
+        for (ids) |id| {
+            const answered = client.readable(id);
+            if (answered.len > 0) try client.consume(id, answered.len);
+        }
+        if (server.streams.retired[0] == ids.len) break;
+    }
+
+    try testing.expectEqual(@as(u64, ids.len), server.streams.retired[0]);
+    try testing.expectEqual(before + ids.len, server.streams.advertised_bidi);
+}
+
 //= https://www.rfc-editor.org/rfc/rfc9000#section-19.14
 //# A STREAMS_BLOCKED frame does not open the stream, but informs the
 //# peer that a new stream was needed and the stream limit prevented the

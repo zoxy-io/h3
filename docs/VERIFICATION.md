@@ -107,6 +107,7 @@ requirement list extracted from the specification.
 | The interop client refused more requests than it had stream identifiers for, rather than issuing them as earlier ones finished | the same case, as a client | `error.TooManyRequests` reads like a guard and was a limitation |
 | A stream the peer abandoned could never retire, and the retirement watermark is contiguous — so one RESET_STREAM, which is an ordinary thing for a peer to send, froze the stream credit for its whole kind for the rest of the connection | reading the retirement code that had just been written | Every interop case completes its streams cleanly, so no gate here has a peer that gives up |
 | The interop client lost a response's FIN when the stream retired in the same pass that consumed the last of its body, and waited for a response it already had | the runner's `http3` case, on the second run | It depends on where a DATA frame's last octet falls relative to the FIN, so it fails on one run and passes on the next |
+| Only the named stream was created, so RFC 9000 §3.2's lower-numbered ones were not — a peer whose third request arrived first had three streams and this endpoint had one, and the two disagreed about which streams existed and how much of the limit had been spent | reading §3.2 against the retirement code | Each endpoint is internally consistent, and every peer this package has met allocates identifiers in order |
 
 Two things about that table.
 
@@ -884,6 +885,28 @@ Closing it needed three things:
    had been hiding it. And the client refused more requests than it had
    identifiers for, with an `error.TooManyRequests` that read like a guard and
    was a limitation; it now issues them as earlier ones finish.
+
+§3.2's implicit creation went with it, and the reason it is worth recording is
+that the argument for doing it was **wrong**. It looked like a live hazard:
+`retireOne` reads the identifier at the contiguous watermark and stops when it
+is missing, so an identifier that was never created seemed to freeze the stream
+credit for the rest of the connection. The revert-check said otherwise. An
+implicitly created stream that nobody uses is *unfinished*, and it blocks the
+watermark exactly as a missing one does — which is also the right answer, since
+§3.2 means the peer has spent that identifier and is holding it. The rule is a
+MUST and is now implemented with a test behind it, and what it actually buys is
+the sentence the RFC gives for it: the two endpoints agree on which streams
+exist. It was written down here as a credit freeze first, and the test that
+could not tell the two versions apart is what corrected it.
+
+It also has a cost that a consumer has to size for, so it is stated where the
+sizing happens: an identifier at index N means N+1 streams of that kind exist,
+so whatever an endpoint advertises is a claim the peer can make on the table all
+at once. A table smaller than that answers a conforming peer with
+STREAM_LIMIT_ERROR — this endpoint's sizing mistake, reported as the peer's
+protocol error. Both shims now state their advertised limits to the stream layer
+instead of letting it enforce the table's size, which was larger than what they
+had offered.
 
 Retirement then had two consequences worth naming, because both are the kind a
 green matrix hides. The first was found by reading the code that had just been
