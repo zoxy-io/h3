@@ -38,6 +38,12 @@ pub const stream = @import("stream.zig");
 /// GOAWAY, and section 4.1's frame sequence on a request stream. `frame.zig`
 /// and `stream.zig` say what a thing is; this says whether it may be here.
 pub const http3 = @import("Http3.zig");
+
+/// qlog records, for a consumer that wants a trace a tool can read. Sans-I/O
+/// like everything else here: it writes octets into a buffer and never opens a
+/// file. See the module comment for what a trace from this seam can and cannot
+/// contain.
+pub const qlog = @import("qlog.zig");
 pub const Http3 = http3.Http3;
 
 test {
@@ -49,4 +55,5 @@ test {
     _ = frame;
     _ = stream;
     _ = http3;
+    _ = qlog;
 }

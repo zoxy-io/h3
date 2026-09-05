@@ -39,6 +39,7 @@ const std = @import("std");
 const h3 = @import("h3");
 
 const tls = @import("tls.zig");
+const qlog_file = @import("qlog_file.zig");
 
 const Io = std.Io;
 const quic = h3.quic;
@@ -114,6 +115,9 @@ pub const Options = struct {
     /// test case. Address validation policy, and therefore this file's: RFC
     /// 9000 section 8.1.2 leaves *when* to retry entirely to the server.
     retry: bool = false,
+    /// Where a per-connection qlog goes, when the runner asks for one. Absent
+    /// is the ordinary case, not an error.
+    qlog: ?Io.Dir = null,
     verbose: bool,
 };
 
@@ -137,6 +141,7 @@ const Shared = struct {
     /// The key the Retry tokens are authenticated with, drawn once per process.
     token_key: [32]u8,
     www: ?Io.Dir,
+    qlog: ?Io.Dir,
     retry: bool,
     verbose: bool,
 };
@@ -144,6 +149,10 @@ const Shared = struct {
 /// One connection and everything attached to it.
 const Peer = struct {
     connection: Connection,
+    /// This connection's trace, if the runner asked for one. Its writer points
+    /// into its own buffer, so a `Peer` must not be moved once one is open —
+    /// and none is: the table is fixed and slots are reused in place.
+    trace: qlog_file.Trace,
     server: tls.Server,
     http3: Http3,
     /// The identifier this endpoint chose, which is what a client addresses
@@ -202,6 +211,7 @@ pub fn run(io: Io, gpa: std.mem.Allocator, log: *Io.Writer, options: Options) !v
         .private_key = try privateKey(&key_storage, options.private_key_pem),
         .token_key = undefined,
         .www = options.www,
+        .qlog = options.qlog,
         .retry = options.retry,
         .verbose = options.verbose,
     };
@@ -253,6 +263,7 @@ pub fn run(io: Io, gpa: std.mem.Allocator, log: *Io.Writer, options: Options) !v
         } orelse continue;
 
         peer.last_ns = now;
+        peer.trace.record(now, .{ .datagrams_received = .{ .count = 1, .octets = message.data.len } });
         peer.connection.receive(message.data, now) catch |err| {
             if (options.verbose) try note(log, "receive: {s}", .{@errorName(err)});
             peer.connection.close(Connection.errorCode(err));
@@ -266,7 +277,7 @@ pub fn run(io: Io, gpa: std.mem.Allocator, log: *Io.Writer, options: Options) !v
         };
         _ = flush(io, &socket, peer, now) catch {};
 
-        retire(peers, now);
+        retire(io, peers, now);
     }
 }
 
@@ -393,6 +404,7 @@ fn accept(
             oldest.local.bytes(),
             (now_ns -| oldest.last_ns) / std.time.ns_per_ms,
         });
+        oldest.trace.finish(io);
         break :free oldest;
     };
 
@@ -436,8 +448,13 @@ fn accept(
         .readable_len = 0,
         .answers = undefined,
         .answers_len = 0,
+        .trace = .{},
         .live = true,
     };
+    // Named for the client's original Destination Connection ID, which is the
+    // value both endpoints agree on before either has chosen anything — so a
+    // client's trace and this one can be put side by side.
+    slot.trace.start(io, shared.qlog, initial.destination.bytes(), .server);
     // The same numbers the transport parameters above carry. The stream layer
     // enforces what was advertised and grants more as streams retire, and it
     // cannot know what a consumer chose to offer: the table is shared between
@@ -955,12 +972,33 @@ fn noteReadable(peer: *Peer, id: u64) void {
 
 fn flush(io: Io, socket: *Io.net.Socket, peer: *Peer, now_ns: u64) !void {
     var datagram: [Connection.datagram_octets]u8 = undefined;
+    var count: u32 = 0;
+    var total: u64 = 0;
+    defer if (count > 0) {
+        peer.trace.record(now_ns, .{ .datagrams_sent = .{ .count = count, .octets = total } });
+        traceMetrics(peer, now_ns);
+    };
     // Bounded, for the reason the client's flush is.
     for (0..64) |_| {
         const octets = try peer.connection.send(&datagram, now_ns);
         if (octets == 0) return;
         try socket.send(io, &peer.address, datagram[0..octets]);
+        count += 1;
+        total += octets;
     }
+}
+
+/// What a congestion plot is drawn from, once per flush rather than per packet.
+fn traceMetrics(peer: *Peer, now_ns: u64) void {
+    const recovery = &peer.connection.recovery;
+    peer.trace.record(now_ns, .{ .metrics = .{
+        .smoothed_rtt_ns = recovery.smoothed_rtt,
+        .rtt_variance_ns = recovery.rttvar,
+        .latest_rtt_ns = recovery.latest_rtt,
+        .congestion_window = recovery.congestion_window,
+        .bytes_in_flight = recovery.bytes_in_flight,
+        .pto_count = recovery.pto_count,
+    } });
 }
 
 fn flushAll(
@@ -987,7 +1025,7 @@ fn flushAll(
         pushAnswers(io, peer, scratch) catch {};
         flush(io, socket, peer, now_ns) catch {};
     }
-    retire(peers, now_ns);
+    retire(io, peers, now_ns);
 }
 
 /// Give the slot back once the connection is over.
@@ -996,14 +1034,20 @@ fn flushAll(
 /// framed and sent by the flush that precedes every call here, and section
 /// 10.2.1 says an endpoint sends one close and then nothing. Keeping the slot
 /// afterwards is keeping it for a connection that will never speak again.
-fn retire(peers: []Peer, now_ns: u64) void {
+fn retire(io: Io, peers: []Peer, now_ns: u64) void {
     for (peers) |*peer| {
         if (!peer.live) continue;
         const over = switch (peer.connection.state) {
             .closing, .draining => true,
             .handshaking, .established => now_ns -| peer.last_ns > idle_ns,
         };
-        if (over) peer.live = false;
+        if (over) {
+            // Flushed and closed here rather than when the slot is reused: a
+            // trace that is still open when the process exits is a trace whose
+            // last records are in a buffer nobody wrote.
+            peer.trace.finish(io);
+            peer.live = false;
+        }
     }
 }
 

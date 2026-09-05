@@ -284,6 +284,10 @@ should_activate |= !is_largest;
 - **[qlog](https://github.com/quicwg/qlog)** — still Internet-Drafts at
   version 14 of the main schema; `qvis` renders it. No stack keeps golden qlog
   fixtures except picoquic. aioquic and quic-go assert on individual events.
+  **Written**, as `src/qlog.zig` and `interop/qlog_file.zig`; see §5.7. Note
+  what it is *not* for: nothing in the interop runner reads a qlog. It sets
+  `QLOGDIR` and keeps whatever is written there, and the value is a trace a
+  person or `qvis` can read afterwards — not a measurement the runner takes.
 - **quic-tracker** — dead at draft-29; not worth targeting.
 - **Formal** — McMillan and Zuck's Ivy model (SIGCOMM 2019) and its draft-29
   extension found real bugs in seven stacks, including client-sent NEW_TOKEN
@@ -648,7 +652,8 @@ Three gaps were waiting on this and did not look related:
   meant `AckedPacket` carrying the same `Context` a lost packet always had.
 - **A qlog writer** needs a trace rather than a poll of accessors, and so does
   any consumer that wants to know about a *transition* without keeping its own
-  shadow copy of every answer.
+  shadow copy of every answer. `src/qlog.zig` is now written against what the
+  poll *can* say, and §5.7 records exactly what that leaves out.
 
 One design note worth keeping. The queue is fixed, like everything else here,
 and a full one **counts the drop and reports it as an event**. The alternative —
@@ -1263,6 +1268,44 @@ about the order in which state is committed, so a rewrite would separate the
 send scheduler from the packet builder, and pull address validation and the
 amplification budget into a struct with its own invariant check the simulator
 calls after every datagram. Neither is needed for §5.1 through §5.5.
+
+### 5.7 A qlog trace — **written, and partial on purpose**
+
+`src/qlog.zig` turns a record into octets and stops; `interop/qlog_file.zig`
+opens `$QLOGDIR/<odcid>.sqlog` and writes them. The split is the seam's, for the
+seam's reason: the library holds no file and no clock. Both roles write one
+trace per connection, named for the *original* Destination Connection ID, which
+is the one value both endpoints agree on before either has chosen anything — so
+a client's trace and a server's of the same connection sit side by side under
+one name.
+
+**There are no packet events, and that is the honest shape of this trace.**
+`transport:packet_sent` and `packet_received` are most of what a qvis timeline
+is made of, and this seam does not expose them: `poll` is a queue of things a
+consumer must *act* on, bounded at `events_max`, and a packet-per-event stream
+would overflow it on every connection that did any work. Reporting packets needs
+a sink rather than a queue — a change to the shape of the seam, not to the
+writer. What a trace carries instead is the metrics after every flush, the loss
+counts, the key updates, the close, the stream terminations, and the datagram
+counts the *consumer* knows because it holds the socket. A 5 MiB transfer
+produces about 22,000 records, all of them valid JSON-SEQ.
+
+It is worth being clear about what this is for, because the obvious guess is
+wrong: **nothing in the interop runner reads a qlog.** It sets `QLOGDIR`, keeps
+what is written there, and that is all. The value is a trace a person or `qvis`
+can read after a failure, not a measurement anything takes.
+
+Two defects, both in the new code and both of one kind:
+
+- **`src/qlog.zig`'s tests never ran.** `src/root.zig` has a `test` block that
+  names each module, and a module nobody names is a module whose tests Zig does
+  not compile. The file was written, wired into both roles, and passing for an
+  hour — and the first test to actually execute failed.
+- **What it was hiding**: two variants wrote their first field with the raw
+  text writer, which does not do the comma bookkeeping, and emitted two fields
+  with nothing between them. Balanced braces, and not JSON. The test that caught
+  it parses each record with `std.json.validate`; the one it replaced counted
+  braces, and counting braces would have passed.
 
 ## 6. The rewrite question
 

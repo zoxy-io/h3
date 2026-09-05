@@ -55,6 +55,7 @@ const h3 = @import("h3");
 
 const server_role = @import("server.zig");
 const tls = @import("tls.zig");
+const qlog_file = @import("qlog_file.zig");
 
 const Io = std.Io;
 const quic = h3.quic;
@@ -291,6 +292,20 @@ pub fn main(init: std.process.Init) !u8 {
         file.close(io);
     };
 
+    // The interop runner names a directory and expects one trace per
+    // connection in it. Absent, unwritable or not there at all is the ordinary
+    // case rather than an error: a shim that refused to run a test because it
+    // could not write a log would be failing the test for the log's sake.
+    var qlog_directory: ?Io.Dir = null;
+    if (environ.get("QLOGDIR")) |path| {
+        if (Io.Dir.cwd().openDir(io, path, .{})) |directory| {
+            qlog_directory = directory;
+        } else |err| {
+            try log.print("h3-interop: QLOGDIR {s}: {s}\n", .{ path, @errorName(err) });
+        }
+    }
+    defer if (qlog_directory) |*directory| directory.close(io);
+
     var requests: std.ArrayList([]const u8) = .empty;
     defer requests.deinit(gpa);
     var fields = std.mem.tokenizeAny(u8, requests_line, " \t\r\n");
@@ -324,13 +339,13 @@ pub fn main(init: std.process.Init) !u8 {
     if (testcase.oneConnectionPerRequest()) {
         for (requests.items) |one| {
             const only = [_][]const u8{one};
-            session.run(io, log, testcase, downloads, key_log, &only, verbose, peer) catch |err| {
+            session.run(io, log, testcase, downloads, key_log, qlog_directory, &only, verbose, peer) catch |err| {
                 try log.print("h3-interop: {s}: {s}\n", .{ one, @errorName(err) });
                 failed = true;
             };
         }
     } else {
-        session.run(io, log, testcase, downloads, key_log, requests.items, verbose, peer) catch |err| {
+        session.run(io, log, testcase, downloads, key_log, qlog_directory, requests.items, verbose, peer) catch |err| {
             try log.print("h3-interop: {s}\n", .{@errorName(err)});
             failed = true;
         };
@@ -405,11 +420,24 @@ fn runServer(init: std.process.Init, log: *Io.Writer, testcase: ServerTestcase) 
     };
     defer www.close(io);
 
+    // The same directory the client role writes into, and the same reason for
+    // shrugging when it is not there.
+    var qlog: ?Io.Dir = null;
+    if (environ.get("QLOGDIR")) |path| {
+        if (Io.Dir.cwd().openDir(io, path, .{})) |directory| {
+            qlog = directory;
+        } else |err| {
+            try log.print("h3-interop: QLOGDIR {s}: {s}\n", .{ path, @errorName(err) });
+        }
+    }
+    defer if (qlog) |*directory| directory.close(io);
+
     try server_role.run(io, gpa, log, .{
         .port = port,
         .certificate_pem = certificate_pem,
         .private_key_pem = key_pem,
         .www = www,
+        .qlog = qlog,
         .retry = testcase.retries(),
         .verbose = environ.get("VERBOSE") != null,
     });
@@ -535,6 +563,11 @@ const Session = struct {
     next_url: usize = 0,
     next_stream: u64 = 0,
     finished: usize = 0,
+    /// This connection's qlog, if the runner asked for one. Held here rather
+    /// than passed around because its writer points into its own buffer, so it
+    /// must not move.
+    trace: qlog_file.Trace = .{},
+
     /// A scratch datagram, held here rather than on the stack for the same
     /// reason the connection is.
     datagram: [Connection.datagram_octets]u8 = undefined,
@@ -559,6 +592,7 @@ const Session = struct {
         testcase: Testcase,
         downloads: []const u8,
         key_log: ?*Io.Writer,
+        qlog_directory: ?Io.Dir,
         urls: []const []const u8,
         verbose: bool,
         peer: Io.net.IpAddress,
@@ -593,6 +627,11 @@ const Session = struct {
             .original_destination = destination,
             .source = source,
         });
+        // Named for the original Destination Connection ID, which is the one
+        // value both endpoints agree on before either has chosen anything —
+        // and therefore the one that lets two traces of the same connection be
+        // put side by side.
+        self.trace.start(io, qlog_directory, destination.bytes(), .client);
         // The same numbers the transport parameters below carry. Without this
         // the stream layer enforces the table's size instead, which is larger
         // than what was offered — so a peer opening past the advertised limit
@@ -660,6 +699,7 @@ const Session = struct {
         // at once is more descriptors than a process is given.
         var directory = try Io.Dir.cwd().openDir(io, downloads, .{});
         defer directory.close(io);
+        defer self.trace.finish(io);
         defer for (self.requests[0..self.requests_len]) |*request| {
             if (!request.in_use) continue;
             request.writer.interface.flush() catch {};
@@ -686,7 +726,7 @@ const Session = struct {
 
             if (testcase == .http3) try self.drainHttp3(log) else try self.drainStreams(now);
             try self.keyUpdate(testcase, now);
-            try self.drainEvents(log);
+            try self.drainEvents(log, now);
             try self.reap(io, log, origin);
 
             try self.flush(io, log, &socket, &peer, now);
@@ -708,6 +748,10 @@ const Session = struct {
                 else => return err,
             };
             if (self.verbose) try note(log, "received {d} octets", .{message.data.len});
+            self.trace.record(elapsed(io, origin), .{ .datagrams_received = .{
+                .count = 1,
+                .octets = message.data.len,
+            } });
             self.connection.receive(message.data, elapsed(io, origin)) catch |err| switch (err) {
                 // A datagram that does not parse or does not authenticate is
                 // discarded by the connection itself; what reaches here is a
@@ -974,10 +1018,29 @@ const Session = struct {
     /// the accessors do not also answer — but `overflowed` is a real signal
     /// and a queue polled by nobody is a queue that reports its own overflow
     /// to nobody.
-    fn drainEvents(self: *Session, log: *Io.Writer) !void {
+    fn drainEvents(self: *Session, log: *Io.Writer, now_ns: u64) !void {
         // Bounded: the queue is fixed and `poll` removes what it returns.
         for (0..events_per_drain_max) |_| {
             const event = self.connection.poll() orelse return;
+            // The trace takes what it can name and ignores the rest. This is
+            // the whole of what a qlog from this seam can say about the
+            // connection's own behaviour — see `src/qlog.zig` on why there are
+            // no packet events.
+            switch (event) {
+                .packets_lost => |count| self.trace.record(now_ns, .{ .packets_lost = count }),
+                .key_updated => self.trace.record(now_ns, .{
+                    .key_updated = @intFromBool(self.connection.one_rtt.phase),
+                }),
+                .closed => |value| self.trace.record(now_ns, .{ .connection_closed = .{
+                    .code = value.code,
+                    .application = value.application,
+                } }),
+                .stream_delivered => |id| self.trace.record(now_ns, .{ .stream_state = .{
+                    .stream = id,
+                    .state = .closed,
+                } }),
+                else => {},
+            }
             switch (event) {
                 // The one event worth a line whether or not the run is
                 // verbose: a peer's close carries the reason the transfer
@@ -997,12 +1060,37 @@ const Session = struct {
 
     /// Build and send datagrams until the connection has nothing more.
     fn flush(self: *Session, io: Io, log: *Io.Writer, socket: *Io.net.Socket, peer: *const Io.net.IpAddress, now_ns: u64) !void {
+        var count: u32 = 0;
+        var total: u64 = 0;
+        defer if (count > 0) {
+            self.trace.record(now_ns, .{ .datagrams_sent = .{ .count = count, .octets = total } });
+            self.traceMetrics(now_ns);
+        };
         for (0..flush_datagrams_max) |_| {
             const octets = try self.connection.send(&self.datagram, now_ns);
             if (octets == 0) return;
             try socket.send(io, peer, self.datagram[0..octets]);
+            count += 1;
+            total += octets;
             if (self.verbose) try note(log, "sent {d} octets at {d}ms", .{ octets, now_ns / std.time.ns_per_ms });
         }
+    }
+
+    /// What a congestion plot is drawn from, read straight off `Recovery`.
+    ///
+    /// Once per flush rather than once per packet: the numbers only move when
+    /// something is sent or acknowledged, and a record per packet is what makes
+    /// a trace larger than the transfer it describes.
+    fn traceMetrics(self: *Session, now_ns: u64) void {
+        const recovery = &self.connection.recovery;
+        self.trace.record(now_ns, .{ .metrics = .{
+            .smoothed_rtt_ns = recovery.smoothed_rtt,
+            .rtt_variance_ns = recovery.rttvar,
+            .latest_rtt_ns = recovery.latest_rtt,
+            .congestion_window = recovery.congestion_window,
+            .bytes_in_flight = recovery.bytes_in_flight,
+            .pto_count = recovery.pto_count,
+        } });
     }
 
     /// When to wake, as the socket wants it: the loss detection timer if there
@@ -1174,4 +1262,12 @@ test "an address literal resolves without a name server" {
     const address = try resolve(io, "127.0.0.1", 4433);
     try testing.expectEqual(@as(u16, 4433), address.getPort());
     try testing.expect(address == .ip4);
+}
+
+test {
+    // `qlog_file`'s own tests, which do not run unless something references
+    // the module. `src/qlog.zig` was written, wired in and passing for an hour
+    // before anyone noticed that none of its tests had ever executed, because
+    // `src/root.zig` did not name it either — and the first one to run failed.
+    _ = qlog_file;
 }

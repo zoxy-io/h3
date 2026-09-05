@@ -287,6 +287,16 @@ a `multiconnect` client abandons the run on the first one it loses, so it
 is the case most able to fail for reasons that are nobody's fault — three of
 three in both roles on the last measurement.
 
+## Traces
+
+Both roles write a qlog to `$QLOGDIR` when the runner sets one — one
+`<odcid>.sqlog` per connection, in JSON-SEQ, named so that a client's trace and
+a server's of the same connection share a name. `qvis` renders them.
+
+There are no packet events in them. `docs/VERIFICATION.md` §5.7 says why and
+what is there instead; the short version is that this package's event queue is
+for things a consumer must act on, and a packet-per-event stream is not that.
+
 ## h3spec
 
 [h3spec](https://github.com/kazu-yamamoto/h3spec) is a conformance tester for
