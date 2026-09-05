@@ -1251,8 +1251,25 @@ pub fn Recovery(comptime config: Config) type {
         //# PTO timer.
         pub fn earliestContext(self: *const Self, space: Space) ?Context {
             const state = &self.spaces[@intFromEnum(space)];
-            if (state.count == 0) return null;
-            return state.sent[0].context;
+            // The earliest *in flight*, not the earliest recorded. Every packet
+            // is recorded here, acknowledgement-only ones included, and an
+            // acknowledgement-only packet carries nothing a retransmission
+            // could make progress with: pointing the probe at one rewinds
+            // nothing, so the probe goes out carrying an ACK and padding while
+            // the peer waits for the handshake bytes it was supposed to carry.
+            //
+            // A server whose flight is lost then never resends it. Its probes
+            // are answered by nothing, `pto_count` doubles each time, and by
+            // the fourth or fifth attempt the period is four or five seconds —
+            // which is how the interop runner's `handshakeloss` case ended with
+            // one connection wedged and a client that gave up on the whole run.
+            //
+            // `in_flight` is exactly "this packet was ack-eliciting", which is
+            // the same question as "could this packet have carried data".
+            for (state.sent[0..state.count]) |packet| {
+                if (packet.in_flight) return packet.context;
+            }
+            return null;
         }
 
         /// Every context still outstanding in a space, oldest first.

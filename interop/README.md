@@ -276,18 +276,16 @@ The control is the only thing that separates "the runner does not pass" from
 ### The matrix
 
 As a **client** against quic-go's server: `handshake`, `transfer`, `chacha20`,
-`retry`, `http3`, `transferloss`, `keyupdate` and `multiplexing`. As a
-**server** against quic-go's client: the same list without `keyupdate`, which
-a server does not initiate here.
+`retry`, `http3`, `transferloss`, `keyupdate`, `multiplexing` and
+`handshakeloss`. As a **server** against quic-go's client: the same list
+without `keyupdate`, which a server does not initiate here.
 
-Run the matrix twice before believing it. `http3` in particular depends on
-where a DATA frame's last octet falls relative to the FIN, and a defect there
-failed one run and passed the next.
-
-`handshakeloss` fails in both roles: fifty handshakes through 30% loss in three
-hundred seconds, of which about thirty-eight finish. The median is half a
-second and the tail is RFC 9002's PTO backoff at 1, 2, 4, 8, 16 seconds — a
-recovery slower than quic-go's rather than a rule broken.
+Run the matrix twice before believing it. `http3` depends on where a DATA
+frame's last octet falls relative to the FIN, and a defect there failed one run
+and passed the next. `handshakeloss` is fifty connections through 30% loss and
+a `multiconnect` client abandons the run on the first one it loses, so it
+passes most runs rather than all of them — three of three as a client and two
+of three as a server on the last measurement.
 
 ## h3spec
 

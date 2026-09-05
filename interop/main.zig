@@ -122,7 +122,7 @@ const connection_id_octets: usize = 8;
 /// connections in three hundred seconds — it sets `TESTCASE=multiconnect` on
 /// the endpoints — so a connection that stalls and holds a sixty-second
 /// deadline is not one failure but ten: the ones that never got their turn.
-const connection_deadline_short_ns: u64 = 10 * std.time.ns_per_s;
+const connection_deadline_short_ns: u64 = 30 * std.time.ns_per_s;
 
 /// And when it is the only one. `transferloss` is a single connection carrying
 /// a large file through a lossy path, where the same ten seconds is the
@@ -131,6 +131,13 @@ const connection_deadline_short_ns: u64 = 10 * std.time.ns_per_s;
 /// One constant would have to be wrong for one of the two, which is why there
 /// are two: the shim knows which case it is running, and the runner's own
 /// budgets differ by case for the same reason.
+///
+/// The short one was ten seconds, and ten seconds is a deadline this shim
+/// invented. `handshakeloss` is fifty connections in three hundred, so the
+/// budget is six apiece on average and nothing says any one of them may not
+/// take longer — and under 30% loss the tail does. A connection abandoned at
+/// ten seconds fails a run the runner would have allowed to finish, which is
+/// the shim losing a result rather than the package failing to produce one.
 const connection_deadline_long_ns: u64 = 60 * std.time.ns_per_s;
 
 /// Datagrams built per flush before the loop goes back to the socket. A bound
@@ -593,6 +600,17 @@ const Session = struct {
         // spend table slots this endpoint had promised to nobody.
         self.connection.streams.setAdvertisedStreamLimits(requests_max, unidirectional_max);
         self.requests_len = 0;
+        // Reset with it, because `Session` is reused across connections and
+        // these three are what say how far through the request list this
+        // *connection* has got. Carrying `finished` forward made `complete()`
+        // answer true before the second connection had sent anything: the loop
+        // broke on its first pass, `run` returned success, and the shim
+        // reported "1 of 1 requests in 0ms" for forty-nine connections that
+        // never happened. `multiconnect` is the only case that opens more than
+        // one, so nothing else could have noticed.
+        self.finished = 0;
+        self.next_url = 0;
+        self.next_stream = 0;
         self.since_key_update = 0;
         self.key_updated_ns = 0;
         self.key_updates = 0;

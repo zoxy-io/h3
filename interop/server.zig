@@ -88,7 +88,14 @@ const connection_id_octets: usize = 8;
 /// server that failed to detect the error under test — which is how a run of
 /// 49 cases showed sixteen passes and thirty-three "did not get expected
 /// exception" while every one of them passed alone.
-const idle_ns: u64 = 5 * std.time.ns_per_s;
+///
+/// It was five seconds for that reason, and five seconds is a deadline rather
+/// than a policy: on the runner's lossy path a peer's own probe timeout backs
+/// off past it, so this server dropped connections its peer was still working
+/// on and then answered nothing for the rest of their idle timeout. What keeps
+/// the table clear is `accept` evicting the least recently heard from when it
+/// is full, which is pressure-driven and cannot kill a live handshake.
+const idle_ns: u64 = 30 * std.time.ns_per_s;
 
 const body = "h3spec\n";
 
@@ -373,7 +380,20 @@ fn accept(
         for (peers) |*peer| {
             if (!peer.live) break :free peer;
         }
-        return error.TooManyConnections;
+        // Full: take the connection nobody has heard from in longest. A server
+        // that answers nothing looks exactly like a server that failed the test
+        // under way, so refusing here is the worst of the options — and the
+        // peer being evicted is, by construction, the one least likely to still
+        // be waiting for an answer.
+        var oldest: *Peer = &peers[0];
+        for (peers) |*peer| {
+            if (peer.last_ns < oldest.last_ns) oldest = peer;
+        }
+        try note(log, "evicting {x}, silent {d}ms", .{
+            oldest.local.bytes(),
+            (now_ns -| oldest.last_ns) / std.time.ns_per_ms,
+        });
+        break :free oldest;
     };
 
     slot.* = .{
@@ -573,6 +593,11 @@ fn transportParameters(
         .initial_max_stream_data_uni = stream_receive_octets,
         .initial_max_streams_bidi = requests_max,
         .initial_max_streams_uni = unidirectional_max,
+        // The same number `idle_ns` retires on, so what this server does is
+        // what it said it would do. It advertised nothing here while dropping
+        // connections after five seconds, which is a server telling its peer
+        // the connection never times out and then behaving as though it does.
+        .max_idle_timeout_ms = idle_ns / std.time.ns_per_ms,
         .max_udp_payload_size = Connection.datagram_octets,
         .active_connection_id_limit = 2,
         .initial_source_connection_id = source,

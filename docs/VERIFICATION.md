@@ -112,6 +112,10 @@ requirement list extracted from the specification.
 | `writeStream` read no send state, so a peer that sent STOP_SENDING got the rest of the buffer anyway. `wantsSend` refusing is not `send` refusing: an owed acknowledgement is enough to build a packet, and the stream writer then filled it | writing the test for the rule above | The test that should have caught it could not — an acknowledgement reclaims the buffer, so a stream that *was* framed and one that never was both end at zero |
 | Skipping section 3.3's terminal states in the stream writer stalled a transfer, because "Data Recvd" is entered when the packet carrying the FIN is acknowledged rather than when every packet is — and an earlier packet can be declared lost afterwards | the runner's `http3` case, one build later | It needs a spurious loss on a stream that has already sent its FIN, which is a property of a path rather than of a state machine |
 | STOP_SENDING was received and never sent, so a consumer could abandon what it wrote and not what it read — the peer went on sending into a buffer the application had walked away from | the ledger, which had section 3.5's SHOULD as a `type=todo` | Nothing in either suite asks a peer to stop; h3spec resets its own streams and the runner's cases all read what they asked for |
+| A PTO probe was pointed at the earliest *recorded* packet rather than the earliest one in flight, and an acknowledgement-only packet carries nothing a retransmission can make progress with — so the probe rewound nothing and went out as an ACK and some padding | the runner's `handshakeloss` case, read packet by packet | Every unit test's probe had data as its oldest packet, because nothing had sent an acknowledgement first |
+| RFC 9001 §5.7's "a server MUST NOT process incoming 1-RTT packets before the handshake is complete" was recorded as satisfied by construction — a 1-RTT key exists only when the handshake is complete — which is true of a client and false of a server | the same case | The argument is written next to the rule and reads as a proof; a TLS 1.3 server holds application keys one flight before it verifies the client |
+| The interop client's `Session` carried its completion counter across connections, so every connection after the first returned at once having done nothing — and reported success | the runner counting handshakes in the capture | The shim said "1 of 1 requests" fifty times and exited zero; only an independent count of what reached the wire disagreed |
+| The interop server retired a peer after five seconds of silence while advertising no idle timeout at all, so it dropped connections whose peer was still probing | the same case | Five seconds is longer than anything a working path needs and shorter than a probe timeout that has backed off twice |
 
 Two things about that table.
 
@@ -796,19 +800,15 @@ tells them apart.
 
 ### The result
 
-**As a client, against quic-go's server: eight of nine.** `handshake`,
-`transfer`, `chacha20`, `retry`, `http3`, `transferloss`, `keyupdate` and
-`multiplexing` pass. `handshakeloss` does not: it is fifty connections through
-30% loss in three hundred seconds, and about thirty-eight finish. Nothing is
-wrong with any one of them — the median handshake is half a second — but the
-tail is RFC 9002's PTO backoff at 1, 2, 4, 8, 16 seconds, and enough
-connections reach the far end of it to run out the budget. That is a
-performance property rather than a defect, and it is the honest place to leave
-it: not a rule broken, a recovery slower than quic-go's.
+**As a client, against quic-go's server: nine of nine**, and as a **server
+against quic-go's client: eight of eight** — `handshake`, `transfer`,
+`chacha20`, `retry`, `http3`, `transferloss`, `multiplexing` and
+`handshakeloss`, with `keyupdate` on the client side as well.
 
-**As a server, against quic-go's client: seven of eight** — `handshake`,
-`transfer`, `chacha20`, `retry`, `http3`, `transferloss` and `multiplexing`.
-Only `handshakeloss` fails, for the same reason it does on the client side.
+`handshakeloss` is the one to read the small print on. It passes, and not every
+time: three runs of three as a client, two of three as a server. See below for
+what it took and what is still behind the run that failed. Every other case has
+passed on every run since the work that fixed it.
 
 Four defects fell out of the attempt, all in the table in §1: the eight-span
 reassembly limit, a probe count that outlived its space, a server that refilled
@@ -981,10 +981,66 @@ could not: they asserted "nothing is owed" at a moment when the frame had
 already been framed, which is true whether or not the ending works. Reporting
 the packet lost first is what made them discriminate.
 
+##### `handshakeloss` — **two defects, two shim mistakes, and it passes**
+
+The last failing case, and the one this document had explained away. It was
+recorded as a performance property — "not a rule broken, a recovery slower than
+quic-go's" — on the strength of a measurement that predated most of the work
+above. It was four separate things, and only one of them was slow.
+
+**In the package.** A PTO probe is supposed to carry unacknowledged data, and
+`Recovery.earliestContext` handed back the earliest *recorded* packet in the
+space. Every packet is recorded, acknowledgement-only ones included, and an
+acknowledgement carries nothing a retransmission can make progress with — so
+whenever an endpoint had sent an ACK before its own flight, every probe rewound
+nothing and went out as an ACK and some padding while the peer waited for the
+handshake bytes that probe was for. `pto_count` doubles each time it is not
+answered, so by the fourth attempt the period is four seconds.
+
+The second is the more interesting, because it was *argued*. RFC 9001 §5.7 says
+a server MUST NOT process incoming 1-RTT packets before its handshake is
+complete, and the comment beside the rule explained that it held by
+construction: a 1-RTT read key only exists once the handshake is complete. That
+is true of a client and false of a server — a TLS 1.3 server derives the
+application traffic secrets when it *sends* its Finished, one flight before it
+has verified the client's. So this server acknowledged a client's first request
+while still waiting for that Finished; quic-go read the acknowledgement as
+"everything arrived", dropped its Handshake keys, and could no longer
+retransmit the Finished that had been lost. Both endpoints then waited, one
+probing at Initial and Handshake for thirty seconds and the other counting down
+an idle timer.
+
+**In the shim**, two mistakes of its own, and the first is the one worth
+remembering. The client's `Session` is reused across connections and carried
+its completion counter forward, so from the second connection on `complete()`
+answered true before anything had been sent: the loop broke on its first pass,
+`run` returned success, and the shim printed "1 of 1 requests in 0ms" fifty
+times and exited zero. Nothing in the shim could see it. What saw it was the
+runner counting handshakes in the packet capture — eighteen where fifty were
+expected — which is exactly the kind of oracle §5.5 exists to buy. The second:
+the server retired a peer after five seconds of silence while advertising no
+idle timeout at all, which is longer than a working path needs and shorter than
+a probe timeout that has backed off twice. It now evicts the least recently
+heard from when the table is full, which is pressure-driven and cannot kill a
+live handshake, and it advertises the timeout it actually applies.
+
+**The result**, and it is not a clean one: the client passes three runs of
+three; the server passes two of three. The run that failed lost one connection
+in about thirteen to a bad enough loss streak that quic-go's own handshake
+timeout ended it, and a `multiconnect` client abandons the whole run on the
+first connection it loses. So `handshakeloss` is a case this package passes and
+does not pass reliably, which is worth more written down than a number that
+looks like a verdict.
+
 What is left here:
 
-- **Recovery under heavy loss**, which is what `handshakeloss` measures and the
-  only case still failing in either role.
+- **The datagram padding is appended after the last packet rather than put
+  inside one.** RFC 9000 §14.1 names two ways to reach 1200 octets — PADDING
+  frames in the Initial packet, or coalescing — and trailing zeros are neither.
+  quic-go parses them as a short-header packet and either discards them or
+  queues them for later decryption, which spends a queue slot a real packet
+  could have used. Twelve of twenty-four coalesced datagrams in one run ended
+  that way. It is the leading suspect for what is left of the tail above.
 
 #### The other outside evidence: `corpus/qifs.zig` — **done**
 

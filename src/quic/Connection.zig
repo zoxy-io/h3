@@ -2165,23 +2165,39 @@ pub fn Connection(comptime config: Config) type {
             const offset = header.packetNumberOffset() orelse return;
             const index = @intFromEnum(level);
             if (self.spaces[@intFromEnum(level.space())].discarded) return;
-            // The TLS engine is the gate: 1-RTT read keys reach `installSecret`
-            // only when the handshake is complete, so a packet that arrives
-            // before then has no key to open it and is discarded here.
+            // For a client the TLS engine is the gate: a 1-RTT read key exists
+            // only once the consumer's engine has handed one over, and it does
+            // that when the handshake completes.
             //= https://www.rfc-editor.org/rfc/rfc9001#section-5.7
             //# Endpoints in either role MUST NOT decrypt 1-RTT packets from
             //# their peer prior to completing the handshake.
             //
-            // Both roles, and both by the same mechanism as the rule already cited above:
-            // a 1-RTT read key exists only once the consumer's engine has handed one
-            // over, and it does that when the handshake completes.
-            //= https://www.rfc-editor.org/rfc/rfc9001#section-5.7
-            //# A server MUST NOT process incoming 1-RTT protected packets
-            //# before the TLS handshake is complete.
-            //
             //= https://www.rfc-editor.org/rfc/rfc9001#section-5.7
             //# Even if it has 1-RTT secrets, a client MUST NOT process incoming
             //# 1-RTT protected packets before the TLS handshake is complete.
+            //
+            // For a server it is not, and the same argument was written here
+            // for both roles. A TLS 1.3 server derives the application traffic
+            // secrets when it *sends* its Finished, one flight before it has
+            // verified the client's — so it holds 1-RTT keys through the whole
+            // of "wait for the client's Finished", and the structural claim
+            // that having a key implies a complete handshake is false on
+            // exactly the side the RFC singles out.
+            //
+            // What it cost: a server that answered a client's first 1-RTT
+            // packet while still waiting for the Finished told the client, by
+            // acknowledging it, that everything had arrived. quic-go then
+            // dropped its Handshake keys and could no longer retransmit the
+            // Finished that had been lost — and this server went on probing at
+            // Initial and Handshake for thirty seconds, answering no request,
+            // until the client gave up on the connection and the runner's
+            // `handshakeloss` case with it. Discarding is what section 5.7
+            // asks for; the client's own probe timer brings the packet back.
+            //= https://www.rfc-editor.org/rfc/rfc9001#section-5.7
+            //# A server MUST NOT process incoming 1-RTT protected packets
+            //# before the TLS handshake is complete.
+            //= type=test
+            if (self.side == .server and level == .one_rtt and !self.recovery.handshake_confirmed) return;
             //
             // The same line answers section 5.6: no 0-RTT key is ever installed in
             // either direction, so a 0-RTT packet reaching a client has nothing to open
@@ -6124,6 +6140,92 @@ test "section 3.2: an abandoned stream still gives its credit back" {
     try testing.expectEqual(before + 1, server.streams.advertised_bidi);
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9001#section-5.7
+//# A server MUST NOT process incoming 1-RTT protected packets
+//# before the TLS handshake is complete.
+//= type=test
+test "section 5.7: a server does not process 1-RTT before its handshake completes" {
+    // The rule was recorded as satisfied by construction — a 1-RTT key exists
+    // only once the handshake is complete — and that is true of a client and
+    // false of a server. A TLS 1.3 server derives the application traffic
+    // secrets when it *sends* its Finished, one flight before it has verified
+    // the client's, so it holds 1-RTT keys through the whole of the wait.
+    var client = testClient();
+    var server = testServer();
+    try client.cryptoIn(.initial, "ClientHello");
+    _ = try deliver(&client, &server, 0);
+    try installBoth(&server, &client, .handshake, 0x11);
+    try installBoth(&client, &server, .handshake, 0x22);
+    try installBoth(&server, &client, .one_rtt, 0x33);
+    try installBoth(&client, &server, .one_rtt, 0x44);
+
+    client.streams.setPeerStreamLimit(true, 4);
+    client.streams.setConnectionSendLimit(1 << 16);
+    try client.streams.setSendLimit(0, 1 << 16);
+    _ = try client.write(0, "GET /", true);
+
+    // The server has the key and has not verified the client's Finished.
+    try testing.expect(!server.recovery.handshake_confirmed);
+    _ = try deliver(&client, &server, 1000);
+    try testing.expectEqualStrings("", server.readable(0));
+
+    // And it owes no acknowledgement for it, which is the half that matters:
+    // acknowledging tells the peer everything arrived, and a peer that believes
+    // that stops retransmitting the Finished this endpoint is still waiting for.
+    try testing.expect(!server.spaces[@intFromEnum(Space.application)].received.ack_eliciting_pending);
+
+    // Once the handshake completes, the peer's retransmission is taken. The
+    // client's own loss detection is what brings it back on a real path.
+    server.confirmHandshake();
+    client.onPacketsLost(&.{.{
+        .level = .one_rtt,
+        .stream = 0,
+        .stream_start = 0,
+        .stream_end = 5,
+        .stream_fin = true,
+    }});
+    _ = try deliver(&client, &server, 2000);
+    try testing.expectEqualStrings("GET /", server.readable(0));
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9002#section-6.2.4
+//# An endpoint SHOULD include new data in packets that are sent on PTO
+//# expiration.
+//= type=test
+test "section 6.2.4: a probe carries data rather than an old acknowledgement" {
+    // Every packet is recorded in `Recovery`, acknowledgement-only ones
+    // included, and the probe used to be pointed at whichever was earliest. An
+    // acknowledgement-only packet carries nothing a retransmission can make
+    // progress with, so the probe rewound nothing and went out as an ACK and
+    // some padding — while the peer sat waiting for the handshake bytes it was
+    // supposed to carry.
+    //
+    // A server whose flight is lost then never resends it: its probes are
+    // answered by nothing, `pto_count` doubles each time, and by the fourth
+    // attempt the period is four seconds. That is how the interop runner's
+    // `handshakeloss` case ended, with one connection wedged and a client that
+    // gave up on the whole run.
+    var client = testClient();
+    var server = testServer();
+    try client.cryptoIn(.initial, "ClientHello");
+    _ = try deliver(&client, &server, 0);
+
+    // Two packets in this order: the acknowledgement the client's Initial owes,
+    // and then the server's own flight.
+    var datagram: [TestConnection.datagram_octets]u8 = @splat(0);
+    try testing.expect(try server.send(&datagram, 1000) > 0);
+    try server.cryptoIn(.initial, "ServerHello");
+    try testing.expect(try server.send(&datagram, 2000) > 0);
+    try testing.expectEqual(@as(usize, 2), server.recovery.inFlight(.initial).len);
+    try testing.expectEqual(@as(u32, "ServerHello".len), server.levels[0].framed);
+
+    // The probe rewinds the flight, not the acknowledgement.
+    const at = server.timeout().?;
+    server.onTimeout(at);
+    try testing.expectEqual(@as(u32, 0), server.levels[0].framed);
+    try testing.expect(server.wantsSend());
+}
+
 //= https://www.rfc-editor.org/rfc/rfc9000#section-3.5
 //# If the stream is in the "Recv" or "Size Known" state, the transport
 //# SHOULD signal this by sending a STOP_SENDING frame to prompt closure
@@ -7917,6 +8019,9 @@ test "section 14.1: a datagram carrying no Initial packet is not padded" {
     try installBoth(&server, &client, .one_rtt, 0x33);
     try installBoth(&client, &server, .one_rtt, 0x44);
     try testing.expect(client.send_keys[@intFromEnum(Level.initial)] != null);
+    // Section 5.7: a server discards a 1-RTT packet until its own handshake is
+    // complete, and this test is about the padding rather than about that.
+    server.confirmHandshake();
 
     client.streams.setPeerStreamLimit(true, 4);
     client.streams.setConnectionSendLimit(1 << 16);
