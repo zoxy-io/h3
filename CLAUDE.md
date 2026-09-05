@@ -19,8 +19,8 @@ threads through `std.Io`). Read before writing code:
 ## Gates — run before every commit
 
 - `zig build ci` — the format check, unit tests, the lint's own tests, the fuzz
-  corpus, the usage example and the boundary lint. This is exactly what CI runs,
-  on each target natively.
+  targets, the seeded simulation, the usage example and the boundary lint. This
+  is exactly what CI runs, one workflow per gate.
 - `zig build ci -Doptimize=ReleaseFast` and
   `zig build ci -Doptimize=ReleaseFast -Dassertions=false` — the two builds that
   ship, zoxy's and zrk's. Not optional, and the Debug run above does *not*
@@ -99,8 +99,10 @@ not represented by any test that runs on a laptop.
   only against itself is verified against nothing. RFC 9001 appendix A's key
   schedule is the clearest case and is already in `crypto/`.
 - **Every parsing change ships with its fuzz coverage.** `fuzz/` holds the
-  targets; a decode path without one is not done. Zig 0.16 hands the target a
-  `*std.testing.Smith`, so inputs are *drawn* rather than cast out of a buffer.
+  targets; a decode path without one is not done. No corpus is checked in, so
+  `zig build fuzz` is one deterministic pass per target and `--fuzz` is the
+  coverage-guided run. Zig 0.16 hands the target a `*std.testing.Smith`, so
+  inputs are *drawn* rather than cast out of a buffer.
 - **Write to zoxy's threat model**, which is the stricter one. Plus the two
   surfaces that are not parser bugs: the amplification limit (RFC 9000 §8.1) and
   the AEAD key limits (RFC 9001 §6.6).

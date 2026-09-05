@@ -1,17 +1,6 @@
 # h3
 
 ![GitHub License](https://img.shields.io/github/license/zoxy-io/h3?color=orange)
-[![test](https://github.com/zoxy-io/h3/actions/workflows/test.yml/badge.svg)](https://github.com/zoxy-io/h3/actions/workflows/test.yml)
-[![sim](https://github.com/zoxy-io/h3/actions/workflows/sim.yml/badge.svg)](https://github.com/zoxy-io/h3/actions/workflows/sim.yml)
-[![fuzz](https://github.com/zoxy-io/h3/actions/workflows/fuzz.yml/badge.svg)](https://github.com/zoxy-io/h3/actions/workflows/fuzz.yml)
-[![corpus](https://github.com/zoxy-io/h3/actions/workflows/corpus.yml/badge.svg)](https://github.com/zoxy-io/h3/actions/workflows/corpus.yml)
-[![requirements](https://github.com/zoxy-io/h3/actions/workflows/requirements.yml/badge.svg)](https://github.com/zoxy-io/h3/actions/workflows/requirements.yml)
-[![lint](https://github.com/zoxy-io/h3/actions/workflows/lint.yml/badge.svg)](https://github.com/zoxy-io/h3/actions/workflows/lint.yml)
-[![checks](https://github.com/zoxy-io/h3/actions/workflows/checks.yml/badge.svg)](https://github.com/zoxy-io/h3/actions/workflows/checks.yml)
-[![example](https://github.com/zoxy-io/h3/actions/workflows/example.yml/badge.svg)](https://github.com/zoxy-io/h3/actions/workflows/example.yml)
-[![interop](https://github.com/zoxy-io/h3/actions/workflows/interop.yml/badge.svg)](https://github.com/zoxy-io/h3/actions/workflows/interop.yml)
-[![bench](https://github.com/zoxy-io/h3/actions/workflows/bench.yml/badge.svg)](https://github.com/zoxy-io/h3/actions/workflows/bench.yml)
-[![fmt](https://github.com/zoxy-io/h3/actions/workflows/fmt.yml/badge.svg)](https://github.com/zoxy-io/h3/actions/workflows/fmt.yml)
 
 QUIC, QPACK and HTTP/3 for Zig 0.16.
 
@@ -176,7 +165,7 @@ The reasoning behind each is in [docs/DESIGN.md](docs/DESIGN.md).
 ## Building and testing
 
 ```sh
-zig build ci                                             # fmt, unit tests, fuzz corpus, RFC corpus, example, lint, requirements
+zig build ci                                             # fmt, unit tests, fuzz targets, RFC corpus, example, lint, requirements, sim
 zig build ci -Doptimize=ReleaseFast                      # release, assertions on
 zig build ci -Doptimize=ReleaseFast -Dassertions=false   # release, assertions off
 zig build fuzz --fuzz                                    # coverage-guided fuzzing
@@ -188,23 +177,23 @@ zig build fmt-fix                                        # reformat
 
 ### The gates
 
-One workflow per gate, each with its own badge above, because a single job
-that ran everything could only ever say "something broke". What each one
-proves:
+One workflow per gate, because a single job that ran everything could only
+ever say "something broke". Each badge below is that gate's own verdict, and
+the row beside it says what a green one means:
 
 | Gate | What it proves | Builds |
 | --- | --- | --- |
-| [`test`](.github/workflows/test.yml) | The unit tests, and everything `zig build test` depends on: the lint's own tests, the ledger's, the simulator's, the RFC corpus, the README example, the negative fixtures and the interop shims | all three |
-| [`sim`](.github/workflows/sim.yml) | 256 seeds of the seeded network simulation, its oracles, and a coverage census that fails the run when a behaviour no seed reached would otherwise pass quietly | all three |
-| [`fuzz`](.github/workflows/fuzz.yml) | The checked-in corpus, replayed. Under the builds that ship, not only under Debug | all three |
-| [`corpus`](.github/workflows/corpus.yml) | RFC 9001 appendix A's worked packets octet for octet, and qifs's QPACK field sections from four other implementations | all three |
-| [`requirements`](.github/workflows/requirements.yml) | Every `//=` citation quotes the RFC section it names, verbatim, and every exception states a reason | source scan |
-| [`lint`](.github/workflows/lint.yml) | No I/O types, no allocator, no unbounded loops and no `std.debug.assert` under `src/` | source scan |
-| [`checks`](.github/workflows/checks.yml) | `checks/` holds fixtures that must *fail* to compile — a `comptime` assertion still fires with `-Dassertions=false` | assertions on and off |
-| [`example`](.github/workflows/example.yml) | The usage example above compiles and runs | Debug |
-| [`interop`](.github/workflows/interop.yml) | The interop shims build, natively and statically for the endpoint image | ReleaseFast |
-| [`bench`](.github/workflows/bench.yml) | The benchmark still compiles and runs. **Not a measurement**: a shared runner cannot produce a band worth comparing, so the numbers it prints mean nothing | ReleaseFast |
-| [`fmt`](.github/workflows/fmt.yml) | Formatting, over the path list that lives in `build.zig` and nowhere else | — |
+| [![test](https://github.com/zoxy-io/h3/actions/workflows/test.yml/badge.svg)](https://github.com/zoxy-io/h3/actions/workflows/test.yml) [`test`](.github/workflows/test.yml) | The unit tests, and everything `zig build test` depends on: the lint's own tests, the ledger's, the simulator's, the RFC corpus, the fuzz targets, the README example, the negative fixture and the interop shims | all three |
+| [![sim](https://github.com/zoxy-io/h3/actions/workflows/sim.yml/badge.svg)](https://github.com/zoxy-io/h3/actions/workflows/sim.yml) [`sim`](.github/workflows/sim.yml) | 256 seeds of the seeded network simulation, its oracles, and a coverage census that fails the run when a behaviour no seed reached would otherwise pass quietly | all three |
+| [![fuzz](https://github.com/zoxy-io/h3/actions/workflows/fuzz.yml/badge.svg)](https://github.com/zoxy-io/h3/actions/workflows/fuzz.yml) [`fuzz`](.github/workflows/fuzz.yml) | The 16 fuzz targets, each run once as a regression with a deterministic draw — their oracles hold and their accept paths still compile. Under the builds that ship, not only under Debug | all three |
+| [![corpus](https://github.com/zoxy-io/h3/actions/workflows/corpus.yml/badge.svg)](https://github.com/zoxy-io/h3/actions/workflows/corpus.yml) [`corpus`](.github/workflows/corpus.yml) | RFC 9001 appendix A's worked packets octet for octet, and qifs's QPACK field sections from four other implementations | all three |
+| [![requirements](https://github.com/zoxy-io/h3/actions/workflows/requirements.yml/badge.svg)](https://github.com/zoxy-io/h3/actions/workflows/requirements.yml) [`requirements`](.github/workflows/requirements.yml) | Every `//=` citation quotes the RFC section it names, verbatim, and every exception states a reason | source scan |
+| [![lint](https://github.com/zoxy-io/h3/actions/workflows/lint.yml/badge.svg)](https://github.com/zoxy-io/h3/actions/workflows/lint.yml) [`lint`](.github/workflows/lint.yml) | No I/O types, no allocator, no unbounded loops and no `std.debug.assert` under `src/` | source scan |
+| [![checks](https://github.com/zoxy-io/h3/actions/workflows/checks.yml/badge.svg)](https://github.com/zoxy-io/h3/actions/workflows/checks.yml) [`checks`](.github/workflows/checks.yml) | `checks/` holds a fixture that must *fail* to compile — a `comptime` assertion still fires with `-Dassertions=false` | Debug on, ReleaseFast off |
+| [![example](https://github.com/zoxy-io/h3/actions/workflows/example.yml/badge.svg)](https://github.com/zoxy-io/h3/actions/workflows/example.yml) [`example`](.github/workflows/example.yml) | The usage example above compiles and runs | Debug |
+| [![interop](https://github.com/zoxy-io/h3/actions/workflows/interop.yml/badge.svg)](https://github.com/zoxy-io/h3/actions/workflows/interop.yml) [`interop`](.github/workflows/interop.yml) | The interop shims build, natively and statically for the endpoint image | ReleaseFast |
+| [![bench](https://github.com/zoxy-io/h3/actions/workflows/bench.yml/badge.svg)](https://github.com/zoxy-io/h3/actions/workflows/bench.yml) [`bench`](.github/workflows/bench.yml) | The benchmark still compiles and runs. **Not a measurement**: a shared runner cannot produce a band worth comparing, so the numbers it prints mean nothing | ReleaseFast |
+| [![fmt](https://github.com/zoxy-io/h3/actions/workflows/fmt.yml/badge.svg)](https://github.com/zoxy-io/h3/actions/workflows/fmt.yml) [`fmt`](.github/workflows/fmt.yml) | Formatting, over the path list that lives in `build.zig` and nowhere else | — |
 
 "All three" is Debug, ReleaseFast, and ReleaseFast with `-Dassertions=false`.
 The last is the one that matters most and the one a local Debug run cannot
@@ -213,7 +202,8 @@ nothing else, so only a release mode tests the elision — and only a release
 mode reaches the undefined behaviour that a `catch unreachable` guarded by a
 removed assertion becomes.
 
-Not a per-change gate: [`nightly-sim`](.github/workflows/nightly-sim.yml)
+Not a per-change gate, and so not in the table:
+[![nightly-sim](https://github.com/zoxy-io/h3/actions/workflows/nightly-sim.yml/badge.svg)](https://github.com/zoxy-io/h3/actions/workflows/nightly-sim.yml) [`nightly-sim`](.github/workflows/nightly-sim.yml)
 sweeps 4096 seeds under all three builds every night, from a range no earlier
 night has run.
 

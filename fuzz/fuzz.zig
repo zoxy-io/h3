@@ -2,7 +2,9 @@
 //! `zig build lint` forbids in the library.
 //!
 //! Run modes:
-//! * `zig build fuzz` — replays the seed corpus once (regression mode).
+//! * `zig build fuzz` — one deterministic pass per target (regression mode),
+//!   plus whatever corpus the local `.zig-cache` holds. Nothing is checked in,
+//!   so on a clean checkout — which is every CI run — it is the pass alone.
 //! * `zig build fuzz --fuzz` — coverage-guided fuzzing via Zig's native fuzzer.
 //!
 //! docs/TIGER_STYLE.md makes fuzzing a gate rather than a nicety. It matters
