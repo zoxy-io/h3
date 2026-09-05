@@ -649,8 +649,8 @@ fn driveApplication(world: *World) void {
     // RFC 9001 section 6's key update, once per connection and only on seeds
     // that ask for it. The census row for it stayed at zero for as long as
     // nothing here initiated one, which is the census reporting that a
-    // behaviour docs/VERIFICATION.md section 5.2 lists as required was not
-    // reached — not that it works.
+    // behaviour this file's census marks required was not reached — not that
+    // it works.
     if (world.key_update_at > 0 and world.written >= world.key_update_at) {
         world.key_update_at = 0;
         world.client.updateKeys();

@@ -46,6 +46,11 @@ pub const http3 = @import("Http3.zig");
 pub const qlog = @import("qlog.zig");
 pub const Http3 = http3.Http3;
 
+// Every module in this package, and a module that is missing from this list is
+// a module whose tests Zig never compiles. That is not a hypothetical: `qlog`
+// was written, wired into both interop roles and green for an hour before this
+// line existed, because a test that never ran and a test that passed produce
+// the same output. Adding a module here is part of adding the module.
 test {
     _ = assertions;
     _ = varint;

@@ -48,9 +48,9 @@ a [QUIC Interop Runner](https://github.com/quic-interop/quic-interop-runner)
 client that completes a real handshake, Retry, and HTTP/3 transfer against
 quic-go, ngtcp2 and aioquic — and a server that passes all 49 of
 [h3spec](https://github.com/kazu-yamamoto/h3spec)'s conformance cases. Between
-them they found eleven defects; see
-[docs/VERIFICATION.md](docs/VERIFICATION.md) §5.5 for what they were and
-[interop/README.md](interop/README.md) for how to run it.
+them they found eleven defects; they are in the table in
+[docs/VERIFICATION.md](docs/VERIFICATION.md) §1, the shims are §5.5, and
+[interop/README.md](interop/README.md) is how to run them.
 
 ## Installation
 
@@ -218,8 +218,8 @@ copies of every gate to say so.
   attaches, what is built and what is next.
 - [docs/TIGER_STYLE.md](docs/TIGER_STYLE.md): the coding rules the lint and
   the review enforce.
-- [docs/VERIFICATION.md](docs/VERIFICATION.md): the testing gaps, how other
-  QUIC implementations test, and the plan.
+- [docs/VERIFICATION.md](docs/VERIFICATION.md): what each gate proves and what
+  it cannot, the fifty-odd defects they found, and how other QUIC stacks test.
 
 ## License
 

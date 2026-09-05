@@ -227,14 +227,9 @@ nix-shell -p openssl wireshark-cli --run \
   './.venv/bin/python run.py -s h3 -c quic-go -t handshake,transfer'
 ```
 
-As of the last run: **as a client, seven of eight** — `handshake`, `transfer`,
-`chacha20`, `retry`, `http3`, `transferloss`, `keyupdate` — with
-`handshakeloss` short of the runner's budget. **As a server, five of eight**,
-with multi-stream transfers of several megabytes still stalling. See
-docs/VERIFICATION.md §5.5.
-
-```sh
-```
+The cases that pass are under "The matrix" below, which is the one place this
+file records a result — a second copy here went stale the first time the matrix
+moved, and stayed stale while claiming to be "the last run".
 
 ### Before believing a failure, run the control
 
@@ -424,6 +419,5 @@ And `h3-server`'s own, which are its whole configuration:
 | `PORT` | UDP port; 4433 by default |
 | `VERBOSE` | narrate on stderr if set |
 
-`QLOGDIR` is accepted by the runner and ignored here: a qlog writer wants the
-event trace `Connection.poll` now produces, and writing one is
-docs/VERIFICATION.md §5.3's remaining half.
+`QLOGDIR` names the directory both roles write a trace to; see above, and
+docs/VERIFICATION.md §5.7 for what a trace does and does not carry.
