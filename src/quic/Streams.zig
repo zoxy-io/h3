@@ -264,6 +264,13 @@ pub fn Streams(comptime config: Config) type {
             /// Whether that frame has been put in a packet. The counterpart of
             /// `fin_framed`, and owed again when the packet carrying it is lost.
             reset_framed: bool = false,
+            /// Section 19.5: the code of a STOP_SENDING this endpoint owes on
+            /// this stream, or null when it owes none. The mirror direction of
+            /// `reset_code`: that one abandons what we send, this one asks the
+            /// peer to stop sending to us.
+            stop_code: ?u64 = null,
+            /// Whether that frame has been put in a packet.
+            stop_framed: bool = false,
             /// The `MAX_STREAM_DATA` last advertised, so a new one goes out
             /// only when the window has moved enough to be worth a frame.
             /// Starts at the window the transport parameters carried, which the
@@ -635,6 +642,86 @@ pub fn Streams(comptime config: Config) type {
             // report that the peer's limit is holding us up is also just false
             // — what is holding us up is that we gave up.
             stream.send_blocked = false;
+        }
+
+        /// Section 3.5: ask the peer to stop sending on a stream.
+        ///
+        /// The mirror of `resetSend`, and the other half of cancelling a
+        /// bidirectional stream: that one abandons what this endpoint sends,
+        /// this one asks the peer to stop sending to us. Neither implies the
+        /// other, and a consumer cancelling a request wants both.
+        ///
+        /// Nothing is sent for a stream the peer has already reset — there is
+        /// nothing left to stop — or for one whose data has all arrived.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-19.5
+        //# An endpoint uses a STOP_SENDING frame (type=0x05) to communicate that
+        //# incoming data is being discarded on receipt per application request.
+        //# STOP_SENDING requests that a peer cease transmission on a stream.
+        //= type=test
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-3.5
+        //# STOP_SENDING SHOULD only be sent for a stream that has not been reset
+        //# by the peer.  STOP_SENDING is most useful for streams in the "Recv"
+        //# or "Size Known" state.
+        //= type=test
+        pub fn stopSending(self: *Self, id: u64, code: u64) Error!void {
+            // Section 19.5 makes a STOP_SENDING for a send-only stream a
+            // connection error at the peer, so it is one this endpoint must not
+            // send rather than one it merely need not.
+            if (!self.weMayReceive(id)) return error.StreamState;
+            const stream = self.open(id) catch |err| switch (err) {
+                error.Retired => return, // Finished; there is nothing to stop.
+                else => return err,
+            };
+            switch (stream.receive_state) {
+                .receiving, .size_known => {},
+                .reset, .data_read => return,
+            }
+            if (stream.stop_code != null) return; // Owed once.
+            stream.stop_code = code;
+            stream.stop_framed = false;
+        }
+
+        /// Whether a STOP_SENDING is owed on any stream.
+        pub fn owesStopSending(self: *const Self) bool {
+            // Bounded by `count`.
+            for (self.streams[0..self.count]) |*stream| {
+                if (stream.stop_code != null and !stream.stop_framed) return true;
+            }
+            return false;
+        }
+
+        /// The next stream owing one, for the writer.
+        pub fn nextStopSending(self: *Self) ?*Stream {
+            // Bounded by `count`.
+            for (self.streams[0..self.count]) |*stream| {
+                if (stream.stop_code != null and !stream.stop_framed) return stream;
+            }
+            return null;
+        }
+
+        /// Owe it again, because the packet carrying it was lost.
+        ///
+        /// Section 13.3 keeps it going until the peer answers rather than until
+        /// this endpoint's packet is acknowledged, and the two differ: an
+        /// acknowledged STOP_SENDING the peer has not acted on is still a
+        /// request in flight. What ends it is `clearStopSending`.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-13.3
+        //# Similarly, a request to cancel stream transmission, as encoded in a
+        //# STOP_SENDING frame, is sent until the receiving part of the stream
+        //# enters either a "Data Recvd" or "Reset Recvd" state; see Section 3.5.
+        //= type=test
+        pub fn reoweStopSending(self: *Self, id: u64) void {
+            const stream = self.find(id) orelse return;
+            if (stream.stop_code == null) return;
+            stream.stop_framed = false;
+        }
+
+        /// The request is over: the peer reset the stream, or all of its data
+        /// arrived and was read.
+        fn clearStopSending(stream: *Stream) void {
+            stream.stop_code = null;
+            stream.stop_framed = true;
         }
 
         /// Whether a RESET_STREAM is owed on any stream.
@@ -1055,6 +1142,9 @@ pub fn Streams(comptime config: Config) type {
             if (stream.receive_state != .size_known) return;
             if (stream.received.isComplete() and stream.readable().len == 0) {
                 stream.receive_state = .data_read;
+                // And the other of the two: everything arrived, so a request to
+                // stop would be asking for something that already happened.
+                clearStopSending(stream);
             }
         }
 
@@ -1116,6 +1206,9 @@ pub fn Streams(comptime config: Config) type {
             try self.admit(stream, final_size);
             stream.receive_state = .reset;
             stream.reset_code = code;
+            // Section 13.3: "Reset Recvd" is one of the two states that end a
+            // STOP_SENDING. The peer answered; there is nothing left to ask.
+            clearStopSending(stream);
 
             // Section 4.1 leaves the release policy to the implementation, and
             // the policy has to be *some* release: the octets a reset claimed

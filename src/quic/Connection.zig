@@ -311,6 +311,11 @@ pub fn Connection(comptime config: Config) type {
         /// owe the frame again and delivering it is what makes the stream's
         /// send half terminal.
         stream_reset: bool = false,
+        /// Whether it carried a STOP_SENDING, for the same reason and with a
+        /// different ending: section 13.3 keeps that one going until the *peer*
+        /// answers, so losing it owes the frame again and delivering it settles
+        /// nothing.
+        stop_sending: bool = false,
         /// Whether the packet carried HANDSHAKE_DONE, which likewise has no
         /// range: losing it has to re-owe the frame or the client never
         /// confirms.
@@ -3625,15 +3630,24 @@ pub fn Connection(comptime config: Config) type {
         /// already charged for those octets still balances.
         ///
         /// One direction. A bidirectional stream's other half keeps arriving;
-        /// asking the peer to stop is STOP_SENDING, which this package does not
-        /// yet send.
+        /// asking the peer to stop is `stopSending`, and a consumer cancelling a
+        /// request wants both.
         //= https://www.rfc-editor.org/rfc/rfc9000#section-3.5
         //# If the stream is in the "Recv" or "Size Known" state, the transport
         //# SHOULD signal this by sending a STOP_SENDING frame to prompt closure
         //# of the stream in the opposite direction.
-        //= type=todo
+        //= type=test
         pub fn resetStream(self: *Self, id: u64, code: u64) ConnectionStreams.Error!void {
             try self.streams.resetSend(id, code);
+        }
+
+        /// Section 3.5: ask the peer to stop sending on a stream.
+        ///
+        /// The other half of cancelling a bidirectional stream. `resetStream`
+        /// abandons what this endpoint sends; this abandons what it receives,
+        /// and neither implies the other.
+        pub fn stopSending(self: *Self, id: u64, code: u64) ConnectionStreams.Error!void {
+            try self.streams.stopSending(id, code);
         }
 
         /// Bytes readable in order on a stream, or an empty slice.
@@ -3851,6 +3865,7 @@ pub fn Connection(comptime config: Config) type {
                     self.streams.rewind(context.stream, context.stream_start, context.stream_fin);
                 }
                 if (context.stream_reset) self.streams.reoweReset(context.stream);
+                if (context.stop_sending) self.streams.reoweStopSending(context.stream);
                 // Outside the stream branch: a packet carrying only window
                 // updates has no byte range to rewind, and it is exactly the
                 // packet whose loss deadlocks the connection.
@@ -4457,6 +4472,7 @@ pub fn Connection(comptime config: Config) type {
                     .stream_end = written.stream_end,
                     .stream_fin = written.stream_fin,
                     .stream_reset = written.stream_reset,
+                    .stop_sending = written.stop_sending,
                     .handshake_done = written.handshake_done,
                     .flow_control = written.flow_control,
                 },
@@ -4545,6 +4561,7 @@ pub fn Connection(comptime config: Config) type {
                 self.streams.rewind(written.stream, written.stream_start, written.stream_fin);
             }
             if (written.stream_reset) self.streams.reoweReset(written.stream);
+            if (written.stop_sending) self.streams.reoweStopSending(written.stream);
         }
 
         const Payload = struct {
@@ -4569,6 +4586,8 @@ pub fn Connection(comptime config: Config) type {
             stream_fin: bool = false,
             /// Whether it carried a RESET_STREAM; see `PacketContext`.
             stream_reset: bool = false,
+            /// And whether it carried a STOP_SENDING; likewise.
+            stop_sending: bool = false,
             /// Likewise for HANDSHAKE_DONE.
             handshake_done: bool = false,
         };
@@ -4802,7 +4821,12 @@ pub fn Connection(comptime config: Config) type {
                 const abandoned = self.writeReset(payload[offset..], &result);
                 offset += abandoned;
                 if (abandoned > 0) result.ack_eliciting = true;
-                if (abandoned == 0) {
+                // One stream per packet, for the reason above: each of these
+                // names a stream in `PacketContext` and there is one field.
+                const stopped = if (abandoned > 0) 0 else self.writeStopSending(payload[offset..], &result);
+                offset += stopped;
+                if (stopped > 0) result.ack_eliciting = true;
+                if (abandoned == 0 and stopped == 0) {
                     const framed = self.writeStream(payload[offset..], &result);
                     offset += framed;
                     if (framed > 0) result.ack_eliciting = true;
@@ -5018,6 +5042,26 @@ pub fn Connection(comptime config: Config) type {
             stream.reset_framed = true;
             result.stream = stream.id;
             result.stream_reset = true;
+            return written;
+        }
+
+        /// Section 3.5's STOP_SENDING, asking the peer to stop.
+        ///
+        /// Sent once and again on loss, and stopped when the peer answers —
+        /// which is what section 13.3 asks for, and is not the same as being
+        /// acknowledged: an acknowledged request the peer has not acted on is
+        /// still outstanding.
+        fn writeStopSending(self: *Self, target: []u8, result: *Payload) usize {
+            const stream = self.streams.nextStopSending() orelse return 0;
+            const code = stream.stop_code orelse return 0;
+            const written = frame.encode(target, .{ .stop_sending = .{
+                .stream = stream.id,
+                .code = @enumFromInt(@as(u62, @truncate(code))),
+            } }) catch return 0;
+            if (written == 0) return 0;
+            stream.stop_framed = true;
+            result.stream = stream.id;
+            result.stop_sending = true;
             return written;
         }
 
@@ -5338,6 +5382,7 @@ pub fn Connection(comptime config: Config) type {
             if (self.streams.wantsSend()) return true;
             if (self.owesFlowControl()) return true;
             if (self.streams.owesReset()) return true;
+            if (self.streams.owesStopSending()) return true;
             if (self.streams.owesBlocked()) return true;
             for (0..Level.count) |index| {
                 const level: Level = @enumFromInt(index);
@@ -6077,6 +6122,132 @@ test "section 3.2: an abandoned stream still gives its credit back" {
     }
     try testing.expect(server.findStream(0) == null);
     try testing.expectEqual(before + 1, server.streams.advertised_bidi);
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9000#section-3.5
+//# If the stream is in the "Recv" or "Size Known" state, the transport
+//# SHOULD signal this by sending a STOP_SENDING frame to prompt closure
+//# of the stream in the opposite direction.
+//= type=test
+test "section 3.5: a consumer that stops reading asks the peer to stop sending" {
+    // The other half of cancelling a stream, and the half that was missing:
+    // `resetStream` abandons what this endpoint sends, and until now nothing
+    // could abandon what it receives. The peer kept sending into a buffer the
+    // application had walked away from.
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+    try testing.expectEqual(@as(usize, 5), try server.write(0, "hello", false));
+
+    try client.stopSending(0, 0x10b);
+    try testing.expect(client.wantsSend());
+    _ = try deliver(&client, &server, 0);
+
+    // Section 3.5's other half, which this package already had: the peer
+    // answers with a RESET_STREAM carrying the code it was given.
+    try testing.expectEqual(streams.SendState.reset, server.findStream(0).?.send_state);
+    try testing.expectEqual(@as(u64, 0x10b), server.findStream(0).?.reset_code);
+
+    // And the round trip ends it: once the reset arrives there is nothing left
+    // to ask for.
+    _ = try deliver(&server, &client, 0);
+    try testing.expectEqual(streams.ReceiveState.reset, client.findStream(0).?.receive_state);
+    try testing.expect(!client.streams.owesStopSending());
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9000#section-13.3
+//# Similarly, a request to cancel stream transmission, as encoded in a
+//# STOP_SENDING frame, is sent until the receiving part of the stream
+//# enters either a "Data Recvd" or "Reset Recvd" state; see Section 3.5.
+//= type=test
+test "section 13.3: a lost STOP_SENDING is sent again" {
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+    try client.stopSending(0, 0x10b);
+
+    var datagram: [TestConnection.datagram_octets]u8 = @splat(0);
+    try testing.expect(try client.send(&datagram, 1000) > 0);
+    try testing.expect(!client.streams.owesStopSending());
+
+    // Section 13.3 keeps it going until the peer answers, and the peer has not:
+    // an acknowledged request the peer has not acted on is still outstanding,
+    // and a lost one is a request that was never made.
+    client.onPacketsLost(&.{.{ .level = .one_rtt, .stream = 0, .stop_sending = true }});
+    try testing.expect(client.streams.owesStopSending());
+    try testing.expect(client.wantsSend());
+
+    // What ends it is the peer answering, not the request being acknowledged.
+    // "Reset Recvd" is one of section 13.3's two endings.
+    var payload: [32]u8 = @splat(0);
+    const written = try frame.encode(&payload, .{ .reset_stream = .{
+        .stream = 0,
+        .code = @enumFromInt(0x10c),
+        .final_size = 0,
+    } });
+    _ = try client.receiveFrames(.one_rtt, payload[0..written], 0);
+    try testing.expect(!client.streams.owesStopSending());
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9000#section-13.3
+//# Similarly, a request to cancel stream transmission, as encoded in a
+//# STOP_SENDING frame, is sent until the receiving part of the stream
+//# enters either a "Data Recvd" or "Reset Recvd" state; see Section 3.5.
+//= type=test
+test "section 13.3: data arriving ends a STOP_SENDING too" {
+    // The other of section 13.3's two endings. A request to stop is pointless
+    // once everything has arrived and been read: there is nothing left for the
+    // peer to stop, and re-sending it on the next loss would ask anyway.
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+    try client.stopSending(0, 0x10b);
+
+    var datagram: [TestConnection.datagram_octets]u8 = @splat(0);
+    try testing.expect(try client.send(&datagram, 1000) > 0);
+    client.onPacketsLost(&.{.{ .level = .one_rtt, .stream = 0, .stop_sending = true }});
+    try testing.expect(client.streams.owesStopSending());
+
+    // The peer's answer is the whole stream instead: it had already finished
+    // sending when the request went out.
+    var payload: [32]u8 = @splat(0);
+    const written = try frame.encode(&payload, .{ .stream = .{
+        .stream = 0,
+        .offset = 0,
+        .data = "hello",
+        .fin = true,
+    } });
+    _ = try client.receiveFrames(.one_rtt, payload[0..written], 0);
+    try client.consume(0, 5);
+    try testing.expect(!client.streams.owesStopSending());
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9000#section-3.5
+//# STOP_SENDING SHOULD only be sent for a stream that has not been reset
+//# by the peer.  STOP_SENDING is most useful for streams in the "Recv"
+//# or "Size Known" state.
+//= type=test
+test "section 3.5: no STOP_SENDING for a stream the peer already reset" {
+    // There is nothing left to stop, and section 19.5 says not to ask.
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+
+    var payload: [32]u8 = @splat(0);
+    const written = try frame.encode(&payload, .{ .reset_stream = .{
+        .stream = 0,
+        .code = @enumFromInt(0x10c),
+        .final_size = 0,
+    } });
+    _ = try client.receiveFrames(.one_rtt, payload[0..written], 0);
+
+    try client.stopSending(0, 0x10b);
+    try testing.expect(!client.streams.owesStopSending());
+
+    // And never on a stream this endpoint cannot receive on: section 19.5
+    // makes that a connection error at the peer, so it is one to refuse rather
+    // than one to merely skip. Stream 2 is client-initiated unidirectional.
+    try testing.expectError(error.StreamState, client.stopSending(2, 0x10b));
 }
 
 //= https://www.rfc-editor.org/rfc/rfc9000#section-19.4

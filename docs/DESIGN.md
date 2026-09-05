@@ -230,8 +230,10 @@ all three build legs):
   Section 3.3's three frames are all here: STREAM, STREAM_DATA_BLOCKED and
   RESET_STREAM. `resetSend` is the one door to abandoning a send half, and it
   fixes the frame's content on the way in because section 13.3 will not let it
-  change on the way out. STOP_SENDING is received and answered with a
-  RESET_STREAM carrying the peer's code; sending one is not implemented.
+  change on the way out. `stopSending` is the other half — it asks the peer to
+  stop, and stops asking when the peer answers rather than when the request is
+  acknowledged. An incoming STOP_SENDING is answered with a RESET_STREAM
+  carrying the peer's code.
   The send buffer is reclaimed as the peer acknowledges it, so
   `stream_send_octets` bounds what is *unacknowledged in flight* rather than
   what a stream can carry; it bounded the total until `interop/server.zig`

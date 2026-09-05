@@ -111,6 +111,7 @@ requirement list extracted from the specification.
 | No RESET_STREAM was ever framed, so a peer's STOP_SENDING moved a state here and was never answered — the final size the two endpoints have to agree on was never communicated, and a consumer had no way to cancel a stream at all | the requirement ledger, which had it as a `type=todo` beside the state it moved | Nothing in the interop matrix cancels a stream, and h3spec resets *its* streams rather than asking this endpoint to |
 | `writeStream` read no send state, so a peer that sent STOP_SENDING got the rest of the buffer anyway. `wantsSend` refusing is not `send` refusing: an owed acknowledgement is enough to build a packet, and the stream writer then filled it | writing the test for the rule above | The test that should have caught it could not — an acknowledgement reclaims the buffer, so a stream that *was* framed and one that never was both end at zero |
 | Skipping section 3.3's terminal states in the stream writer stalled a transfer, because "Data Recvd" is entered when the packet carrying the FIN is acknowledged rather than when every packet is — and an earlier packet can be declared lost afterwards | the runner's `http3` case, one build later | It needs a spurious loss on a stream that has already sent its FIN, which is a property of a path rather than of a state machine |
+| STOP_SENDING was received and never sent, so a consumer could abandon what it wrote and not what it read — the peer went on sending into a buffer the application had walked away from | the ledger, which had section 3.5's SHOULD as a `type=todo` | Nothing in either suite asks a peer to stop; h3spec resets its own streams and the runner's cases all read what they asked for |
 
 Two things about that table.
 
@@ -962,13 +963,28 @@ Two defects came out of writing it, and the second is the more interesting:
    `type=todo` on section 3.1's precision rather than a guard that reads a state
    this package sets early.
 
+##### STOP_SENDING — **the other half**
+
+Cancelling a bidirectional stream is two frames, and the second one closed the
+same week as the first. `resetStream` abandons what this endpoint sends;
+`stopSending` abandons what it receives, and neither implies the other — a
+consumer cancelling a request wants both.
+
+Its ending is the part worth reading, because it is not the one RESET_STREAM
+has. Section 13.3 keeps a STOP_SENDING going *until the peer answers* rather
+than until the packet carrying it is acknowledged, and the two are different: an
+acknowledged request the peer has not acted on is still outstanding. So it is
+re-owed on loss like the others and cleared by either of section 13.3's two
+endings — the peer's RESET_STREAM, or the whole stream arriving and being read.
+Both of those needed a test that could see the difference, and the first two
+could not: they asserted "nothing is owed" at a moment when the frame had
+already been framed, which is true whether or not the ending works. Reporting
+the packet lost first is what made them discriminate.
+
 What is left here:
 
 - **Recovery under heavy loss**, which is what `handshakeloss` measures and the
   only case still failing in either role.
-- **STOP_SENDING is received and never sent.** Cancelling a bidirectional
-  stream is two frames, and this is the other one: a consumer can abandon its
-  own half and cannot ask the peer to stop.
 
 #### The other outside evidence: `corpus/qifs.zig` — **done**
 
