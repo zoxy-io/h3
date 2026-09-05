@@ -184,21 +184,17 @@ pub fn Streams(comptime config: Config) type {
     return struct {
         const Self = @This();
 
-        /// The limit this endpoint advertises, and the only one it will ever
-        /// advertise: it is comptime, so it never rises and no MAX_STREAMS
-        /// frame is generated anywhere in the package (see
-        /// `Connection.max_data_sent`, which says the same about the field that
-        /// used to sit beside it). The MUST NOT below is therefore satisfied
-        /// vacuously — nothing waits for STREAMS_BLOCKED because nothing issues
-        /// credit at all — and the cost is the one the sentence is warning
-        /// about: a peer that closes streams never gets them back, so a
-        /// long-lived connection reaches `streams_max` and stays there.
-        //= https://www.rfc-editor.org/rfc/rfc9000#section-4.6
-        //# An endpoint MUST NOT wait to receive this signal before advertising
-        //# additional credit, since doing so will mean that the peer will be
-        //# blocked for at least an entire round trip, and potentially
-        //# indefinitely if the peer chooses not to send STREAMS_BLOCKED frames.
-        //= type=todo
+        /// How many streams are tracked at once, which is a bound on this
+        /// table and no longer a bound on the connection.
+        ///
+        /// It used to be both, and the comment here said so: "the only limit
+        /// this endpoint will ever advertise", on the grounds that a comptime
+        /// number never rises. A peer that closed a stream never got it back,
+        /// and section 4.6's MUST NOT was called satisfied vacuously — nothing
+        /// waits for STREAMS_BLOCKED if nothing issues credit at all. That is
+        /// the shape of a limitation arguing itself into a design. See
+        /// `advertised_bidi` for what replaced it, and `owesStreamCredit` for
+        /// the sentence this used to cite.
         pub const streams_max: u32 = config.streams_max;
         pub const receive_octets: u32 = config.receive_octets;
         pub const connection_receive_octets: u64 = config.connection_receive_octets;

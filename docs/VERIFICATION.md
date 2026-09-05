@@ -703,8 +703,6 @@ became unnecessary once confirmation started discarding Handshake keys on both
 sides. Both were removed. A fix no test can distinguish is a claim, and this
 document has enough of those in its history.
 
-What is left here:
-
 **The interop runner's server role is done too.** `ROLE=server` runs under the
 runner's contract — port 443, `/www` for the files, `/certs` for the key — and
 answers `hq-interop` as well as `h3`. RFC 9000 §8.1.2's address validation came
@@ -742,10 +740,14 @@ complete `handshake`, `transfer`, `chacha20`, `multiconnect`, `http3` and
 `retry`, a megabyte byte for byte each time. ngtcp2's *client* image does not
 run outside the runner's simulator network, which is its scaffolding rather
 than a result.
+
+What is left here:
+
 - **Server push and QPACK's dynamic table**, which `Http3.zig` refuses and
   declines rather than implements — correctly, and they are the two places its
   module comment says it stops.
-#### The real runner, inside the network simulator — **attempted, and two more defects**
+
+#### The real runner, inside the network simulator — **run, and green but for loss**
 
 The runner drives both endpoints through ns-3 with `simple-p2p --delay=15ms
 --bandwidth=10Mbps --queue=25`, which is a path nothing on a loopback
