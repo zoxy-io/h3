@@ -623,9 +623,32 @@ pub fn Streams(comptime config: Config) type {
         /// A unidirectional stream is asked about one half only: the other does
         /// not exist, and its state field sits at the value it was initialised
         /// with for the life of the stream.
+        ///
+        /// An abandoned half counts as finished. It has to: the watermark is
+        /// contiguous, so a stream that could never retire would freeze the
+        /// credit for its whole kind — one RESET_STREAM from the peer, which
+        /// is an ordinary thing for it to send, and the connection stops
+        /// granting stream identifiers for the rest of its life. Section 3.1
+        /// and section 3.2 both make the reset states terminal, which is the
+        /// same claim this needs.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-3.2
+        //# Once the application receives the signal indicating that the
+        //# stream was reset, the receiving part of the stream transitions
+        //# to the "Reset Read" state, which is a terminal state.
+        //= type=test
         fn finished(self: *const Self, stream: *const Stream) bool {
-            if (stream_id.sendable(stream.id, self.side) and stream.send_state != .data_recvd) return false;
-            if (stream_id.receivable(stream.id, self.side) and stream.receive_state != .data_read) return false;
+            if (stream_id.sendable(stream.id, self.side)) {
+                switch (stream.send_state) {
+                    .data_recvd, .reset => {},
+                    .sending, .data_sent => return false,
+                }
+            }
+            if (stream_id.receivable(stream.id, self.side)) {
+                switch (stream.receive_state) {
+                    .data_read, .reset => {},
+                    .receiving, .size_known => return false,
+                }
+            }
             return true;
         }
 

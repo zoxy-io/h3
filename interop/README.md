@@ -280,6 +280,10 @@ As a **client** against quic-go's server: `handshake`, `transfer`, `chacha20`,
 **server** against quic-go's client: the same list without `keyupdate`, which
 a server does not initiate here.
 
+Run the matrix twice before believing it. `http3` in particular depends on
+where a DATA frame's last octet falls relative to the FIN, and a defect there
+failed one run and passed the next.
+
 `handshakeloss` fails in both roles: fifty handshakes through 30% loss in three
 hundred seconds, of which about thirty-eight finish. The median is half a
 second and the tail is RFC 9002's PTO backoff at 1, 2, 4, 8, 16 seconds — a

@@ -2729,6 +2729,12 @@ pub fn Connection(comptime config: Config) type {
                 try self.receiveFrame(level, value, now_ns);
             }
             if (frames == 0) return error.Protocol;
+            // After the loop, because it moves streams within the table and the
+            // arms above hold pointers into it. A RESET_STREAM or a STOP_SENDING
+            // can finish a stream, and a stream that is finished and not swept
+            // holds a slot and — because the retirement watermark is contiguous
+            // — the credit for every identifier of its kind behind it.
+            self.streams.sweep();
             return eliciting;
         }
 
@@ -5905,6 +5911,44 @@ test "section 4.6: a finished stream gives its credit back" {
     // a limit this endpoint believes it granted.
     server.onPacketsLost(&.{.{ .level = .one_rtt, .flow_control = true }});
     try testing.expect(server.streams.owesStreamCredit());
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9000#section-3.2
+//# Once the application receives the signal indicating that the
+//# stream was reset, the receiving part of the stream transitions
+//# to the "Reset Read" state, which is a terminal state.
+//= type=test
+test "section 3.2: an abandoned stream still gives its credit back" {
+    // The retirement watermark is contiguous, so a stream that can never retire
+    // freezes the credit for its whole kind: one RESET_STREAM from the peer —
+    // an ordinary thing for it to send — and the connection stops granting
+    // stream identifiers for the rest of its life.
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+
+    const before = server.streams.advertised_bidi;
+    _ = try client.write(0, "GET /", false);
+    _ = try deliver(&client, &server, 0);
+    try testing.expect(server.findStream(0) != null);
+
+    // Both halves abandoned: the peer gives up sending, and asks this endpoint
+    // to give up too.
+    var payload: [64]u8 = @splat(0);
+    var offset: usize = 0;
+    offset += try frame.encode(payload[offset..], .{ .reset_stream = .{
+        .stream = 0,
+        .code = @enumFromInt(0x10c),
+        .final_size = 5,
+    } });
+    offset += try frame.encode(payload[offset..], .{ .stop_sending = .{
+        .stream = 0,
+        .code = @enumFromInt(0x10c),
+    } });
+    _ = try server.receiveFrames(.one_rtt, payload[0..offset], 0);
+
+    try testing.expect(server.findStream(0) == null);
+    try testing.expectEqual(before + 1, server.streams.advertised_bidi);
 }
 
 //= https://www.rfc-editor.org/rfc/rfc9000#section-19.14

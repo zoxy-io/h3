@@ -784,7 +784,15 @@ const Session = struct {
         // Bounded by `readable_len`, which is bounded by the stream table.
         while (index < self.readable_len) : (index += 1) {
             const id = self.readable[index];
-            const stream = self.connection.findStream(id) orelse continue;
+            // A stream the connection has given up is one both halves have
+            // finished with, so there is nothing more coming on it. Reading
+            // that as "not yet" loses the FIN when the last of a body and the
+            // end of the stream land in the same pass — the response is whole
+            // and the client waits for it anyway.
+            const stream = self.connection.findStream(id) orelse {
+                if (self.requestFor(id)) |request| request.complete = true;
+                continue;
+            };
             if (stream.receive_state == .reset) return error.StreamReset;
             const data = self.connection.readable(id);
             // Whether the FIN sits at the end of what is readable now. A

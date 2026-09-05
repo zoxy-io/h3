@@ -105,6 +105,8 @@ requirement list extracted from the specification.
 | No MAX_STREAMS frame was generated anywhere, and `Streams.open` never freed a slot — so `streams_max` bounded a connection's *lifetime* rather than its concurrency, and a peer that closed a stream never got it back | the runner's `multiplexing` case, which is 1999 files on one connection | The comment above the constant argued it was sound because the limit is comptime and never rises. The limit never rising is the defect |
 | The interop shim's own list of readable streams was append-only and bounded by the stream table, so the twenty-fifth request on a connection was silently never answered | the same case, one layer up | The same defect as the one below it — a fixed array nobody gives back — and it was hidden by the one below it until that was fixed |
 | The interop client refused more requests than it had stream identifiers for, rather than issuing them as earlier ones finished | the same case, as a client | `error.TooManyRequests` reads like a guard and was a limitation |
+| A stream the peer abandoned could never retire, and the retirement watermark is contiguous — so one RESET_STREAM, which is an ordinary thing for a peer to send, froze the stream credit for its whole kind for the rest of the connection | reading the retirement code that had just been written | Every interop case completes its streams cleanly, so no gate here has a peer that gives up |
+| The interop client lost a response's FIN when the stream retired in the same pass that consumed the last of its body, and waited for a response it already had | the runner's `http3` case, on the second run | It depends on where a DATA frame's last octet falls relative to the FIN, so it fails on one run and passes on the next |
 
 Two things about that table.
 
@@ -880,6 +882,19 @@ Closing it needed three things:
    had been hiding it. And the client refused more requests than it had
    identifiers for, with an `error.TooManyRequests` that read like a guard and
    was a limitation; it now issues them as earlier ones finish.
+
+Retirement then had two consequences worth naming, because both are the kind a
+green matrix hides. The first was found by reading the code that had just been
+written: an abandoned half never reaches a *clean* terminal state, so a stream
+the peer reset could never retire — and with a contiguous watermark, one
+RESET_STREAM freezes the credit for that whole kind for the life of the
+connection. Every interop case completes its streams cleanly, so nothing here
+would have caught it. The second the runner did catch, on the second run rather
+than the first: the client read "this stream is not in the table" as "not yet"
+rather than "finished", and lost a response's FIN whenever the last of a body
+and the end of the stream landed in the same pass. It depends on where a DATA
+frame's last octet falls, so it fails on one run and passes on the next — which
+is the argument for running the matrix twice.
 
 What is left here:
 
