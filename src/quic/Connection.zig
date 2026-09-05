@@ -72,13 +72,6 @@ const Space = packet_number.Space;
 /// it commits state to it.
 pub const initial_datagram_min: u32 = 1200;
 
-/// Lost packets reported out of one acknowledgement or timeout. A bound rather
-/// than a promise: `Recovery` answers the true count, so a caller can tell it
-/// did not see everything — and this package's response to a loss is to rewind
-/// a cursor, which the *earliest* lost packet decides. Seeing the rest changes
-/// nothing.
-const lost_report_max: u32 = 32;
-
 /// Octets of a Retry token this endpoint will hold.
 ///
 /// RFC 9000 puts no bound on the field — a Retry packet's token runs to sixteen
@@ -111,33 +104,21 @@ const retry_octets_max: usize = 1 + 4 +
 /// Destination Connection ID, and the Retry packet up to its tag.
 const retry_pseudo_packet_octets_max: usize = 1 + @as(usize, ConnectionId.octets_max) + retry_octets_max;
 
-/// Events held between polls. Sized so that one datagram's worth of frames
-/// cannot overflow it: a datagram carries at most `lost_report_max` losses plus
-/// a bounded number of stream events, and a consumer polls between datagrams.
-const events_max: u32 = 64;
-
-comptime {
-    assert(events_max > lost_report_max);
-}
-
-comptime {
-    // A report array smaller than what one ACK can retire means the caller sees
-    // a prefix, which is what the comment above promises. Stated as a relation
-    // so that raising `sent_max` without raising this stays a deliberate act
-    // rather than a silent narrowing.
-    assert(lost_report_max >= 1);
-    assert(lost_report_max <= connection_config_sent_max_ceiling);
-}
+/// Event slots beyond `report_max`, for the events one datagram can produce
+/// that are not a packet report: the frames it carries make a stream readable,
+/// reset or stopped, and the datagram itself can confirm the handshake, move
+/// the key phase or close the connection.
+///
+/// A datagram can in principle carry more small frames than this, and the queue
+/// answers that with `overflowed` rather than by growing — that is what the
+/// event is for. What it must never do is overflow because of the *reports*,
+/// because those are bounded by a number this file chooses.
+const events_headroom: u32 = 64;
 
 /// The largest payload a UDP datagram can carry: 65535 minus the eight-octet
 /// UDP header. A `datagram_octets` above this names a datagram no socket can
 /// send, so the bound is the transport's rather than this package's.
 const udp_payload_octets_max: u32 = 65_535 - 8;
-
-/// The largest `sent_max` this file's fixed arrays are written for. Not a limit
-/// on `Config` — `Recovery` owns that — but the number `lost_report_max` is
-/// checked against, so that the two cannot drift apart unnoticed.
-const connection_config_sent_max_ceiling: u32 = 1024;
 
 /// RFC 9000 section 18.2's default `ack_delay_exponent`, used until the peer's
 /// transport parameters are decoded.
@@ -207,6 +188,19 @@ pub const Config = struct {
     /// encoding.
     transport_parameters_octets: u32 = 1024,
     /// Unacknowledged packets tracked per space, for RFC 9002.
+    ///
+    /// It sizes three things, and they are one number on purpose. `Recovery`
+    /// holds this many packets per space; `report_max` is the same, because a
+    /// report shorter than the table it draws from is a report that silently
+    /// drops what did not fit; and `events_max` is that again plus headroom,
+    /// because settling a report emits an event per context. The three used to
+    /// be `sent_max`, a fixed 32 and a fixed 64, and the two fixed ones were
+    /// both below the first — see `report_max`, and docs/VERIFICATION.md §1.
+    ///
+    /// The cost of raising it is therefore about eighty octets a packet rather
+    /// than the forty `Recovery` alone would suggest. Beside the stream windows
+    /// below, which dominate `footprint_octets` by two orders of magnitude,
+    /// that is not the number to tune first.
     sent_max: u32 = 128,
     /// Concurrent streams, and the two flow control windows of section 4.1.
     ///
@@ -366,10 +360,58 @@ pub fn Connection(comptime config: Config) type {
         .Context = PacketContext,
     });
 
+    // Packet contexts this file can take from `Recovery` in one report, which
+    // is `config.sent_max` and may not be anything smaller.
+    //
+    // It used to be 32 regardless, on the reasoning that a loss is answered by
+    // rewinding a cursor and the *earliest* lost packet decides where to — so
+    // seeing the rest changed nothing, and `Recovery` returning the true count
+    // let a caller know it had seen a prefix. Both halves of that were wrong,
+    // and the second is what made the first unrecoverable.
+    //
+    // **A report is not one cursor.** Each context names one stream, and
+    // `onPacketsLost` rewinds *that* stream: thirty-three lost packets on
+    // thirty-three streams rewind thirty-two of them and abandon the last,
+    // whose octets are then in no packet and in front of no cursor. The same
+    // applies to `handshake_done`, `stream_reset`, `stop_sending` and
+    // `flow_control`, each of which re-owes a frame per context.
+    //
+    // **And an acknowledgement is not a loss.** A dropped loss report is at
+    // least the kind of mistake the PTO exists to paper over. A dropped
+    // *delivery* report is silent and permanent: `Streams.acknowledge` is
+    // never called for that stream, its send half stays in "Data Sent" for
+    // ever, and because retirement walks a contiguous watermark, that one
+    // stream pins every stream above it. The table fills and the connection
+    // stops opening streams while both endpoints believe they are healthy.
+    //
+    // zrk found it as a load generator that ran at 6k requests a second for
+    // about a second and then went to zero, with no error on either side: its
+    // congestion window had grown past thirty-two packets, so a routine
+    // acknowledgement began retiring more than one report could carry.
+    //
+    // A caller cannot size this and `Recovery` cannot bound it below the
+    // packets it tracks, so it is exactly the packets it tracks. `sent_max`
+    // is then the one number that governs both, which is what the relation
+    // asserted here says.
+    const report_max: u32 = config.sent_max;
+
     return struct {
         const Self = @This();
 
         pub const datagram_octets: u32 = config.datagram_octets;
+
+        /// Events this connection holds between polls, and so the most a
+        /// consumer's drain loop can need in one pass.
+        ///
+        /// Sized from `report_max` rather than as a round number, because the
+        /// events a report can produce are one *per context*:
+        /// `onPacketsDelivered` emits `stream_delivered` for every
+        /// acknowledged FIN and every acknowledged RESET_STREAM. The fixed 64
+        /// this used to be was below that from the moment a connection carried
+        /// more than 64 streams — and an event dropped here is dropped in the
+        /// same way and with the same consequence as a report: `stream_readable`
+        /// is how a consumer learns a response arrived.
+        pub const events_max: u32 = report_max + events_headroom;
         // What `datagram_octets` is and is not. It is a comptime bound on what this
         // package will build; it is not a discovered path MTU, and nothing here can
         // discover one.
@@ -814,6 +856,22 @@ pub fn Connection(comptime config: Config) type {
         /// retransmitted either.
         handshake_done_pending: bool = false,
         handshake_done_framed: bool = false,
+
+        /// Where `Recovery` writes the contexts of one report, for
+        /// `receiveAck` and `onTimeout`.
+        ///
+        /// Fields rather than two arrays on `receiveAck`'s frame. `report_max`
+        /// is `config.sent_max`, so at the largest configuration a consumer
+        /// might reasonably choose these are tens of kilobytes — a stack frame
+        /// that size, inside `receive`, is a thing a coroutine runtime finds
+        /// out about by overflowing. Here they are part of `footprint_octets`,
+        /// which is the number this package promises answers "what does a
+        /// connection cost".
+        ///
+        /// One report at a time: `receiveAck` fills both and drains them before
+        /// it returns, and `onTimeout` uses the first alone.
+        report_lost: [report_max]PacketContext = undefined,
+        report_delivered: [report_max]PacketContext = undefined,
 
         /// The event queue of `Event`. Fixed, like everything else here: a
         /// consumer that polls after every `receive` and `send` never fills it,
@@ -3546,23 +3604,24 @@ pub fn Connection(comptime config: Config) type {
             const delay_ns: u64 = (delay_units << ack_delay_exponent_default) * std.time.ns_per_us;
             assert(delay_ns <= ack_delay_ns_max);
 
-            var lost: [lost_report_max]PacketContext = undefined;
-            var delivered: [lost_report_max]PacketContext = undefined;
             const result = self.recovery.onAckReceived(
                 level.space(),
                 value,
                 delay_ns,
                 now_ns,
-                &lost,
-                &delivered,
+                &self.report_lost,
+                &self.report_delivered,
             ) catch return error.Protocol;
-            // `onPacketsLost` indexes `lost`, so the count has to be clamped to
-            // it rather than trusted — the clamp is the guard, and `result.lost`
-            // counts what was detected rather than what was reported.
-            assert(result.lost >= @min(result.lost, lost.len));
-            self.onPacketsLost(lost[0..@min(result.lost, lost.len)]);
+            // No clamp, and the assertions are why. Neither count can pass
+            // `report_max`, because a packet has to be tracked to be reported
+            // and `Recovery` tracks `config.sent_max` of them per space — so a
+            // slice shorter than the count would be dropping a report rather
+            // than shortening one. See `report_max` for what that cost.
+            assert(result.lost <= self.report_lost.len);
+            assert(result.acked <= self.report_delivered.len);
+            self.onPacketsLost(self.report_lost[0..result.lost]);
             if (result.lost > 0) self.emit(.{ .packets_lost = result.lost });
-            self.onPacketsDelivered(delivered[0..@min(result.acked, delivered.len)]);
+            self.onPacketsDelivered(self.report_delivered[0..result.acked]);
         }
 
         /// Section 19.6: CRYPTO carries the handshake, at its own offsets, in a
@@ -3826,7 +3885,7 @@ pub fn Connection(comptime config: Config) type {
         /// to enter them: a stream could be written, sent, acknowledged, and
         /// still sit in "Data Sent" for the life of the connection.
         fn onPacketsDelivered(self: *Self, contexts: []const PacketContext) void {
-            assert(contexts.len <= lost_report_max);
+            assert(contexts.len <= report_max);
             for (contexts) |context| {
                 // The octets are the peer's now, so the buffer they sit in can
                 // be reused. Without this a stream could send `send_octets` in
@@ -3895,9 +3954,11 @@ pub fn Connection(comptime config: Config) type {
             //# packets once they are acknowledged.
             //= type=exception
             //= reason=declined deliberately, and the cost is bounded by design. Rewinding a level's send cursor to where the lost packet began re-frames every octet from there, including octets a later packet also carried and that may already be acknowledged. Avoiding that means tracking acknowledgement per range, which is a second reassembler on the send side; the duplicate is free to the peer, because section 2.2 guarantees the bytes are identical, and a handshake is a few kilobytes. See the note on `onPacketsLost`.
-            // Bounded by the caller's array rather than by anything the peer
-            // chose; `receiveAck` clamps the count to it before calling here.
-            assert(contexts.len <= lost_report_max);
+            // Bounded by the packets `Recovery` tracks rather than by anything
+            // the peer chose, and *every* one of them is here: the loop below
+            // rewinds a cursor per context, so a prefix would abandon the
+            // streams that did not fit. See `report_max`.
+            assert(contexts.len <= report_max);
             for (contexts) |context| {
                 assert(context.crypto_end >= context.crypto_start);
                 assert(context.stream_end >= context.stream_start);
@@ -4000,9 +4061,13 @@ pub fn Connection(comptime config: Config) type {
 
         /// Section A.9 of RFC 9002: the timer fired.
         pub fn onTimeout(self: *Self, now_ns: u64) void {
-            var lost: [lost_report_max]PacketContext = undefined;
-            switch (self.recovery.onLossDetectionTimeout(now_ns, &lost)) {
-                .lost => |count| self.onPacketsLost(lost[0..@min(count, lost.len)]),
+            switch (self.recovery.onLossDetectionTimeout(now_ns, &self.report_lost)) {
+                // No clamp here either, and for the reason `receiveAck` gives:
+                // a timeout cannot declare more packets lost than are tracked.
+                .lost => |count| {
+                    assert(count <= self.report_lost.len);
+                    self.onPacketsLost(self.report_lost[0..count]);
+                },
                 // Section 6.2.4: nothing is known to be lost and the peer has
                 // gone quiet, so send something it must answer — and where
                 // there is unacknowledged data, that rather than a bare PING,
@@ -8228,6 +8293,133 @@ test "section 10.2.3: after confirmation the close is 1-RTT only" {
     try testing.expectEqual(State.draining, client.state);
 }
 
+/// A connection wide enough that one acknowledgement can retire more packets
+/// than a report used to hold, and name a different stream in each.
+///
+/// `TestConnection` cannot: its `sent_max` is 32, which is exactly the bound
+/// that was wrong, so a thirty-third packet is refused by `Recovery` before any
+/// report is built. Everything here is small except the two numbers under
+/// test — how many packets one acknowledgement can retire, and how many
+/// distinct streams those packets can name.
+const WideConnection = Connection(.{
+    .crypto_octets = 1024,
+    .ack_ranges_max = 8,
+    .sent_max = 64,
+    .streams_max = 72,
+    .stream_receive_octets = 256,
+    .stream_send_octets = 256,
+    .connection_receive_octets = 64 * 1024,
+});
+
+/// How many streams the test below opens: more than the fixed 32 the report
+/// arrays used to be, and fewer than either limit above.
+const wide_streams: u64 = 40;
+
+fn wideDeliver(from: *WideConnection, to: *WideConnection, now_ns: u64) !usize {
+    var datagram: [WideConnection.datagram_octets]u8 = @splat(0);
+    const octets = try from.send(&datagram, now_ns);
+    if (octets == 0) return 0;
+    try to.receive(datagram[0..octets], now_ns);
+    return octets;
+}
+
+fn wideInstall(a: *WideConnection, b: *WideConnection, level: Level, seed: u8) !void {
+    const raw: [32]u8 = @splat(seed);
+    const secret = try crypto.secrets.Secret.init(&raw);
+    try a.installSecret(level, .send, &secret, .aes_128_gcm_sha256);
+    try b.installSecret(level, .receive, &secret, .aes_128_gcm_sha256);
+}
+
+/// `established`, for the wide pair. The same flights in the same order; the
+/// limits at the end are set once for every stream rather than for stream 0,
+/// because this test opens forty of them.
+fn wideEstablished(client: *WideConnection, server: *WideConnection) !void {
+    try client.cryptoIn(.initial, "ClientHello");
+    _ = try wideDeliver(client, server, 0);
+    try wideInstall(server, client, .handshake, 0x11);
+    try wideInstall(client, server, .handshake, 0x22);
+    try client.cryptoIn(.handshake, "ClientFinished");
+    _ = try wideDeliver(client, server, 0);
+    try wideInstall(server, client, .one_rtt, 0x33);
+    try wideInstall(client, server, .one_rtt, 0x44);
+
+    var payload: [16]u8 = @splat(0);
+    const written = try frame.encode(&payload, .handshake_done);
+    _ = try client.receiveFrames(.one_rtt, payload[0..written], 0);
+    server.confirmHandshake();
+
+    const permitted = @TypeOf(client.streams).streams_max;
+    for ([_]*WideConnection{ client, server }) |one| {
+        one.streams.setPeerStreamLimit(true, permitted);
+        one.streams.setPeerStreamLimit(false, permitted);
+        one.streams.setPeerInitialLimits(1 << 16, 1 << 16, 1 << 16);
+        one.streams.setConnectionSendLimit(1 << 20);
+        one.address_validated = true;
+    }
+}
+
+test "one acknowledgement settles every stream it retires, not the first 32" {
+    // `report_max` has the defect this witnesses. What it means here is that
+    // both handlers act *per context*, so a report truncated at 32 leaves every
+    // stream after the thirty-second unsettled — and `Streams` retires on a
+    // contiguous watermark, so one of those pins all the rest.
+    var client: WideConnection = .init(.{
+        .side = .client,
+        .original_destination = ConnectionId.init(&client_cid) catch unreachable,
+        .source = ConnectionId.init(&client_source) catch unreachable,
+    });
+    var server: WideConnection = .init(.{
+        .side = .server,
+        .original_destination = ConnectionId.init(&client_cid) catch unreachable,
+        .source = ConnectionId.init(&server_source) catch unreachable,
+    });
+    try wideEstablished(&client, &server);
+
+    // One short message per stream, so each rides its own packet: `writeStream`
+    // frames one stream per packet, which is what makes forty streams forty
+    // acknowledgements to apply rather than one.
+    var index: u64 = 0;
+    while (index < wide_streams) : (index += 1) {
+        const id = stream_id.make(.client_bidirectional, index);
+        _ = try client.write(id, "x", true);
+    }
+
+    // The whole flight, then the single acknowledgement that answers it.
+    var sent: u64 = 0;
+    while (client.wantsSend() and sent < wide_streams * 2) : (sent += 1) {
+        if (try wideDeliver(&client, &server, 1000) == 0) break;
+    }
+    try testing.expect(sent >= wide_streams);
+    _ = try wideDeliver(&server, &client, 2000);
+
+    // Every stream, not thirty-two of them. Counted rather than spot-checked:
+    // the bug left a suffix behind, and asserting on stream 0 passes either way.
+    var settled: u64 = 0;
+    index = 0;
+    while (index < wide_streams) : (index += 1) {
+        const id = stream_id.make(.client_bidirectional, index);
+        // A stream that reached its terminal state may already have been
+        // retired out of the table, which is the outcome this is about.
+        const one = client.findStream(id) orelse {
+            settled += 1;
+            continue;
+        };
+        if (one.send_state == .data_recvd) settled += 1;
+    }
+    try testing.expectEqual(wide_streams, settled);
+
+    // And the relation that makes the failure unreachable rather than merely
+    // fixed: a packet has to be tracked to be reported, so a report as long as
+    // the tracking table cannot be overrun by one. This is the line a future
+    // edit would have to narrow to bring the defect back.
+    try testing.expectEqual(client.recovery.spaces[0].sent.len, client.report_lost.len);
+    try testing.expectEqual(client.report_lost.len, client.report_delivered.len);
+    // `onPacketsDelivered` emits one event per context it settles, so the queue
+    // has to outlast a full report for the same reason the report has to
+    // outlast a full acknowledgement.
+    try testing.expect(WideConnection.events_max > client.report_delivered.len);
+}
+
 //= https://www.rfc-editor.org/rfc/rfc9000#section-3.1
 //# Once all stream data has been successfully acknowledged, the sending
 //# part of the stream enters the "Data Recvd" state, which is a terminal
@@ -8271,7 +8463,12 @@ test "poll reports a dropped event rather than losing it" {
     // this package has met six times in other guises — a check that ignores its
     // input reports success either way. Overflow is an event.
     var client = testClient();
-    for (0..events_max + 3) |_| client.emit(.key_updated);
+    // The queue's size is derived from `sent_max` now, so the test asks the
+    // type rather than a file-level constant — a number written here again
+    // would be the one thing the assertion below could agree with while the
+    // queue disagreed.
+    const capacity = TestConnection.events_max;
+    for (0..capacity + 3) |_| client.emit(.key_updated);
 
     const first = client.poll().?;
     try testing.expectEqual(@as(u32, 3), first.overflowed);
@@ -8281,7 +8478,7 @@ test "poll reports a dropped event rather than losing it" {
         try testing.expectEqual(TestConnection.Event.key_updated, event);
         kept += 1;
     }
-    try testing.expectEqual(events_max, kept);
+    try testing.expectEqual(capacity, kept);
 }
 
 //= https://www.rfc-editor.org/rfc/rfc9001#section-4.9.1
