@@ -119,6 +119,8 @@ requirement list extracted from the specification.
 | Section 14.1's 1200-octet floor was met by zeroing the datagram *after* the last packet, which is neither of the two ways the sentence names — a peer parses the zeroes as one more packet and throws it away | reading quic-go's log while chasing `handshakeloss` | Every peer accepts it, so nothing fails; what it costs is a slot in the peer's undecryptable queue and half of every padded datagram |
 | Moving that padding into the *first* packet then stopped the coalescing, so a server's flight went out as two datagrams instead of one — sixty per cent more octets against section 8.1's budget, and two datagrams that both have to survive | `handshakeloss`, which went from two runs in three to none in four | The unit tests only ask whether the datagram reaches 1200; which packet holds the padding is invisible to them |
 | A PTO probed only the space whose timer expired, so a handshake — which is two spaces at once — repaired one flight per timeout while the other space's timer went on backing off in parallel | the ledger, which had RFC 9002 §6.2.4's coalescing as a `type=todo`, and the padding fallback that kept firing because of it | The rule is a SHOULD about an optimisation, and what it optimises is the case where both spaces are lost together — which is the ordinary case under 30% loss and never happens on a clean path |
+| An endpoint that initiated a key update could not read anything the peer had sent under the old generation, so it stopped hearing acknowledgements at the instant it updated — RFC 9001 §6.1's retention rule, broken by the AEAD's own failure path | the simulator, the first sweep in which any seed updated its keys | `std.crypto.aead` scrubs its output buffer on a tag mismatch, deliberately, and the output buffer is the packet: the first speculative key destroys the ciphertext the second needs. The interop `keyupdate` case passes because there the peer follows promptly and the *other* branch is the one that runs |
+| The census merged into the sweep total through a hand-written list of fields, so a counter nobody remembered to add read as a behaviour no seed reached | adding two counters and watching both report zero while the sweep reached one of them eleven thousand times | It is the same shape as the defect the file already recorded — a row that is zero because the accumulator is wrong rather than because the behaviour is absent — and the second instance arrived four months after the comment about the first |
 
 Two things about that table.
 
@@ -419,8 +421,8 @@ collapses the window and the transfer resumes".
 
 **Status.** `sim/Link.zig` and `sim/main.zig` exist and run as `zig build sim`.
 The link has delay, jitter, a rotating loss mask, reordering, duplication, MTU
-and a token-bucket queue with tail drop. Four oracles are live and the census
-counts thirteen behaviours.
+and a token-bucket queue with tail drop. Five oracles are live and the census
+counts nineteen behaviours, twelve of them required.
 
 It is part of `zig build ci`. It was held out while the census reported
 behaviours no seed reached, because a gate that passes while saying so would be
@@ -488,12 +490,60 @@ with nothing in it:
   when the three-times limit actually binds. With a token-sized flight the
   amplification counter never moved, and it was right not to.
 
-Still to come: the adversary node, fault injection, the `poll` of §5.3, and the
-4096-seed nightly cadence under all three build legs. One census row stays at
-zero on purpose — "packets declared lost" — because `Recovery` reports losses
-per acknowledgement and keeps no lifetime total, so nothing outside the library
-can count them. That is what §5.3 is for, and until then the halved-window
-count is the signal that loss was reached.
+**The cadence and three more census rows.** `.github/workflows/nightly-sim.yml`
+sweeps 4096 seeds under all three build legs every night, from a range derived
+from the run number so that no two nights run the same one — a sample taken
+from the same 256 seeds every time proves the same thing every time. `--from`
+exists for that: `--seed` pins the count to one, which is right for replaying a
+failure and wrong for choosing a range.
+
+Three rows were added, and each of them found something.
+
+- **"datagrams accounted for by their packets"**, with its counterpart
+  "datagrams with loose padding". A datagram is the packets in it and nothing
+  else; what a walk of it does not reach is padding no packet claims, which
+  §14.1 does not name and every peer nonetheless throws away. This is the
+  measurement that had been taken by hand out of quic-go's log, and it belongs
+  where every seed takes it. It reads 0 of 181,855 over a 4096-seed sweep;
+  removing the padding fix takes it to 317 of 11,096 in a 256-seed one.
+- **"probes carrying data"**, against "probes carrying a bare PING". The
+  difference is whether the timeout rewound a framing watermark, which is
+  exactly what the probe defect above got wrong, and it was invisible from
+  outside the library. Removing that fix moves the bare-PING row from 38 to
+  255.
+- **"key updates"**, which §5.2 lists as required and which sat at zero because
+  nothing in the harness initiated one. Making half the seeds update took the
+  row to 132 — **and took transfers completed from 256 to 197**. See below.
+
+**A defect the moment the row moved.** RFC 9001 §6.1 requires an endpoint to
+retain old keys until it has unprotected a packet under the new ones, because
+everything already in flight when it updates arrives under the old generation.
+This package tried the next generation first and the previous second, and the
+second could never work: `std.crypto.aead`'s decrypt does `@memset(m,
+undefined)` on a tag mismatch — deliberately, so a caller cannot read a
+plaintext that was never authenticated — and the output buffer *is* the packet.
+The first speculative key scrubbed the ciphertext the second one needed. So an
+endpoint stopped hearing acknowledgements at the instant it initiated an update,
+which is why every seed that updated stalled. The fix is a copy of the octets
+the AEAD will touch, restored between attempts.
+
+It is worth being precise about why nothing else caught it. The interop runner's
+`keyupdate` case passes, and passed throughout: there the peer follows the
+update promptly, so the *first* branch is the one that runs. The branch that had
+never worked is the one that only matters while the peer has not caught up —
+which is a window of one round trip, and a window every packet already in flight
+falls into.
+
+**The merge was a hand-written list**, and both new counters read zero on the
+first run while the sweep was reaching one of them eleven thousand times. That
+is the same shape as the defect this file already records — a row that is zero
+because the accumulator is wrong rather than because the behaviour is absent —
+so the merge is now a `inline for` over the census's own fields and a new
+counter cannot be forgotten.
+
+Still to come: the adversary node, and fault injection. One census row no longer
+stays at zero: "packets declared lost" reads from the `poll` of §5.3 now that it
+exists.
 
 ### 5.3 Events out — **done**
 

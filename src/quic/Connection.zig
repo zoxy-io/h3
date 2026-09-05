@@ -2629,13 +2629,36 @@ pub fn Connection(comptime config: Config) type {
             //# send keys to the corresponding key phase in response, as described in
             //# Section 6.1.  Sending keys MUST be updated before sending an
             //# acknowledgment for the packet that was received with updated keys.
+            // A speculative attempt is destructive, and that is not an accident
+            // of this code: `std.crypto.aead`'s decrypt does `@memset(m,
+            // undefined)` on a tag mismatch, deliberately, so that a caller
+            // cannot read a plaintext that was never authenticated. The output
+            // buffer is the packet, so the first candidate key that fails
+            // scrubs the ciphertext the second one needs.
+            //
+            // The cost was the whole of section 6.1's retention rule. Trying the
+            // next generation first and the previous second meant the previous
+            // was always handed a wiped buffer — so an endpoint that had just
+            // updated could not read anything the peer sent before it caught
+            // up, which is *every* packet in flight at that moment. It stopped
+            // hearing acknowledgements at the instant it initiated an update.
+            // The interop runner's `keyupdate` case passes because there the
+            // peer follows promptly and the first branch is the one that runs;
+            // it is the second that had never worked.
+            var keep: [config.datagram_octets]u8 = undefined;
+            const body = bytes[header.header_octets..];
+            if (body.len > keep.len) return self.countForgery();
+            @memcpy(keep[0..body.len], body);
+
             if (one.next_receive) |next| {
                 if (next.decrypt(bytes, header)) |opened| {
                     // Section 6.2: a packet that opens under the next generation
                     // *is* the peer's update, and this endpoint follows it.
                     self.updateKeys();
                     return opened;
-                } else |_| {}
+                } else |_| {
+                    @memcpy(body, keep[0..body.len]);
+                }
             }
             // The old generation is tried without comparing packet numbers, so
             // a peer that goes *backwards* — old keys on a higher number than
@@ -2648,7 +2671,9 @@ pub fn Connection(comptime config: Config) type {
             //# MUST treat this as a connection error of type KEY_UPDATE_ERROR.
             //= type=todo
             if (one.previous_receive) |previous| {
-                if (previous.decrypt(bytes, header)) |opened| return opened else |_| {}
+                if (previous.decrypt(bytes, header)) |opened| return opened else |_| {
+                    @memcpy(body, keep[0..body.len]);
+                }
             }
             //= https://www.rfc-editor.org/rfc/rfc9001#section-5.5
             //# Similarly, a packet
@@ -6271,6 +6296,25 @@ test "section 14.1: the padding is inside the packet, not after it" {
     // own length, and it accounts for every octet.
     const parsed = try packet.parse(datagram[0..octets], 0);
     try testing.expectEqual(octets, parsed.octets);
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9001#section-6.1
+//# An endpoint MUST retain old keys until it has successfully
+//# unprotected a packet sent using the new keys.
+//= type=test
+test "section 6.1: an endpoint that updates can still read the old generation" {
+    // The peer has not updated yet and will not until it sees a packet under
+    // the new keys, so everything it sends in the meantime arrives under the
+    // old ones. An endpoint that cannot read those has stopped hearing
+    // acknowledgements at the moment it initiated the update.
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+    try testing.expectEqual(@as(usize, 5), try server.write(0, "hello", false));
+
+    client.updateKeys();
+    _ = try deliver(&server, &client, 1000);
+    try testing.expectEqualStrings("hello", client.readable(0));
 }
 
 //= https://www.rfc-editor.org/rfc/rfc9001#section-5.7

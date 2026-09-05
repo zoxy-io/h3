@@ -1,0 +1,55 @@
+name: nightly-sim
+
+# A long sweep, on a range nobody has run before, under every build that ships.
+#
+# `zig build ci` already runs 256 seeds on every push, which is what fits in a
+# per-change gate. That is a sample, and a sample from the same 256 seeds every
+# time proves the same thing every time — so this takes a fresh range each
+# night, chosen from the run number, and runs it sixteen times longer.
+#
+# The census is the point as much as the oracles: a row that reaches zero here
+# is a behaviour the sweep did not exercise, and confidence drawn from a sweep
+# about a behaviour it never reached is unearned. `sim` exits non-zero on that,
+# so a silent gap fails the job rather than reading as a pass.
+on:
+  schedule:
+    # 04:00 UTC, which is outside the working day in the time zones this is
+    # developed in — a nightly that competes with a push queue is a nightly
+    # that gets read as flaky.
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+jobs:
+  sweep:
+    strategy:
+      # Every leg runs even when one fails: a break that only the
+      # no-assertions build reaches is exactly the one worth seeing.
+      fail-fast: false
+      matrix:
+        include:
+          - name: Debug, assertions on
+            flags: ""
+          - name: ReleaseFast, assertions on
+            flags: "-Doptimize=ReleaseFast"
+          - name: ReleaseFast, assertions off
+            flags: "-Doptimize=ReleaseFast -Dassertions=false"
+    runs-on: ubuntu-latest
+    name: Sweep ${{ matrix.name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      # 4096 seeds from a range this repository has not swept before. The
+      # arithmetic is deliberate rather than random: a failing seed is replayed
+      # with `zig build sim -- --seed N`, and a number that can be read off the
+      # log is worth more than one that cannot be reproduced.
+      - name: Sweep
+        run: |
+          from=$(( ${{ github.run_number }} * 4096 ))
+          echo "sweeping 4096 seeds from $from"
+          zig build sim ${{ matrix.flags }} -- --from "$from" --seeds 4096

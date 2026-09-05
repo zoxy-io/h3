@@ -108,6 +108,11 @@ const fake_secret_seeds = [_]u8{ 0x11, 0x22, 0x33, 0x44 };
 /// like a token, for the reason in `driveHandshake`.
 const server_flight: [2600]u8 = @splat(0xa5);
 
+/// The two endpoints' Source Connection IDs, at file scope because the
+/// datagram oracle needs the *peer's* length to walk a short header.
+const client_source = [_]u8{ 0x01, 0x02, 0x03, 0x04 };
+const server_source = [_]u8{ 0xf0, 0x67, 0xa5, 0x50, 0x2a, 0x42, 0x62, 0xb5 };
+
 const Census = struct {
     runs: u64 = 0,
     handshakes_completed: u64 = 0,
@@ -124,6 +129,26 @@ const Census = struct {
     amplification_binding: u64 = 0,
     closes_observed: u64 = 0,
     streams_delivered: u64 = 0,
+    /// Datagrams whose packets account for every octet of them, and datagrams
+    /// that end in padding no packet claims.
+    ///
+    /// Section 14.1 names two ways to reach 1200 octets — PADDING frames in the
+    /// Initial packet, or coalescing — and zeroes after the last packet are
+    /// neither. Every peer accepts them, so nothing fails; what it costs is
+    /// that a peer parses them as one more packet and throws it away. This is
+    /// the measurement that was taken by hand, out of quic-go's log, while
+    /// chasing `handshakeloss`: it belongs here, where every seed takes it.
+    datagrams_whole: u64 = 0,
+    datagrams_with_loose_padding: u64 = 0,
+    /// Probes that carried unacknowledged data, and probes that went out with
+    /// nothing but a PING.
+    ///
+    /// RFC 9002 section 6.2.4 prefers the first: a probe that carries the
+    /// handshake makes progress and a probe that carries nothing only asks
+    /// whether the path is alive. A sweep where the second dominates is a
+    /// sweep where loss recovery is one round trip slower than it reads.
+    probes_carrying_data: u64 = 0,
+    probes_carrying_ping: u64 = 0,
 
     /// The counters that must move somewhere in a sweep. A zero here means the
     /// sweep did not reach the behaviour, so any confidence drawn from it about
@@ -174,6 +199,21 @@ const Census = struct {
                 return c.amplification_binding;
             }
         }.get },
+        .{ .name = "datagrams accounted for by their packets", .get = struct {
+            fn get(c: *const Census) u64 {
+                return c.datagrams_whole;
+            }
+        }.get },
+        .{ .name = "probes carrying data", .get = struct {
+            fn get(c: *const Census) u64 {
+                return c.probes_carrying_data;
+            }
+        }.get },
+        .{ .name = "key updates", .get = struct {
+            fn get(c: *const Census) u64 {
+                return c.key_updates;
+            }
+        }.get },
     };
 };
 
@@ -218,6 +258,11 @@ const World = struct {
     /// read as the client's going backwards — an oracle that fired on every
     /// seed before it had seen a single packet.
     highest_sent: [2][3]?u64 = @splat(@splat(null)),
+
+    /// How far into the transfer this seed updates its keys, or zero for a seed
+    /// that does not. Drawn rather than fixed so the update lands in different
+    /// places relative to loss and reordering.
+    key_update_at: u32 = 0,
 
     /// When the application last had something to do, for the quiet oracle.
     busy_until_ns: u64 = 0,
@@ -272,8 +317,7 @@ fn buildWorld(seed: u64) World {
     // requires a packet that fails authentication to be dropped rather than
     // reported: exactly the shape a simulator is for.
     const client_cid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
-    const client_source = [_]u8{ 0x01, 0x02, 0x03, 0x04 };
-    const server_source = [_]u8{ 0xf0, 0x67, 0xa5, 0x50, 0x2a, 0x42, 0x62, 0xb5 };
+
 
     var world: World = .{
         .seed = seed,
@@ -304,6 +348,12 @@ fn buildWorld(seed: u64) World {
         }),
         .payload_len = 1 + random.uintLessThan(u32, payload_octets_max - 1),
     };
+    // Half the seeds update their keys, somewhere in the first half of the
+    // transfer. Half rather than all, because a behaviour every seed reaches is
+    // one no seed can be compared against.
+    if (random.boolean()) {
+        world.key_update_at = 1 + random.uintLessThan(u32, @max(2, world.payload_len / 2));
+    }
     // Content that a partial or reordered delivery cannot accidentally satisfy.
     for (&world.payload, 0..) |*octet, index| octet.* = @truncate(index *% 31 +% 7);
     world.prng = prng;
@@ -402,6 +452,16 @@ fn driveApplication(world: *World) void {
     if (world.client_installed < 2) return;
     const stream = quic.stream_id.make(.client_bidirectional, 0);
 
+    // RFC 9001 section 6's key update, once per connection and only on seeds
+    // that ask for it. The census row for it stayed at zero for as long as
+    // nothing here initiated one, which is the census reporting that a
+    // behaviour docs/VERIFICATION.md section 5.2 lists as required was not
+    // reached — not that it works.
+    if (world.key_update_at > 0 and world.written >= world.key_update_at) {
+        world.key_update_at = 0;
+        world.client.updateKeys();
+    }
+
     if (!world.write_done) {
         const remaining = world.payload[world.written..world.payload_len];
         if (remaining.len > 0) {
@@ -429,6 +489,45 @@ fn driveApplication(world: *World) void {
     world.received += @intCast(readable.len);
     world.server.consume(stream, readable.len) catch {};
     world.busy_until_ns = world.now_ns;
+}
+
+/// Oracle seven: a datagram is the packets in it and nothing else.
+///
+/// Walk it the way a peer does. Every packet must parse, and the walk must
+/// reach the end. What it does not reach is padding no packet claims — legal
+/// enough, and the thing section 14.1 does not name: a peer reads the first
+/// zero octet as a short header, fails the fixed-bit check, and throws the rest
+/// away. That is counted rather than failed, because this package still falls
+/// back to it when the packet it expected to pad declines to be written; a
+/// count is what says how often, and a count that starts rising again is what
+/// says a change made it worse.
+///
+/// Anything else in the tail *is* a failure: a datagram whose trailing octets
+/// are neither a packet nor zeroes is one this endpoint built wrong.
+fn inspectDatagram(world: *World, datagram: []const u8, peer_id_octets: u8) void {
+    if (world.failure != null) return;
+    var offset: usize = 0;
+    // Bounded by the datagram: every packet is at least one octet.
+    while (offset < datagram.len) {
+        const parsed = quic.packet.parse(datagram[offset..], peer_id_octets) catch break;
+        if (parsed.octets == 0) break;
+        offset += parsed.octets;
+        if (offset > datagram.len) {
+            fail(world, "a packet claimed more octets than the datagram holds", offset);
+            return;
+        }
+    }
+    if (offset == datagram.len) {
+        world.census.datagrams_whole += 1;
+        return;
+    }
+    for (datagram[offset..]) |octet| {
+        if (octet != 0) {
+            fail(world, "a datagram ended in something that is neither a packet nor padding", offset);
+            return;
+        }
+    }
+    world.census.datagrams_with_loose_padding += 1;
 }
 
 fn fail(world: *World, what: []const u8, detail: u64) void {
@@ -533,13 +632,20 @@ fn stepOnce(world: *World) bool {
     driveApplication(world);
 
     // Then let each side put what it has on the wire.
-    inline for (.{ .{ &world.client, &world.to_server }, .{ &world.server, &world.to_client } }) |pair| {
+    inline for (.{
+        .{ &world.client, &world.to_server, server_source.len },
+        .{ &world.server, &world.to_client, client_source.len },
+    }) |pair| {
         const connection = pair[0];
         const link = pair[1];
+        // The identifier length the *peer* issued, which is the only way a
+        // short header's Destination Connection ID can be found.
+        const peer_id_octets: u8 = pair[2];
         var guard: u32 = 0;
         while (guard < 16) : (guard += 1) {
             const octets = connection.send(&datagram, world.now_ns) catch break;
             if (octets == 0) break;
+            inspectDatagram(world, datagram[0..octets], peer_id_octets);
             link.send(datagram[0..octets], world.now_ns, random);
         }
     }
@@ -570,8 +676,23 @@ fn stepOnce(world: *World) bool {
             const at = connection.timeout() orelse break;
             if (at > world.now_ns) break;
             const before = connection.recovery.pto_count;
+            // What a probe will carry, measured as what `onTimeout` put back.
+            // A probe is supposed to re-send unacknowledged data rather than a
+            // bare PING, and the difference is exactly whether the timeout
+            // rewound a framing watermark: a probe pointed at an
+            // acknowledgement-only packet rewinds nothing and goes out empty.
+            // That was a real defect and it was invisible from outside the
+            // library, which is what this row is for.
+            const framed_before = framedTotal(connection);
             connection.onTimeout(world.now_ns);
-            if (connection.recovery.pto_count > before) world.census.ptos_fired += 1;
+            if (connection.recovery.pto_count > before) {
+                world.census.ptos_fired += 1;
+                if (framedTotal(connection) < framed_before) {
+                    world.census.probes_carrying_data += 1;
+                } else {
+                    world.census.probes_carrying_ping += 1;
+                }
+            }
         }
         if (fired == timers_per_step_max) {
             fail(world, "timer re-armed in the past without making progress", fired);
@@ -619,6 +740,16 @@ fn drainEvents(world: *World) void {
 fn recordClose(world: *World, err: anyerror) void {
     std.debug.assert(@errorName(err).len > 0);
     world.census.closes_observed += 1;
+}
+
+/// Everything this endpoint has framed and not yet had acknowledged, across the
+/// handshake levels and the streams. Only the total matters: a probe that
+/// carries data is one that made this number fall.
+fn framedTotal(connection: anytype) u64 {
+    var total: u64 = 0;
+    for (connection.levels) |level| total += level.framed;
+    for (connection.streams.streams[0..connection.streams.count]) |stream| total += stream.framed;
+    return total;
 }
 
 fn minimum(current: ?u64, candidate: u64) u64 {
@@ -669,24 +800,30 @@ fn runSeed(seed: u64, census: *Census) ?Failure {
     if (world.received == world.payload_len and world.payload_len > 0) {
         census.transfers_completed += 1;
     }
-    // From the event stream now, not from a field nothing ever wrote. This read
-    // `world.lost_declared`, which was added when the count was unobtainable and
-    // then never incremented — so the row was zero because the accumulator was
-    // reading a variable that stayed zero, not only because the library could
-    // not report it. Two reasons for one symptom, and the second outlived the
-    // first fix.
-    census.packets_lost_declared += world.census.packets_lost_declared;
-    census.streams_delivered += world.census.streams_delivered;
-    census.key_updates += world.census.key_updates;
+    // Every counter the world kept, added by name. It used to be a
+    // hand-written list of fields, and the list was a trap of exactly the kind
+    // this file already records one instance of: a counter nobody remembered to
+    // add reads as a behaviour no seed reached, which is the lie the census
+    // exists to prevent. Two rows were added in one change and both reported
+    // zero while the sweep was reaching one of them constantly.
+    //
+    // The comment that stood here is worth keeping, because it names the other
+    // half of the same symptom: "packets declared lost" read
+    // `world.lost_declared`, a field added when the count was unobtainable and
+    // then never incremented — so the row was zero because the accumulator read
+    // a variable that stayed zero, not only because the library could not
+    // report it. Two reasons for one symptom, and the second outlived the first
+    // fix.
+    inline for (@typeInfo(Census).@"struct".fields) |field| {
+        // `runs` is counted per call rather than per world, and the link and
+        // window rows below are drawn from somewhere other than `world.census`.
+        if (comptime std.mem.eql(u8, field.name, "runs")) continue;
+        @field(census, field.name) += @field(&world.census, field.name);
+    }
     census.link_dropped += world.to_server.counters.dropped_loss + world.to_client.counters.dropped_loss;
     census.link_queue_dropped += world.to_server.counters.dropped_queue + world.to_client.counters.dropped_queue;
     census.link_reordered += world.to_server.counters.reordered + world.to_client.counters.reordered;
     census.link_duplicated += world.to_server.counters.duplicated + world.to_client.counters.duplicated;
-    census.ptos_fired += world.census.ptos_fired;
-    census.handshakes_completed += world.census.handshakes_completed;
-    census.amplification_binding += world.census.amplification_binding;
-    census.closes_observed += world.census.closes_observed;
-    census.windows_collapsed += world.census.windows_collapsed;
     if (world.client.recovery.ssthresh != std.math.maxInt(u64)) census.windows_halved += 1;
 
     return world.failure;
@@ -707,6 +844,15 @@ pub fn main(init: std.process.Init) !u8 {
         }
         if (std.mem.eql(u8, args[index], "--seeds") and index + 1 < args.len) {
             seeds = std.fmt.parseInt(u64, args[index + 1], 10) catch seeds;
+            index += 1;
+            continue;
+        }
+        // Where the sweep starts, without saying how long it is. A nightly that
+        // runs the same range every night proves the same thing every night;
+        // this is what lets it take a fresh one, and `--seed` alone could not
+        // because it also pins the count to one.
+        if (std.mem.eql(u8, args[index], "--from") and index + 1 < args.len) {
+            first = std.fmt.parseInt(u64, args[index + 1], 10) catch first;
             index += 1;
             continue;
         }
@@ -774,6 +920,10 @@ fn printCensus(census: *const Census) void {
         .{ .name = "amplification limit binding", .value = census.amplification_binding },
         .{ .name = "connection errors seen", .value = census.closes_observed },
         .{ .name = "streams fully delivered", .value = census.streams_delivered },
+        .{ .name = "datagrams whole", .value = census.datagrams_whole },
+        .{ .name = "datagrams with loose padding", .value = census.datagrams_with_loose_padding },
+        .{ .name = "probes carrying data", .value = census.probes_carrying_data },
+        .{ .name = "probes carrying a bare PING", .value = census.probes_carrying_ping },
     };
     for (rows) |row| std.debug.print("  {s:<32} {d}\n", .{ row.name, row.value });
 
