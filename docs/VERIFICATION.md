@@ -422,7 +422,8 @@ collapses the window and the transfer resumes".
 **Status.** `sim/Link.zig` and `sim/main.zig` exist and run as `zig build sim`.
 The link has delay, jitter, a rotating loss mask, reordering, duplication, MTU
 and a token-bucket queue with tail drop. Five oracles are live and the census
-counts nineteen behaviours, twelve of them required.
+counts twenty-two behaviours, fifteen of them required, and an off-path
+attacker is on a third of the seeds.
 
 It is part of `zig build ci`. It was held out while the census reported
 behaviours no seed reached, because a gate that passes while saying so would be
@@ -541,9 +542,36 @@ because the accumulator is wrong rather than because the behaviour is absent —
 so the merge is now a `inline for` over the census's own fields and a new
 counter cannot be forgotten.
 
-Still to come: the adversary node, and fault injection. One census row no longer
-stays at zero: "packets declared lost" reads from the `poll` of §5.3 now that it
-exists.
+**The adversary node**, which §5.2 asked for and which is the last of the
+harness's own gaps but one. A third of seeds are watched by an off-path
+attacker: it sees everything that crosses the link, holds no key, and can
+therefore do exactly three things — send a datagram again, send part of one, or
+send one with a bit changed. That is not a small threat model. A replay is the
+only one of the three that authenticates, so it is the only one an endpoint has
+to *decide* about rather than discard, and the other two are the only routine
+source of packets that fail authentication.
+
+The oracle is the transfer completing, because an endpoint a stranger can stall
+is an endpoint anyone on the path can stall. Over 4096 seeds and about seven
+thousand injections, every handshake and every transfer completed and no
+endpoint reported an error. It found nothing, which is worth recording as
+plainly as a finding would be: the gate that pays out is not the same as the
+gate that was worth building, and this one is cheap to keep.
+
+**The oracle that would have caught the key update**, and did not exist. A run
+could end by reaching the virtual-time deadline without finishing, and that exit
+was silent — which is how a defect that stalled fifty-nine transfers in a sweep
+showed up as a census row going *down* rather than as a failure with a seed
+attached. A run that stops with the transfer unfinished and neither endpoint
+reporting anything is now a failure. Reverting the key fix turns it back into
+four named seeds in the first ten.
+
+Not modelled: forging an Initial packet. Its keys are derived from a connection
+identifier that travels in the clear, so an attacker who saw the first flight
+can seal one — and the defect that reached review by that route, a server
+adopting the Source Connection ID from any Initial it could open, is covered by
+a test in `Connection` instead. Fault injection — a seal that fails, a `now_ns`
+that jumps — is what is left.
 
 ### 5.3 Events out — **done**
 

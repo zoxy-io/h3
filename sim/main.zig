@@ -149,6 +149,12 @@ const Census = struct {
     /// sweep where loss recovery is one round trip slower than it reads.
     probes_carrying_data: u64 = 0,
     probes_carrying_ping: u64 = 0,
+    /// What the off-path attacker put back on the wire. It holds no key, so
+    /// everything it can do is done with what it has already seen: send it
+    /// again, send part of it, or send it with an octet changed.
+    adversary_replays: u64 = 0,
+    adversary_truncations: u64 = 0,
+    adversary_corruptions: u64 = 0,
 
     /// The counters that must move somewhere in a sweep. A zero here means the
     /// sweep did not reach the behaviour, so any confidence drawn from it about
@@ -214,7 +220,58 @@ const Census = struct {
                 return c.key_updates;
             }
         }.get },
+        .{ .name = "datagrams replayed by the adversary", .get = struct {
+            fn get(c: *const Census) u64 {
+                return c.adversary_replays;
+            }
+        }.get },
+        .{ .name = "datagrams truncated by the adversary", .get = struct {
+            fn get(c: *const Census) u64 {
+                return c.adversary_truncations;
+            }
+        }.get },
+        .{ .name = "datagrams corrupted by the adversary", .get = struct {
+            fn get(c: *const Census) u64 {
+                return c.adversary_corruptions;
+            }
+        }.get },
     };
+};
+
+/// An off-path attacker.
+///
+/// It sees everything that crosses the link and holds no key, which is the
+/// whole of what it can do: send a datagram again, send part of one, or send
+/// one with an octet changed. That is not a small threat model — a replay is
+/// the only one of the three a conforming endpoint must *decrypt* and then
+/// decide about, and the other two are the only routine source of packets that
+/// fail authentication.
+///
+/// What it must not be able to do is anything at all. The oracle is the
+/// transfer completing: an endpoint that a stranger can stall is an endpoint
+/// anyone on the path can stall.
+///
+/// Not modelled here: forging an Initial packet. The keys for those are derived
+/// from a connection identifier that travels in the clear, so an attacker who
+/// saw the first flight can seal one — and the defect that reached review by
+/// that route, a server adopting the source identifier from any Initial it
+/// could open, is covered by a test in `Connection` rather than from here.
+const Adversary = struct {
+    /// The last datagram seen in each direction: index 0 is client to server.
+    seen: [2][Link.datagram_octets_max]u8 = @splat(@splat(0)),
+    seen_len: [2]u32 = @splat(0),
+    /// How many injections this seed allows, and zero for a seed with no
+    /// attacker at all. Bounded, because a flood is a different experiment: it
+    /// would be measuring how long an endpoint takes to discard rubbish, not
+    /// whether it discards it.
+    budget: u32 = 0,
+
+    fn capture(self: *Adversary, direction: usize, datagram: []const u8) void {
+        if (self.budget == 0) return;
+        assert(datagram.len <= self.seen[direction].len);
+        @memcpy(self.seen[direction][0..datagram.len], datagram);
+        self.seen_len[direction] = @intCast(datagram.len);
+    }
 };
 
 /// Everything a failure needs to be understood without re-running it.
@@ -271,6 +328,7 @@ const World = struct {
     drain_steps: u32 = 0,
 
     census: Census = .{},
+    adversary: Adversary = .{},
     failure: ?Failure = null,
 };
 
@@ -353,6 +411,11 @@ fn buildWorld(seed: u64) World {
     // one no seed can be compared against.
     if (random.boolean()) {
         world.key_update_at = 1 + random.uintLessThan(u32, @max(2, world.payload_len / 2));
+    }
+    // And a third of them are watched by somebody. The same reasoning: a sweep
+    // where every seed has an attacker cannot say what the attacker changed.
+    if (random.uintLessThan(u8, 3) == 0) {
+        world.adversary.budget = 1 + random.uintLessThan(u32, 24);
     }
     // Content that a partial or reordered delivery cannot accidentally satisfy.
     for (&world.payload, 0..) |*octet, index| octet.* = @truncate(index *% 31 +% 7);
@@ -530,6 +593,50 @@ fn inspectDatagram(world: *World, datagram: []const u8, peer_id_octets: u8) void
     world.census.datagrams_with_loose_padding += 1;
 }
 
+/// Put something back on the wire, if this seed has an attacker and it has
+/// anything to work with.
+fn injectAdversary(world: *World, random: std.Random) void {
+    if (world.adversary.budget == 0) return;
+    // Sparse. The interesting question is whether an endpoint discards one of
+    // these correctly, and asking it once per step would drown the connection
+    // rather than test it.
+    if (random.uintLessThan(u8, 8) != 0) return;
+
+    const direction = random.uintLessThan(usize, 2);
+    const length = world.adversary.seen_len[direction];
+    if (length == 0) return;
+    const link = if (direction == 0) &world.to_server else &world.to_client;
+
+    var copy: [Link.datagram_octets_max]u8 = undefined;
+    @memcpy(copy[0..length], world.adversary.seen[direction][0..length]);
+    world.adversary.budget -= 1;
+
+    switch (random.uintLessThan(u8, 3)) {
+        // A replay. The only one of the three that authenticates, so it is the
+        // only one an endpoint has to *decide* about rather than discard:
+        // section 12.3's packet numbers are what make it a duplicate.
+        0 => {
+            world.census.adversary_replays += 1;
+            link.send(copy[0..length], world.now_ns, random);
+        },
+        // A truncation, which is what a middlebox with a smaller idea of the
+        // path produces as well as what an attacker does on purpose.
+        1 => {
+            const cut = 1 + random.uintLessThan(u32, length);
+            world.census.adversary_truncations += 1;
+            link.send(copy[0..cut], world.now_ns, random);
+        },
+        // And a flipped bit. Anywhere: in the header, in the protected packet
+        // number, in the ciphertext, in the tag.
+        else => {
+            const at = random.uintLessThan(u32, length);
+            copy[at] ^= @as(u8, 1) << random.int(u3);
+            world.census.adversary_corruptions += 1;
+            link.send(copy[0..length], world.now_ns, random);
+        },
+    }
+}
+
 fn fail(world: *World, what: []const u8, detail: u64) void {
     if (world.failure != null) return;
     world.failure = .{
@@ -633,22 +740,26 @@ fn stepOnce(world: *World) bool {
 
     // Then let each side put what it has on the wire.
     inline for (.{
-        .{ &world.client, &world.to_server, server_source.len },
-        .{ &world.server, &world.to_client, client_source.len },
+        .{ &world.client, &world.to_server, server_source.len, 0 },
+        .{ &world.server, &world.to_client, client_source.len, 1 },
     }) |pair| {
         const connection = pair[0];
         const link = pair[1];
         // The identifier length the *peer* issued, which is the only way a
         // short header's Destination Connection ID can be found.
         const peer_id_octets: u8 = pair[2];
+        const direction: usize = pair[3];
         var guard: u32 = 0;
         while (guard < 16) : (guard += 1) {
             const octets = connection.send(&datagram, world.now_ns) catch break;
             if (octets == 0) break;
             inspectDatagram(world, datagram[0..octets], peer_id_octets);
+            world.adversary.capture(direction, datagram[0..octets]);
             link.send(datagram[0..octets], world.now_ns, random);
         }
     }
+
+    injectAdversary(world, random);
 
     drainEvents(world);
     checkInvariants(world);
@@ -796,6 +907,19 @@ fn runSeed(seed: u64, census: *Census) ?Failure {
     if (world.failure == null and world.step >= steps_max) {
         fail(&world, "step budget exhausted without finishing", world.step);
     }
+    // And the other way a run can end without finishing: the virtual clock
+    // reaching the deadline. That exit was silent, and the silence cost
+    // something — a key update stalled fifty-nine transfers in a sweep and the
+    // only trace was a census row that had gone down. A run that stops with the
+    // transfer unfinished and nothing having gone wrong is a failure, and the
+    // "nothing having gone wrong" is what keeps a legitimate connection error
+    // out of it: a lossy path plus an adversarial schedule may end a connection,
+    // and that is the endpoint behaving.
+    if (world.failure == null and world.census.closes_observed == 0 and
+        world.received != world.payload_len)
+    {
+        fail(&world, "the transfer stopped and neither endpoint reported anything", world.received);
+    }
 
     if (world.received == world.payload_len and world.payload_len > 0) {
         census.transfers_completed += 1;
@@ -924,6 +1048,9 @@ fn printCensus(census: *const Census) void {
         .{ .name = "datagrams with loose padding", .value = census.datagrams_with_loose_padding },
         .{ .name = "probes carrying data", .value = census.probes_carrying_data },
         .{ .name = "probes carrying a bare PING", .value = census.probes_carrying_ping },
+        .{ .name = "adversary: replays", .value = census.adversary_replays },
+        .{ .name = "adversary: truncations", .value = census.adversary_truncations },
+        .{ .name = "adversary: corruptions", .value = census.adversary_corruptions },
     };
     for (rows) |row| std.debug.print("  {s:<32} {d}\n", .{ row.name, row.value });
 
