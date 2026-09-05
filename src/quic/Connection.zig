@@ -4036,12 +4036,49 @@ pub fn Connection(comptime config: Config) type {
             //# When packets of different types need to be sent, endpoints
             //# SHOULD use coalesced packets to send them in the same UDP
             //# datagram.
+            // Which packet carries section 14.1's padding. The *last* one, not
+            // the first: padding the Initial to 1200 leaves no room to coalesce
+            // anything behind it, so a server's flight goes out as an Initial
+            // datagram and a Handshake datagram instead of one — sixty per cent
+            // more octets against section 8.1's three-times budget, and two
+            // datagrams that both have to survive instead of one. The runner's
+            // `handshakeloss` case failed four runs out of four on that alone.
+            //
+            // "Last" is answered by the keys: levels are written oldest first,
+            // so the last one that can write is the newest this endpoint holds
+            // send keys for. It may decline to write, which is what the fallback
+            // after the loop is for.
+            var pad_level: Level = .initial;
+            for ([_]Level{ .initial, .handshake, .one_rtt }) |level| {
+                if (self.send_keys[@intFromEnum(level)] == null) continue;
+                if (self.spaces[@intFromEnum(level.space())].discarded) continue;
+                pad_level = level;
+            }
+
             var initial_ack_eliciting = false;
             var initial_written = false;
             var handshake_sent = false;
             for ([_]Level{ .initial, .handshake, .one_rtt }) |level| {
                 var eliciting = false;
-                const written = self.sendPacket(buffer[offset..limit], level, now_ns, &eliciting) catch 0;
+                // A client pads every datagram carrying an Initial; a server
+                // only those carrying an *ack-eliciting* one, because a bare ACK
+                // from a server neither probes the path nor needs to. For the
+                // Initial that is not answerable until its payload is built, so
+                // `sendPacket` decides; for a later level it is already known.
+                //
+                // Nothing is padded past `limit`, and that is correct rather
+                // than a shortfall: for an unvalidated server `limit` is
+                // section 8.1's three-times budget, and section 14.1 does not
+                // license exceeding it.
+                const owed = if (level == .initial)
+                    true
+                else
+                    initial_written and (self.side == .client or initial_ack_eliciting);
+                const floor: usize = if (level == pad_level and owed and limit >= initial_datagram_min)
+                    initial_datagram_min -| offset
+                else
+                    0;
+                const written = self.sendPacket(buffer[offset..limit], level, now_ns, &eliciting, floor) catch 0;
                 offset += written;
                 if (level == .initial and written > 0) initial_written = true;
                 if (level == .initial and eliciting) initial_ack_eliciting = true;
@@ -4049,66 +4086,43 @@ pub fn Connection(comptime config: Config) type {
             }
             if (offset == 0) return 0;
 
-            // Section 14.1: a datagram carrying a client Initial is padded to
-            // 1200 octets. The padding is zeroes, which *is* a PADDING frame,
-            // but it goes outside the packet rather than inside it — this
-            // endpoint has already sealed by now, and section 12.2 allows a
-            // datagram to be longer than the packets it carries.
-            //= https://www.rfc-editor.org/rfc/rfc9000#section-14.1
-            //# A client MUST expand the payload of all UDP datagrams carrying
-            //# Initial packets to at least the smallest allowed maximum datagram
-            //# size of 1200 bytes by adding PADDING frames to the Initial packet or
-            //# by coalescing the Initial packet; see Section 12.2.
-            //
-            //= https://www.rfc-editor.org/rfc/rfc9000#section-14.1
-            //# Similarly, a server MUST expand the payload of all UDP
-            //# datagrams carrying ack-eliciting Initial packets to at least the
-            //# smallest allowed maximum datagram size of 1200 bytes.
-            //
-            // The server's half, which was a `todo` here and — worse — was
-            // asserted the other way by a test that called the floor "the
-            // client's obligation". Both halves now run through the same
-            // padding, gated on what each side actually owes: a client pads
-            // every datagram carrying an Initial, a server only those carrying
-            // an *ack-eliciting* Initial, because a bare ACK from a server
-            // neither probes the path nor needs to.
-            //
-            // Padding past `limit` is not possible and that is correct: for an
-            // unvalidated server `limit` is section 8.1's three-times budget,
-            // and section 14.1 does not license exceeding it.
-            //
-            // Section 8.1 states the client's half of the floor as an obligation on the
-            // datagram rather than on the packet, which is the same padding read from
-            // the other end: this is the only place a datagram's length is decided.
-            //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1
-            //# Clients MUST ensure that UDP datagrams containing Initial
-            //# packets have UDP payloads of at least 1200 bytes, adding PADDING
-            //# frames as necessary.
-            //
-            // RFC 9001 section 9.3 states the same floor as a reflection defence rather
-            // than as a path check, and it is the same padding: a client's Initial is
-            // expanded to 1200 octets whatever it carries.
-            //= https://www.rfc-editor.org/rfc/rfc9001#section-9.3
-            //# First, the packet containing a ClientHello MUST be padded to a
-            //# minimum size.
-            // Whether this datagram *carries* an Initial packet, which is what
-            // section 14.1's floor is about. It used to ask whether the Initial
-            // keys still existed, which was a proxy — and a proxy that held only
-            // because the keys were discarded one event too early, immediately
-            // on installing Handshake keys. Correcting that discard turned the
-            // proxy false: a client with Initial keys it had not yet retired
-            // began padding datagrams that carried nothing but a 1-RTT packet,
-            // and a short header runs to the end of the datagram, so the
-            // padding landed inside the AEAD's ciphertext and every one of them
-            // failed to open at the peer. One bug held another one up.
-            const owes_padding = (self.side == .client and initial_written) or
-                initial_ack_eliciting;
-            if (owes_padding) {
+            // The fallback, and it is a real gap rather than a tidy ending: the
+            // level expected to carry the padding can decline to write — a
+            // server's ack-eliciting Initial probe with nothing owed at the
+            // Handshake level is the case — and a datagram carrying an Initial
+            // that falls short of 1200 is a MUST violated. Zeroes after the last
+            // packet are what section 14.1 does not name and what every peer
+            // nonetheless accepts, so they are what stands here until the send
+            // path can pad a packet it has already sealed.
+            if (initial_written and (self.side == .client or initial_ack_eliciting)) {
                 if (offset < initial_datagram_min and limit >= initial_datagram_min) {
                     @memset(buffer[offset..initial_datagram_min], 0);
                     offset = initial_datagram_min;
                 }
             }
+
+            // The remaining halves of section 14.1's floor, and section 8.1's
+            // statement of the same thing as an obligation on the datagram.
+            // All of them are met by the padding `sendPacket` writes into the
+            // Initial packet above; this is where the datagram's length is
+            // decided, so it is where they are recorded.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-14.1
+            //# Similarly, a server MUST expand the payload of all UDP
+            //# datagrams carrying ack-eliciting Initial packets to at least the
+            //# smallest allowed maximum datagram size of 1200 bytes.
+            //= type=test
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1
+            //# Clients MUST ensure that UDP datagrams containing Initial
+            //# packets have UDP payloads of at least 1200 bytes, adding PADDING
+            //# frames as necessary.
+            //= type=test
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9001#section-9.3
+            //# First, the packet containing a ClientHello MUST be padded to a
+            //# minimum size.
+            //= type=test
+            //
             // Section 4.9.1, at the point it names: the Handshake packet is in
             // the datagram, so the Initial keys go. After the padding above
             // rather than before, because this datagram may still carry an
@@ -4253,7 +4267,13 @@ pub fn Connection(comptime config: Config) type {
 
         /// One packet at one level, or `error.Empty` when the level has nothing
         /// to say.
-        fn sendPacket(self: *Self, buffer: []u8, level: Level, now_ns: u64, ack_eliciting_out: *bool) !usize {
+        /// `datagram_floor` is section 14.1's 1200 octets when this packet is
+        /// the first in a datagram that owes them, and zero otherwise. It is
+        /// applied here rather than after the loop in `send` because padding is
+        /// a *frame*, and a frame has to be inside a packet: everything this
+        /// function writes lands under the AEAD, and everything written after
+        /// it returns does not.
+        fn sendPacket(self: *Self, buffer: []u8, level: Level, now_ns: u64, ack_eliciting_out: *bool, datagram_floor: usize) !usize {
             const index = @intFromEnum(level);
             const keys = self.send_keys[index] orelse return error.Empty;
             const space = &self.spaces[@intFromEnum(level.space())];
@@ -4349,7 +4369,33 @@ pub fn Connection(comptime config: Config) type {
             //= type=test
             const sample_floor = crypto.protect.sample_offset + crypto.protect.sample_octets;
             const carried = number_octets + payload_octets + crypto.tag_octets;
-            const padding = if (carried < sample_floor) @min(sample_floor - carried, payload_room - payload_octets) else 0;
+            var padding = if (carried < sample_floor) @min(sample_floor - carried, payload_room - payload_octets) else 0;
+
+            // Section 14.1's floor, which the caller has already decided this
+            // datagram owes. It used to be met by zeroing the buffer *after*
+            // the last packet — legal enough, and not what section 14.1 says:
+            // the two ways it names are PADDING frames in the Initial packet
+            // and coalescing, and trailing zeroes are neither. A peer parses
+            // them as one more packet: quic-go read every one of ours as a
+            // short header it could not unprotect, and either discarded it or
+            // spent a slot in its undecryptable queue on it. Half the padded
+            // datagrams in a `handshakeloss` run ended that way.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-14.1
+            //# A client MUST expand the payload of all UDP datagrams carrying
+            //# Initial packets to at least the smallest allowed maximum datagram
+            //# size of 1200 bytes by adding PADDING frames to the Initial packet or
+            //# by coalescing the Initial packet; see Section 12.2.
+            //= type=test
+            // The caller has already applied this test for every level but the
+            // Initial, whose payload is not built until here: a client pads
+            // every datagram carrying an Initial, a server only those carrying
+            // an ack-eliciting one.
+            const owes_floor = level != .initial or self.side == .client or written.ack_eliciting;
+            // `overhead` above is the same header-plus-tag total this needs.
+            if (owes_floor and datagram_floor > overhead + payload_octets + padding) {
+                const wanted = datagram_floor - overhead - payload_octets;
+                padding = @min(wanted, payload_room - payload_octets);
+            }
             // A PADDING frame is a zero octet, and `buffer` is not otherwise
             // initialised.
             //= https://www.rfc-editor.org/rfc/rfc9000#section-19.1
@@ -6138,6 +6184,27 @@ test "section 3.2: an abandoned stream still gives its credit back" {
     }
     try testing.expect(server.findStream(0) == null);
     try testing.expectEqual(before + 1, server.streams.advertised_bidi);
+}
+
+test "section 14.1: the padding is inside the packet, not after it" {
+    // The floor used to be met by zeroing the datagram after the last packet.
+    // Legal enough, and not what section 14.1 says: the two ways it names are
+    // PADDING frames in the Initial packet and coalescing, and trailing zeroes
+    // are neither. A peer parses them as one more packet — quic-go read every
+    // one of ours as a short header it could not unprotect — and a datagram
+    // whose packets do not account for its length is a datagram half of which
+    // is thrown away on arrival.
+    var client = testClient();
+    try client.cryptoIn(.initial, "ClientHello");
+
+    var datagram: [TestConnection.datagram_octets]u8 = @splat(0);
+    const octets = try client.send(&datagram, 0);
+    try testing.expectEqual(@as(usize, initial_datagram_min), octets);
+
+    // The datagram is one packet and nothing else: `parse` reports the packet's
+    // own length, and it accounts for every octet.
+    const parsed = try packet.parse(datagram[0..octets], 0);
+    try testing.expectEqual(octets, parsed.octets);
 }
 
 //= https://www.rfc-editor.org/rfc/rfc9001#section-5.7

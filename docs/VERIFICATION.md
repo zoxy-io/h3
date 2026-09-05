@@ -116,6 +116,8 @@ requirement list extracted from the specification.
 | RFC 9001 §5.7's "a server MUST NOT process incoming 1-RTT packets before the handshake is complete" was recorded as satisfied by construction — a 1-RTT key exists only when the handshake is complete — which is true of a client and false of a server | the same case | The argument is written next to the rule and reads as a proof; a TLS 1.3 server holds application keys one flight before it verifies the client |
 | The interop client's `Session` carried its completion counter across connections, so every connection after the first returned at once having done nothing — and reported success | the runner counting handshakes in the capture | The shim said "1 of 1 requests" fifty times and exited zero; only an independent count of what reached the wire disagreed |
 | The interop server retired a peer after five seconds of silence while advertising no idle timeout at all, so it dropped connections whose peer was still probing | the same case | Five seconds is longer than anything a working path needs and shorter than a probe timeout that has backed off twice |
+| Section 14.1's 1200-octet floor was met by zeroing the datagram *after* the last packet, which is neither of the two ways the sentence names — a peer parses the zeroes as one more packet and throws it away | reading quic-go's log while chasing `handshakeloss` | Every peer accepts it, so nothing fails; what it costs is a slot in the peer's undecryptable queue and half of every padded datagram |
+| Moving that padding into the *first* packet then stopped the coalescing, so a server's flight went out as two datagrams instead of one — sixty per cent more octets against section 8.1's budget, and two datagrams that both have to survive | `handshakeloss`, which went from two runs in three to none in four | The unit tests only ask whether the datagram reaches 1200; which packet holds the padding is invisible to them |
 
 Two things about that table.
 
@@ -805,10 +807,11 @@ against quic-go's client: eight of eight** — `handshake`, `transfer`,
 `chacha20`, `retry`, `http3`, `transferloss`, `multiplexing` and
 `handshakeloss`, with `keyupdate` on the client side as well.
 
-`handshakeloss` is the one to read the small print on. It passes, and not every
-time: three runs of three as a client, two of three as a server. See below for
-what it took and what is still behind the run that failed. Every other case has
-passed on every run since the work that fixed it.
+`handshakeloss` is the one to read the small print on: it is fifty connections
+through 30% loss and a `multiconnect` client abandons the run on the first one
+it loses, so it is the case most able to fail for reasons that are nobody's
+fault. Three runs of three in both roles on the last measurement. Every other
+case has passed on every run since the work that fixed it.
 
 Four defects fell out of the attempt, all in the table in §1: the eight-span
 reassembly limit, a probe count that outlived its space, a server that refilled
@@ -1032,15 +1035,41 @@ first connection it loses. So `handshakeloss` is a case this package passes and
 does not pass reliably, which is worth more written down than a number that
 looks like a verdict.
 
+##### The padding, and which packet holds it — **fixed, after getting it wrong once**
+
+§14.1's floor was met by zeroing the datagram after the last packet. The
+sentence names two ways to reach 1200 octets — PADDING frames in the Initial
+packet, or coalescing — and trailing zeroes are neither. Every peer accepts
+them, which is why it had never failed anything: quic-go parses them as one more
+packet, cannot unprotect it, and either discards it or spends a slot in its
+undecryptable queue on it.
+
+The first attempt put the padding in the Initial packet, which is what §14.1
+literally says, and it made things worse: an Initial padded to 1200 leaves no
+room to coalesce anything behind it, so a server's flight went out as an Initial
+datagram *and* a Handshake datagram — sixty per cent more octets against §8.1's
+three-times budget, and two datagrams that both have to survive instead of one.
+`handshakeloss` went from two runs in three to none in four. The unit tests
+could not see it: they ask whether the datagram reaches 1200, and which packet
+holds the padding is invisible to that question. The runner asked a different
+one.
+
+What works is padding the *last* packet, and "last" is answered by the keys —
+levels are written oldest first, so the last one that can write is the newest
+this endpoint holds send keys for. A client's first flight pads its Initial; a
+server's flight coalesces Initial and Handshake and pads the Handshake. Both
+roles now pass `handshakeloss` three runs of three, and a client's datagrams
+carry no trailing zeroes at all: twelve "not a QUIC packet" in a run before,
+none after.
+
 What is left here:
 
-- **The datagram padding is appended after the last packet rather than put
-  inside one.** RFC 9000 §14.1 names two ways to reach 1200 octets — PADDING
-  frames in the Initial packet, or coalescing — and trailing zeros are neither.
-  quic-go parses them as a short-header packet and either discards them or
-  queues them for later decryption, which spends a queue slot a real packet
-  could have used. Twelve of twenty-four coalesced datagrams in one run ended
-  that way. It is the leading suspect for what is left of the tail above.
+- **A probe does not coalesce packets from other spaces**, which RFC 9002 §6.2.4
+  asks for and which the ledger already carries as a `type=todo`. It is why the
+  padding fallback still fires on a server: an ack-eliciting Initial probe with
+  nothing owed at the Handshake level has no later packet to put the padding in,
+  so eleven of fifteen padded server datagrams still end in zeroes. Fixing the
+  coalescing would remove most of them and improve recovery at the same time.
 
 #### The other outside evidence: `corpus/qifs.zig` — **done**
 

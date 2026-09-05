@@ -284,8 +284,8 @@ Run the matrix twice before believing it. `http3` depends on where a DATA
 frame's last octet falls relative to the FIN, and a defect there failed one run
 and passed the next. `handshakeloss` is fifty connections through 30% loss and
 a `multiconnect` client abandons the run on the first one it loses, so it
-passes most runs rather than all of them — three of three as a client and two
-of three as a server on the last measurement.
+is the case most able to fail for reasons that are nobody's fault — three of
+three in both roles on the last measurement.
 
 ## h3spec
 
