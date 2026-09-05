@@ -2,7 +2,7 @@
 
 Why the review keeps finding what the gates do not, what the other QUIC stacks
 run that this package does not, and the order in which to close the gap.
-Written 2026-09-02, revised 2026-09-03 against commit `8e77c63`. [DESIGN.md](DESIGN.md) is the
+Written 2026-09-02, revised 2026-09-05 against commit `7411c7a`. [DESIGN.md](DESIGN.md) is the
 argument for the code; this is the argument for the evidence.
 
 ---
@@ -96,6 +96,12 @@ requirement list extracted from the specification.
 | A probe owed by a discarded packet number space was never cleared, so a stalled connection reported probes outstanding on two spaces that no longer existed | reading a stall the runner produced | Nothing acts on the count, so nothing could notice it was wrong — it cost an hour of looking at the wrong thing |
 | The server refilled its send buffer only when a datagram arrived, so a client waiting for a download and a server waiting for a datagram waited for each other | the runner, `transfer` against quic-go's client | Every earlier test had a peer that kept talking |
 | The server truncated any response over two megabytes and served the prefix as if it were the file | the runner, which compares byte for byte | A cap chosen for memory that was never about memory: the body is streamed in scratch-sized pieces |
+| Reclamation advanced the send buffer only on a range that began exactly where the acknowledged prefix ended, so the first acknowledgement that arrived out of order stopped it permanently | the runner, `transfer` against quic-go's client | The rule is right for a path that never reorders, and every test path was one |
+| Reclaiming past the framing watermark dropped octets a spurious loss had put back, so the stream carried a hole and the far end answered FLOW_CONTROL_ERROR | the runner, once reclamation kept up | Two correct-looking rules — release what is acknowledged, re-frame what is lost — that contradict each other only when both fire on the same octets |
+| `wantsSend` did not consider flow control, so an endpoint that owed a MAX_STREAM_DATA reported it had nothing to send, and a consumer that sends when told to never sent it | three streams at once, in a unit test written after the runner stalled | The accessor and the writer disagreed, and each is right on its own |
+| No DATA_BLOCKED or STREAM_DATA_BLOCKED frame was ever sent, so a lost window update deadlocked the connection with no way for either endpoint to learn why | the same stall | RFC 9000 section 4.1 reads like a courtesy; it is the only thing that breaks the tie |
+| A lost MAX_DATA or MAX_STREAM_DATA was never sent again: the limit is recorded when the frame is *written*, so the threshold that decides the next one had already moved past it | the same stall | Loss detection needs later packets to declare the loss, and a deadlocked connection has none |
+| A packet whose payload came to fewer than four octets could not be sealed — RFC 9001 section 5.4.2's sample — and `send` turned that into "nothing to send". A lone HANDSHAKE_DONE is one octet; so is a lone PING probe | fixing the flow control above, which removed the MAX_DATA that had been padding the first 1-RTT packet by accident | One bug was holding another one up, for the second time in this document |
 
 Two things about that table.
 
@@ -780,31 +786,74 @@ tells them apart.
 
 **As a client, against quic-go's server: seven of eight.** `handshake`,
 `transfer`, `chacha20`, `retry`, `http3`, `transferloss` and `keyupdate` pass.
-`handshakeloss` does not: it is fifty connections through 30% loss in three
-hundred seconds, and about thirty-eight finish. Nothing is wrong with any one
+`multiplexing` fails for the reason given below, which is a gap on both sides.
+`handshakeloss` does not pass either: it is fifty connections through 30% loss
+in three hundred seconds, and about thirty-eight finish. Nothing is wrong with any one
 of them — the median handshake is half a second — but the tail is RFC 9002's
 PTO backoff at 1, 2, 4, 8, 16 seconds, and enough connections reach the far end
 of it to run out the budget. That is a performance property rather than a
 defect, and it is the honest place to leave it: not a rule broken, a recovery
 slower than quic-go's.
 
-**As a server, against quic-go's client: five of eight** on the last run —
-`handshake`, `chacha20`, `retry`, `http3` and `transferloss` — with `transfer`,
-`multiplexing` and `handshakeloss` failing on multi-stream transfers of several
-megabytes at once. Two defects in that path were found and fixed and a third is
-still there; the runs also vary, because the runner draws new file sizes each
-time. Written down as five of eight rather than rounded up.
+**As a server, against quic-go's client: six of eight** — `handshake`,
+`transfer`, `chacha20`, `retry`, `http3` and `transferloss`. `multiplexing` and
+`handshakeloss` fail, each for a reason named below.
 
-Four more defects fell out of the attempt, all in the table in §1: the
-eight-span reassembly limit, a probe count that outlived its space, a server
-that refilled its send buffer only on inbound datagrams, and a server that
-truncated responses over two megabytes and served the prefix.
+Four defects fell out of the attempt, all in the table in §1: the eight-span
+reassembly limit, a probe count that outlived its space, a server that refilled
+its send buffer only on inbound datagrams, and a server that truncated
+responses over two megabytes and served the prefix.
+
+##### The multi-stream stall — **fixed, and six defects deep**
+
+`transfer` failed as a server on three simultaneous streams carrying several
+megabytes: both endpoints idle, neither of them wrong. It took six fixes, and
+the chain is the interesting part, because each one uncovered the next.
+
+1. **The send buffer was never reclaimed** — found earlier, and the reason the
+   file stopped at 64 KiB.
+2. **Reclamation by exact contiguity**: only a range beginning exactly where
+   the acknowledged prefix ended advanced the buffer, so the first
+   acknowledgement to arrive out of order stopped it for good. What replaced it
+   asks a different question — how much of this stream is still in any
+   unacknowledged packet — and releases everything below that.
+3. **Releasing past the framing watermark.** A loss rewinds framing to the
+   start of the lost range, so those octets are back in the buffer waiting; and
+   they can sit *below* the highest offset the peer has acknowledged, because
+   acknowledgements do not arrive in order. Releasing them put a hole in the
+   stream, and the far end reported it as FLOW_CONTROL_ERROR — a name three
+   removes from the cause.
+4. **`wantsSend` did not consider flow control**, so an endpoint owing a
+   MAX_STREAM_DATA said it had nothing to send.
+5. **The deadlock underneath all of it: a lost window update.** The limit is
+   recorded when the frame is *written*, so a lost MAX_STREAM_DATA is never
+   re-sent, and the threshold deciding when to send the next one has already
+   moved past it. Loss detection cannot break the tie either — it needs later
+   packets to declare the loss, and a deadlocked connection has none. Two fixes
+   close it: RFC 9000 §4.1's DATA_BLOCKED and STREAM_DATA_BLOCKED, which are
+   the only thing that tells a receiver its update never landed, and §13.3's
+   re-advertisement of the current limit when the packet carrying it is lost.
+6. **RFC 9001 §5.4.2's padding**, which fell out of fixing (5). Starting
+   `max_data_sent` at the limit the transport parameters had already carried —
+   rather than at zero, which made every connection owe a MAX_DATA from its
+   first packet — took away the frame that had been padding the first 1-RTT
+   packet by accident. Four tests failed at once: a payload under four octets
+   cannot be sealed, and `send` reported that as "nothing to send". A lone
+   HANDSHAKE_DONE is one octet. So is a lone PING probe.
+
+Five of the six are invisible to a peer that neither reorders nor loses
+anything, which is every test path this package had.
 
 What is left here:
 
-- **The server's multi-stream transfer path**, which stalls on three
-  simultaneous streams carrying ten megabytes between them. The client side of
-  the same path is fine, and so is the server on one stream.
+- **`multiplexing`**, which is 1999 files on one connection and whose stated
+  purpose is that "server increased stream limits to accommodate client
+  requests". No MAX_STREAMS frame is generated anywhere in this package:
+  `Streams.open` never frees a slot, so `streams_max` is a lifetime limit on a
+  connection rather than a concurrency one. The client opens its eight, sends
+  STREAMS_BLOCKED, and waits out the idle timeout. Closing it means retiring
+  finished streams and a watermark that tells a retired identifier from a new
+  one — a slice of its own, and the next one.
 - **Recovery under heavy loss**, which is what `handshakeloss` measures.
 
 #### The other outside evidence: `corpus/qifs.zig` — **done**
@@ -837,7 +886,7 @@ external evidence means choosing which disagreements are possible.
 
 ### 5.6 Structure — only if rewriting anyway
 
-`Connection.zig` is 5977 lines, roughly half of them RFC citations. Both send-path findings were
+`Connection.zig` is 8127 lines, roughly half of them RFC citations. Both send-path findings were
 about the order in which state is committed, so a rewrite would separate the
 send scheduler from the packet builder, and pull address validation and the
 amplification budget into a struct with its own invariant check the simulator

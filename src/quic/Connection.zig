@@ -310,6 +310,10 @@ pub fn Connection(comptime config: Config) type {
         /// range: losing it has to re-owe the frame or the client never
         /// confirms.
         handshake_done: bool = false,
+        /// And whether it carried a window update, for the same reason: RFC
+        /// 9000 section 13.3 repairs a lost MAX_DATA or MAX_STREAM_DATA by
+        /// sending the current limit again, and nothing else will.
+        flow_control: bool = false,
     };
 
     // RFC 9001 section 6: 1-RTT keys come in generations, and the Key Phase
@@ -778,15 +782,14 @@ pub fn Connection(comptime config: Config) type {
 
         /// Sections 2, 3 and 4: the streams and their flow control.
         streams: ConnectionStreams = .{},
-        /// The limit last advertised, so a new one goes out only when it has
-        /// moved enough to be worth a frame.
+        /// The connection-level limit last advertised, so a new MAX_DATA goes
+        /// out only when the window has moved enough to be worth a frame.
         ///
-        /// There was a `max_streams_sent` beside this, written nowhere and read
-        /// nowhere. This endpoint's stream limit is `streams_max`, a comptime
-        /// bound that never moves, so there is no "last advertised" value to
-        /// remember and no MAX_STREAMS to re-send — the field was a placeholder
-        /// for a frame this package does not generate.
-        max_data_sent: u64 = 0,
+        /// It starts at the limit the transport parameters carried rather than
+        /// at zero. A connection that had already advertised its initial window
+        /// and counted it as unsent would owe a MAX_DATA from its very first
+        /// packet, repeating what the handshake had just said.
+        max_data_sent: u64 = config.connection_receive_octets,
 
         //= https://www.rfc-editor.org/rfc/rfc9001#section-4.1.2
         //# The server MUST send a HANDSHAKE_DONE frame as soon as the handshake
@@ -3188,8 +3191,14 @@ pub fn Connection(comptime config: Config) type {
                 // direction, and section 19.13 makes it a connection error.
                 .stream_data_blocked => |value| {
                     if (!self.streams.peerMaySend(value.stream)) return error.StreamState;
+                    // The peer has data and no credit. Whatever this endpoint
+                    // believes it granted, the peer did not get it — so say the
+                    // current limit again rather than waiting for a threshold
+                    // that has already moved past it.
+                    if (self.streams.find(value.stream)) |stream| stream.max_data_sent = 0;
                 },
-                .data_blocked, .streams_blocked => {},
+                .data_blocked => self.max_data_sent = 0,
+                .streams_blocked => {},
                 //= https://www.rfc-editor.org/rfc/rfc9000#section-19.8
                 //# An endpoint MUST terminate the connection with error
                 //# STREAM_STATE_ERROR if it receives a STREAM frame for a locally
@@ -3581,6 +3590,37 @@ pub fn Connection(comptime config: Config) type {
             return self.streams.find(id);
         }
 
+        /// Give back the part of a stream's send buffer nothing can still need.
+        ///
+        /// An octet is needed only while some unacknowledged packet carries it,
+        /// so the buffer may be released up to the *oldest outstanding* packet's
+        /// starting offset — capped by the highest offset actually
+        /// acknowledged, since a stream with nothing in flight has still only
+        /// been acknowledged so far.
+        ///
+        /// The first version of this asked a different question — "does this
+        /// acknowledgement begin exactly where the last one ended?" — and
+        /// dropped anything that did not. That is fine while acknowledgements
+        /// arrive in order and permanently wrong once they do not: one
+        /// out-of-order report and the watermark never moves again, because the
+        /// range that would have advanced it has already been reported and will
+        /// not be reported twice. The interop runner found it as a 5 MiB
+        /// transfer that stopped at 256 KiB with a full send buffer, a peer
+        /// whose limits had room, and two smaller streams on the same
+        /// connection finishing normally.
+        fn reclaimStream(self: *Self, id: u64) void {
+            var oldest: ?u64 = null;
+            // Bounded by `sent_max`, which is the same order of work loss
+            // detection already does on every acknowledgement.
+            for (self.recovery.inFlight(.application)) |sent| {
+                const context = sent.context;
+                if (context.stream != id) continue;
+                if (context.stream_end <= context.stream_start) continue;
+                oldest = @min(oldest orelse context.stream_start, context.stream_start);
+            }
+            self.streams.release(id, oldest);
+        }
+
         /// Section 4.9: drop a level's keys and its packet number space.
         fn discard(self: *Self, level: Level) void {
             assert(@intFromEnum(level) < self.send_keys.len);
@@ -3658,7 +3698,8 @@ pub fn Connection(comptime config: Config) type {
                 // file larger than one buffer: the transfer stopped at 64 KiB
                 // with both endpoints idle and neither wrong.
                 if (context.stream_end > context.stream_start) {
-                    self.streams.reclaim(context.stream, context.stream_start, context.stream_end);
+                    self.streams.acknowledge(context.stream, context.stream_end);
+                    self.reclaimStream(context.stream);
                 }
                 if (!context.stream_fin) continue;
                 const stream = self.streams.find(context.stream) orelse continue;
@@ -3726,6 +3767,33 @@ pub fn Connection(comptime config: Config) type {
                 if (context.handshake_done) self.handshake_done_framed = false;
                 if (context.stream_end > context.stream_start or context.stream_fin) {
                     self.streams.rewind(context.stream, context.stream_start, context.stream_fin);
+                }
+                // Outside the stream branch: a packet carrying only window
+                // updates has no byte range to rewind, and it is exactly the
+                // packet whose loss deadlocks the connection.
+                //
+                // Section 13.3 asks for the *current* limit rather than the
+                // frame that was lost, which is what zeroing the watermarks
+                // does: the next packet re-advertises whatever the windows are
+                // now, and limits only rise, so that is at least what was lost.
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-13.3
+                //# The current connection maximum data is sent in MAX_DATA frames.
+                //# An updated value is sent in a MAX_DATA frame if the packet
+                //# containing the most recently sent MAX_DATA frame is declared lost
+                //# or when the endpoint decides to update the limit.
+                //= type=test
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-13.3
+                //# The current maximum stream data offset is sent in MAX_STREAM_DATA
+                //# frames.  Like MAX_DATA, an updated value is sent when the packet
+                //# containing the most recent MAX_STREAM_DATA frame for a stream is
+                //# lost or when the limit is updated, with care taken to prevent the
+                //# frame from being sent too often.
+                //= type=test
+                if (context.flow_control) {
+                    self.max_data_sent = 0;
+                    self.streams.reoweFlowControl();
+                    self.streams.reoweBlocked();
                 }
             }
         }
@@ -4145,6 +4213,35 @@ pub fn Connection(comptime config: Config) type {
                 return error.Empty;
             }
 
+            // Section 5.4.2 makes the padding the *sender's* obligation, and
+            // nothing here did it. `seal` refuses a packet whose packet number
+            // and protected payload are shorter than the sample — correctly,
+            // since the peer could not unprotect one — and `send` turns that
+            // refusal into `error.Empty`, so a packet whose payload came to
+            // fewer than four octets was built and silently dropped. A lone
+            // HANDSHAKE_DONE is one octet; so is a lone PING probe.
+            //
+            // It hid behind flow control: the connection-level `MAX_DATA` was
+            // recorded as unsent at startup, so the first 1-RTT packet a
+            // connection ever sent carried one and was long enough by accident.
+            // Recording the limit the transport parameters already carried took
+            // the accident away and four tests failed at once.
+            //= https://www.rfc-editor.org/rfc/rfc9001#section-5.4.2
+            //# To ensure that sufficient data is available for sampling,
+            //# packets are padded so that the combined lengths of the encoded
+            //# packet number and protected payload is at least 4 bytes longer
+            //# than the sample required for header protection.
+            //= type=test
+            const sample_floor = crypto.protect.sample_offset + crypto.protect.sample_octets;
+            const carried = number_octets + payload_octets + crypto.tag_octets;
+            const padding = if (carried < sample_floor) @min(sample_floor - carried, payload_room - payload_octets) else 0;
+            // A PADDING frame is a zero octet, and `buffer` is not otherwise
+            // initialised.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-19.1
+            //# A PADDING frame (type=0x00) has no semantic value.
+            @memset(buffer[header.header_octets + payload_octets ..][0..padding], 0);
+            const sealed_octets = payload_octets + padding;
+
             // A long header's Length field was reserved at a fixed width above
             // and is written back now that the payload's size is known. This is
             // section 16's non-minimal encoding used for the one thing it is
@@ -4152,7 +4249,7 @@ pub fn Connection(comptime config: Config) type {
             // being a different length and moving the payload out from under
             // what was just built.
             if (level != .one_rtt) {
-                const length = @as(u64, number_octets) + payload_octets + crypto.tag_octets;
+                const length = @as(u64, number_octets) + sealed_octets + crypto.tag_octets;
                 const at = header.packet_number_offset - length_field_octets;
                 varint.encodeIn(buffer[at..][0..length_field_octets], length, length_field_octets) catch unreachable; // The width was chosen at comptime to hold any length this datagram can carry.
             }
@@ -4178,7 +4275,7 @@ pub fn Connection(comptime config: Config) type {
             //# (see Appendix B.2) to be larger than the congestion window, unless
             //# the packet is sent on a PTO timer expiration (see Section 6.2) or
             //# when entering recovery (see Section 7.3.2).
-            const in_flight_estimate = header.header_octets + payload_octets + crypto.tag_octets;
+            const in_flight_estimate = header.header_octets + sealed_octets + crypto.tag_octets;
             if (written.ack_eliciting and space.probes_pending == 0 and
                 !self.recovery.canSend(in_flight_estimate))
             {
@@ -4186,7 +4283,7 @@ pub fn Connection(comptime config: Config) type {
                 return error.Empty;
             }
 
-            const total = keys.seal(buffer, header.packet_number_offset, header.header_octets, payload_octets, number) catch {
+            const total = keys.seal(buffer, header.packet_number_offset, header.header_octets, sealed_octets, number) catch {
                 self.rollback(level, undo, written);
                 return error.Empty;
             };
@@ -4276,6 +4373,7 @@ pub fn Connection(comptime config: Config) type {
                     .stream_end = written.stream_end,
                     .stream_fin = written.stream_fin,
                     .handshake_done = written.handshake_done,
+                    .flow_control = written.flow_control,
                 },
             }) catch {};
             return total;
@@ -4377,6 +4475,8 @@ pub fn Connection(comptime config: Config) type {
             /// Absolute stream offsets, matching `PacketContext`.
             stream_start: u64 = 0,
             stream_end: u64 = 0,
+            /// Whether it carried a window update; see `PacketContext`.
+            flow_control: bool = false,
             /// Whether this packet carried the stream's FIN. Tracked apart from
             /// the range because a FIN carries no octets, so a lost one has no
             /// byte range to rewind.
@@ -4597,7 +4697,15 @@ pub fn Connection(comptime config: Config) type {
                         result.ack_eliciting = true;
                     }
                 }
-                offset += self.writeFlowControl(payload[offset..]);
+                const credit = self.writeFlowControl(payload[offset..]);
+                offset += credit;
+                if (credit > 0) result.flow_control = true;
+                const blocked = self.writeBlocked(payload[offset..]);
+                offset += blocked;
+                if (blocked > 0) {
+                    result.flow_control = true;
+                    result.ack_eliciting = true;
+                }
                 const framed = self.writeStream(payload[offset..], &result);
                 offset += framed;
                 if (framed > 0) result.ack_eliciting = true;
@@ -4617,6 +4725,68 @@ pub fn Connection(comptime config: Config) type {
         /// MAX_DATA per octet consumed would spend more of the connection on
         /// flow control than on data, and a peer only needs the limit before it
         /// runs out.
+        /// Whether a window update is owed, asked with the same arithmetic
+        /// `writeFlowControl` uses to write one.
+        ///
+        /// `wantsSend` did not consider flow control at all, so an endpoint
+        /// that owed a MAX_STREAM_DATA reported that it had nothing to send. A
+        /// consumer that sends when `wantsSend` says so — which is what the
+        /// accessor is for — then never sends the update, the peer stops at its
+        /// limit, and both endpoints wait: the sender for credit, the receiver
+        /// for data. Found as a three-stream transfer that stopped with an
+        /// *empty* send buffer and `send_limit` exactly equal to what had been
+        /// sent.
+        fn owesFlowControl(self: *const Self) bool {
+            if (self.streams.receiveLimit() >= self.max_data_sent + config.connection_receive_octets / 2) {
+                return true;
+            }
+            // Bounded by `count`, which never exceeds `streams_max`.
+            for (self.streams.streams[0..self.streams.count]) |*stream| {
+                if (stream.send_state == .reset) continue;
+                if (!self.streams.weMayReceive(stream.id)) continue;
+                const limit = stream.receiveLimit();
+                if (limit >= stream.max_data_sent + config.stream_receive_octets / 2) return true;
+            }
+            return false;
+        }
+
+        /// RFC 9000 section 4.1's blocked reports.
+        ///
+        /// A sender that has data and no credit tells the receiver so. It reads
+        /// like a courtesy and is not one: a window update is an ordinary frame
+        /// and an ordinary frame can be lost, and once it is, the receiver
+        /// believes the credit was granted and the sender waits for credit that
+        /// will never be re-sent. Nothing else in the protocol breaks that tie —
+        /// loss detection needs later packets to declare the loss, and a
+        /// deadlocked connection has none.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-4.1
+        //# A sender SHOULD send a STREAM_DATA_BLOCKED or DATA_BLOCKED frame to
+        //# indicate to the receiver that it has data to write but is blocked by
+        //# flow control limits.
+        //= type=test
+        fn writeBlocked(self: *Self, target: []u8) usize {
+            var offset: usize = 0;
+            if (self.streams.send_blocked) {
+                offset += frame.encode(target[offset..], .{ .data_blocked = .{
+                    .limit = self.streams.send_limit,
+                } }) catch 0;
+                if (offset > 0) self.streams.send_blocked = false;
+            }
+            // Bounded by `count`, which never exceeds `streams_max`.
+            for (self.streams.streams[0..self.streams.count]) |*stream| {
+                if (!stream.send_blocked) continue;
+                if (offset >= target.len) break;
+                const written = frame.encode(target[offset..], .{ .stream_data_blocked = .{
+                    .stream = stream.id,
+                    .limit = stream.send_limit,
+                } }) catch 0;
+                if (written == 0) break;
+                offset += written;
+                stream.send_blocked = false;
+            }
+            return offset;
+        }
+
         fn writeFlowControl(self: *Self, target: []u8) usize {
             var offset: usize = 0;
             const limit = self.streams.receiveLimit();
@@ -4974,6 +5144,8 @@ pub fn Connection(comptime config: Config) type {
                 if (space.probes_pending > 0 and !space.discarded) return true;
             }
             if (self.streams.wantsSend()) return true;
+            if (self.owesFlowControl()) return true;
+            if (self.streams.owesBlocked()) return true;
             for (0..Level.count) |index| {
                 const level: Level = @enumFromInt(index);
                 if (self.send_keys[index] == null) continue;
@@ -6285,6 +6457,124 @@ test "RFC 9001 section 4.1.2: the server sends HANDSHAKE_DONE" {
     try testing.expect(client.recovery.handshake_confirmed);
 }
 
+/// Move `octets` from `from` to `to` on stream 0, and drain the
+/// acknowledgements behind them. Bounded: a pair that stops making progress
+/// should fail a test rather than hang it.
+fn transfer(from: *TestConnection, to: *TestConnection, octets: usize) !void {
+    const filler: [1024]u8 = @splat('x');
+    var offered: usize = 0;
+    for (0..64) |_| {
+        while (offered < octets) {
+            const room = @min(filler.len, octets - offered);
+            const taken = try from.write(0, filler[0..room], false);
+            if (taken == 0) break;
+            offered += taken;
+        }
+        if (try deliver(from, to, 0) == 0 and to.readable(0).len >= octets) break;
+        _ = try deliver(to, from, 0);
+    }
+    try testing.expect(to.readable(0).len >= octets);
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9000#section-4.1
+//# A receiver MUST close the connection with an error of type
+//# FLOW_CONTROL_ERROR if the sender violates the advertised connection
+//# or stream data limits; see Section 11 for details on error handling.
+//= type=test
+//= reason=The test below is about the *other* half of section 4.1 — that a
+//= receiver which owes a window update reports it. The violation half is
+//= tested by "section 4.1: a stream past its limit is a flow control error".
+test "section 4.1: an endpoint owing a window update says it wants to send" {
+    // `wantsSend` did not consider flow control at all, so an endpoint that
+    // owed a MAX_STREAM_DATA reported that it had nothing to send. A consumer
+    // that sends when `wantsSend` says so — which is what the accessor is for —
+    // then never sends the update, the peer stops at its limit, and both
+    // endpoints wait: the sender for credit, the receiver for data.
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+
+    const half = 8 * 1024 / 2; // `TestConnection`'s `stream_receive_octets`.
+    try transfer(&client, &server, half + 8);
+
+    // Nothing is owed: the acknowledgements are drained, and a window that has
+    // not moved needs no announcing.
+    for (0..8) |_| {
+        if (!server.wantsSend()) break;
+        if (try deliver(&server, &client, 0) == 0) break;
+    }
+    try testing.expect(!server.wantsSend());
+
+    // The application reads, which is the only thing that moves the window.
+    try server.consume(0, half + 8);
+    try testing.expect(server.wantsSend());
+}
+
+test "section 13.3: a lost window update is advertised again" {
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+
+    const half = 8 * 1024 / 2; // `TestConnection`'s `stream_receive_octets`.
+    try transfer(&client, &server, half + 8);
+    try server.consume(0, half + 8);
+    try testing.expect(server.owesFlowControl());
+
+    // The update goes out, and then nothing is owed.
+    for (0..8) |_| {
+        if (!server.wantsSend()) break;
+        if (try deliver(&server, &client, 0) == 0) break;
+    }
+    try testing.expect(!server.owesFlowControl());
+
+    // Section 13.3 asks for the current limit again when the packet carrying
+    // the last one is lost, and nothing else in the protocol repairs it:
+    // `max_data_sent` records what went on the wire, so the threshold that
+    // decides when to send the next update has already moved past the limit the
+    // peer is waiting for. Loss detection cannot help either — it needs later
+    // packets to declare the loss, and a deadlocked connection has none.
+    server.onPacketsLost(&.{.{ .level = .one_rtt, .flow_control = true }});
+    try testing.expect(server.owesFlowControl());
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9001#section-5.4.2
+//# To ensure that sufficient data is available for sampling,
+//# packets are padded so that the combined lengths of the encoded
+//# packet number and protected payload is at least 4 bytes longer
+//# than the sample required for header protection.
+//= type=test
+test "section 5.4.2: a packet with a one-octet payload is padded to the sample" {
+    // The padding is the sender's obligation and nothing here supplied it, so
+    // `seal` refused every packet whose payload came to fewer than four octets
+    // and `send` reported `error.Empty`. A lone PING is one octet; so is a lone
+    // HANDSHAKE_DONE.
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+    // Bounded: `wantsSend` staying true while `send` produces nothing is
+    // exactly the failure this test is about, and an unbounded drain would hang
+    // rather than fail.
+    for (0..8) |_| {
+        if (!client.wantsSend()) break;
+        if (try deliver(&client, &server, 0) == 0) break;
+    }
+    for (0..8) |_| {
+        if (!server.wantsSend()) break;
+        if (try deliver(&server, &client, 0) == 0) break;
+    }
+
+    // A probe with nothing to carry is a PING, and a PING is the whole payload.
+    client.spaces[@intFromEnum(Space.application)].probes_pending = 1;
+    var datagram: [TestConnection.datagram_octets]u8 = @splat(0);
+    const octets = try client.send(&datagram, 0);
+    try testing.expect(octets > 0);
+
+    // The peer unprotecting it is the point: section 5.4.2 has a receiver
+    // discard a packet too short to sample, so a sender that does not pad is
+    // sending packets nobody can read.
+    try server.receive(datagram[0..octets], 0);
+}
+
 //= https://www.rfc-editor.org/rfc/rfc9000#section-13.3
 //# The HANDSHAKE_DONE frame MUST be retransmitted until it is
 //# acknowledged.
@@ -7566,21 +7856,26 @@ test "a spuriously lost packet that is acknowledged anyway still reclaims" {
     }});
     try testing.expectEqual(@as(u32, 0), client.findStream(0).?.framed);
 
-    // And then acknowledged, because it arrived after all.
-    client.onPacketsDelivered(&.{.{
-        .level = .one_rtt,
-        .stream = 0,
-        .stream_start = 0,
-        .stream_end = framed,
-    }});
+    // And then acknowledged, because it arrived after all — through the
+    // server's own ACK, so that `Recovery` stops holding the packet. Reclaiming
+    // reads what is still in flight, so a test that only called the callback
+    // would be testing a connection that believes the packet is still out
+    // there.
+    try server.receive(datagram[0..octets], 1500);
+    _ = try deliver(&server, &client, 1600);
 
-    // The octets are the peer's, so they are gone from the buffer and will not
-    // be sent again — which is the point of reclaiming them rather than only
-    // not crashing.
+    // Nothing is released yet, and that is the point: the loss rewound `framed`
+    // to zero, so as far as this endpoint is committed those octets have not
+    // been sent. Releasing them because a *later* acknowledgement named a
+    // higher offset would drop data the peer may never have received.
+    try testing.expectEqual(@as(u64, 0), client.findStream(0).?.send_offset);
+
+    // Sending them again is what makes them releasable, and then they go.
+    _ = try deliver(&client, &server, 2000);
+    _ = try deliver(&server, &client, 2100);
     const after = client.findStream(0).?;
-    try testing.expectEqual(@as(u64, framed), after.send_offset);
-    try testing.expectEqual(@as(u32, 0), after.framed);
-    try testing.expectEqual(@as(u32, @intCast(body.len)) - framed, after.send_len);
+    try testing.expect(after.send_offset > 0);
+    try testing.expect(after.send_len < body.len);
 }
 
 test "a probe timeout with data in flight actually sends something" {
@@ -7655,4 +7950,178 @@ test "a probe owed on a discarded space does not silence the connection" {
     client.spaces[initial].probes_pending = 3;
     client.discard(.initial);
     try testing.expectEqual(@as(u8, 0), client.spaces[initial].probes_pending);
+}
+
+test "three streams at once each get through" {
+    // The interop runner's `transfer` case asks for three files at once, ten
+    // megabytes between them, and the server stalled partway. One stream of any
+    // size works; the client side of the same path works. This is that shape at
+    // a size a test can hold: three ids, each several times the send
+    // buffer, with the receiver's connection window having to move for any of
+    // them to finish.
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+
+    const each = 24 * 1024;
+    const ids = [_]u64{ 0, 4, 8 };
+    const total = each * ids.len;
+
+    client.streams.setConnectionSendLimit(total);
+    for (ids) |id| try client.streams.setSendLimit(id, each);
+    client.streams.setPeerStreamLimit(true, 4);
+
+    var body: [each]u8 = undefined;
+    for (&body, 0..) |*octet, index| octet.* = @truncate(index *% 7);
+
+    var queued: [ids.len]usize = @splat(0);
+    var taken: [ids.len]usize = @splat(0);
+    var now: u64 = 1000;
+    var rounds: u32 = 0;
+    // Bounded: each round moves at most one datagram each way, and the loop
+    // stops when every stream has arrived.
+    while (rounds < 20000) : (rounds += 1) {
+        now += 1000;
+        var progress = false;
+        for (ids, 0..) |id, index| {
+            if (queued[index] < body.len) {
+                const wrote = try client.write(id, body[queued[index]..], false);
+                queued[index] += wrote;
+                if (wrote > 0) progress = true;
+            }
+        }
+        if (try deliver(&client, &server, now) > 0) progress = true;
+
+        for (ids, 0..) |id, index| {
+            const readable = server.readable(id);
+            if (readable.len == 0) continue;
+            // Every octet has to be the one that was sent, in order.
+            for (readable, taken[index]..) |octet, at| {
+                try testing.expectEqual(body[at], octet);
+            }
+            taken[index] += readable.len;
+            try server.consume(id, readable.len);
+            progress = true;
+        }
+        // The server's acknowledgements and its MAX_DATA are what let the
+        // client keep going: without either, three ids fill the connection
+        // window and nothing moves again.
+        if (try deliver(&server, &client, now + 1) > 0) progress = true;
+
+        var done = true;
+        for (taken) |one| {
+            if (one < body.len) done = false;
+        }
+        if (done) break;
+        if (!progress) {
+            // Both endpoints idle with data outstanding is the stall itself.
+            std.debug.print(
+                "\nstalled after {d} rounds: queued {any} taken {any}\n",
+                .{ rounds, queued, taken },
+            );
+            return error.TestUnexpectedResult;
+        }
+    }
+
+    for (taken) |one| try testing.expectEqual(@as(usize, body.len), one);
+}
+
+test "three streams at once each get through a lossy path" {
+    // The same shape with datagrams dropped, which is what the runner's
+    // `transfer` case really is: `simple-p2p` has no loss setting, but a
+    // 25-packet queue tail-drops under a 10 Mbps link, and three streams of
+    // several megabytes fill it. Reordering and loss are where reclamation and
+    // the framing watermark have to agree, and they are what a clean exchange
+    // never asks about.
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+
+    const each = 160 * 1024;
+    const ids = [_]u64{ 0, 4, 8 };
+
+    client.streams.setPeerStreamLimit(true, 4);
+    // The credit a peer grants at the start, and nothing more by hand: the
+    // server raises it with the MAX_DATA and MAX_STREAM_DATA frames it already
+    // sends as the application consumes, and those travel through `deliver`
+    // like everything else. A test that set the limits itself would be testing
+    // its own arithmetic.
+    client.streams.setConnectionSendLimit(32 * 1024);
+    for (ids) |id| try client.streams.setSendLimit(id, 8 * 1024);
+
+    var body: [each]u8 = undefined;
+    for (&body, 0..) |*octet, index| octet.* = @truncate(index *% 7);
+
+    var queued: [ids.len]usize = @splat(0);
+    var taken: [ids.len]usize = @splat(0);
+    var now: u64 = 1000;
+    var dropped: u32 = 0;
+    var datagram: [TestConnection.datagram_octets]u8 = @splat(0);
+    var rounds: u32 = 0;
+    // Bounded by `rounds`; a stall is the loop running out rather than looping
+    // for ever.
+    while (rounds < 200000) : (rounds += 1) {
+        now += 1000;
+        for (ids, 0..) |id, index| {
+            if (queued[index] < body.len) {
+                queued[index] += try client.write(id, body[queued[index]..], false);
+            }
+        }
+
+        // One in eleven datagrams each way goes nowhere. Deterministic, so a
+        // failure is the same failure next time.
+        const to_server = try client.send(&datagram, now);
+        if (to_server > 0) {
+            if (rounds % 37 < 3) dropped += 1 else try server.receive(datagram[0..to_server], now);
+        }
+
+        for (ids, 0..) |id, index| {
+            const readable = server.readable(id);
+            if (readable.len == 0) continue;
+            for (readable, taken[index]..) |octet, at| {
+                if (body[at] != octet) {
+                    std.debug.print(
+                        "\nstream {d} octet {d}: expected {d}, got {d}\n",
+                        .{ id, at, body[at], octet },
+                    );
+                    return error.TestUnexpectedResult;
+                }
+            }
+            taken[index] += readable.len;
+            try server.consume(id, readable.len);
+        }
+
+        const to_client = try server.send(&datagram, now + 1);
+        if (to_client > 0) {
+            if (rounds % 41 < 3) dropped += 1 else try client.receive(datagram[0..to_client], now + 1);
+        }
+
+        // The timers are what recover a dropped datagram, and a test that never
+        // fires them is a test of a path that never loses anything.
+        if (client.timeout()) |at| {
+            if (at <= now) client.onTimeout(now);
+        }
+        if (server.timeout()) |at| {
+            if (at <= now) server.onTimeout(now);
+        }
+
+        var done = true;
+        for (taken) |one| {
+            if (one < body.len) done = false;
+        }
+        if (done) break;
+    }
+
+    try testing.expect(dropped > 0);
+    for (taken, ids) |one, id| {
+        if (one < body.len) {
+            // Which stream stopped and where, because "expected 163840, found
+            // 92160" three times over says nothing about which one is stuck.
+            std.debug.print(
+                "\nstream {d} stalled at {d}/{d} after {d} rounds, {d} dropped\n",
+                .{ id, one, body.len, rounds, dropped },
+            );
+        }
+        try testing.expectEqual(@as(usize, body.len), one);
+    }
 }

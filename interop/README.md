@@ -273,6 +273,20 @@ decision rather than a step.
 The control is the only thing that separates "the runner does not pass" from
 "the runner does not run", and it is one command.
 
+### The matrix
+
+As a **client** against quic-go's server: `handshake`, `transfer`, `chacha20`,
+`retry`, `http3`, `transferloss` and `keyupdate`. As a **server** against
+quic-go's client: `handshake`, `transfer`, `chacha20`, `retry`, `http3` and
+`transferloss`.
+
+`multiplexing` fails in both roles for one reason: it is 1999 files on a single
+connection, and no MAX_STREAMS frame is generated anywhere in this package.
+`Streams.open` never frees a slot, so `streams_max` bounds a connection's
+*lifetime* rather than its concurrency. `handshakeloss` fails as fifty
+handshakes through 30% loss in three hundred seconds, of which about
+thirty-eight finish — RFC 9002's PTO backoff, not a rule broken.
+
 ## h3spec
 
 [h3spec](https://github.com/kazu-yamamoto/h3spec) is a conformance tester for

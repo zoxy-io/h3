@@ -1254,6 +1254,18 @@ pub fn Recovery(comptime config: Config) type {
             if (state.count == 0) return null;
             return state.sent[0].context;
         }
+
+        /// Every context still outstanding in a space, oldest first.
+        ///
+        /// A slice rather than an interpretation: this file never learns what a
+        /// packet contained — `Context` is the caller's opaque token — so a
+        /// caller that needs to ask "which of my octets are still in the air"
+        /// has to do the asking. `Connection` uses it to decide how much of a
+        /// stream's send buffer can be given back.
+        pub fn inFlight(self: *const Self, space: Space) []const Sent {
+            const state = &self.spaces[@intFromEnum(space)];
+            return state.sent[0..state.count];
+        }
     };
 }
 

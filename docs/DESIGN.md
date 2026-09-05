@@ -234,7 +234,11 @@ all three build legs):
   The connection-level window is the one that bounds memory; see the file. Also
   section 4.6's stream limit, which is the peer's cap on what *this* endpoint
   opens — the peer's own streams are bounded by `streams_max`, which is the
-  limit we advertised.
+  limit we advertised. That limit never rises: no MAX_STREAMS frame is
+  generated anywhere in the package and `open` never frees a slot, so
+  `streams_max` bounds a connection's *lifetime* rather than its concurrency.
+  The runner's `multiplexing` case, which is 1999 files on one connection, is
+  the one that says so out loud.
 - `quic/Connection.zig` — the state machine, including RFC 9001 section 6's key
   update and section 6.6's AEAD confidentiality and integrity limits. The state machine: three packet number spaces, four
   encryption levels and their keys, CRYPTO reassembly per level, ACK

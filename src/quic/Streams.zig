@@ -241,12 +241,20 @@ pub fn Streams(comptime config: Config) type {
             fin_framed: bool = false,
             /// The peer's `MAX_STREAM_DATA` for this stream.
             send_limit: u64 = 0,
+            /// RFC 9000 section 4.1: this endpoint has octets to write on this
+            /// stream and the peer's limit is what stops it. Owed as a
+            /// STREAM_DATA_BLOCKED frame, and the reason it is worth sending is
+            /// that a receiver has no other way to learn that the window update
+            /// it believes it granted never arrived.
+            send_blocked: bool = false,
 
             /// The error code a RESET_STREAM carried, in either direction.
             reset_code: u64 = 0,
             /// The `MAX_STREAM_DATA` last advertised, so a new one goes out
             /// only when the window has moved enough to be worth a frame.
-            max_data_sent: u64 = 0,
+            /// Starts at the window the transport parameters carried, which the
+            /// peer has already been told.
+            max_data_sent: u64 = config.receive_octets,
 
             /// Bytes readable in order.
             ///
@@ -330,6 +338,8 @@ pub fn Streams(comptime config: Config) type {
         consumed_total: u64 = 0,
         /// The peer's `MAX_DATA` for this connection.
         send_limit: u64 = 0,
+        /// The same, for the connection window.
+        send_blocked: bool = false,
 
         /// Section 4.1: the peer's `initial_max_stream_data_*`, which is the
         /// send limit a stream *starts* with. Held here rather than pushed into
@@ -397,6 +407,45 @@ pub fn Streams(comptime config: Config) type {
         /// And the mirror: whether this endpoint may write on it.
         pub fn weMaySend(self: *const Self, id: u64) bool {
             return stream_id.sendable(id, self.side);
+        }
+
+        /// Owe every window update again.
+        ///
+        /// RFC 9000 section 13.3: MAX_DATA and MAX_STREAM_DATA are among the
+        /// frames whose loss has to be repaired, and the repair is not a
+        /// retransmission of the old frame — it is the *current* limit, sent
+        /// again. `max_data_sent` records what was put on the wire, so a lost
+        /// packet leaves the peer below a limit this endpoint believes it has
+        /// granted, and the threshold that decides when to send the next one
+        /// has already moved past it. The connection then deadlocks: the sender
+        /// waiting for credit, the receiver waiting for data, both correct.
+        ///
+        /// Zeroing is safe because limits only rise. The next packet
+        /// re-advertises whatever the windows are now, which is at least what
+        /// was lost.
+        pub fn reoweFlowControl(self: *Self) void {
+            // Bounded by `count`.
+            for (self.streams[0..self.count]) |*stream| stream.max_data_sent = 0;
+        }
+
+        /// Whether a blocked report is owed, on the connection or any stream.
+        pub fn owesBlocked(self: *const Self) bool {
+            if (self.send_blocked) return true;
+            // Bounded by `count`.
+            for (self.streams[0..self.count]) |*stream| {
+                if (stream.send_blocked) return true;
+            }
+            return false;
+        }
+
+        /// Re-owe the reports, for the same reason `reoweFlowControl` exists:
+        /// a lost STREAM_DATA_BLOCKED leaves both endpoints waiting.
+        pub fn reoweBlocked(self: *Self) void {
+            // Bounded by `count`.
+            for (self.streams[0..self.count]) |*stream| {
+                if (stream.send_offset + stream.send_len >= stream.send_limit) stream.send_blocked = true;
+            }
+            if (self.sent_total >= self.send_limit) self.send_blocked = true;
         }
 
         pub fn weMayReceive(self: *const Self, id: u64) bool {
@@ -767,6 +816,15 @@ pub fn Streams(comptime config: Config) type {
             const connection_room = sendRoom(self.send_limit, self.sent_total);
             const take = @min(data.len, @min(room, connection_room));
 
+            // Refused by a *limit* rather than by the buffer is the case
+            // section 4.1 asks to be reported: the peer decides when it ends,
+            // and until it hears about it, it may not know it has to.
+            if (take < data.len) {
+                const stream_room = sendRoom(stream.send_limit, stream.send_offset + stream.send_len);
+                if (stream_room == take) stream.send_blocked = true;
+                if (connection_room == take) self.send_blocked = true;
+            }
+
             @memcpy(stream.send[stream.send_len..][0..take], data[0..take]);
             stream.send_len += @intCast(take);
             self.sent_total += take;
@@ -809,11 +867,15 @@ pub fn Streams(comptime config: Config) type {
             const stream = try self.open(id);
             // Limits only ever rise; a peer lowering one is ignored rather than
             // an error, which is what section 4.1 says to do.
-            stream.send_limit = @max(stream.send_limit, limit);
+            const raised = @max(stream.send_limit, limit);
+            if (raised > stream.send_limit) stream.send_blocked = false;
+            stream.send_limit = raised;
         }
 
         pub fn setConnectionSendLimit(self: *Self, limit: u64) void {
-            self.send_limit = @max(self.send_limit, limit);
+            const raised = @max(self.send_limit, limit);
+            if (raised > self.send_limit) self.send_blocked = false;
+            self.send_limit = raised;
         }
 
         /// Streams with data waiting to be framed.
@@ -898,30 +960,39 @@ pub fn Streams(comptime config: Config) type {
             if (fin_lost) stream.fin_framed = false;
         }
 
-        /// Give back the octets a packet acknowledged.
+        /// Note that the peer has this stream's octets up to `end`.
         ///
-        /// `start` and `end` are absolute stream offsets. Only a range that
-        /// begins exactly where the acknowledged prefix ends advances it: a
-        /// range past a gap is dropped, and comes back when the gap is filled.
-        /// That is not a heuristic — `rewind` moves the framing watermark back
-        /// to the *start* of a lost packet, so everything after it is framed
-        /// again and its acknowledgements arrive in order behind the
-        /// retransmission.
-        pub fn reclaim(self: *Self, id: u64, start: u64, end: u64) void {
+        /// The highest offset acknowledged, not a contiguous watermark: an
+        /// acknowledgement can arrive for a later range before an earlier one,
+        /// and a rule that insisted on contiguity would stop advancing the
+        /// first time that happened and never start again.
+        pub fn acknowledge(self: *Self, id: u64, end: u64) void {
             const stream = self.find(id) orelse return;
-            if (start != stream.acked_to) return;
-            assert(end >= start);
-            stream.acked_to = end;
+            stream.acked_to = @max(stream.acked_to, end);
+        }
 
-            assert(stream.acked_to >= stream.send_offset);
-            const octets = stream.acked_to - stream.send_offset;
-            if (octets == 0) return;
-            // Acknowledged implies *buffered*. It does not imply framed:
-            // RFC 9002's loss detection is a heuristic, so a packet can be
-            // declared lost — which rewinds `framed` behind it — and then
-            // acknowledged anyway, because it was only late. The simulator
-            // found this on the first sweep after reclamation landed, and the
-            // assertion it broke was the claim that the two are the same.
+        /// Release the front of a stream's send buffer.
+        ///
+        /// `oldest` is the starting offset of the oldest packet still
+        /// outstanding for this stream, or null when nothing is in flight. An
+        /// octet below it is in no unacknowledged packet, so nothing can ask
+        /// for it again — and it is capped by `acked_to` because a stream with
+        /// nothing in flight has still only been acknowledged as far as it has.
+        pub fn release(self: *Self, id: u64, oldest: ?u64) void {
+            const stream = self.find(id) orelse return;
+            const acknowledged = if (oldest) |one| @min(one, stream.acked_to) else stream.acked_to;
+            // And never past what has been framed. A loss rewinds `framed` to
+            // the start of the lost range, so those octets are back in the
+            // buffer waiting to go again — and they can sit *below* the highest
+            // offset the peer has acknowledged, because acknowledgements do not
+            // arrive in order. Releasing them would drop data the peer never
+            // received: the stream then carries a hole, the receiver holds
+            // everything after it, and the symptom is a flow control error at
+            // the far end rather than anything that names the cause.
+            const bound = @min(acknowledged, stream.send_offset + stream.framed);
+            if (bound <= stream.send_offset) return;
+
+            const octets = bound - stream.send_offset;
             assert(octets <= stream.send_len);
             assert(stream.framed <= stream.send_len);
             const width: u32 = @intCast(octets);
@@ -932,10 +1003,12 @@ pub fn Streams(comptime config: Config) type {
             );
             stream.send_len -= width;
             // Octets the peer has do not need framing again, whatever a
-            // spurious loss did to the watermark.
+            // spurious loss did to the watermark: RFC 9002's loss detection is
+            // a heuristic, so a packet declared lost — which rewinds `framed`
+            // behind it — can be acknowledged afterwards because it was only
+            // late.
             stream.framed = if (stream.framed > width) stream.framed - width else 0;
-            stream.send_offset += width;
-            assert(stream.send_offset == stream.acked_to);
+            stream.send_offset = bound;
         }
     };
 }
