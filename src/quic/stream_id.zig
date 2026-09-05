@@ -61,6 +61,14 @@ comptime {
     assert(count_max * 4 == varint.max + 1);
 }
 
+/// How many kinds there are, for a caller sizing a per-kind array. Named here
+/// so the array and the enum cannot drift.
+pub const kind_count: usize = @typeInfo(Kind).@"enum".fields.len;
+
+comptime {
+    assert(kind_count == 4);
+}
+
 pub fn kindOf(id: u64) Kind {
     assert(id <= varint.max);
     return @enumFromInt(@as(u2, @truncate(id)));

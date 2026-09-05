@@ -102,6 +102,9 @@ requirement list extracted from the specification.
 | No DATA_BLOCKED or STREAM_DATA_BLOCKED frame was ever sent, so a lost window update deadlocked the connection with no way for either endpoint to learn why | the same stall | RFC 9000 section 4.1 reads like a courtesy; it is the only thing that breaks the tie |
 | A lost MAX_DATA or MAX_STREAM_DATA was never sent again: the limit is recorded when the frame is *written*, so the threshold that decides the next one had already moved past it | the same stall | Loss detection needs later packets to declare the loss, and a deadlocked connection has none |
 | A packet whose payload came to fewer than four octets could not be sealed — RFC 9001 section 5.4.2's sample — and `send` turned that into "nothing to send". A lone HANDSHAKE_DONE is one octet; so is a lone PING probe | fixing the flow control above, which removed the MAX_DATA that had been padding the first 1-RTT packet by accident | One bug was holding another one up, for the second time in this document |
+| No MAX_STREAMS frame was generated anywhere, and `Streams.open` never freed a slot — so `streams_max` bounded a connection's *lifetime* rather than its concurrency, and a peer that closed a stream never got it back | the runner's `multiplexing` case, which is 1999 files on one connection | The comment above the constant argued it was sound because the limit is comptime and never rises. The limit never rising is the defect |
+| The interop shim's own list of readable streams was append-only and bounded by the stream table, so the twenty-fifth request on a connection was silently never answered | the same case, one layer up | The same defect as the one below it — a fixed array nobody gives back — and it was hidden by the one below it until that was fixed |
+| The interop client refused more requests than it had stream identifiers for, rather than issuing them as earlier ones finished | the same case, as a client | `error.TooManyRequests` reads like a guard and was a limitation |
 
 Two things about that table.
 
@@ -784,20 +787,19 @@ tells them apart.
 
 ### The result
 
-**As a client, against quic-go's server: seven of eight.** `handshake`,
-`transfer`, `chacha20`, `retry`, `http3`, `transferloss` and `keyupdate` pass.
-`multiplexing` fails for the reason given below, which is a gap on both sides.
-`handshakeloss` does not pass either: it is fifty connections through 30% loss
-in three hundred seconds, and about thirty-eight finish. Nothing is wrong with any one
+**As a client, against quic-go's server: eight of nine.** `handshake`,
+`transfer`, `chacha20`, `retry`, `http3`, `transferloss`, `keyupdate` and
+`multiplexing` pass. `handshakeloss` does not: it is fifty connections through
+30% loss in three hundred seconds, and about thirty-eight finish. Nothing is wrong with any one
 of them — the median handshake is half a second — but the tail is RFC 9002's
 PTO backoff at 1, 2, 4, 8, 16 seconds, and enough connections reach the far end
 of it to run out the budget. That is a performance property rather than a
 defect, and it is the honest place to leave it: not a rule broken, a recovery
 slower than quic-go's.
 
-**As a server, against quic-go's client: six of eight** — `handshake`,
-`transfer`, `chacha20`, `retry`, `http3` and `transferloss`. `multiplexing` and
-`handshakeloss` fail, each for a reason named below.
+**As a server, against quic-go's client: seven of eight** — `handshake`,
+`transfer`, `chacha20`, `retry`, `http3`, `transferloss` and `multiplexing`.
+Only `handshakeloss` fails, for the same reason it does on the client side.
 
 Four defects fell out of the attempt, all in the table in §1: the eight-span
 reassembly limit, a probe count that outlived its space, a server that refilled
@@ -844,17 +846,45 @@ the chain is the interesting part, because each one uncovered the next.
 Five of the six are invisible to a peer that neither reorders nor loses
 anything, which is every test path this package had.
 
+##### `multiplexing`, and a limit nobody had noticed was one — **fixed**
+
+`multiplexing` is 1999 files on a single connection, and the runner's own
+description says what it is for: "server increased stream limits to accommodate
+client requests". This package generated no MAX_STREAMS frame anywhere, and the
+comment above the constant argued that it did not need to — the limit is
+comptime, so it never rises and there is nothing to re-advertise. The limit
+never rising *is* the defect. `Streams.open` never freed a slot either, so
+`streams_max` bounded how many streams a connection could carry in its
+*lifetime* rather than how many it could carry at once.
+
+Closing it needed three things:
+
+1. **Retirement.** A stream whose halves have both reached a terminal state
+   gives its slot back. The watermark that records this is contiguous per kind,
+   which is not an optimisation: a hole in it cannot tell a retired identifier
+   from one that was never opened, and the two need opposite answers — a frame
+   for the first is a retransmission to discard, and a frame for the second
+   opens a stream. `open` is the one place that knows, and it says so with
+   `error.Retired`; each caller decides, and for a frame from the peer the
+   decision is to ignore it.
+2. **The credit, and telling the peer.** The advertised limit rises as
+   peer-initiated streams retire, and a MAX_STREAMS carries it. Any credit at
+   all is worth a frame rather than a fraction of the window, because this
+   endpoint sends no STREAMS_BLOCKED: with no way for a peer to ask, a threshold
+   is a deadlock whenever the credit owed stops one short of it. A lost
+   MAX_STREAMS is re-owed like a lost MAX_DATA, and an incoming STREAMS_BLOCKED
+   is answered with the current limit.
+3. **Two fixed arrays in the shim, for the same reason.** Its own list of
+   readable streams was append-only and bounded by the stream table, so the
+   twenty-fifth request on a connection was never answered — the library defect
+   had been hiding it. And the client refused more requests than it had
+   identifiers for, with an `error.TooManyRequests` that read like a guard and
+   was a limitation; it now issues them as earlier ones finish.
+
 What is left here:
 
-- **`multiplexing`**, which is 1999 files on one connection and whose stated
-  purpose is that "server increased stream limits to accommodate client
-  requests". No MAX_STREAMS frame is generated anywhere in this package:
-  `Streams.open` never frees a slot, so `streams_max` is a lifetime limit on a
-  connection rather than a concurrency one. The client opens its eight, sends
-  STREAMS_BLOCKED, and waits out the idle timeout. Closing it means retiring
-  finished streams and a watermark that tells a retired identifier from a new
-  one — a slice of its own, and the next one.
-- **Recovery under heavy loss**, which is what `handshakeloss` measures.
+- **Recovery under heavy loss**, which is what `handshakeloss` measures and the
+  only case still failing in either role.
 
 #### The other outside evidence: `corpus/qifs.zig` — **done**
 

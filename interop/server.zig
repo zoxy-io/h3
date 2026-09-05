@@ -418,6 +418,11 @@ fn accept(
         .answers_len = 0,
         .live = true,
     };
+    // The same numbers the transport parameters above carry. The stream layer
+    // enforces what was advertised and grants more as streams retire, and it
+    // cannot know what a consumer chose to offer: the table is shared between
+    // four kinds of stream, so `streams_max` is never the per-kind limit.
+    slot.connection.streams.setAdvertisedStreamLimits(requests_max, unidirectional_max);
     try note(log, "accepted a connection as {x}", .{source.bytes()});
     return slot;
 }
@@ -649,6 +654,7 @@ fn drive(io: Io, log: *Io.Writer, peer: *Peer, now_ns: u64, shared: *const Share
             respondHq(io, peer, shared, peer.readable[index]) catch {};
         }
         try pushAnswers(io, peer, scratch);
+        compactReadable(peer);
         return;
     }
 
@@ -693,6 +699,7 @@ fn drive(io: Io, log: *Io.Writer, peer: *Peer, now_ns: u64, shared: *const Share
         }
         if (result.consumed > 0) try peer.connection.consume(id, result.consumed);
     }
+    compactReadable(peer);
     try pushAnswers(io, peer, scratch);
 }
 
@@ -890,6 +897,25 @@ fn respondHq(io: Io, peer: *Peer, shared: *const Shared, stream: u64) !void {
 
     const space = std.mem.indexOfScalar(u8, line, ' ') orelse return;
     _ = openAnswer(io, peer, shared, stream, line[space + 1 ..]) orelse return;
+}
+
+/// Drop the identifiers whose streams are gone.
+///
+/// This list is bounded by the stream table and it used to be append-only: once
+/// `streams_max` distinct identifiers had been noted, the next one was silently
+/// refused and its request was never answered. That is the same defect the
+/// stream table itself had — a fixed array nobody gave back — and it surfaced
+/// the same way, as a run that stopped partway with both endpoints idle. The
+/// runner's `multiplexing` case served twenty-four of its files and stopped.
+fn compactReadable(peer: *Peer) void {
+    var kept: usize = 0;
+    // Bounded by `readable_len`.
+    for (peer.readable[0..peer.readable_len]) |id| {
+        if (peer.connection.findStream(id) == null) continue;
+        peer.readable[kept] = id;
+        kept += 1;
+    }
+    peer.readable_len = kept;
 }
 
 fn noteReadable(peer: *Peer, id: u64) void {

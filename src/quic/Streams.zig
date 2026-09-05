@@ -359,6 +359,39 @@ pub fn Streams(comptime config: Config) type {
         /// Octets this endpoint has queued across all streams, against that.
         sent_total: u64 = 0,
 
+        /// Section 4.6: how many identifiers of each kind the peer may open,
+        /// which is what a MAX_STREAMS frame carries and what
+        /// `checkAdvertisedStreamLimit` enforces.
+        ///
+        /// It rises as finished streams are retired. It used to be the comptime
+        /// `streams_max` and nothing else, which made the table's size a bound
+        /// on the connection's *lifetime* rather than on its concurrency: a peer
+        /// that closed a stream never got it back, and the runner's
+        /// `multiplexing` case — 1999 files on one connection — stopped after
+        /// the first eight and waited out the idle timeout.
+        advertised_bidi: u64 = streams_max,
+        advertised_uni: u64 = streams_max,
+        /// The base each of those started from, which is what the transport
+        /// parameters carried. Kept because a MAX_STREAMS is only worth sending
+        /// against the credit the peer is actually working through.
+        advertised_bidi_base: u64 = streams_max,
+        advertised_uni_base: u64 = streams_max,
+        /// What has already gone out in a MAX_STREAMS, so the frame is not
+        /// repeated. Starts at the base for the reason `max_data_sent` does:
+        /// the peer has already been told that much.
+        max_streams_bidi_sent: u64 = streams_max,
+        max_streams_uni_sent: u64 = streams_max,
+        /// Identifiers of each kind, counting from zero, that have been opened
+        /// and given up.
+        ///
+        /// Contiguous on purpose. A stream that finishes before a lower-numbered
+        /// one keeps its slot until that one finishes too, because a watermark
+        /// with holes in it cannot tell a retired identifier from one that was
+        /// never opened — and the two need opposite answers: a frame for the
+        /// first is a retransmission to ignore, and a frame for the second opens
+        /// a stream.
+        retired: [stream_id.kind_count]u64 = @splat(0),
+
         pub const Error = error{
             /// More streams than `streams_max`. Section 4.6's
             /// `STREAM_LIMIT_ERROR` when the peer opened it, and a caller's own
@@ -376,6 +409,10 @@ pub fn Streams(comptime config: Config) type {
             Protocol,
             /// The stream is not open.
             NotFound,
+            /// The stream existed and has been given up. Not a protocol error:
+            /// a frame naming it is a retransmission of one that arrived before
+            /// the stream finished, and section 3.2 has the receiver discard it.
+            Retired,
             /// More distinct received spans than the reassembler holds. Not a
             /// protocol error in the RFC's vocabulary: the peer is within its
             /// rights and this endpoint is out of room, so `INTERNAL_ERROR` is
@@ -496,10 +533,142 @@ pub fn Streams(comptime config: Config) type {
         pub fn open(self: *Self, id: u64) Error!*Stream {
             assert(id <= varint.max);
             if (self.find(id)) |stream| return stream;
+            // A retired identifier is never handed out a second time. Section
+            // 2.1's rule is about reuse for a *new* stream, and this is the
+            // guard that keeps the slot reclamation below from being exactly
+            // that: without it a retransmitted STREAM frame arriving after the
+            // stream was given up would create a second stream with the same
+            // identifier, at offset zero, with the peer's credit already spent.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-2.1
+            //# A QUIC endpoint MUST NOT reuse a stream ID within a connection.
+            //= type=test
+            if (self.isRetired(id)) return error.Retired;
             if (self.count == streams_max) return error.TooManyStreams;
             self.streams[self.count] = .{ .id = id, .send_limit = self.initialSendLimit(id) };
             self.count += 1;
             return &self.streams[self.count - 1];
+        }
+
+        /// Whether an identifier names a stream that has been given up.
+        pub fn isRetired(self: *const Self, id: u64) bool {
+            const kind = stream_id.kindOf(id);
+            return stream_id.index(id) < self.retired[@intFromEnum(kind)];
+        }
+
+        /// The stream credit this endpoint puts in its transport parameters.
+        ///
+        /// Held here as well as on the wire because it is the base a
+        /// MAX_STREAMS is measured from, and because the limit that has to be
+        /// enforced is the one that was advertised rather than the table's size.
+        /// The two differ whenever a consumer offers the peer less than the
+        /// table can hold, which it must do when one table is shared between
+        /// four kinds of stream.
+        pub fn setAdvertisedStreamLimits(self: *Self, bidi: u64, uni: u64) void {
+            assert(bidi <= streams_max);
+            assert(uni <= streams_max);
+            assert(self.count == 0);
+            self.advertised_bidi = bidi;
+            self.advertised_uni = uni;
+            self.advertised_bidi_base = bidi;
+            self.advertised_uni_base = uni;
+            self.max_streams_bidi_sent = bidi;
+            self.max_streams_uni_sent = uni;
+        }
+
+        /// Whether a MAX_STREAMS is owed on either kind.
+        ///
+        /// Any credit at all, rather than a fraction of the window: this
+        /// endpoint sends no STREAMS_BLOCKED, so a peer that runs out has no way
+        /// to ask. A threshold would then be a deadlock whenever the credit
+        /// owed stopped one short of it — which is the ordinary end of a run,
+        /// not a corner.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-4.6
+        //# An endpoint MUST NOT wait to receive this signal before advertising
+        //# additional credit, since doing so will mean that the peer will be
+        //# blocked for at least an entire round trip, and potentially
+        //# indefinitely if the peer chooses not to send STREAMS_BLOCKED frames.
+        //= type=test
+        pub fn owesStreamCredit(self: *const Self) bool {
+            if (self.advertised_bidi > self.max_streams_bidi_sent) return true;
+            if (self.advertised_uni > self.max_streams_uni_sent) return true;
+            return false;
+        }
+
+        /// Owe both limits again, for the reason `reoweFlowControl` exists: a
+        /// MAX_STREAMS is an ordinary frame and an ordinary frame can be lost.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-13.3
+        //# The limit on streams of a given type is sent in MAX_STREAMS
+        //# frames.  Like MAX_DATA, an updated value is sent when a packet
+        //# containing the most recent MAX_STREAMS for a stream type frame is
+        //# declared lost or when the limit is updated, with care taken to
+        //# prevent the frame from being sent too often.
+        //= type=test
+        pub fn reoweStreamCredit(self: *Self) void {
+            self.max_streams_bidi_sent = 0;
+            self.max_streams_uni_sent = 0;
+        }
+
+        /// The credit to put in the next MAX_STREAMS of this kind, and the note
+        /// that it has gone out.
+        pub fn takeStreamCredit(self: *Self, bidirectional: bool) ?u64 {
+            const limit = if (bidirectional) self.advertised_bidi else self.advertised_uni;
+            const sent = if (bidirectional) &self.max_streams_bidi_sent else &self.max_streams_uni_sent;
+            if (limit <= sent.*) return null;
+            sent.* = limit;
+            return limit;
+        }
+
+        /// Whether a stream has nothing left to do in either direction it has.
+        ///
+        /// A unidirectional stream is asked about one half only: the other does
+        /// not exist, and its state field sits at the value it was initialised
+        /// with for the life of the stream.
+        fn finished(self: *const Self, stream: *const Stream) bool {
+            if (stream_id.sendable(stream.id, self.side) and stream.send_state != .data_recvd) return false;
+            if (stream_id.receivable(stream.id, self.side) and stream.receive_state != .data_read) return false;
+            return true;
+        }
+
+        /// Give up every finished stream whose predecessors are also finished,
+        /// and hand the credit back to the peer.
+        ///
+        /// Called where a stream can reach a terminal state: after the
+        /// application consumes, and after `Connection` reports what a packet
+        /// acknowledged. It moves streams within the table, so nothing may hold
+        /// a `*Stream` across it.
+        pub fn sweep(self: *Self) void {
+            for (0..stream_id.kind_count) |raw| {
+                const kind: stream_id.Kind = @enumFromInt(raw);
+                // Bounded: each pass gives up one stream, and the table holds
+                // `streams_max`.
+                for (0..streams_max) |_| {
+                    if (!self.retireOne(kind)) break;
+                }
+            }
+        }
+
+        fn retireOne(self: *Self, kind: stream_id.Kind) bool {
+            const next = self.retired[@intFromEnum(kind)];
+            if (next >= stream_id.count_max) return false;
+            const id = stream_id.make(kind, next);
+            const stream = self.find(id) orelse return false;
+            if (!self.finished(stream)) return false;
+
+            const at = (@intFromPtr(stream) - @intFromPtr(&self.streams[0])) / @sizeOf(Stream);
+            assert(at < self.count);
+            self.streams[at] = self.streams[self.count - 1];
+            self.count -= 1;
+            self.retired[@intFromEnum(kind)] = next + 1;
+
+            // Only the peer's own kinds earn it credit. A slot freed by a
+            // stream this endpoint opened is room in the table and nothing the
+            // peer is waiting for.
+            if (kind.initiator() != self.side) {
+                const limit = if (kind.bidirectional()) &self.advertised_bidi else &self.advertised_uni;
+                assert(limit.* < stream_id.count_max);
+                limit.* += 1;
+            }
+            return true;
         }
 
         /// Section 4.1's starting credit for a stream, from whichever of the
@@ -578,6 +747,17 @@ pub fn Streams(comptime config: Config) type {
             if (position >= limit) return error.TooManyStreams;
         }
 
+        /// Whether the peer's section 4.6 limit admits this identifier yet.
+        ///
+        /// For a caller that opens streams as earlier ones finish: writing to a
+        /// stream the peer has not permitted is a connection error at the peer,
+        /// so the question has to be askable before the write rather than only
+        /// answerable after it.
+        pub fn peerPermits(self: *const Self, id: u64) bool {
+            self.checkPeerStreamLimit(id) catch return false;
+            return true;
+        }
+
         //= https://www.rfc-editor.org/rfc/rfc9000#section-4.6
         //# An endpoint
         //# that receives a frame with a stream ID exceeding the limit it has
@@ -597,7 +777,8 @@ pub fn Streams(comptime config: Config) type {
         fn checkAdvertisedStreamLimit(self: *const Self, id: u64) Error!void {
             const kind = stream_id.kindOf(id);
             if (kind.initiator() == self.side) return;
-            if (stream_id.index(id) >= streams_max) return error.TooManyStreams;
+            const limit = if (kind.bidirectional()) self.advertised_bidi else self.advertised_uni;
+            if (stream_id.index(id) >= limit) return error.TooManyStreams;
         }
 
         /// Take a STREAM frame.
@@ -612,7 +793,21 @@ pub fn Streams(comptime config: Config) type {
             if (offset > varint.max or data.len > varint.max - offset) return error.FinalSize;
             const end = offset + data.len;
 
-            const stream = try self.open(id);
+            // Section 3.2 has a receiver discard a frame for a stream it has
+            // already finished with, and once the slot is reclaimed that is
+            // every frame naming a retired identifier — a retransmission of one
+            // that arrived while the stream was alive. `open` is the single
+            // place that knows a retired identifier from a new one; each caller
+            // decides what to do about it, and for a frame from the peer the
+            // answer is nothing.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-3.2
+            //# After all data has been received, any STREAM or
+            //# STREAM_DATA_BLOCKED frames for the stream can be discarded.
+            //= type=test
+            const stream = self.open(id) catch |err| switch (err) {
+                error.Retired => return,
+                else => return err,
+            };
             if (stream.receive_state == .reset) return; // Section 3.2: discard.
 
             try self.admit(stream, end);
@@ -692,6 +887,9 @@ pub fn Streams(comptime config: Config) type {
             assert(stream.consumed <= stream.received_highest);
             assert(self.consumed_total <= self.received_total);
             self.settle(stream);
+            // `stream` is not touched again: `sweep` moves streams within the
+            // table, so the pointer above is stale from here on.
+            self.sweep();
         }
 
         /// Move a stream to `data_read` once everything has arrived and been
@@ -743,7 +941,10 @@ pub fn Streams(comptime config: Config) type {
         pub fn reset(self: *Self, id: u64, code: u64, final_size: u64) Error!void {
             if (!self.peerMaySend(id)) return error.StreamState;
             if (final_size > varint.max) return error.FinalSize;
-            const stream = try self.open(id);
+            const stream = self.open(id) catch |err| switch (err) {
+                error.Retired => return, // Section 3.2: discard, as in `receive`.
+                else => return err,
+            };
             if (stream.receive_state == .reset) return;
 
             // Section 4.5: "Once a final size for a stream is known, it cannot
@@ -864,7 +1065,10 @@ pub fn Streams(comptime config: Config) type {
             // Section 19.10: MAX_STREAM_DATA for a stream this endpoint cannot
             // send on is the peer raising a limit that could never apply.
             if (!self.weMaySend(id)) return error.StreamState;
-            const stream = try self.open(id);
+            const stream = self.open(id) catch |err| switch (err) {
+                error.Retired => return, // A limit raised on a finished stream raises nothing.
+                else => return err,
+            };
             // Limits only ever rise; a peer lowering one is ignored rather than
             // an error, which is what section 4.1 says to do.
             const raised = @max(stream.send_limit, limit);

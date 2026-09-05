@@ -491,6 +491,14 @@ const Request = struct {
     buffer: [4096]u8 = undefined,
     octets: u64 = 0,
     complete: bool = false,
+    /// Whether this slot holds a request at all.
+    ///
+    /// The slots are a *window* over the request list rather than the whole of
+    /// it: `multiplexing` asks for 1999 files on one connection, which is more
+    /// identifiers than a connection has room for at once. A finished slot is
+    /// reused in place — `writer` holds a pointer into `buffer`, so a slot that
+    /// moved would leave the writer pointing at another request's bytes.
+    in_use: bool = false,
 };
 
 const Session = struct {
@@ -507,7 +515,14 @@ const Session = struct {
     readable: [streams_max]u64 = undefined,
     readable_len: usize = 0,
     requests: [requests_max]Request = undefined,
+    /// Slots initialised, which only ever grows to `requests_max`. Whether a
+    /// slot holds a live request is `in_use`.
     requests_len: usize = 0,
+    /// The request list, and how far into it the window has reached.
+    pending: []const []const u8 = &.{},
+    next_url: usize = 0,
+    next_stream: u64 = 0,
+    finished: usize = 0,
     /// A scratch datagram, held here rather than on the stack for the same
     /// reason the connection is.
     datagram: [Connection.datagram_octets]u8 = undefined,
@@ -538,7 +553,7 @@ const Session = struct {
     ) !void {
         self.verbose = verbose;
         std.debug.assert(urls.len > 0);
-        if (urls.len > requests_max) return error.TooManyRequests;
+        self.pending = urls;
 
         const first = try Url.parse(urls[0]);
 
@@ -610,30 +625,18 @@ const Session = struct {
         const hello = try self.client.clientHello(&hello_buffer);
         try self.connection.cryptoIn(.initial, hello);
 
-        // Files are opened before the handshake so that a directory that does
-        // not exist fails immediately rather than after a successful transfer.
+        // Opened before the handshake so that a directory that does not exist
+        // fails immediately rather than after a successful transfer. The files
+        // themselves are opened as each request is issued, because 1999 of them
+        // at once is more descriptors than a process is given.
         var directory = try Io.Dir.cwd().openDir(io, downloads, .{});
         defer directory.close(io);
-        for (urls, 0..) |text, index| {
-            const url = try Url.parse(text);
-            const file = try directory.createFile(io, url.fileName(), .{});
-            // RFC 9000 section 2.1: client-initiated bidirectional streams are
-            // numbered 0, 4, 8 — the two least significant bits are the type.
-            self.requests[index] = .{
-                .url = url,
-                .stream = @as(u64, index) * 4,
-                .file = file,
-                .writer = undefined,
-            };
-            self.requests[index].writer = file.writer(io, &self.requests[index].buffer);
-            self.requests_len += 1;
-        }
         defer for (self.requests[0..self.requests_len]) |*request| {
+            if (!request.in_use) continue;
             request.writer.interface.flush() catch {};
             request.file.close(io);
         };
 
-        var requests_sent = false;
         var receive_buffer: [receive_octets]u8 = undefined;
 
         // Bounded by the deadline: every iteration either moves data or waits,
@@ -648,23 +651,14 @@ const Session = struct {
             if (self.connection.state == .established and !self.http3_started and testcase == .http3) {
                 try self.startHttp3();
             }
-            if (!requests_sent and self.connection.state == .established) {
-                for (self.requests[0..self.requests_len]) |*request| {
-                    var line_buffer: [1024]u8 = undefined;
-                    const line = if (testcase == .http3)
-                        try self.writeRequest(&line_buffer, request.url)
-                    else
-                        // HTTP/0.9, which is the whole of `hq-interop`'s request.
-                        try std.fmt.bufPrint(&line_buffer, "GET {s}\r\n", .{request.url.path});
-                    const written = try self.connection.write(request.stream, line, true);
-                    if (written != line.len) return error.RequestTooLarge;
-                }
-                requests_sent = true;
+            if (self.connection.state == .established) {
+                try self.issue(io, log, testcase, &directory);
             }
 
             if (testcase == .http3) try self.drainHttp3(log) else try self.drainStreams(now);
             try self.keyUpdate(testcase, now);
             try self.drainEvents(log);
+            try self.reap(io, log, origin);
 
             try self.flush(io, log, &socket, &peer, now);
 
@@ -704,14 +698,11 @@ const Session = struct {
         self.connection.close(.no_error);
         try self.flush(io, log, &socket, &peer, elapsed(io, origin));
 
-        for (self.requests[0..self.requests_len]) |*request| {
-            try request.writer.interface.flush();
-            try log.print("h3-interop: {s} {d} octets in {d}ms\n", .{
-                request.url.path,
-                request.octets,
-                elapsed(io, origin) / std.time.ns_per_ms,
-            });
-        }
+        try log.print("h3-interop: {d} of {d} requests in {d}ms\n", .{
+            self.finished,
+            self.pending.len,
+            elapsed(io, origin) / std.time.ns_per_ms,
+        });
         if (testcase == .keyupdate) {
             try log.print("h3-interop: {d} key updates\n", .{self.key_updates});
         }
@@ -818,6 +809,7 @@ const Session = struct {
             if (result.consumed > 0) try self.connection.consume(id, result.consumed);
             self.since_key_update += result.consumed;
         }
+        self.compactReadable();
     }
 
     fn applyHttp3(self: *Session, log: *Io.Writer, event: h3.http3.Event) !void {
@@ -861,9 +853,23 @@ const Session = struct {
     fn requestFor(self: *Session, id: u64) ?*Request {
         // Bounded by `requests_len`.
         for (self.requests[0..self.requests_len]) |*request| {
-            if (request.stream == id) return request;
+            if (request.in_use and request.stream == id) return request;
         }
         return null;
+    }
+
+    /// Drop the identifiers whose streams are gone, so the list does not fill
+    /// up and start refusing new ones. See `interop/server.zig`, which had the
+    /// same defect and showed it first.
+    fn compactReadable(self: *Session) void {
+        var kept: usize = 0;
+        // Bounded by `readable_len`.
+        for (self.readable[0..self.readable_len]) |id| {
+            if (self.connection.findStream(id) == null) continue;
+            self.readable[kept] = id;
+            kept += 1;
+        }
+        self.readable_len = kept;
     }
 
     /// Remember that a stream has data, once.
@@ -881,7 +887,7 @@ const Session = struct {
     fn drainStreams(self: *Session, now_ns: u64) !void {
         _ = now_ns;
         for (self.requests[0..self.requests_len]) |*request| {
-            if (request.complete) continue;
+            if (!request.in_use or request.complete) continue;
             const readable = self.connection.readable(request.stream);
             if (readable.len > 0) {
                 try request.writer.interface.writeAll(readable);
@@ -892,7 +898,14 @@ const Session = struct {
                 request.octets += readable.len;
                 self.since_key_update += readable.len;
             }
-            const stream = self.connection.findStream(request.stream) orelse continue;
+            // A stream that is no longer in the table is one the connection
+            // has given up, which it does only when both halves are finished.
+            // Reading that as "not there yet" is a client that waits for a
+            // response it already has.
+            const stream = self.connection.findStream(request.stream) orelse {
+                request.complete = true;
+                continue;
+            };
             if (stream.receive_state == .data_read) request.complete = true;
             if (stream.receive_state == .reset) return error.StreamReset;
         }
@@ -965,10 +978,74 @@ const Session = struct {
     }
 
     fn complete(self: *const Session) bool {
-        for (self.requests[0..self.requests_len]) |*request| {
-            if (!request.complete) return false;
+        return self.finished == self.pending.len;
+    }
+
+    /// Open as many requests as the window and the peer's stream limit allow.
+    ///
+    /// Called every pass rather than once: a slot frees when a response is
+    /// complete, and section 4.6's limit rises as the peer's MAX_STREAMS
+    /// arrive, so what can be asked for changes over the life of a connection.
+    fn issue(self: *Session, io: Io, log: *Io.Writer, testcase: Testcase, directory: *Io.Dir) !void {
+        // Bounded by the window, which is `requests_max`.
+        for (0..requests_max) |_| {
+            if (self.next_url >= self.pending.len) return;
+            const slot = self.free() orelse return;
+            const id = self.next_stream;
+            // The peer decides how many identifiers this endpoint may use, and
+            // writing to one it has not permitted is a connection error at the
+            // far end rather than a short write here.
+            if (!self.connection.streams.peerPermits(id)) return;
+
+            const url = try Url.parse(self.pending[self.next_url]);
+            const file = try directory.createFile(io, url.fileName(), .{});
+            slot.* = .{ .url = url, .stream = id, .file = file, .writer = undefined, .in_use = true };
+            slot.writer = file.writer(io, &slot.buffer);
+            self.next_url += 1;
+            // RFC 9000 section 2.1: client-initiated bidirectional streams are
+            // numbered 0, 4, 8 — the two least significant bits are the type.
+            self.next_stream += 4;
+
+            var line_buffer: [1024]u8 = undefined;
+            const line = if (testcase == .http3)
+                try self.writeRequest(&line_buffer, url)
+            else
+                // HTTP/0.9, which is the whole of `hq-interop`'s request.
+                try std.fmt.bufPrint(&line_buffer, "GET {s}\r\n", .{url.path});
+            const written = try self.connection.write(id, line, true);
+            if (written != line.len) return error.RequestTooLarge;
+            if (self.verbose) try note(log, "stream {d}: GET {s}", .{ id, url.path });
         }
-        return true;
+    }
+
+    /// A slot with nothing in it, growing the window until it is full.
+    fn free(self: *Session) ?*Request {
+        // Bounded by `requests_len`.
+        for (self.requests[0..self.requests_len]) |*request| {
+            if (!request.in_use) return request;
+        }
+        if (self.requests_len == requests_max) return null;
+        const slot = &self.requests[self.requests_len];
+        self.requests_len += 1;
+        return slot;
+    }
+
+    /// Close what has finished, so the slot and the file both go back.
+    fn reap(self: *Session, io: Io, log: *Io.Writer, origin: Io.Timestamp) !void {
+        // Bounded by `requests_len`.
+        for (self.requests[0..self.requests_len]) |*request| {
+            if (!request.in_use or !request.complete) continue;
+            try request.writer.interface.flush();
+            request.file.close(io);
+            request.in_use = false;
+            request.complete = false;
+            self.finished += 1;
+            if (self.verbose) try note(log, "{s} {d} octets in {d}ms", .{
+                request.url.path,
+                request.octets,
+                elapsed(io, origin) / std.time.ns_per_ms,
+            });
+        }
     }
 };
 

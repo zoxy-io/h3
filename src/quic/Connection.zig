@@ -3198,7 +3198,22 @@ pub fn Connection(comptime config: Config) type {
                     if (self.streams.find(value.stream)) |stream| stream.max_data_sent = 0;
                 },
                 .data_blocked => self.max_data_sent = 0,
-                .streams_blocked => {},
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-19.14
+                //# A STREAMS_BLOCKED frame does not open the stream, but informs the
+                //# peer that a new stream was needed and the stream limit prevented the
+                //# creation of the stream.
+                //
+                // The answer is the current limit, sent again. Credit is granted as
+                // streams retire and does not wait for this — section 4.6 forbids
+                // waiting — but a MAX_STREAMS can be lost, and this frame is the
+                // peer saying so.
+                .streams_blocked => |value| {
+                    if (value.bidirectional) {
+                        self.streams.max_streams_bidi_sent = 0;
+                    } else {
+                        self.streams.max_streams_uni_sent = 0;
+                    }
+                },
                 //= https://www.rfc-editor.org/rfc/rfc9000#section-19.8
                 //# An endpoint MUST terminate the connection with error
                 //# STREAM_STATE_ERROR if it receives a STREAM frame for a locally
@@ -3370,13 +3385,19 @@ pub fn Connection(comptime config: Config) type {
                     {
                         return error.StreamState;
                     }
-                    const stream = self.streams.open(value.stream) catch |err| return streamError(err);
-                    stream.send_state = .reset;
-                    stream.reset_code = @intFromEnum(value.code);
-                    self.emit(.{ .stream_stopped = .{
-                        .stream = value.stream,
-                        .code = @intFromEnum(value.code),
-                    } });
+                    // A stream that has already finished has nothing to stop,
+                    // and re-opening it would undo the retirement.
+                    if (self.streams.open(value.stream) catch |err| switch (err) {
+                        error.Retired => null,
+                        else => return streamError(err),
+                    }) |stream| {
+                        stream.send_state = .reset;
+                        stream.reset_code = @intFromEnum(value.code);
+                        self.emit(.{ .stream_stopped = .{
+                            .stream = value.stream,
+                            .code = @intFromEnum(value.code),
+                        } });
+                    }
                 },
             }
         }
@@ -3553,6 +3574,11 @@ pub fn Connection(comptime config: Config) type {
                 error.StreamState => error.StreamState,
                 error.TooFragmented => error.TooFragmented,
                 error.Protocol, error.NotFound => error.Protocol,
+                // Defensive. Every frame path discards a retired identifier
+                // before it reaches the stream layer's `open`, so nothing here
+                // produces this; the arm exists because an exhaustive switch is
+                // the thing that will fail to compile if a new path forgets to.
+                error.Retired => error.Protocol,
             };
         }
 
@@ -3711,6 +3737,12 @@ pub fn Connection(comptime config: Config) type {
                 stream.send_state = .data_recvd;
                 self.emit(.{ .stream_delivered = context.stream });
             }
+            // Outside the loop, because it moves streams within the table and
+            // `stream` above is a pointer into it. A send half reaching its
+            // terminal state is one of the two things that can finish a stream;
+            // the other is the application consuming the last of it, which
+            // `Streams.consume` sweeps for itself.
+            self.streams.sweep();
         }
 
         fn onPacketsLost(self: *Self, contexts: []const PacketContext) void {
@@ -3794,6 +3826,7 @@ pub fn Connection(comptime config: Config) type {
                     self.max_data_sent = 0;
                     self.streams.reoweFlowControl();
                     self.streams.reoweBlocked();
+                    self.streams.reoweStreamCredit();
                 }
             }
         }
@@ -4737,6 +4770,12 @@ pub fn Connection(comptime config: Config) type {
         /// *empty* send buffer and `send_limit` exactly equal to what had been
         /// sent.
         fn owesFlowControl(self: *const Self) bool {
+            // Section 4.6's limit on the *number* of streams belongs here for
+            // the same reason it is written by `writeFlowControl`: it is owed,
+            // sent and lost exactly like a window update, and the packet
+            // carrying it has to be marked the same way so that losing it puts
+            // the credit back on the books.
+            if (self.streams.owesStreamCredit()) return true;
             if (self.streams.receiveLimit() >= self.max_data_sent + config.connection_receive_octets / 2) {
                 return true;
             }
@@ -4841,6 +4880,38 @@ pub fn Connection(comptime config: Config) type {
                 if (written == 0) break;
                 offset += written;
                 stream.max_data_sent = stream_limit;
+            }
+
+            // Section 4.6's other limit, on the number of streams rather than
+            // on their contents. It belongs here because it is owed for the
+            // same reason and lost the same way: the credit is recorded when
+            // the frame is written, and a MAX_STREAMS that never arrives leaves
+            // a peer that has run out of stream identifiers waiting for one.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-4.6
+            //# An endpoint that is unable to open a new stream due to the peer's
+            //# limits SHOULD send a STREAMS_BLOCKED frame (Section 19.14).
+            //
+            // Section 19.11's two frame types, one per kind of stream.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-19.11
+            //# A MAX_STREAMS frame (type=0x12 or 0x13) informs the peer of the
+            //# cumulative number of streams of a given type it is permitted to
+            //# open.
+            //= type=test
+            for ([_]bool{ true, false }) |bidirectional| {
+                if (offset >= target.len) break;
+                const credit = self.streams.takeStreamCredit(bidirectional) orelse continue;
+                const written = frame.encode(target[offset..], .{ .max_streams = .{
+                    .bidirectional = bidirectional,
+                    .maximum = credit,
+                } }) catch 0;
+                if (written == 0) {
+                    // Put it back: nothing went out, so the credit is still
+                    // owed. Without this the frame is dropped on a full packet
+                    // and never offered again.
+                    self.streams.reoweStreamCredit();
+                    break;
+                }
+                offset += written;
             }
             return offset;
         }
@@ -5761,6 +5832,162 @@ test "a response larger than one packet arrives in order" {
     }
     try testing.expectEqual(body.len, received_len);
     try testing.expectEqualSlices(u8, &body, received[0..body.len]);
+}
+
+/// One request and one response on `id`, carried to completion in both
+/// directions: both endpoints end with the stream's send half acknowledged and
+/// its receive half read, which is what makes it retirable.
+fn exchange(client: *TestConnection, server: *TestConnection, id: u64) !void {
+    const request = "GET /\r\n";
+    try testing.expectEqual(request.len, try client.write(id, request, true));
+    // Bounded: each round is one datagram each way, and a pair that stops
+    // making progress should fail the test rather than hang it.
+    for (0..24) |_| {
+        _ = try deliver(client, server, 0);
+        const asked = server.readable(id);
+        if (asked.len > 0) try server.consume(id, asked.len);
+        if (server.findStream(id)) |stream| {
+            if (stream.receive_state == .data_read and stream.send_state == .sending) {
+                try testing.expectEqual(@as(usize, 5), try server.write(id, "hello", true));
+            }
+        }
+        _ = try deliver(server, client, 0);
+        const answered = client.readable(id);
+        if (answered.len > 0) try client.consume(id, answered.len);
+        if (client.streams.isRetired(id) and server.streams.isRetired(id)) return;
+    }
+    return error.TestUnexpectedResult;
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9000#section-4.6
+//# An endpoint that receives a frame with a stream ID exceeding the limit
+//# it has sent MUST treat this as a connection error of type
+//# STREAM_LIMIT_ERROR; see Section 11 for details on error handling.
+//= type=test
+test "section 4.6: a finished stream gives its credit back" {
+    // `streams_max` used to be the whole story, and it is a comptime bound: a
+    // peer that closed a stream never got it back, so the table's size was a
+    // limit on the connection's *lifetime* rather than on how many streams it
+    // carried at once. The runner's `multiplexing` case is 1999 files on one
+    // connection, and this endpoint served the first four and idled out.
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+
+    const before = server.streams.advertised_bidi;
+    try exchange(&client, &server, 0);
+    try testing.expectEqual(before + 1, server.streams.advertised_bidi);
+
+    // And the peer is told, which is the half that matters: credit nobody hears
+    // about is credit nobody can spend.
+    try testing.expectEqual(before + 1, client.streams.peer_streams_bidi);
+
+    // Drained, so the credit is the only thing that could still be owed.
+    for (0..8) |_| {
+        if (!server.wantsSend()) break;
+        if (try deliver(&server, &client, 0) == 0) break;
+    }
+    try testing.expect(!server.wantsSend());
+
+    // Credit that is owed makes `wantsSend` true on its own, which is what a
+    // consumer that sends when it is told to depends on.
+    server.streams.reoweStreamCredit();
+    try testing.expect(server.wantsSend());
+    for (0..8) |_| {
+        if (!server.wantsSend()) break;
+        if (try deliver(&server, &client, 0) == 0) break;
+    }
+    try testing.expect(!server.streams.owesStreamCredit());
+
+    // A MAX_STREAMS is an ordinary frame and can be lost. Section 13.3 asks for
+    // the current limit again, and nothing else will: the credit is recorded as
+    // sent when the frame is written, so a peer that never received it waits on
+    // a limit this endpoint believes it granted.
+    server.onPacketsLost(&.{.{ .level = .one_rtt, .flow_control = true }});
+    try testing.expect(server.streams.owesStreamCredit());
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9000#section-19.14
+//# A STREAMS_BLOCKED frame does not open the stream, but informs the
+//# peer that a new stream was needed and the stream limit prevented the
+//# creation of the stream.
+//= type=test
+test "section 19.14: STREAMS_BLOCKED is answered with the limit again" {
+    // The credit is granted as streams retire and does not wait for this —
+    // section 4.6 forbids waiting. But a MAX_STREAMS is an ordinary frame and
+    // can be lost, and this frame is the peer saying it never arrived.
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+    for (0..8) |_| {
+        if (!server.wantsSend()) break;
+        if (try deliver(&server, &client, 0) == 0) break;
+    }
+    try testing.expect(!server.streams.owesStreamCredit());
+
+    var payload: [16]u8 = @splat(0);
+    const written = try frame.encode(&payload, .{ .streams_blocked = .{
+        .bidirectional = true,
+        .limit = 4,
+    } });
+    _ = try server.receiveFrames(.one_rtt, payload[0..written], 0);
+    try testing.expect(server.streams.owesStreamCredit());
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9000#section-2.1
+//# A QUIC endpoint MUST NOT reuse a stream ID within a connection.
+//= type=test
+test "section 2.1: a retired identifier is not opened a second time" {
+    // The slot is reclaimed, so `find` misses — and a miss is what `open` turns
+    // into a new stream. Without the watermark a retransmitted STREAM frame
+    // arriving after the stream was given up would build a second stream with
+    // the same identifier, at offset zero, holding credit the peer has spent.
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+    try exchange(&client, &server, 0);
+    try testing.expect(server.findStream(0) == null);
+
+    const was = server.streams.count;
+    var payload: [32]u8 = @splat(0);
+    const written = try frame.encode(&payload, .{ .stream = .{
+        .stream = 0,
+        .offset = 0,
+        .data = "GET /\r\n",
+        .fin = true,
+    } });
+    _ = try server.receiveFrames(.one_rtt, payload[0..written], 0);
+    try testing.expectEqual(was, server.streams.count);
+    try testing.expect(server.findStream(0) == null);
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9000#section-4.6
+//# An endpoint MUST NOT wait to receive this signal before advertising
+//# additional credit, since doing so will mean that the peer will be
+//# blocked for at least an entire round trip, and potentially
+//# indefinitely if the peer chooses not to send STREAMS_BLOCKED frames.
+//= type=test
+test "section 4.6: more streams than the table holds, one at a time" {
+    // Four slots, eight requests. This is `multiplexing` in miniature, and the
+    // whole point of the credit: what bounds a connection is how many streams
+    // are open at once, not how many it has ever carried.
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+    // Section 18.2's `initial_max_stream_data_*`, which is what a stream this
+    // endpoint has not yet opened starts with. `established` grants stream 0 by
+    // hand and nothing else, which is enough for a test that opens one stream.
+    client.streams.setPeerInitialLimits(1 << 16, 1 << 16, 1 << 16);
+    server.streams.setPeerInitialLimits(1 << 16, 1 << 16, 1 << 16);
+
+    for (0..8) |index| {
+        const id = 4 * index;
+        // The peer's limit rises as the server's MAX_STREAMS arrive, and
+        // nothing here grants it by hand.
+        try exchange(&client, &server, id);
+    }
+    try testing.expectEqual(@as(u64, 8), server.streams.retired[0]);
+    try testing.expect(server.streams.count <= 4);
 }
 
 //= https://www.rfc-editor.org/rfc/rfc9000#section-4.1

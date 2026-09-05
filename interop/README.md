@@ -276,16 +276,14 @@ The control is the only thing that separates "the runner does not pass" from
 ### The matrix
 
 As a **client** against quic-go's server: `handshake`, `transfer`, `chacha20`,
-`retry`, `http3`, `transferloss` and `keyupdate`. As a **server** against
-quic-go's client: `handshake`, `transfer`, `chacha20`, `retry`, `http3` and
-`transferloss`.
+`retry`, `http3`, `transferloss`, `keyupdate` and `multiplexing`. As a
+**server** against quic-go's client: the same list without `keyupdate`, which
+a server does not initiate here.
 
-`multiplexing` fails in both roles for one reason: it is 1999 files on a single
-connection, and no MAX_STREAMS frame is generated anywhere in this package.
-`Streams.open` never frees a slot, so `streams_max` bounds a connection's
-*lifetime* rather than its concurrency. `handshakeloss` fails as fifty
-handshakes through 30% loss in three hundred seconds, of which about
-thirty-eight finish — RFC 9002's PTO backoff, not a rule broken.
+`handshakeloss` fails in both roles: fifty handshakes through 30% loss in three
+hundred seconds, of which about thirty-eight finish. The median is half a
+second and the tail is RFC 9002's PTO backoff at 1, 2, 4, 8, 16 seconds — a
+recovery slower than quic-go's rather than a rule broken.
 
 ## h3spec
 
