@@ -118,6 +118,7 @@ requirement list extracted from the specification.
 | The interop server retired a peer after five seconds of silence while advertising no idle timeout at all, so it dropped connections whose peer was still probing | the same case | Five seconds is longer than anything a working path needs and shorter than a probe timeout that has backed off twice |
 | Section 14.1's 1200-octet floor was met by zeroing the datagram *after* the last packet, which is neither of the two ways the sentence names — a peer parses the zeroes as one more packet and throws it away | reading quic-go's log while chasing `handshakeloss` | Every peer accepts it, so nothing fails; what it costs is a slot in the peer's undecryptable queue and half of every padded datagram |
 | Moving that padding into the *first* packet then stopped the coalescing, so a server's flight went out as two datagrams instead of one — sixty per cent more octets against section 8.1's budget, and two datagrams that both have to survive | `handshakeloss`, which went from two runs in three to none in four | The unit tests only ask whether the datagram reaches 1200; which packet holds the padding is invisible to them |
+| A PTO probed only the space whose timer expired, so a handshake — which is two spaces at once — repaired one flight per timeout while the other space's timer went on backing off in parallel | the ledger, which had RFC 9002 §6.2.4's coalescing as a `type=todo`, and the padding fallback that kept firing because of it | The rule is a SHOULD about an optimisation, and what it optimises is the case where both spaces are lost together — which is the ordinary case under 30% loss and never happens on a clean path |
 
 Two things about that table.
 
@@ -1062,14 +1063,38 @@ roles now pass `handshakeloss` three runs of three, and a client's datagrams
 carry no trailing zeroes at all: twelve "not a QUIC packet" in a run before,
 none after.
 
-What is left here:
+##### Probe coalescing — **and the padding fallback stopped firing**
 
-- **A probe does not coalesce packets from other spaces**, which RFC 9002 §6.2.4
-  asks for and which the ledger already carries as a `type=todo`. It is why the
-  padding fallback still fires on a server: an ack-eliciting Initial probe with
-  nothing owed at the Handshake level has no later packet to put the padding in,
-  so eleven of fifteen padded server datagrams still end in zeroes. Fixing the
-  coalescing would remove most of them and improve recovery at the same time.
+RFC 9002 §6.2.4 asks a sender to probe the *other* packet number spaces that
+have data in flight, coalescing them, and this package probed only the space
+whose timer expired. A handshake is two spaces at once: a server whose Initial
+and Handshake packets were both lost repaired one of them per timeout while the
+other space's timer backed off in parallel. The comment beside the rule said the
+coalescing "cannot be driven from this answer", which was true of `Recovery`
+alone and not of `Recovery` plus the caller — `Connection.onTimeout` now walks
+the other spaces, asks `earliestContext` which of them have anything in flight,
+and probes those too.
+
+The two changes turned out to be the same change seen twice. A probe carrying
+only Initial data has nothing behind it, so §14.1's floor had no later packet to
+live in and fell back to trailing zeroes; the fallback fired on eleven of
+fifteen padded server datagrams. With coalescing it fires on none — but only
+after two corrections to *which* packet is expected to be last, both of which
+the runner had to point out:
+
+1. The newest level this endpoint holds send keys for is not the last one to
+   write. A server installs 1-RTT send keys when it sends its Finished, so from
+   that moment the newest level has nothing to say on a handshake datagram.
+   Sixty-four of a hundred and eleven datagrams fell back.
+2. Nor is the newest level that has *keys and something owed* the same as the
+   newest with keys. Adding the second half — unframed CRYPTO, a pending probe,
+   or an owed acknowledgement — took it from twenty-four in a hundred and twenty
+   to zero.
+
+A guess that is wrong here costs trailing zeroes and never a short datagram,
+which is why guessing is acceptable at all: the fallback is what makes §14.1's
+MUST independent of the heuristic above it. It is still there, and now unused on
+every path the runner exercises.
 
 #### The other outside evidence: `corpus/qifs.zig` — **done**
 

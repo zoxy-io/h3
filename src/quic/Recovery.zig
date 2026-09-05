@@ -1135,16 +1135,13 @@ pub fn Recovery(comptime config: Config) type {
             //= https://www.rfc-editor.org/rfc/rfc9002#section-6.2.4
             //# All probe packets sent on a PTO MUST be ack-eliciting.
             //
-            // One space, not several: a caller told to probe `.initial` is
-            // told nothing about the Handshake data it may also have in
-            // flight, so the coalescing section 6.2.4 asks for cannot be
-            // driven from this answer.
-            //= https://www.rfc-editor.org/rfc/rfc9002#section-6.2.4
-            //# In addition to sending data in the packet number space for which the
-            //# timer expired, the sender SHOULD send ack-eliciting packets from
-            //# other packet number spaces with in-flight data, coalescing packets if
-            //# possible.
-            //= type=todo
+            // One space, because one timer expired. The coalescing section
+            // 6.2.4 asks for is the caller's: `Connection.onTimeout` walks the
+            // other spaces, asks `earliestContext` which of them have data in
+            // flight, and probes those too — and `send` writes all of them into
+            // one datagram. It is driven from this answer plus that walk rather
+            // than from this answer alone, which is what the comment here used
+            // to say could not be done.
             probe: struct { space: Space, packets: u8 },
             /// Nothing to do.
             idle,

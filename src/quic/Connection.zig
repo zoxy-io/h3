@@ -3986,6 +3986,45 @@ pub fn Connection(comptime config: Config) type {
                     if (self.recovery.earliestContext(probe.space)) |context| {
                         self.onPacketsLost(&.{context});
                     }
+                    // Section 6.2.4's other half: the spaces the timer did not
+                    // fire for probe too, when they have data in flight, and
+                    // `send` puts all of them in one datagram.
+                    //
+                    // A handshake is two spaces at once, and the timer names
+                    // one. Probing only that one leaves the other flight
+                    // unrepaired until its own timer, which has been backing
+                    // off in parallel — so a server whose Initial and Handshake
+                    // packets were both lost repaired them a PTO apart instead
+                    // of together. It is also what gives the padding in `send`
+                    // a later packet to live in: a probe carrying only Initial
+                    // data has nothing behind it, and section 14.1's floor then
+                    // falls back to zeroes after the packet.
+                    //= https://www.rfc-editor.org/rfc/rfc9002#section-6.2.4
+                    //# In addition to sending data in the packet number space for which the
+                    //# timer expired, the sender SHOULD send ack-eliciting packets from
+                    //# other packet number spaces with in-flight data, coalescing packets if
+                    //# possible.
+                    //= type=test
+                    for (0..Space.count) |index| {
+                        const space: Space = @enumFromInt(index);
+                        if (space == probe.space) continue;
+                        if (self.spaces[index].discarded) continue;
+                        //= https://www.rfc-editor.org/rfc/rfc9002#section-6.2.1
+                        //# An endpoint MUST NOT set its PTO timer for the Application Data
+                        //# packet number space until the handshake is confirmed.
+                        //
+                        // The same rule read as a bound on this loop: a space
+                        // whose timer may not be armed may not be probed either.
+                        if (space == .application and !self.recovery.handshake_confirmed) continue;
+                        // `earliestContext` answers null when nothing
+                        // ack-eliciting is outstanding, which is section 6.2.4's
+                        // "with in-flight data" exactly.
+                        const context = self.recovery.earliestContext(space) orelse continue;
+                        if (self.spaces[index].probes_pending == 0) {
+                            self.spaces[index].probes_pending = 1;
+                        }
+                        self.onPacketsLost(&.{context});
+                    }
                 },
                 .idle => {},
             }
@@ -4052,6 +4091,33 @@ pub fn Connection(comptime config: Config) type {
             for ([_]Level{ .initial, .handshake, .one_rtt }) |level| {
                 if (self.send_keys[@intFromEnum(level)] == null) continue;
                 if (self.spaces[@intFromEnum(level.space())].discarded) continue;
+                // The 1-RTT level is skipped while the handshake is still
+                // running, and skipping it is what makes this a useful guess
+                // rather than an idle one. A server installs 1-RTT *send* keys
+                // when it sends its Finished, so from that moment the newest
+                // level it holds keys for is one with nothing to say on a
+                // handshake datagram — the floor went to a packet that was
+                // never written, and every probe fell back to trailing zeroes.
+                // Sixty-four of a hundred and eleven coalesced datagrams in a
+                // `handshakeloss` run, which is most of them.
+                //
+                // A datagram that owes the floor carries an Initial, and an
+                // Initial means the handshake is not confirmed, which is the
+                // same condition section 6.2.1 uses to keep the application
+                // space out of the probe timer.
+                if (level == .one_rtt and !self.recovery.handshake_confirmed) continue;
+                // And a level with nothing owed is not going to be the last
+                // packet either. The Initial is exempt because it is the floor's
+                // own level and the fallback below covers it: a guess that is
+                // wrong costs trailing zeroes, never a short datagram.
+                if (level != .initial) {
+                    const stream = &self.levels[@intFromEnum(level)];
+                    const state = &self.spaces[@intFromEnum(level.space())];
+                    const owes = stream.framed < stream.pending_len or
+                        state.probes_pending > 0 or
+                        state.received.ack_eliciting_pending;
+                    if (!owes) continue;
+                }
                 pad_level = level;
             }
 
@@ -6253,6 +6319,43 @@ test "section 5.7: a server does not process 1-RTT before its handshake complete
     }});
     _ = try deliver(&client, &server, 2000);
     try testing.expectEqualStrings("GET /", server.readable(0));
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9002#section-6.2.4
+//# In addition to sending data in the packet number space for which the
+//# timer expired, the sender SHOULD send ack-eliciting packets from
+//# other packet number spaces with in-flight data, coalescing packets if
+//# possible.
+//= type=test
+test "section 6.2.4: a probe repairs every space with data in flight" {
+    // A handshake is two spaces at once and the timer names one. Probing only
+    // that one leaves the other flight unrepaired until its own timer, which
+    // has been backing off in parallel — so a server whose Initial and
+    // Handshake packets were both lost repaired them a PTO apart rather than
+    // together, and each gap doubled.
+    var client = testClient();
+    var server = testServer();
+    try client.cryptoIn(.initial, "ClientHello");
+    _ = try deliver(&client, &server, 0);
+    try installBoth(&server, &client, .handshake, 0x11);
+
+    // The server's flight: both levels, one datagram, nothing acknowledged.
+    try server.cryptoIn(.initial, "ServerHello");
+    try server.cryptoIn(.handshake, "EncryptedExtensions");
+    var datagram: [TestConnection.datagram_octets]u8 = @splat(0);
+    try testing.expect(try server.send(&datagram, 1000) > 0);
+    try testing.expectEqual(@as(u32, "ServerHello".len), server.levels[0].framed);
+    try testing.expectEqual(@as(u32, "EncryptedExtensions".len), server.levels[2].framed);
+
+    const at = server.timeout().?;
+    server.onTimeout(at);
+
+    // Both cursors are back, so the next datagram carries the whole flight
+    // rather than half of it, and both spaces owe an ack-eliciting packet.
+    try testing.expectEqual(@as(u32, 0), server.levels[0].framed);
+    try testing.expectEqual(@as(u32, 0), server.levels[2].framed);
+    try testing.expect(server.spaces[@intFromEnum(Space.initial)].probes_pending > 0);
+    try testing.expect(server.spaces[@intFromEnum(Space.handshake)].probes_pending > 0);
 }
 
 //= https://www.rfc-editor.org/rfc/rfc9002#section-6.2.4
