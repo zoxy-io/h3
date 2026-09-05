@@ -134,7 +134,44 @@ fn drawPayloadLength(random: std.Random) u32 {
     if (random.uintLessThan(u8, 4) == 0) {
         return 1 + random.uintLessThan(u32, payload_octets_max - 1);
     }
-    return 1 + random.uintLessThan(u32, 24 * 1024);
+    return 1 + random.uintLessThan(u32, payload_octets_common);
+}
+
+/// One step in this many advances the clock past the next event, and by at
+/// most this much. Named and related to the deadline: a jump is virtual time
+/// spent on nothing, and enough of them would exhaust a run's budget and
+/// produce a failure the library did not cause.
+const clock_jump_period: u8 = 16;
+const clock_jump_ns_max: u64 = 50 * std.time.ns_per_ms;
+
+/// One step in this many puts something back on the wire, and a seed's attacker
+/// gets at most this many injections. A flood would measure how long an
+/// endpoint takes to discard rubbish rather than whether it discards it.
+const adversary_period: u8 = 8;
+const adversary_budget_max: u32 = 24;
+
+/// One seed in this many draws an attacker, and one in this many reads slowly.
+/// Not all of them: a behaviour every seed reaches is one no seed can be
+/// compared against.
+const adversary_seed_period: u8 = 3;
+const reader_seed_period: u8 = 3;
+
+/// The most steps a late reader waits between drains, and how far the clock
+/// moves when the network is quiet and it still has data.
+const read_every_max: u32 = 8;
+const reader_catch_up_ns: u64 = std.time.ns_per_ms;
+
+/// Payloads below this are the common case; above it, up to
+/// `payload_octets_max`, is the quarter that outruns the windows.
+const payload_octets_common: u32 = 24 * 1024;
+
+comptime {
+    assert(clock_jump_ns_max < quiet_ns);
+    assert(clock_jump_ns_max * @as(u64, steps_max / clock_jump_period) > deadline_ns);
+    assert(read_every_max < quiet_steps_max);
+    assert(reader_catch_up_ns < quiet_ns);
+    assert(payload_octets_common < payload_octets_max);
+    assert(adversary_budget_max < steps_max);
 }
 
 const fake_secret_seeds = [_]u8{ 0x11, 0x22, 0x33, 0x44 };
@@ -493,16 +530,16 @@ fn buildWorld(seed: u64) World {
     }
     // And a third of them are watched by somebody. The same reasoning: a sweep
     // where every seed has an attacker cannot say what the attacker changed.
-    if (random.uintLessThan(u8, 3) == 0) {
-        world.adversary.budget = 1 + random.uintLessThan(u32, 24);
+    if (random.uintLessThan(u8, adversary_seed_period) == 0) {
+        world.adversary.budget = 1 + random.uintLessThan(u32, adversary_budget_max);
     }
     // A third read slowly. Bounded, and bounded on purpose: a reader that
     // stops for ever stalls the transfer by construction, and the oracle that
     // the transfer completes would then be measuring the harness. What this
     // draws is a reader that is *late*, which is what closes a receive window
     // and makes the other endpoint ask for it to be reopened.
-    if (random.uintLessThan(u8, 3) == 0) {
-        world.read_every = 1 + random.uintLessThan(u32, 8);
+    if (random.uintLessThan(u8, reader_seed_period) == 0) {
+        world.read_every = 1 + random.uintLessThan(u32, read_every_max);
     }
     // Content that a partial or reordered delivery cannot accidentally satisfy.
     for (&world.payload, 0..) |*octet, index| octet.* = @truncate(index *% 31 +% 7);
@@ -636,9 +673,14 @@ fn driveApplication(world: *World) void {
             if (taken > 0) world.busy_until_ns = world.now_ns;
         }
         if (world.written == world.payload_len) {
-            _ = world.client.write(stream, &.{}, true) catch {};
-            world.write_done = true;
-            world.busy_until_ns = world.now_ns;
+            // Only when the FIN was actually taken. Setting `write_done`
+            // regardless made a refused FIN look like a finished write, and the
+            // run then counted as a completed transfer with nothing having been
+            // delivered.
+            if (world.client.write(stream, &.{}, true)) |_| {
+                world.write_done = true;
+                world.busy_until_ns = world.now_ns;
+            } else |_| {}
         }
     }
 
@@ -678,11 +720,15 @@ fn driveApplication(world: *World) void {
 /// are neither a packet nor zeroes is one this endpoint built wrong.
 fn inspectDatagram(world: *World, datagram: []const u8, peer_id_octets: u8) void {
     if (world.failure != null) return;
+    assert(datagram.len <= Link.datagram_octets_max);
+    assert(peer_id_octets <= quic.ConnectionId.octets_max);
     var offset: usize = 0;
-    // Bounded by the datagram: every packet is at least one octet.
+    // Bounded by the datagram, because every packet is at least one octet —
+    // and the assertion below is what makes that a checked claim rather than
+    // this sentence.
     while (offset < datagram.len) {
         const parsed = quic.packet.parse(datagram[offset..], peer_id_octets) catch break;
-        if (parsed.octets == 0) break;
+        assert(parsed.octets >= 1);
         offset += parsed.octets;
         if (offset > datagram.len) {
             fail(world, "a packet claimed more octets than the datagram holds", offset);
@@ -709,7 +755,7 @@ fn injectAdversary(world: *World, random: std.Random) void {
     // Sparse. The interesting question is whether an endpoint discards one of
     // these correctly, and asking it once per step would drown the connection
     // rather than test it.
-    if (random.uintLessThan(u8, 8) != 0) return;
+    if (random.uintLessThan(u8, adversary_period) != 0) return;
 
     // `u8` rather than `usize`: `uintLessThan` consumes `@sizeOf(T)` octets per
     // attempt, so drawing through a `usize` makes the whole PRNG stream — and
@@ -718,11 +764,14 @@ fn injectAdversary(world: *World, random: std.Random) void {
     const direction: usize = random.uintLessThan(u8, 2);
     const length = world.adversary.seen_len[direction];
     if (length == 0) return;
+    assert(length <= Link.datagram_octets_max);
     const link = if (direction == 0) &world.to_server else &world.to_client;
 
     var copy: [Link.datagram_octets_max]u8 = undefined;
     @memcpy(copy[0..length], world.adversary.seen[direction][0..length]);
+    const budget_before = world.adversary.budget;
     world.adversary.budget -= 1;
+    assert(world.adversary.budget < budget_before);
 
     switch (random.uintLessThan(u8, 3)) {
         // A replay. The only one of the three that authenticates, so it is the
@@ -736,6 +785,7 @@ fn injectAdversary(world: *World, random: std.Random) void {
         // path produces as well as what an attacker does on purpose.
         1 => {
             const cut = 1 + random.uintLessThan(u32, length);
+            assert(cut >= 1 and cut <= length);
             world.census.adversary_truncations += 1;
             link.send(copy[0..cut], world.now_ns, random);
         },
@@ -743,6 +793,7 @@ fn injectAdversary(world: *World, random: std.Random) void {
         // number, in the ciphertext, in the tag.
         else => {
             const at = random.uintLessThan(u32, length);
+            assert(at < length);
             copy[at] ^= @as(u8, 1) << random.int(u3);
             world.census.adversary_corruptions += 1;
             link.send(copy[0..length], world.now_ns, random);
@@ -878,6 +929,16 @@ fn stepOnce(world: *World) bool {
     checkInvariants(world);
     if (world.failure != null) return false;
 
+    // Advance the clock and service whatever it reached. Split out because
+    // `stepOnce` was three separate things — deliver, send, advance — in one
+    // function past the length limit, and the third is the one with the
+    // invariants worth reading on their own.
+    return advanceClock(world, random);
+}
+
+/// Move to the next thing that can happen, then fire everything the clock
+/// reached. Answers false when there is nothing left to move to.
+fn advanceClock(world: *World, random: std.Random) bool {
     // Advance to the next thing that can happen: a delivery, or a timer.
     var next: ?u64 = null;
     if (world.to_server.nextAt()) |at| next = minimum(next, at);
@@ -893,7 +954,7 @@ fn stepOnce(world: *World) bool {
     if (next == null and world.received < world.payload_len and
         world.server.readable(quic.stream_id.make(.client_bidirectional, 0)).len > 0)
     {
-        world.now_ns += std.time.ns_per_ms;
+        world.now_ns += reader_catch_up_ns;
         return true;
     }
 
@@ -905,10 +966,13 @@ fn stepOnce(world: *World) bool {
     // promptly works only on an idle machine. The jump is bounded so that a
     // sweep still finishes inside its virtual deadline — what is being tested
     // is lateness, not the idle timeout.
-    if (random.uintLessThan(u8, 16) == 0) {
-        target += random.uintLessThan(u64, 50 * std.time.ns_per_ms);
+    if (random.uintLessThan(u8, clock_jump_period) == 0) {
+        target += random.uintLessThan(u64, clock_jump_ns_max);
         world.census.clock_jumps += 1;
     }
+    // The one invariant a jump could break, and the reason it is checked here
+    // rather than trusted: everything downstream reads `now_ns` as monotone.
+    assert(target > world.now_ns);
     world.now_ns = target;
 
     // Fire whatever the clock reached, to a fixpoint. A real event loop drains
@@ -993,6 +1057,7 @@ fn recordClose(world: *World, err: anyerror) void {
 /// handshake levels and the streams. Only the total matters: a probe that
 /// carries data is one that made this number fall.
 fn framedTotal(connection: anytype) u64 {
+    assert(connection.streams.count <= @TypeOf(connection.streams).streams_max);
     var total: u64 = 0;
     for (connection.levels) |level| total += level.framed;
     for (connection.streams.streams[0..connection.streams.count]) |stream| total += stream.framed;
@@ -1105,14 +1170,25 @@ pub fn main(init: std.process.Init) !u8 {
     var first: u64 = 0;
     var index: usize = 1;
     while (index < args.len) : (index += 1) {
+        // A number that does not parse, or a flag nobody recognises, ends the
+        // run. Falling back silently is how a nightly sweeps the same range it
+        // was written to avoid while reporting that it did something else: the
+        // shell echoes the range it *meant* to pass and the sweep never sees
+        // it.
         if (std.mem.eql(u8, args[index], "--seed") and index + 1 < args.len) {
-            first = std.fmt.parseInt(u64, args[index + 1], 10) catch 0;
+            first = std.fmt.parseInt(u64, args[index + 1], 10) catch {
+                std.debug.print("sim: --seed '{s}' is not a number\n", .{args[index + 1]});
+                return 2;
+            };
             seeds = 1;
             index += 1;
             continue;
         }
         if (std.mem.eql(u8, args[index], "--seeds") and index + 1 < args.len) {
-            seeds = std.fmt.parseInt(u64, args[index + 1], 10) catch seeds;
+            seeds = std.fmt.parseInt(u64, args[index + 1], 10) catch {
+                std.debug.print("sim: --seeds '{s}' is not a number\n", .{args[index + 1]});
+                return 2;
+            };
             index += 1;
             continue;
         }
@@ -1121,10 +1197,15 @@ pub fn main(init: std.process.Init) !u8 {
         // this is what lets it take a fresh one, and `--seed` alone could not
         // because it also pins the count to one.
         if (std.mem.eql(u8, args[index], "--from") and index + 1 < args.len) {
-            first = std.fmt.parseInt(u64, args[index + 1], 10) catch first;
+            first = std.fmt.parseInt(u64, args[index + 1], 10) catch {
+                std.debug.print("sim: --from '{s}' is not a number\n", .{args[index + 1]});
+                return 2;
+            };
             index += 1;
             continue;
         }
+        std.debug.print("sim: unrecognised argument '{s}'\n", .{args[index]});
+        return 2;
     }
 
     std.debug.print("h3 sim — {d} seed(s) from {d}, assertions {s}\n", .{

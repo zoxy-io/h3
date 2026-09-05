@@ -3741,6 +3741,7 @@ pub fn Connection(comptime config: Config) type {
         /// whose limits had room, and two smaller streams on the same
         /// connection finishing normally.
         fn reclaimStream(self: *Self, id: u64) void {
+            assert(id <= varint.max);
             var oldest: ?u64 = null;
             // Bounded by `sent_max`, which is the same order of work loss
             // detection already does on every acknowledgement.
@@ -4017,6 +4018,9 @@ pub fn Connection(comptime config: Config) type {
                 //# 1200 bytes if it does not have Handshake keys, and otherwise send a
                 //# Handshake packet.
                 .probe => |probe| {
+                    // Section 6.2.4 asks for at least one and allows two; a
+                    // probe of zero packets is a timer that fired for nothing.
+                    assert(probe.packets >= 1);
                     self.spaces[@intFromEnum(probe.space)].probes_pending = probe.packets;
                     if (self.recovery.earliestContext(probe.space)) |context| {
                         self.onPacketsLost(&.{context});
@@ -4058,6 +4062,11 @@ pub fn Connection(comptime config: Config) type {
                         if (self.spaces[index].probes_pending == 0) {
                             self.spaces[index].probes_pending = 1;
                         }
+                        // One extra packet per space, not a licence for more:
+                        // `probes_pending` is what exempts a packet from the
+                        // congestion window, and this loop grants at most one
+                        // exemption to each of the two spaces it can reach.
+                        assert(self.spaces[index].probes_pending >= 1);
                         self.onPacketsLost(&.{context});
                     }
                 },
@@ -4368,6 +4377,85 @@ pub fn Connection(comptime config: Config) type {
 
         /// One packet at one level, or `error.Empty` when the level has nothing
         /// to say.
+        /// What a packet's payload has to be padded by, and the two rules that
+        /// decide it.
+        ///
+        /// Lifted out of `sendPacket` because it is the only self-contained
+        /// thing in it — and because two obligations that reach for the same
+        /// `@min` are worth reading in one place, with their own assertions,
+        /// rather than as forty lines in the middle of a function that is also
+        /// sealing a packet.
+        const Padding = struct {
+            level: Level,
+            side: Side,
+            ack_eliciting: bool,
+            number_octets: usize,
+            payload_octets: usize,
+            payload_room: usize,
+            overhead: usize,
+            datagram_floor: usize,
+        };
+
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-5.4.2
+        //# To ensure that sufficient data is available for sampling,
+        //# packets are padded so that the combined lengths of the encoded
+        //# packet number and protected payload is at least 4 bytes longer
+        //# than the sample required for header protection.
+        //= type=test
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-14.1
+        //# A client MUST expand the payload of all UDP datagrams carrying
+        //# Initial packets to at least the smallest allowed maximum datagram
+        //# size of 1200 bytes by adding PADDING frames to the Initial packet or
+        //# by coalescing the Initial packet; see Section 12.2.
+        //= type=test
+        fn paddingFor(options: Padding) usize {
+            assert(options.payload_octets <= options.payload_room);
+            assert(options.number_octets >= packet_number.octets_min);
+            assert(options.number_octets <= packet_number.octets_max);
+            const room = options.payload_room - options.payload_octets;
+
+            // Section 5.4.2's floor, which is the sender's obligation and was
+            // nobody's. `seal` refuses a packet whose packet number and
+            // protected payload are shorter than the sample — correctly, since
+            // the peer could not unprotect one — and `send` turns that refusal
+            // into `error.Empty`, so a packet whose payload came to fewer than
+            // four octets was built and silently dropped. A lone HANDSHAKE_DONE
+            // is one octet; so is a lone PING probe.
+            //
+            // It hid behind flow control: the connection-level `MAX_DATA` was
+            // recorded as unsent at startup, so the first 1-RTT packet a
+            // connection ever sent carried one and was long enough by accident.
+            // Recording the limit the transport parameters already carried took
+            // the accident away and four tests failed at once.
+            const sample_floor = crypto.protect.sample_offset + crypto.protect.sample_octets;
+            const carried = options.number_octets + options.payload_octets + crypto.tag_octets;
+            var padding: usize = if (carried < sample_floor) @min(sample_floor - carried, room) else 0;
+
+            // Section 14.1's floor, which the caller decided this datagram
+            // owes. It used to be met by zeroing the buffer *after* the last
+            // packet — legal enough, and not what section 14.1 says: the two
+            // ways it names are PADDING frames in the Initial packet and
+            // coalescing, and trailing zeroes are neither. A peer parses them
+            // as one more packet: quic-go read every one of ours as a short
+            // header it could not unprotect, and either discarded it or spent a
+            // slot in its undecryptable queue on it.
+            //
+            // The caller has already applied the "who owes it" test for every
+            // level but the Initial, whose payload is not built until now: a
+            // client pads every datagram carrying an Initial, a server only
+            // those carrying an ack-eliciting one.
+            const owes_floor = options.level != .initial or
+                options.side == .client or options.ack_eliciting;
+            const reached = options.overhead + options.payload_octets + padding;
+            if (owes_floor and options.datagram_floor > reached) {
+                padding = @min(options.datagram_floor - options.overhead - options.payload_octets, room);
+            }
+
+            assert(padding <= room);
+            return padding;
+        }
+
         /// `datagram_floor` is section 14.1's 1200 octets when this packet is
         /// the first in a datagram that owes them, and zero otherwise. It is
         /// applied here rather than after the loop in `send` because padding is
@@ -4449,58 +4537,21 @@ pub fn Connection(comptime config: Config) type {
                 return error.Empty;
             }
 
-            // Section 5.4.2 makes the padding the *sender's* obligation, and
-            // nothing here did it. `seal` refuses a packet whose packet number
-            // and protected payload are shorter than the sample — correctly,
-            // since the peer could not unprotect one — and `send` turns that
-            // refusal into `error.Empty`, so a packet whose payload came to
-            // fewer than four octets was built and silently dropped. A lone
-            // HANDSHAKE_DONE is one octet; so is a lone PING probe.
-            //
-            // It hid behind flow control: the connection-level `MAX_DATA` was
-            // recorded as unsent at startup, so the first 1-RTT packet a
-            // connection ever sent carried one and was long enough by accident.
-            // Recording the limit the transport parameters already carried took
-            // the accident away and four tests failed at once.
-            //= https://www.rfc-editor.org/rfc/rfc9001#section-5.4.2
-            //# To ensure that sufficient data is available for sampling,
-            //# packets are padded so that the combined lengths of the encoded
-            //# packet number and protected payload is at least 4 bytes longer
-            //# than the sample required for header protection.
-            //= type=test
-            const sample_floor = crypto.protect.sample_offset + crypto.protect.sample_octets;
-            const carried = number_octets + payload_octets + crypto.tag_octets;
-            var padding = if (carried < sample_floor) @min(sample_floor - carried, payload_room - payload_octets) else 0;
-
-            // Section 14.1's floor, which the caller has already decided this
-            // datagram owes. It used to be met by zeroing the buffer *after*
-            // the last packet — legal enough, and not what section 14.1 says:
-            // the two ways it names are PADDING frames in the Initial packet
-            // and coalescing, and trailing zeroes are neither. A peer parses
-            // them as one more packet: quic-go read every one of ours as a
-            // short header it could not unprotect, and either discarded it or
-            // spent a slot in its undecryptable queue on it. Half the padded
-            // datagrams in a `handshakeloss` run ended that way.
-            //= https://www.rfc-editor.org/rfc/rfc9000#section-14.1
-            //# A client MUST expand the payload of all UDP datagrams carrying
-            //# Initial packets to at least the smallest allowed maximum datagram
-            //# size of 1200 bytes by adding PADDING frames to the Initial packet or
-            //# by coalescing the Initial packet; see Section 12.2.
-            //= type=test
-            // The caller has already applied this test for every level but the
-            // Initial, whose payload is not built until here: a client pads
-            // every datagram carrying an Initial, a server only those carrying
-            // an ack-eliciting one.
-            const owes_floor = level != .initial or self.side == .client or written.ack_eliciting;
-            // `overhead` above is the same header-plus-tag total this needs.
-            if (owes_floor and datagram_floor > overhead + payload_octets + padding) {
-                const wanted = datagram_floor - overhead - payload_octets;
-                padding = @min(wanted, payload_room - payload_octets);
-            }
+            const padding = paddingFor(.{
+                .level = level,
+                .side = self.side,
+                .ack_eliciting = written.ack_eliciting,
+                .number_octets = number_octets,
+                .payload_octets = payload_octets,
+                .payload_room = payload_room,
+                .overhead = overhead,
+                .datagram_floor = datagram_floor,
+            });
             // A PADDING frame is a zero octet, and `buffer` is not otherwise
             // initialised.
             //= https://www.rfc-editor.org/rfc/rfc9000#section-19.1
             //# A PADDING frame (type=0x00) has no semantic value.
+            assert(payload_octets + padding <= payload_room);
             @memset(buffer[header.header_octets + payload_octets ..][0..padding], 0);
             const sealed_octets = payload_octets + padding;
 
@@ -5004,12 +5055,6 @@ pub fn Connection(comptime config: Config) type {
             return result;
         }
 
-        /// Section 4.1: raise the peer's limits as the application reads.
-        ///
-        /// Sent when the window has moved by half, rather than on every read: a
-        /// MAX_DATA per octet consumed would spend more of the connection on
-        /// flow control than on data, and a peer only needs the limit before it
-        /// runs out.
         /// Whether a window update is owed, asked with the same arithmetic
         /// `writeFlowControl` uses to write one.
         ///
@@ -5022,6 +5067,7 @@ pub fn Connection(comptime config: Config) type {
         /// *empty* send buffer and `send_limit` exactly equal to what had been
         /// sent.
         fn owesFlowControl(self: *const Self) bool {
+            assert(self.streams.count <= ConnectionStreams.streams_max);
             // Section 4.6's limit on the *number* of streams belongs here for
             // the same reason it is written by `writeFlowControl`: it is owed,
             // sent and lost exactly like a window update, and the packet
@@ -5056,6 +5102,7 @@ pub fn Connection(comptime config: Config) type {
         //# flow control limits.
         //= type=test
         fn writeBlocked(self: *Self, target: []u8) usize {
+            assert(self.streams.count <= ConnectionStreams.streams_max);
             var offset: usize = 0;
             if (self.streams.send_blocked) {
                 offset += frame.encode(target[offset..], .{ .data_blocked = .{
@@ -5078,6 +5125,12 @@ pub fn Connection(comptime config: Config) type {
             return offset;
         }
 
+        /// Section 4.1: raise the peer's limits as the application reads.
+        ///
+        /// Sent when the window has moved by half, rather than on every read: a
+        /// MAX_DATA per octet consumed would spend more of the connection on
+        /// flow control than on data, and a peer only needs the limit before it
+        /// runs out.
         fn writeFlowControl(self: *Self, target: []u8) usize {
             var offset: usize = 0;
             const limit = self.streams.receiveLimit();
@@ -5168,22 +5221,6 @@ pub fn Connection(comptime config: Config) type {
             return offset;
         }
 
-        // Both limits are `Streams`': `write` refuses what would exceed the
-        // connection or stream window and what would follow a FIN, so
-        // everything in `send[framed..send_len]` is already within both.
-        //= https://www.rfc-editor.org/rfc/rfc9000#section-4.1
-        //# Senders MUST NOT send data in excess of either limit.
-        //
-        //= https://www.rfc-editor.org/rfc/rfc9000#section-4.5
-        //# An endpoint MUST NOT send data on a stream at or beyond the final
-        //# size.
-        //
-        /// Frame whatever one stream has waiting.
-        ///
-        /// One stream per packet rather than as many as fit: a packet carrying
-        /// two streams' data has to record two ranges to undo on loss, and the
-        /// gain is a few octets of header on a path that is already
-        /// AEAD-bound.
         /// Section 3.3's RESET_STREAM, for a stream this endpoint abandoned.
         ///
         /// Sent until acknowledged, and unchanged each time: the code and the
@@ -5195,7 +5232,9 @@ pub fn Connection(comptime config: Config) type {
         //# terminate the sending part of a stream.
         //= type=test
         fn writeReset(self: *Self, target: []u8, result: *Payload) usize {
+            assert(!result.stream_reset);
             const stream = self.streams.nextReset() orelse return 0;
+            assert(stream.send_state == .reset);
             assert(stream.reset_code <= varint.max);
             assert(stream.reset_final_size <= varint.max);
             const written = frame.encode(target, .{ .reset_stream = .{
@@ -5226,8 +5265,10 @@ pub fn Connection(comptime config: Config) type {
         /// acknowledged: an acknowledged request the peer has not acted on is
         /// still outstanding.
         fn writeStopSending(self: *Self, target: []u8, result: *Payload) usize {
+            assert(!result.stop_sending);
             const stream = self.streams.nextStopSending() orelse return 0;
             const code = stream.stop_code orelse return 0;
+            assert(!stream.stop_framed);
             assert(code <= varint.max);
             const written = frame.encode(target, .{ .stop_sending = .{
                 .stream = stream.id,
@@ -5245,6 +5286,22 @@ pub fn Connection(comptime config: Config) type {
             return written;
         }
 
+        // Both limits are `Streams`': `write` refuses what would exceed the
+        // connection or stream window and what would follow a FIN, so
+        // everything in `send[framed..send_len]` is already within both.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-4.1
+        //# Senders MUST NOT send data in excess of either limit.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-4.5
+        //# An endpoint MUST NOT send data on a stream at or beyond the final
+        //# size.
+        //
+        /// Frame whatever one stream has waiting.
+        ///
+        /// One stream per packet rather than as many as fit: a packet carrying
+        /// two streams' data has to record two ranges to undo on loss, and the
+        /// gain is a few octets of header on a path that is already
+        /// AEAD-bound.
         fn writeStream(self: *Self, target: []u8, result: *Payload) usize {
             assert(self.streams.count <= self.streams.streams.len);
             for (self.streams.streams[0..self.streams.count]) |*stream| {
@@ -5542,6 +5599,7 @@ pub fn Connection(comptime config: Config) type {
         /// accessor and the writer cannot drift into disagreeing.
         fn oneRttWritable(self: *const Self) bool {
             const index = @intFromEnum(Level.one_rtt);
+            assert(index < self.send_keys.len);
             if (self.send_keys[index] == null) return false;
             const space = &self.spaces[@intFromEnum(Space.application)];
             if (space.discarded) return false;

@@ -41,6 +41,8 @@ const h3 = @import("h3");
 const tls = @import("tls.zig");
 const qlog_file = @import("qlog_file.zig");
 
+const assert = std.debug.assert;
+
 const Io = std.Io;
 const quic = h3.quic;
 
@@ -401,6 +403,7 @@ fn accept(
         // a backed-off probe timeout, so recency alone makes the connection
         // least able to survive eviction the one most likely to be chosen.
         var oldest: *Peer = &peers[0];
+        assert(peers.len == connections_max);
         for (peers) |*peer| {
             if (rank(peer) < rank(oldest)) {
                 oldest = peer;
@@ -412,6 +415,7 @@ fn accept(
             oldest.local.bytes(),
             (now_ns -| oldest.last_ns) / std.time.ns_per_ms,
         });
+        assert(oldest.last_ns <= now_ns);
         release(io, oldest);
         break :free oldest;
     };
@@ -969,6 +973,7 @@ fn respondHq(io: Io, peer: *Peer, shared: *const Shared, stream: u64) !void {
 /// the same way, as a run that stopped partway with both endpoints idle. The
 /// runner's `multiplexing` case served twenty-four of its files and stopped.
 fn compactReadable(peer: *Peer) void {
+    assert(peer.readable_len <= peer.readable.len);
     var kept: usize = 0;
     // Bounded by `readable_len`.
     for (peer.readable[0..peer.readable_len]) |id| {
@@ -976,6 +981,7 @@ fn compactReadable(peer: *Peer) void {
         peer.readable[kept] = id;
         kept += 1;
     }
+    assert(kept <= peer.readable.len);
     peer.readable_len = kept;
 }
 
@@ -1010,6 +1016,7 @@ fn flush(io: Io, socket: *Io.net.Socket, peer: *Peer, now_ns: u64) !void {
 /// What a congestion plot is drawn from, once per flush rather than per packet.
 fn traceMetrics(peer: *Peer, now_ns: u64) void {
     const recovery = &peer.connection.recovery;
+    assert(recovery.smoothed_rtt > 0);
     peer.trace.record(now_ns, .{ .metrics = .{
         .smoothed_rtt_ns = recovery.smoothed_rtt,
         .rtt_variance_ns = recovery.rttvar,
@@ -1062,6 +1069,7 @@ fn flushAll(
 /// under h3spec, where thirty-three of forty-nine cases *are* protocol errors:
 /// every one of them left a file handle open and a buffered trace unwritten.
 fn release(io: Io, peer: *Peer) void {
+    assert(peer.answers_len <= peer.answers.len);
     peer.trace.finish(io);
     // Bounded by `answers_len`, which is bounded by `requests_max`.
     for (peer.answers[0..peer.answers_len]) |*answer| {
@@ -1070,6 +1078,7 @@ fn release(io: Io, peer: *Peer) void {
     }
     peer.answers_len = 0;
     peer.live = false;
+    assert(!peer.live);
 }
 
 fn retire(io: Io, peers: []Peer, now_ns: u64) void {

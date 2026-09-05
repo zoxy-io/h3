@@ -841,9 +841,24 @@ fn fuzzStreams(_: void, smith: *std.testing.Smith) !void {
 
     var operations: u32 = 0;
     while (operations < streams_operations_max and !smith.eosWeightedSimple(8, 1)) : (operations += 1) {
-        const id: u64 = @as(u64, smith.valueRangeAtMost(u8, 0, 5)) * 4;
+        // Drawn past the advertised limit on purpose. Section 3.2 makes an
+        // identifier a request to create every lower-numbered stream of its
+        // kind, so an index the limit refuses is the input that decides whether
+        // one frame can fill the table — and the old range of 0..5 could not
+        // reach it.
+        const id: u64 = @as(u64, smith.valueRangeAtMost(u8, 0, 24)) * 4;
 
-        switch (smith.value(enum { receive, consume, reset, write, limits })) {
+        switch (smith.value(enum {
+            receive,
+            consume,
+            reset,
+            write,
+            limits,
+            abandon,
+            stop,
+            acknowledge,
+            deliver,
+        })) {
             .receive => {
                 var chunk: [96]u8 = undefined;
                 const length = @min(smith.slice(&chunk), chunk.len);
@@ -867,6 +882,15 @@ fn fuzzStreams(_: void, smith: *std.testing.Smith) !void {
                 set.setConnectionSendLimit(smith.value(u16));
                 set.setSendLimit(id, smith.value(u16)) catch {};
             },
+            // The four the retirement work added, none of which had a target.
+            .abandon => set.resetSend(id, smith.value(u16)) catch {},
+            .stop => set.stopSending(id, smith.value(u16)) catch {},
+            .acknowledge => set.acknowledge(id, smith.value(u16)),
+            .deliver => {
+                set.resetDelivered(id);
+                set.release(id, null);
+                set.sweep();
+            },
         }
 
         // Section 4.1's connection limit, which is what bounds memory: without
@@ -884,6 +908,27 @@ fn fuzzStreams(_: void, smith: *std.testing.Smith) !void {
             assert(stream.consumed <= stream.received_highest);
         }
         assert(set.count <= FuzzStreams.streams_max);
+
+        // The retirement invariants, which are what the operations above exist
+        // to attack. A watermark with a hole in it cannot tell a retired
+        // identifier from one that was never opened, and an identifier handed
+        // out twice is section 2.1's MUST NOT.
+        for (set.streams[0..set.count]) |*stream| {
+            assert(!set.isRetired(stream.id));
+            for (set.streams[0..set.count]) |*other| {
+                if (stream == other) continue;
+                assert(stream.id != other.id);
+            }
+        }
+        // Everything below a kind's watermark is gone, and everything at or
+        // above it that exists is present — which is what makes `find`
+        // returning null mean "retired" rather than "never seen".
+        for (0..h3.quic.stream_id.kind_count) |raw| {
+            const kind: h3.quic.stream_id.Kind = @enumFromInt(raw);
+            const watermark = set.retired[raw];
+            if (watermark == 0) continue;
+            assert(set.find(h3.quic.stream_id.make(kind, watermark - 1)) == null);
+        }
     }
 }
 

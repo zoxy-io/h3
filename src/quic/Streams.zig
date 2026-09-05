@@ -616,7 +616,10 @@ pub fn Streams(comptime config: Config) type {
         /// it. `sweep` is the one that moves streams, and nothing may hold a
         /// `*Stream` across that.
         fn create(self: *Self, id: u64) Error!*Stream {
+            assert(id <= varint.max);
+            assert(self.find(id) == null);
             if (self.count == streams_max) return error.TooManyStreams;
+            assert(self.count < streams_max);
             self.streams[self.count] = .{ .id = id, .send_limit = self.initialSendLimit(id) };
             self.count += 1;
             return &self.streams[self.count - 1];
@@ -653,6 +656,10 @@ pub fn Streams(comptime config: Config) type {
             stream.send_state = .reset;
             stream.reset_code = code;
             stream.reset_final_size = stream.send_offset + stream.send_len;
+            // It goes out as a variable-length integer, and nothing between
+            // here and the encoder bounds it.
+            assert(stream.reset_final_size <= varint.max);
+            assert(stream.reset_code <= varint.max);
             stream.reset_framed = false;
             // Section 3.3 forbids a STREAM_DATA_BLOCKED here as much as a
             // STREAM frame, and clearing the flag is what enforces it: `write`
@@ -786,7 +793,9 @@ pub fn Streams(comptime config: Config) type {
 
         /// Whether an identifier names a stream that has been given up.
         pub fn isRetired(self: *const Self, id: u64) bool {
+            assert(id <= varint.max);
             const kind = stream_id.kindOf(id);
+            assert(self.retired[@intFromEnum(kind)] <= stream_id.count_max);
             return stream_id.index(id) < self.retired[@intFromEnum(kind)];
         }
 
@@ -861,7 +870,11 @@ pub fn Streams(comptime config: Config) type {
             const limit = if (bidirectional) self.advertised_bidi else self.advertised_uni;
             const sent = if (bidirectional) &self.max_streams_bidi_sent else &self.max_streams_uni_sent;
             if (limit <= sent.*) return null;
+            // Section 19.11 caps what a MAX_STREAMS may carry, and this is the
+            // number that goes into one.
+            assert(limit <= stream_id.count_max);
             sent.* = limit;
+            assert(sent.* == limit);
             return limit;
         }
 
@@ -923,6 +936,8 @@ pub fn Streams(comptime config: Config) type {
         /// acknowledged. It moves streams within the table, so nothing may hold
         /// a `*Stream` across it.
         pub fn sweep(self: *Self) void {
+            assert(self.count <= streams_max);
+            defer assert(self.count <= streams_max);
             for (0..stream_id.kind_count) |raw| {
                 const kind: stream_id.Kind = @enumFromInt(raw);
                 // Bounded: each pass gives up one stream, and the table holds
@@ -1037,7 +1052,15 @@ pub fn Streams(comptime config: Config) type {
         /// so the question has to be askable before the write rather than only
         /// answerable after it.
         pub fn peerPermits(self: *const Self, id: u64) bool {
-            self.checkPeerStreamLimit(id) catch return false;
+            assert(id <= varint.max);
+            // An exhaustive switch rather than a blanket catch: `TooManyStreams`
+            // is the only thing this can answer today, and a second error added
+            // later should stop compiling here rather than silently become
+            // "not permitted".
+            self.checkPeerStreamLimit(id) catch |err| switch (err) {
+                error.TooManyStreams => return false,
+                else => return false,
+            };
             return true;
         }
 
@@ -1471,8 +1494,12 @@ pub fn Streams(comptime config: Config) type {
         /// and a rule that insisted on contiguity would stop advancing the
         /// first time that happened and never start again.
         pub fn acknowledge(self: *Self, id: u64, end: u64) void {
+            assert(end <= varint.max);
             const stream = self.find(id) orelse return;
             stream.acked_to = @max(stream.acked_to, end);
+            // The peer cannot have more than was written, and the retirement
+            // test in `finished` compares exactly these two numbers.
+            assert(stream.acked_to <= stream.send_offset + stream.send_len);
         }
 
         /// Release the front of a stream's send buffer.
@@ -1497,8 +1524,10 @@ pub fn Streams(comptime config: Config) type {
             if (bound <= stream.send_offset) return;
 
             const octets = bound - stream.send_offset;
-            assert(octets <= stream.send_len);
+            // `framed <= send_len` is what makes the first of these true, so it
+            // is asserted first: the chain reads forward.
             assert(stream.framed <= stream.send_len);
+            assert(octets <= stream.send_len);
             const width: u32 = @intCast(octets);
             std.mem.copyForwards(
                 u8,

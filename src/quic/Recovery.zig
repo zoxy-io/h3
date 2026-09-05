@@ -1248,6 +1248,7 @@ pub fn Recovery(comptime config: Config) type {
         //# PTO timer.
         pub fn earliestContext(self: *const Self, space: Space) ?Context {
             const state = &self.spaces[@intFromEnum(space)];
+            assert(state.count <= config.sent_max);
             // The earliest *in flight*, not the earliest recorded. Every packet
             // is recorded here, acknowledgement-only ones included, and an
             // acknowledgement-only packet carries nothing a retransmission
@@ -1283,6 +1284,7 @@ pub fn Recovery(comptime config: Config) type {
         /// stream's send buffer can be given back.
         pub fn recorded(self: *const Self, space: Space) []const Sent {
             const state = &self.spaces[@intFromEnum(space)];
+            assert(state.count <= config.sent_max);
             return state.sent[0..state.count];
         }
     };

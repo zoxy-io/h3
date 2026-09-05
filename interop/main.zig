@@ -298,14 +298,7 @@ pub fn main(init: std.process.Init) !u8 {
     // connection in it. Absent, unwritable or not there at all is the ordinary
     // case rather than an error: a shim that refused to run a test because it
     // could not write a log would be failing the test for the log's sake.
-    var qlog_directory: ?Io.Dir = null;
-    if (environ.get("QLOGDIR")) |path| {
-        if (Io.Dir.cwd().openDir(io, path, .{})) |directory| {
-            qlog_directory = directory;
-        } else |err| {
-            try log.print("h3-interop: QLOGDIR {s}: {s}\n", .{ path, @errorName(err) });
-        }
-    }
+    var qlog_directory = try qlogDirectory(io, log, environ);
     defer if (qlog_directory) |*directory| directory.close(io);
 
     var requests: std.ArrayList([]const u8) = .empty;
@@ -422,16 +415,7 @@ fn runServer(init: std.process.Init, log: *Io.Writer, testcase: ServerTestcase) 
     };
     defer www.close(io);
 
-    // The same directory the client role writes into, and the same reason for
-    // shrugging when it is not there.
-    var qlog: ?Io.Dir = null;
-    if (environ.get("QLOGDIR")) |path| {
-        if (Io.Dir.cwd().openDir(io, path, .{})) |directory| {
-            qlog = directory;
-        } else |err| {
-            try log.print("h3-interop: QLOGDIR {s}: {s}\n", .{ path, @errorName(err) });
-        }
-    }
+    var qlog = try qlogDirectory(io, log, environ);
     defer if (qlog) |*directory| directory.close(io);
 
     try server_role.run(io, gpa, log, .{
@@ -444,6 +428,21 @@ fn runServer(init: std.process.Init, log: *Io.Writer, testcase: ServerTestcase) 
         .verbose = environ.get("VERBOSE") != null,
     });
     return 0;
+}
+
+/// Where a per-connection qlog goes, or null.
+///
+/// The interop runner names a directory and expects one trace per connection in
+/// it. Absent, unwritable or not there at all is the ordinary case rather than
+/// an error: a shim that refused to run a test because it could not write a log
+/// would be failing the test for the log's sake. One function because both
+/// roles want exactly this and had a verbatim copy each.
+fn qlogDirectory(io: Io, log: *Io.Writer, environ: *std.process.Environ.Map) !?Io.Dir {
+    const path = environ.get("QLOGDIR") orelse return null;
+    return Io.Dir.cwd().openDir(io, path, .{}) catch |err| {
+        try log.print("h3-interop: QLOGDIR {s}: {s}\n", .{ path, @errorName(err) });
+        return null;
+    };
 }
 
 fn readAll(io: Io, gpa: std.mem.Allocator, path: []const u8) ![]u8 {
@@ -736,6 +735,11 @@ const Session = struct {
             }
 
             if (testcase == .http3) try self.drainHttp3(log) else try self.drainStreams(now);
+            // On both paths. `drainStreams` never consults `readable`, so an
+            // `hq-interop` run grew the list to `streams_max` and then dropped
+            // identifiers in silence — which is the defect `compactReadable`
+            // was written for, left in place on the other half of the fork.
+            self.compactReadable();
             try self.keyUpdate(testcase, now);
             try self.drainEvents(log, now);
             try self.reap(io, log, origin);
@@ -954,6 +958,7 @@ const Session = struct {
     /// up and start refusing new ones. See `interop/server.zig`, which had the
     /// same defect and showed it first.
     fn compactReadable(self: *Session) void {
+        assert(self.readable_len <= self.readable.len);
         var kept: usize = 0;
         // Bounded by `readable_len`.
         for (self.readable[0..self.readable_len]) |id| {
@@ -961,6 +966,7 @@ const Session = struct {
             self.readable[kept] = id;
             kept += 1;
         }
+        assert(kept <= self.readable.len);
         self.readable_len = kept;
     }
 
@@ -1105,6 +1111,7 @@ const Session = struct {
     /// a trace larger than the transfer it describes.
     fn traceMetrics(self: *Session, now_ns: u64) void {
         const recovery = &self.connection.recovery;
+        assert(recovery.smoothed_rtt > 0);
         self.trace.record(now_ns, .{ .metrics = .{
             .smoothed_rtt_ns = recovery.smoothed_rtt,
             .rtt_variance_ns = recovery.rttvar,
@@ -1140,6 +1147,7 @@ const Session = struct {
     /// complete, and section 4.6's limit rises as the peer's MAX_STREAMS
     /// arrive, so what can be asked for changes over the life of a connection.
     fn issue(self: *Session, io: Io, log: *Io.Writer, testcase: Testcase, directory: *Io.Dir) !void {
+        assert(self.next_url <= self.pending.len);
         // Bounded by the window, which is `requests_max`.
         for (0..requests_max) |_| {
             if (self.next_url >= self.pending.len) return;
@@ -1156,8 +1164,11 @@ const Session = struct {
             slot.writer = file.writer(io, &slot.buffer);
             self.next_url += 1;
             // RFC 9000 section 2.1: client-initiated bidirectional streams are
-            // numbered 0, 4, 8 — the two least significant bits are the type.
+            // numbered 0, 4, 8 — the two least significant bits are the type,
+            // and the assertion is what keeps that a fact rather than a comment.
+            assert(self.next_stream % 4 == 0);
             self.next_stream += 4;
+            assert(self.next_url <= self.pending.len);
 
             var line_buffer: [1024]u8 = undefined;
             const line = if (testcase == .http3)
