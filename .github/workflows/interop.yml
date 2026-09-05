@@ -1,0 +1,39 @@
+name: interop
+
+# One workflow per gate, so each carries its own badge and its own result. A
+# single matrix job that ran everything could only ever say "something broke".
+# They share `.github/actions/zig`, which is where the toolchain version lives.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege: every gate only reads the tree. Declared rather than
+# inherited, so a change to the repository default cannot widen it silently.
+permissions:
+  contents: read
+
+jobs:
+  interop:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/zig
+
+      # Compiled, not run: the QUIC Interop Runner needs docker, two networks
+      # and NET_ADMIN, and the matrix it produces is a measurement somebody
+      # reads rather than a pass a shared runner can produce. What this gate
+      # catches is the shim failing to build, which otherwise surfaces a week
+      # later when somebody tries to run it — see interop/README.md.
+      - name: interop, native
+        run: zig build interop -Doptimize=ReleaseFast
+
+      # The endpoint image is statically linked against musl, and a target that
+      # stops building breaks the image rather than this repository — which is
+      # the kind of break nobody sees until they need it.
+      - name: interop, static for the endpoint image
+        run: zig build interop -Dtarget=x86_64-linux-musl -Doptimize=ReleaseFast

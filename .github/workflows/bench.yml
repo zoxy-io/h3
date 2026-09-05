@@ -1,0 +1,34 @@
+name: bench
+
+# One workflow per gate, so each carries its own badge and its own result. A
+# single matrix job that ran everything could only ever say "something broke".
+# They share `.github/actions/zig`, which is where the toolchain version lives.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege: every gate only reads the tree. Declared rather than
+# inherited, so a change to the repository default cannot widen it silently.
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/zig
+
+      # A smoke run and **not a measurement**. A shared runner cannot produce a
+      # band anyone should compare against, so the numbers printed here mean
+      # nothing; what this proves is that the benchmark still compiles and
+      # runs, so it cannot rot between the days somebody reads its output on a
+      # machine that can. CLAUDE.md requires a real run by hand for a change
+      # that touches a protection or codec path.
+      - name: bench, smoke
+        run: zig build bench -Druns=1 -Diterations=1000

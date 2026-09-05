@@ -1,0 +1,29 @@
+name: example
+
+# One workflow per gate, so each carries its own badge and its own result. A
+# single matrix job that ran everything could only ever say "something broke".
+# They share `.github/actions/zig`, which is where the toolchain version lives.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege: every gate only reads the tree. Declared rather than
+# inherited, so a change to the repository default cannot widen it silently.
+permissions:
+  contents: read
+
+jobs:
+  example:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/zig
+      # The README's usage example, compiled and run. A README that stopped
+      # compiling is documentation that is wrong rather than out of date.
+      - name: example
+        run: zig build example

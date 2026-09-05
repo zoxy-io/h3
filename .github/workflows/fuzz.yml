@@ -1,0 +1,49 @@
+name: fuzz
+
+# One workflow per gate, so each carries its own badge and its own result. A
+# single matrix job that ran everything could only ever say "something broke".
+# They share `.github/actions/zig`, which is where the toolchain version lives.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege: every gate only reads the tree. Declared rather than
+# inherited, so a change to the repository default cannot widen it silently.
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    strategy:
+      # Every leg runs even when one fails. `-Dassertions=false` in Debug
+      # removes the `if (!ok)` and nothing else — the condition is still
+      # evaluated and a safety check inside one still traps — so only a release
+      # mode tests the elision, and only a release mode reaches the undefined
+      # behaviour a `catch unreachable` guarded by a removed assertion becomes.
+      # That distinction is not academic: it is how a livelock in an encoder
+      # path in h2 reached review rather than CI.
+      fail-fast: false
+      matrix:
+        include:
+          - name: Debug, assertions on
+            flags: ""
+          - name: ReleaseFast, assertions on
+            flags: "-Doptimize=ReleaseFast"
+          - name: ReleaseFast, assertions off
+            flags: "-Doptimize=ReleaseFast -Dassertions=false"
+    name: fuzz (${{ matrix.name }})
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/zig
+      # The corpus, replayed. Under every build that ships, because a corpus
+      # replayed only in Debug is a corpus that never meets the build a
+      # consumer runs — which is a claim this repository's own table once got
+      # wrong.
+      - name: fuzz
+        run: zig build fuzz ${{ matrix.flags }}

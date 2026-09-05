@@ -1,0 +1,40 @@
+name: checks
+
+# One workflow per gate, so each carries its own badge and its own result. A
+# single matrix job that ran everything could only ever say "something broke".
+# They share `.github/actions/zig`, which is where the toolchain version lives.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege: every gate only reads the tree. Declared rather than
+# inherited, so a change to the repository default cannot widen it silently.
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    strategy:
+      # Both legs that the fixture is about. `checks/` holds files that must
+      # FAIL to compile, and the one there proves a `comptime` assertion still
+      # fires with `-Dassertions=false` — which is a claim about the build that
+      # ships and cannot be tested from the build that does not.
+      fail-fast: false
+      matrix:
+        include:
+          - name: assertions on
+            flags: ""
+          - name: assertions off
+            flags: "-Doptimize=ReleaseFast -Dassertions=false"
+    name: checks (${{ matrix.name }})
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/zig
+      - name: checks
+        run: zig build checks ${{ matrix.flags }}

@@ -1,0 +1,11 @@
+name: zig
+description: >
+  Install the Zig toolchain this repository is pinned to. One place, so that
+  eleven workflows cannot drift onto eleven different compilers.
+runs:
+  using: composite
+  steps:
+    - uses: mlugg/setup-zig@v2
+      with:
+        # The pin. Moving it here moves it everywhere.
+        version: 0.16.0

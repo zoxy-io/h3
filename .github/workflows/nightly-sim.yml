@@ -39,10 +39,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Setup Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.16.0
+      - uses: ./.github/actions/zig
 
       # 4096 seeds from a range this repository has not swept before. The
       # arithmetic is deliberate rather than random: a failing seed is replayed
