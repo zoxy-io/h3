@@ -792,12 +792,12 @@ tells them apart.
 **As a client, against quic-go's server: eight of nine.** `handshake`,
 `transfer`, `chacha20`, `retry`, `http3`, `transferloss`, `keyupdate` and
 `multiplexing` pass. `handshakeloss` does not: it is fifty connections through
-30% loss in three hundred seconds, and about thirty-eight finish. Nothing is wrong with any one
-of them — the median handshake is half a second — but the tail is RFC 9002's
-PTO backoff at 1, 2, 4, 8, 16 seconds, and enough connections reach the far end
-of it to run out the budget. That is a performance property rather than a
-defect, and it is the honest place to leave it: not a rule broken, a recovery
-slower than quic-go's.
+30% loss in three hundred seconds, and about thirty-eight finish. Nothing is
+wrong with any one of them — the median handshake is half a second — but the
+tail is RFC 9002's PTO backoff at 1, 2, 4, 8, 16 seconds, and enough
+connections reach the far end of it to run out the budget. That is a
+performance property rather than a defect, and it is the honest place to leave
+it: not a rule broken, a recovery slower than quic-go's.
 
 **As a server, against quic-go's client: seven of eight** — `handshake`,
 `transfer`, `chacha20`, `retry`, `http3`, `transferloss` and `multiplexing`.
