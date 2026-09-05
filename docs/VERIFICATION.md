@@ -597,15 +597,29 @@ way round every short write was this endpoint filling up rather than the peer's
 window closing. Writes refused by flow control went from zero to about 292,000
 in a 4096-seed sweep.
 
-One honest limit. The sweep now enters the state the window-update deadlock
-lived in and does **not** reproduce the deadlock: removing both §4.1's blocked
-frames and §13.3's re-owing leaves 256 of 256 seeds passing. The escape is that
-the receiver keeps consuming, so its window keeps moving, so the next threshold
-crossing sends a fresh MAX_STREAM_DATA even though the lost one was never
-repaired. That deadlock needs a receiver that has *stopped* owing updates while
-the sender is blocked, which is a narrower schedule than a random sweep finds.
-It is a scenario test rather than a seed, and it is written down here rather
-than left as an assumption that the sweep covers it.
+One honest limit, and it is now closed from the other end. The sweep enters the
+state the window-update deadlock lived in and does **not** reproduce the
+deadlock: removing both §4.1's blocked frames and §13.3's re-owing leaves 256 of
+256 seeds passing. The escape is that the receiver keeps consuming, so its
+window keeps moving, so the next threshold crossing sends a fresh
+MAX_STREAM_DATA even though the lost one was never repaired. That deadlock needs
+a receiver which has *stopped* owing updates while the sender is blocked, which
+is a narrower schedule than a random sweep finds.
+
+So it is a scenario rather than a seed: "a window update lost on the wire does
+not deadlock" drives a sender at its limit, a receiver reading slowly, and a
+*targeted* drop of the one datagram carrying the update — then asserts the
+transfer finishes. It is the first test of these two fixes that loses a frame at
+all. The two that existed report a loss through `onPacketsLost` with a context
+made up by hand and check what is owed afterwards, which is the mechanism and
+not the situation.
+
+Its revert-check says exactly one thing, and the test says so in its own
+comment: removing §4.1's blocked frames fails it, and removing §13.3's
+re-advertisement does not. They are independent ways out of the same state — one
+asks the receiver, the other repairs the loss once later traffic reveals it —
+and 13.3's has a test of its own. A scenario that claimed both would be claiming
+coverage it does not have.
 
 It also cost one harness defect, of the kind this file keeps recording. A run
 ended when the network went quiet — and with a late reader, everything can be

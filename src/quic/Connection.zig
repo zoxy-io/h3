@@ -6858,6 +6858,92 @@ test "section 4.6: more streams than the table holds, one at a time" {
 }
 
 //= https://www.rfc-editor.org/rfc/rfc9000#section-4.1
+//# To keep the connection from closing, a sender that is flow control
+//# limited SHOULD periodically send a STREAM_DATA_BLOCKED or DATA_BLOCKED
+//# frame when it has no ack-eliciting packets in flight.
+//= type=test
+test "section 4.1: a window update lost on the wire does not deadlock" {
+    // The scenario the two fixes for this exist for, driven end to end rather
+    // than asserted through `onPacketsLost` with a context made up by hand.
+    // Both of those tests are real and neither of them loses a frame: they
+    // report a loss and check what is owed afterwards, which is the mechanism
+    // and not the situation.
+    //
+    // The situation is a sender at its limit, a receiver that owes nothing
+    // because its window has already moved, and the one frame that would have
+    // said so missing. Nothing else in the protocol breaks that tie — loss
+    // detection needs later ack-eliciting packets to declare the loss, and a
+    // blocked sender has none — so what recovers it is section 4.1's blocked
+    // frame prompting the receiver to say the limit again.
+    //
+    // That is the one of the two fixes this exercises, and the revert-check
+    // says so: removing the blocked frames fails this test and removing section
+    // 13.3's re-advertisement does not. The two are independent paths out of
+    // the same state — one asks the receiver, the other repairs the loss when
+    // later traffic reveals it — and 13.3's has a test of its own. A scenario
+    // that claimed both would be claiming coverage it does not have.
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+
+    // Stream 4 rather than 0: `established` grants stream 0 a send limit of
+    // 64 KiB by hand, which is larger than the server's own receive window, so
+    // the window would never be what stops the client. Here the limit starts at
+    // the window and only a MAX_STREAM_DATA can raise it.
+    const window = 8 * 1024; // `TestConnection`'s `stream_receive_octets`.
+    try client.streams.setSendLimit(4, window);
+
+    var body: [3 * window]u8 = undefined;
+    for (&body, 0..) |*octet, index| octet.* = @truncate(index *% 7);
+
+    var queued: usize = 0;
+    var taken: usize = 0;
+    var dropped = false;
+    var now: u64 = 1000;
+    var datagram: [TestConnection.datagram_octets]u8 = @splat(0);
+
+    // Bounded: a deadlock is this loop running out, which is the point.
+    for (0..8000) |_| {
+        now += 1000;
+        if (queued < body.len) queued += try client.write(4, body[queued..], false);
+
+        const to_server = try client.send(&datagram, now);
+        if (to_server > 0) try server.receive(datagram[0..to_server], now);
+
+        const readable = server.readable(4);
+        if (readable.len > 0) {
+            for (readable, taken..) |octet, at| try testing.expectEqual(body[at], octet);
+            taken += readable.len;
+            try server.consume(4, readable.len);
+        }
+
+        // The first datagram carrying a window update goes missing, once. One
+        // datagram, because the question is whether a single loss is
+        // recoverable and not whether the connection survives a blackhole.
+        const owed = server.owesFlowControl();
+        const to_client = try server.send(&datagram, now + 1);
+        if (to_client > 0) {
+            if (owed and !dropped) {
+                dropped = true;
+            } else {
+                try client.receive(datagram[0..to_client], now + 1);
+            }
+        }
+
+        if (client.timeout()) |at| {
+            if (at <= now) client.onTimeout(now);
+        }
+        if (server.timeout()) |at| {
+            if (at <= now) server.onTimeout(now);
+        }
+        if (taken == body.len) break;
+    }
+
+    try testing.expect(dropped);
+    try testing.expectEqual(body.len, taken);
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9000#section-4.1
 //# A receiver MUST close the connection with an error of type
 //# FLOW_CONTROL_ERROR if the sender violates the advertised connection
 //# or stream data limits; see Section 11 for details on error handling.
