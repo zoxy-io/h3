@@ -227,6 +227,11 @@ all three build legs):
   `:authority` and `Host` agree. Trailer sections are a `Kind` of their own,
   because section 4.3 forbids every pseudo-header in one.
 - `quic/Streams.zig` — streams, their states, and both levels of flow control.
+  Section 3.3's three frames are all here: STREAM, STREAM_DATA_BLOCKED and
+  RESET_STREAM. `resetSend` is the one door to abandoning a send half, and it
+  fixes the frame's content on the way in because section 13.3 will not let it
+  change on the way out. STOP_SENDING is received and answered with a
+  RESET_STREAM carrying the peer's code; sending one is not implemented.
   The send buffer is reclaimed as the peer acknowledges it, so
   `stream_send_octets` bounds what is *unacknowledged in flight* rather than
   what a stream can carry; it bounded the total until `interop/server.zig`

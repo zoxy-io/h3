@@ -99,24 +99,28 @@ pub const SendState = enum {
     sending,
     /// A FIN was queued; no more writes are accepted.
     data_sent,
-    /// This endpoint abandoned it with RESET_STREAM.
+    /// Section 3.1's "Reset Sent": this endpoint abandoned the stream and the
+    /// RESET_STREAM is owed or in flight, but not yet acknowledged.
     ///
-    /// Also where `Connection.receiveFrames` puts a stream on receiving
-    /// STOP_SENDING — which is section 3.5's cue to *send* a RESET_STREAM, and
-    /// no RESET_STREAM is ever framed. The state moves and the peer is never
-    /// told, so a peer that asked us to stop learns nothing and the final size
-    /// the two endpoints are supposed to agree on is never communicated.
-    //= https://www.rfc-editor.org/rfc/rfc9000#section-3.5
-    //# An endpoint that receives a STOP_SENDING frame MUST send a
-    //# RESET_STREAM frame if the stream is in the "Ready" or "Send" state.
-    //= type=todo
-    //
-    //= https://www.rfc-editor.org/rfc/rfc9000#section-3.5
-    //# An endpoint SHOULD copy the error code from the STOP_SENDING frame to
-    //# the RESET_STREAM frame it sends, but it can use any application error
-    //# code.
-    //= type=todo
+    /// The state used to mean "abandoned" and nothing more, because no
+    /// RESET_STREAM was ever framed: `Connection` moved a stream here on
+    /// receiving STOP_SENDING and the peer was never told, so the final size
+    /// the two endpoints are supposed to agree on was never communicated.
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-3.3
+    //# A sender MUST NOT send any of these frames from a terminal state
+    //# ("Data Recvd" or "Reset Recvd").
+    //= type=test
     reset,
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-3.1
+    //# Once a packet containing a RESET_STREAM has been acknowledged, the
+    //# sending part of the stream enters the "Reset Recvd" state, which is a
+    //# terminal state.
+    //= type=test
+    ///
+    /// Terminal, and the state a reset stream has to reach before its slot can
+    /// be given back: retiring one that still owed a RESET_STREAM would drop
+    /// the frame the peer is waiting for.
+    reset_recvd,
     //= https://www.rfc-editor.org/rfc/rfc9000#section-3.1
     //# Once all stream data has been successfully acknowledged, the sending
     //# part of the stream enters the "Data Recvd" state, which is a terminal
@@ -246,6 +250,20 @@ pub fn Streams(comptime config: Config) type {
 
             /// The error code a RESET_STREAM carried, in either direction.
             reset_code: u64 = 0,
+            /// The Final Size this endpoint's own RESET_STREAM carries, fixed
+            /// when the stream is abandoned. Section 13.3 requires the frame's
+            /// content not to change when it is sent again, so it is recorded
+            /// rather than recomputed — `send_len` moves when the buffer is
+            /// reclaimed, and a retransmission built from it would carry a
+            /// different final size than the one already on the wire.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-13.3
+            //# The content of a RESET_STREAM frame MUST NOT change when it is sent
+            //# again.
+            //= type=test
+            reset_final_size: u64 = 0,
+            /// Whether that frame has been put in a packet. The counterpart of
+            /// `fin_framed`, and owed again when the packet carrying it is lost.
+            reset_framed: bool = false,
             /// The `MAX_STREAM_DATA` last advertised, so a new one goes out
             /// only when the window has moved enough to be worth a frame.
             /// Starts at the window the transport parameters carried, which the
@@ -579,6 +597,88 @@ pub fn Streams(comptime config: Config) type {
             return &self.streams[self.count - 1];
         }
 
+        /// Section 3.3: abandon this endpoint's half of a stream.
+        ///
+        /// Idempotent, and deliberately so. Section 13.3 fixes the frame's
+        /// content once it exists, so a second call with a different code would
+        /// be a different RESET_STREAM for a stream the peer may already have
+        /// seen one for.
+        ///
+        /// The Final Size is everything the application handed over, including
+        /// octets still sitting in the buffer that will now never be sent. That
+        /// is the number the peer needs: `write` charged them against both flow
+        /// control windows when it took them, and section 4.5 makes the final
+        /// size what the *receiver* counts, so anything smaller leaves the two
+        /// endpoints disagreeing about how much credit this stream spent.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-4.5
+        //# A receiver SHOULD treat receipt of data at or beyond the final size as
+        //# an error of type FINAL_SIZE_ERROR, even after a stream is closed.
+        //= type=exception
+        //= reason=this is the receive half, and `Reassembler.push` is what enforces it; the sentence is quoted here because it is the reason the final size below is what the application wrote rather than what went out
+        pub fn resetSend(self: *Self, id: u64, code: u64) Error!void {
+            if (!self.weMaySend(id)) return error.StreamState;
+            const stream = self.open(id) catch |err| switch (err) {
+                error.Retired => return, // Finished; there is nothing to abandon.
+                else => return err,
+            };
+            switch (stream.send_state) {
+                .reset, .reset_recvd, .data_recvd => return,
+                .sending, .data_sent => {},
+            }
+            stream.send_state = .reset;
+            stream.reset_code = code;
+            stream.reset_final_size = stream.send_offset + stream.send_len;
+            stream.reset_framed = false;
+            // Section 3.3 forbids a STREAM_DATA_BLOCKED here as much as a
+            // STREAM frame, and clearing the flag is what enforces it: `write`
+            // refuses an abandoned stream, so nothing can set it again. A
+            // report that the peer's limit is holding us up is also just false
+            // — what is holding us up is that we gave up.
+            stream.send_blocked = false;
+        }
+
+        /// Whether a RESET_STREAM is owed on any stream.
+        pub fn owesReset(self: *const Self) bool {
+            // Bounded by `count`.
+            for (self.streams[0..self.count]) |*stream| {
+                if (stream.send_state == .reset and !stream.reset_framed) return true;
+            }
+            return false;
+        }
+
+        /// The next stream owing one, for the writer.
+        pub fn nextReset(self: *Self) ?*Stream {
+            // Bounded by `count`.
+            for (self.streams[0..self.count]) |*stream| {
+                if (stream.send_state == .reset and !stream.reset_framed) return stream;
+            }
+            return null;
+        }
+
+        /// Owe it again, because the packet carrying it was lost.
+        ///
+        /// Section 13.3 lists RESET_STREAM among the frames that are sent until
+        /// acknowledged, and it carries no byte range — so like a FIN it needs
+        /// its own re-owing rather than a rewound watermark.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-13.3
+        //# Cancellation of stream transmission, as carried in a RESET_STREAM
+        //# frame, is sent until acknowledged or until all stream data is
+        //# acknowledged by the peer (that is, either the "Reset Recvd" or
+        //# "Data Recvd" state is reached on the sending part of the stream).
+        //= type=test
+        pub fn reoweReset(self: *Self, id: u64) void {
+            const stream = self.find(id) orelse return;
+            if (stream.send_state != .reset) return;
+            stream.reset_framed = false;
+        }
+
+        /// The peer has the RESET_STREAM, so section 3.1's terminal state.
+        pub fn resetDelivered(self: *Self, id: u64) void {
+            const stream = self.find(id) orelse return;
+            if (stream.send_state != .reset) return;
+            stream.send_state = .reset_recvd;
+        }
+
         /// Whether an identifier names a stream that has been given up.
         pub fn isRetired(self: *const Self, id: u64) bool {
             const kind = stream_id.kindOf(id);
@@ -677,8 +777,11 @@ pub fn Streams(comptime config: Config) type {
         fn finished(self: *const Self, stream: *const Stream) bool {
             if (stream_id.sendable(stream.id, self.side)) {
                 switch (stream.send_state) {
-                    .data_recvd, .reset => {},
-                    .sending, .data_sent => return false,
+                    .data_recvd, .reset_recvd => {},
+                    // "Reset Sent" is not terminal: the RESET_STREAM is still
+                    // owed or in flight, and retiring the stream would drop the
+                    // frame the peer is waiting for.
+                    .sending, .data_sent, .reset => return false,
                 }
             }
             if (stream_id.receivable(stream.id, self.side)) {
@@ -1166,7 +1269,10 @@ pub fn Streams(comptime config: Config) type {
                 // answered true while octets remained — and `writeStream` reads
                 // no send state at all, so it framed and sent them. The peer
                 // asked us to stop and we kept writing.
-                if (stream.send_state == .reset) continue;
+                switch (stream.send_state) {
+                    .sending, .data_sent => {},
+                    .reset, .reset_recvd, .data_recvd => continue,
+                }
                 if (stream.framed < stream.send_len) return true;
                 // A FIN is owed once, not once per poll.
                 if (stream.send_fin and !stream.fin_framed) return true;

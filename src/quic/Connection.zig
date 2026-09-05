@@ -306,6 +306,11 @@ pub fn Connection(comptime config: Config) type {
         stream_end: u64 = 0,
         /// Whether the packet carried a FIN, which no byte range can express.
         stream_fin: bool = false,
+        /// And whether it carried a RESET_STREAM, which has no range either:
+        /// section 13.3 sends it until it is acknowledged, so losing it has to
+        /// owe the frame again and delivering it is what makes the stream's
+        /// send half terminal.
+        stream_reset: bool = false,
         /// Whether the packet carried HANDSHAKE_DONE, which likewise has no
         /// range: losing it has to re-owe the frame or the client never
         /// confirms.
@@ -3391,19 +3396,33 @@ pub fn Connection(comptime config: Config) type {
                     {
                         return error.StreamState;
                     }
+                    // The peer asked this endpoint to stop, and section 3.5
+                    // says to answer with a RESET_STREAM carrying its code.
+                    // The state used to move here and nothing was ever sent, so
+                    // a peer that asked us to stop learned nothing and the
+                    // final size the two endpoints have to agree on was never
+                    // communicated.
+                    //
                     // A stream that has already finished has nothing to stop,
-                    // and re-opening it would undo the retirement.
-                    if (self.streams.open(value.stream) catch |err| switch (err) {
-                        error.Retired => null,
-                        else => return streamError(err),
-                    }) |stream| {
-                        stream.send_state = .reset;
-                        stream.reset_code = @intFromEnum(value.code);
-                        self.emit(.{ .stream_stopped = .{
-                            .stream = value.stream,
-                            .code = @intFromEnum(value.code),
-                        } });
-                    }
+                    // which `resetSend` answers by doing nothing.
+                    //= https://www.rfc-editor.org/rfc/rfc9000#section-3.5
+                    //# An endpoint that receives a STOP_SENDING frame MUST send a
+                    //# RESET_STREAM frame if the stream is in the "Ready" or "Send"
+                    //# state.
+                    //= type=test
+                    //
+                    //= https://www.rfc-editor.org/rfc/rfc9000#section-3.5
+                    //# An endpoint SHOULD copy the error code from the STOP_SENDING
+                    //# frame to the RESET_STREAM frame it sends, but it can use any
+                    //# application error code.
+                    //= type=test
+                    self.streams.resetSend(value.stream, @intFromEnum(value.code)) catch |err| {
+                        return streamError(err);
+                    };
+                    self.emit(.{ .stream_stopped = .{
+                        .stream = value.stream,
+                        .code = @intFromEnum(value.code),
+                    } });
                 },
             }
         }
@@ -3597,6 +3616,26 @@ pub fn Connection(comptime config: Config) type {
             return self.streams.write(id, data, fin);
         }
 
+        /// Section 3.3: abandon this endpoint's half of a stream.
+        ///
+        /// The RESET_STREAM goes out on the next `send` and is sent again until
+        /// the peer acknowledges it. Nothing more is written on the stream
+        /// after this, including what is still in the buffer — the peer is told
+        /// the final size instead, so the flow control both endpoints have
+        /// already charged for those octets still balances.
+        ///
+        /// One direction. A bidirectional stream's other half keeps arriving;
+        /// asking the peer to stop is STOP_SENDING, which this package does not
+        /// yet send.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-3.5
+        //# If the stream is in the "Recv" or "Size Known" state, the transport
+        //# SHOULD signal this by sending a STOP_SENDING frame to prompt closure
+        //# of the stream in the opposite direction.
+        //= type=todo
+        pub fn resetStream(self: *Self, id: u64, code: u64) ConnectionStreams.Error!void {
+            try self.streams.resetSend(id, code);
+        }
+
         /// Bytes readable in order on a stream, or an empty slice.
         pub fn readable(self: *Self, id: u64) []const u8 {
             const stream = self.streams.find(id) orelse return &.{};
@@ -3733,6 +3772,11 @@ pub fn Connection(comptime config: Config) type {
                     self.streams.acknowledge(context.stream, context.stream_end);
                     self.reclaimStream(context.stream);
                 }
+                if (context.stream_reset) {
+                    self.streams.resetDelivered(context.stream);
+                    self.emit(.{ .stream_delivered = context.stream });
+                    continue;
+                }
                 if (!context.stream_fin) continue;
                 const stream = self.streams.find(context.stream) orelse continue;
                 if (stream.send_state != .data_sent) continue;
@@ -3806,6 +3850,7 @@ pub fn Connection(comptime config: Config) type {
                 if (context.stream_end > context.stream_start or context.stream_fin) {
                     self.streams.rewind(context.stream, context.stream_start, context.stream_fin);
                 }
+                if (context.stream_reset) self.streams.reoweReset(context.stream);
                 // Outside the stream branch: a packet carrying only window
                 // updates has no byte range to rewind, and it is exactly the
                 // packet whose loss deadlocks the connection.
@@ -4411,6 +4456,7 @@ pub fn Connection(comptime config: Config) type {
                     .stream_start = written.stream_start,
                     .stream_end = written.stream_end,
                     .stream_fin = written.stream_fin,
+                    .stream_reset = written.stream_reset,
                     .handshake_done = written.handshake_done,
                     .flow_control = written.flow_control,
                 },
@@ -4498,6 +4544,7 @@ pub fn Connection(comptime config: Config) type {
             if (written.stream_end > written.stream_start or written.stream_fin) {
                 self.streams.rewind(written.stream, written.stream_start, written.stream_fin);
             }
+            if (written.stream_reset) self.streams.reoweReset(written.stream);
         }
 
         const Payload = struct {
@@ -4520,6 +4567,8 @@ pub fn Connection(comptime config: Config) type {
             /// the range because a FIN carries no octets, so a lost one has no
             /// byte range to rewind.
             stream_fin: bool = false,
+            /// Whether it carried a RESET_STREAM; see `PacketContext`.
+            stream_reset: bool = false,
             /// Likewise for HANDSHAKE_DONE.
             handshake_done: bool = false,
         };
@@ -4745,9 +4794,19 @@ pub fn Connection(comptime config: Config) type {
                     result.flow_control = true;
                     result.ack_eliciting = true;
                 }
-                const framed = self.writeStream(payload[offset..], &result);
-                offset += framed;
-                if (framed > 0) result.ack_eliciting = true;
+                // Ahead of the stream data, and instead of it: `PacketContext`
+                // names one stream per packet, so a packet that carries a
+                // RESET_STREAM for one stream cannot also carry octets for
+                // another and still be able to say what to repair when it is
+                // lost. Resets are rare and the data goes in the next packet.
+                const abandoned = self.writeReset(payload[offset..], &result);
+                offset += abandoned;
+                if (abandoned > 0) result.ack_eliciting = true;
+                if (abandoned == 0) {
+                    const framed = self.writeStream(payload[offset..], &result);
+                    offset += framed;
+                    if (framed > 0) result.ack_eliciting = true;
+                }
             }
 
             if (self.close_pending[@intFromEnum(level)] and offset < payload.len) {
@@ -4938,12 +4997,68 @@ pub fn Connection(comptime config: Config) type {
         /// two streams' data has to record two ranges to undo on loss, and the
         /// gain is a few octets of header on a path that is already
         /// AEAD-bound.
+        /// Section 3.3's RESET_STREAM, for a stream this endpoint abandoned.
+        ///
+        /// Sent until acknowledged, and unchanged each time: the code and the
+        /// final size were fixed when the stream was abandoned, because a
+        /// retransmission built from the buffer would carry a different final
+        /// size once the buffer had been reclaimed.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-19.4
+        //# An endpoint uses a RESET_STREAM frame (type=0x04) to abruptly
+        //# terminate the sending part of a stream.
+        //= type=test
+        fn writeReset(self: *Self, target: []u8, result: *Payload) usize {
+            const stream = self.streams.nextReset() orelse return 0;
+            const written = frame.encode(target, .{ .reset_stream = .{
+                .stream = stream.id,
+                .code = @enumFromInt(@as(u62, @truncate(stream.reset_code))),
+                .final_size = stream.reset_final_size,
+            } }) catch return 0;
+            if (written == 0) return 0;
+            stream.reset_framed = true;
+            result.stream = stream.id;
+            result.stream_reset = true;
+            return written;
+        }
+
         fn writeStream(self: *Self, target: []u8, result: *Payload) usize {
             assert(self.streams.count <= self.streams.streams.len);
             for (self.streams.streams[0..self.streams.count]) |*stream| {
                 // `framed` is how much of the send buffer has been put into a
                 // packet, so it never passes what the application wrote —
                 // `onPacketsLost` only ever moves it back.
+                // Section 3.3 forbids a STREAM frame once the stream has been
+                // abandoned, and this loop read no send state at all: a peer
+                // that sent STOP_SENDING got the rest of the buffer anyway,
+                // because `wantsSend` refusing is not the same as `send`
+                // refusing — an ACK alone is enough to build a packet, and the
+                // stream writer then filled it.
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-3.3
+                //# A sender MUST NOT send a STREAM or
+                //# STREAM_DATA_BLOCKED frame for a stream in the "Reset Sent" state or
+                //# any terminal state -- that is, after sending a RESET_STREAM frame.
+                //= type=test
+                switch (stream.send_state) {
+                    .sending, .data_sent => {},
+                    .reset, .reset_recvd => continue,
+                    // "Data Recvd" is one of section 3.3's terminal states and
+                    // is deliberately *not* skipped here, because this package
+                    // enters it early: it is set when the packet carrying the
+                    // FIN is acknowledged, not when every packet is. RFC 9002's
+                    // loss detection is a heuristic, so an earlier packet can be
+                    // declared lost after the FIN's has been acknowledged —
+                    // `rewind` puts those octets back in front of the cursor,
+                    // and a sender that refused to frame them because the state
+                    // said "terminal" would stall the stream with data the peer
+                    // never received. The runner's `http3` case found exactly
+                    // that, one build after the reset states were added here.
+                    //= https://www.rfc-editor.org/rfc/rfc9000#section-3.1
+                    //# Once all stream data has been successfully acknowledged, the sending
+                    //# part of the stream enters the "Data Recvd" state, which is a terminal
+                    //# state.
+                    //= type=todo
+                    .data_recvd => {},
+                }
                 assert(stream.framed <= stream.send_len);
                 const waiting = stream.send_len - stream.framed;
                 // Owed once. Without `fin_framed` this was permanently true,
@@ -5222,6 +5337,7 @@ pub fn Connection(comptime config: Config) type {
             }
             if (self.streams.wantsSend()) return true;
             if (self.owesFlowControl()) return true;
+            if (self.streams.owesReset()) return true;
             if (self.streams.owesBlocked()) return true;
             for (0..Level.count) |index| {
                 const level: Level = @enumFromInt(index);
@@ -5947,8 +6063,143 @@ test "section 3.2: an abandoned stream still gives its credit back" {
     } });
     _ = try server.receiveFrames(.one_rtt, payload[0..offset], 0);
 
+    // Not yet: section 3.5's answer to STOP_SENDING is a RESET_STREAM, and
+    // "Reset Sent" is not terminal. Retiring the stream here would drop the
+    // frame the peer is waiting for.
+    try testing.expectEqual(streams.SendState.reset, server.findStream(0).?.send_state);
+    try testing.expect(server.wantsSend());
+
+    // Once it is out and acknowledged, the slot and the credit come back.
+    for (0..8) |_| {
+        if (server.streams.isRetired(0)) break;
+        if (try deliver(&server, &client, 0) == 0) break;
+        _ = try deliver(&client, &server, 0);
+    }
     try testing.expect(server.findStream(0) == null);
     try testing.expectEqual(before + 1, server.streams.advertised_bidi);
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9000#section-19.4
+//# An endpoint uses a RESET_STREAM frame (type=0x04) to abruptly terminate
+//# the sending part of a stream.
+//= type=test
+test "section 3.5: STOP_SENDING is answered with a RESET_STREAM carrying its code" {
+    // No RESET_STREAM was ever framed. The state moved and the peer was never
+    // told, so an endpoint that asked us to stop learned nothing, and the final
+    // size the two of them have to agree on was never communicated.
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+
+    // The server has queued a response and the client gives up on it.
+    try testing.expectEqual(@as(usize, 5), try server.write(0, "hello", false));
+    var payload: [32]u8 = @splat(0);
+    const written = try frame.encode(&payload, .{ .stop_sending = .{
+        .stream = 0,
+        .code = @enumFromInt(0x10c),
+    } });
+    _ = try server.receiveFrames(.one_rtt, payload[0..written], 0);
+
+    try testing.expect(server.wantsSend());
+    _ = try deliver(&server, &client, 0);
+
+    // Section 4.5's final size is what the application handed over, including
+    // the octets that will now never be sent: `write` charged them against both
+    // windows when it took them.
+    const theirs = client.findStream(0).?;
+    try testing.expectEqual(streams.ReceiveState.reset, theirs.receive_state);
+    try testing.expectEqual(@as(u64, 0x10c), theirs.reset_code);
+    try testing.expectEqual(@as(u64, 5), theirs.received_highest);
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9000#section-3.3
+//# A sender MUST NOT send a STREAM or
+//# STREAM_DATA_BLOCKED frame for a stream in the "Reset Sent" state or
+//# any terminal state -- that is, after sending a RESET_STREAM frame.
+//= type=test
+test "section 3.3: nothing more is written on a stream once it is abandoned" {
+    // `writeStream` read no send state at all. `wantsSend` refusing is not the
+    // same as `send` refusing — an owed acknowledgement is enough to build a
+    // packet, and the stream writer then filled it with the octets the peer
+    // had just asked us to stop sending.
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+    // Stream 4 rather than 0, because `established` grants stream 0 a window
+    // large enough that nothing is ever refused on it.
+    try server.streams.setSendLimit(4, 5);
+    try testing.expectEqual(@as(usize, 5), try server.write(4, "hello", false));
+
+    // A refused write leaves a STREAM_DATA_BLOCKED owed, which the same
+    // sentence forbids once the stream is abandoned.
+    try testing.expectEqual(@as(usize, 0), try server.write(4, "more", false));
+    try testing.expect(server.streams.owesBlocked());
+
+    try server.resetStream(4, 0x10b);
+    try testing.expect(!server.streams.owesBlocked());
+
+    // Sent rather than delivered, and `send_len` checked alongside `framed`:
+    // an acknowledgement reclaims the buffer, which takes both to zero and
+    // would make a stream that *was* framed look like one that never was. The
+    // first packet carries the RESET_STREAM and the second carries whatever
+    // comes after it, which must not be these five octets.
+    var datagram: [TestConnection.datagram_octets]u8 = @splat(0);
+    _ = try server.send(&datagram, 1000);
+    _ = try server.send(&datagram, 1001);
+    try testing.expectEqual(@as(u32, 5), server.findStream(4).?.send_len);
+    try testing.expectEqual(@as(u32, 0), server.findStream(4).?.framed);
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9000#section-13.3
+//# Cancellation of stream transmission, as carried in a RESET_STREAM
+//# frame, is sent until acknowledged or until all stream data is
+//# acknowledged by the peer (that is, either the "Reset Recvd" or "Data
+//# Recvd" state is reached on the sending part of the stream).
+//= type=test
+test "section 13.3: a lost RESET_STREAM is sent again" {
+    // It carries no byte range, so like a FIN it needs its own re-owing: a
+    // peer that missed it waits for data that will never come, on a stream this
+    // endpoint believes it has cancelled.
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+    try testing.expectEqual(@as(usize, 5), try server.write(0, "hello", false));
+    try server.resetStream(0, 0x10b);
+
+    var datagram: [TestConnection.datagram_octets]u8 = @splat(0);
+    try testing.expect(try server.send(&datagram, 1000) > 0);
+    try testing.expect(server.findStream(0).?.reset_framed);
+    try testing.expect(!server.wantsSend());
+
+    server.onPacketsLost(&.{.{ .level = .one_rtt, .stream = 0, .stream_reset = true }});
+    try testing.expect(!server.findStream(0).?.reset_framed);
+    try testing.expect(server.wantsSend());
+
+    // And the content does not change on the way back out: section 13.3 asks
+    // for the same frame, and the final size is recorded rather than recomputed
+    // because the buffer it would be recomputed from moves.
+    _ = try deliver(&server, &client, 0);
+    try testing.expectEqual(@as(u64, 5), client.findStream(0).?.received_highest);
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9000#section-3.1
+//# Once a packet containing a RESET_STREAM has been acknowledged, the
+//# sending part of the stream enters the "Reset Recvd" state, which is a
+//# terminal state.
+//= type=test
+test "section 3.1: the send half is terminal once the RESET_STREAM is acknowledged" {
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+    try server.resetStream(0, 0x10b);
+    try testing.expectEqual(streams.SendState.reset, server.findStream(0).?.send_state);
+
+    _ = try deliver(&server, &client, 0);
+    _ = try deliver(&client, &server, 0);
+    // The receive half is still open — the client has sent nothing on this
+    // stream — so the stream stays in the table and the send half is what the
+    // acknowledgement moved.
+    try testing.expectEqual(streams.SendState.reset_recvd, server.findStream(0).?.send_state);
 }
 
 //= https://www.rfc-editor.org/rfc/rfc9000#section-3.2

@@ -108,6 +108,9 @@ requirement list extracted from the specification.
 | A stream the peer abandoned could never retire, and the retirement watermark is contiguous — so one RESET_STREAM, which is an ordinary thing for a peer to send, froze the stream credit for its whole kind for the rest of the connection | reading the retirement code that had just been written | Every interop case completes its streams cleanly, so no gate here has a peer that gives up |
 | The interop client lost a response's FIN when the stream retired in the same pass that consumed the last of its body, and waited for a response it already had | the runner's `http3` case, on the second run | It depends on where a DATA frame's last octet falls relative to the FIN, so it fails on one run and passes on the next |
 | Only the named stream was created, so RFC 9000 §3.2's lower-numbered ones were not — a peer whose third request arrived first had three streams and this endpoint had one, and the two disagreed about which streams existed and how much of the limit had been spent | reading §3.2 against the retirement code | Each endpoint is internally consistent, and every peer this package has met allocates identifiers in order |
+| No RESET_STREAM was ever framed, so a peer's STOP_SENDING moved a state here and was never answered — the final size the two endpoints have to agree on was never communicated, and a consumer had no way to cancel a stream at all | the requirement ledger, which had it as a `type=todo` beside the state it moved | Nothing in the interop matrix cancels a stream, and h3spec resets *its* streams rather than asking this endpoint to |
+| `writeStream` read no send state, so a peer that sent STOP_SENDING got the rest of the buffer anyway. `wantsSend` refusing is not `send` refusing: an owed acknowledgement is enough to build a packet, and the stream writer then filled it | writing the test for the rule above | The test that should have caught it could not — an acknowledgement reclaims the buffer, so a stream that *was* framed and one that never was both end at zero |
+| Skipping section 3.3's terminal states in the stream writer stalled a transfer, because "Data Recvd" is entered when the packet carrying the FIN is acknowledged rather than when every packet is — and an earlier packet can be declared lost afterwards | the runner's `http3` case, one build later | It needs a spurious loss on a stream that has already sent its FIN, which is a property of a path rather than of a state machine |
 
 Two things about that table.
 
@@ -921,10 +924,51 @@ and the end of the stream landed in the same pass. It depends on where a DATA
 frame's last octet falls, so it fails on one run and passes on the next — which
 is the argument for running the matrix twice.
 
+##### RESET_STREAM — **framed at last**
+
+The largest remaining protocol gap, and it had been recorded as one: two of
+section 3.5's MUSTs sat in the ledger as `type=todo` beside the state they moved.
+`Connection` put a stream in "Reset Sent" on receiving STOP_SENDING and then
+never told the peer, so the final size the two endpoints are supposed to agree
+on was never communicated — and a consumer had no way to cancel a stream at all.
+
+`Streams.resetSend` is the one door. It fixes the frame's content on the way in,
+which section 13.3 requires: the final size is recorded rather than recomputed,
+because the buffer it would be recomputed from moves as the peer acknowledges.
+The final size is everything the application handed over, including octets that
+will now never be sent — `write` charged them against both windows when it took
+them, and section 4.5 makes the final size what the receiver counts, so anything
+smaller leaves the two endpoints disagreeing about what this stream spent.
+"Reset Sent" is no longer terminal for retirement: a stream that still owes the
+frame keeps its slot, because retiring it would drop what the peer is waiting
+for.
+
+Two defects came out of writing it, and the second is the more interesting:
+
+1. **`writeStream` read no send state at all**, so a peer that sent
+   STOP_SENDING got the rest of the buffer anyway. `wantsSend` refusing is not
+   `send` refusing — an owed acknowledgement is enough to build a packet, and
+   the stream writer then filled it. The first test written for this could not
+   tell the two cases apart: an acknowledgement reclaims the send buffer, so a
+   stream that *was* framed and one that never was both end with `framed` at
+   zero. Checking `send_len` alongside it is what made the test discriminate.
+2. **Skipping section 3.3's terminal states there stalled a transfer.** "Data
+   Recvd" is entered when the packet carrying the FIN is acknowledged rather
+   than when every packet is, and RFC 9002's loss detection is a heuristic — an
+   earlier packet can be declared lost afterwards, which puts its octets back in
+   front of the cursor. A sender that refuses to frame them because the state
+   says "terminal" stalls the stream with data the peer never received. The
+   runner's `http3` case found it one build later, and the honest fix is a
+   `type=todo` on section 3.1's precision rather than a guard that reads a state
+   this package sets early.
+
 What is left here:
 
 - **Recovery under heavy loss**, which is what `handshakeloss` measures and the
   only case still failing in either role.
+- **STOP_SENDING is received and never sent.** Cancelling a bidirectional
+  stream is two frames, and this is the other one: a consumer can abandon its
+  own half and cannot ask the peer to stop.
 
 #### The other outside evidence: `corpus/qifs.zig` — **done**
 
