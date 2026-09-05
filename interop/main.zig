@@ -57,6 +57,8 @@ const server_role = @import("server.zig");
 const tls = @import("tls.zig");
 const qlog_file = @import("qlog_file.zig");
 
+const assert = std.debug.assert;
+
 const Io = std.Io;
 const quic = h3.quic;
 
@@ -567,6 +569,9 @@ const Session = struct {
     /// than passed around because its writer points into its own buffer, so it
     /// must not move.
     trace: qlog_file.Trace = .{},
+    /// How many key updates this connection has seen, for the trace. Not the
+    /// key *phase*, which alternates — qlog wants a number that only rises.
+    key_generation: u64 = 0,
 
     /// A scratch datagram, held here rather than on the stack for the same
     /// reason the connection is.
@@ -632,6 +637,12 @@ const Session = struct {
         // and therefore the one that lets two traces of the same connection be
         // put side by side.
         self.trace.start(io, qlog_directory, destination.bytes(), .client);
+        // Immediately, not at the end of the setup below. There are four `try`s
+        // between here and the end of it — one of them an `openDir` that is
+        // *expected* to fail when the runner's download directory is missing —
+        // and a `Session` is reused for the next connection, so a return in
+        // between used to leak the file rather than close it.
+        defer self.trace.finish(io);
         // The same numbers the transport parameters below carry. Without this
         // the stream layer enforces the table's size instead, which is larger
         // than what was offered — so a peer opening past the advertised limit
@@ -650,6 +661,7 @@ const Session = struct {
         self.finished = 0;
         self.next_url = 0;
         self.next_stream = 0;
+        self.key_generation = 0;
         self.since_key_update = 0;
         self.key_updated_ns = 0;
         self.key_updates = 0;
@@ -699,7 +711,6 @@ const Session = struct {
         // at once is more descriptors than a process is given.
         var directory = try Io.Dir.cwd().openDir(io, downloads, .{});
         defer directory.close(io);
-        defer self.trace.finish(io);
         defer for (self.requests[0..self.requests_len]) |*request| {
             if (!request.in_use) continue;
             request.writer.interface.flush() catch {};
@@ -1028,15 +1039,26 @@ const Session = struct {
             // no packet events.
             switch (event) {
                 .packets_lost => |count| self.trace.record(now_ns, .{ .packets_lost = count }),
-                .key_updated => self.trace.record(now_ns, .{
-                    .key_updated = @intFromBool(self.connection.one_rtt.phase),
+                .key_updated => {
+                    // The generation counts updates and only rises; the phase
+                    // alternates. Two facts, and qlog has a field for each.
+                    self.key_generation += 1;
+                    self.trace.record(now_ns, .{ .key_updated = .{
+                        .generation = self.key_generation,
+                        .phase = @intFromBool(self.connection.one_rtt.phase),
+                        .owner = .local,
+                    } });
+                },
+                .closed => |value| self.trace.record(now_ns, .{
+                    .connection_closed = .{
+                        .code = value.code,
+                        .application = value.application,
+                        // `Event.closed` is only emitted for a close that *arrived*.
+                        .owner = .remote,
+                    },
                 }),
-                .closed => |value| self.trace.record(now_ns, .{ .connection_closed = .{
-                    .code = value.code,
-                    .application = value.application,
-                } }),
                 .stream_delivered => |id| self.trace.record(now_ns, .{ .stream_state = .{
-                    .stream = id,
+                    .stream_id = id,
                     .state = .closed,
                 } }),
                 else => {},
@@ -1103,7 +1125,13 @@ const Session = struct {
     }
 
     fn complete(self: *const Session) bool {
-        return self.finished == self.pending.len;
+        // `>=` with the assertion beside it, rather than `==`. An equality is
+        // the comparison that turns a counter which has run ahead of itself
+        // into a connection that never finishes and reports a timeout — and a
+        // counter running ahead is exactly the defect this shim already had
+        // once, when `finished` carried across connections.
+        assert(self.finished <= self.pending.len);
+        return self.finished >= self.pending.len;
     }
 
     /// Open as many requests as the window and the peer's stream limit allow.
@@ -1144,14 +1172,32 @@ const Session = struct {
     }
 
     /// A slot with nothing in it, growing the window until it is full.
+    ///
+    /// A grown slot is made inert before it is counted. `requests` is
+    /// `undefined`, and `issue` can decline to fill the slot it asked for —
+    /// the peer's stream limit refuses the identifier, or the file will not
+    /// open — so a slot counted in `requests_len` and never written is an
+    /// undefined `in_use` that every loop over the window then reads. Garbage
+    /// that reads true wedges the window shut; garbage that reads true in
+    /// `reap` counts a request that never happened, which is the same class of
+    /// defect as the completion counter that used to carry across connections.
     fn free(self: *Session) ?*Request {
+        assert(self.requests_len <= requests_max);
         // Bounded by `requests_len`.
         for (self.requests[0..self.requests_len]) |*request| {
             if (!request.in_use) return request;
         }
         if (self.requests_len == requests_max) return null;
         const slot = &self.requests[self.requests_len];
+        slot.* = .{
+            .url = undefined,
+            .stream = 0,
+            .file = undefined,
+            .writer = undefined,
+            .in_use = false,
+        };
         self.requests_len += 1;
+        assert(!slot.in_use);
         return slot;
     }
 
@@ -1165,6 +1211,7 @@ const Session = struct {
             request.in_use = false;
             request.complete = false;
             self.finished += 1;
+            assert(self.finished <= self.pending.len);
             if (self.verbose) try note(log, "{s} {d} octets in {d}ms", .{
                 request.url.path,
                 request.octets,

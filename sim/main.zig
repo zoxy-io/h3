@@ -75,10 +75,25 @@ const Connection = quic.Connection(.{
     // entered. A receiver whose window is tighter than the sender's buffer is
     // also the ordinary case: the buffer is a local choice and the window is a
     // promise about memory.
-    .stream_receive_octets = 16 * 1024,
+    .stream_receive_octets = stream_receive_octets,
     .stream_send_octets = 32 * 1024,
-    .connection_receive_octets = 64 * 1024,
+    .connection_receive_octets = connection_receive_octets,
 });
+
+/// The receive windows, named so that the transport parameters this harness
+/// advertises can be derived from them rather than restated beside them. A
+/// promise larger than the buffer behind it is a sender permitted to overrun a
+/// receiver, which is a defect in the harness that reads as one in the library.
+const stream_receive_octets: u32 = 16 * 1024;
+const connection_receive_octets: u64 = 64 * 1024;
+
+comptime {
+    // The window is smaller than the send buffer on purpose — see the note in
+    // the `Connection` config above — and the payload has to outrun both or
+    // flow control never paces anything.
+    assert(stream_receive_octets < 32 * 1024);
+    assert(payload_octets_max > connection_receive_octets);
+}
 
 /// Virtual time a run may take before it is called a livelock. Generous
 /// against a lossy path with exponential backoff, and far below anything a
@@ -149,6 +164,11 @@ const Census = struct {
     link_queue_dropped: u64 = 0,
     amplification_binding: u64 = 0,
     closes_observed: u64 = 0,
+    /// Runs that ended short *and* had reported a connection error, so the
+    /// oracle above let them pass. Printed because a sweep where most runs are
+    /// excused is a sweep proving much less than its pass suggests, and that is
+    /// invisible without a count.
+    runs_ended_by_close: u64 = 0,
     streams_delivered: u64 = 0,
     /// Datagrams whose packets account for every octet of them, and datagrams
     /// that end in padding no packet claims.
@@ -376,6 +396,11 @@ const World = struct {
     /// places relative to loss and reordering.
     key_update_at: u32 = 0,
 
+    /// The step a connection error was seen at, or null. What makes a
+    /// short transfer excusable, and a number rather than a flag so that a
+    /// reader can tell "closed at the end" from "closed at the start".
+    closed_at_step: ?u32 = null,
+
     /// When the application last had something to do, for the quiet oracle.
     busy_until_ns: u64 = 0,
     /// Steps taken since the transfer finished, which is the other half of that
@@ -430,7 +455,6 @@ fn buildWorld(seed: u64) World {
     // requires a packet that fails authentication to be dropped rather than
     // reported: exactly the shape a simulator is for.
     const client_cid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
-
 
     var world: World = .{
         .seed = seed,
@@ -541,10 +565,17 @@ fn exchangeTransportParameters(world: *World) void {
     const parameters: quic.transport_parameters.Parameters = .{
         .initial_source_connection_id = ConnectionId.init(&.{ 0xf0, 0x67, 0xa5, 0x50, 0x2a, 0x42, 0x62, 0xb5 }) catch unreachable, // Eight octets.
         .original_destination_connection_id = ConnectionId.init(&.{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 }) catch unreachable, // As above.
-        .initial_max_data = 1 << 20,
-        .initial_max_stream_data_bidi_local = 1 << 18,
-        .initial_max_stream_data_bidi_remote = 1 << 18,
-        .initial_max_stream_data_uni = 1 << 18,
+        // The windows this connection actually has, not larger ones. These
+        // were 1 MiB and 256 KiB against buffers of 64 KiB and 16 KiB, which is
+        // a promise the receiver cannot keep: the sender is permitted past the
+        // window and takes a FLOW_CONTROL_ERROR for doing what it was told it
+        // could. A harness misconfiguration scored against the library — and,
+        // because a connection error exempts a run from the transfer oracle,
+        // one that hid itself.
+        .initial_max_data = connection_receive_octets,
+        .initial_max_stream_data_bidi_local = stream_receive_octets,
+        .initial_max_stream_data_bidi_remote = stream_receive_octets,
+        .initial_max_stream_data_uni = stream_receive_octets,
         .initial_max_streams_bidi = 8,
         .initial_max_streams_uni = 8,
     };
@@ -592,11 +623,15 @@ fn driveApplication(world: *World) void {
         const remaining = world.payload[world.written..world.payload_len];
         if (remaining.len > 0) {
             const taken = world.client.write(stream, remaining, false) catch 0;
-            // A short write is the peer's window closing, or this endpoint's
-            // own buffer filling. Either way it is the state a window update
-            // has to end, and the census counts it because a sweep that never
-            // reaches it proves nothing about the frames that end it.
-            if (taken < remaining.len) world.census.writes_refused_by_flow_control += 1;
+            // Read off the flag the library sets, not off the short write. A
+            // short write is *either* the peer's window closing or this
+            // endpoint's own buffer filling, and only the first is the state a
+            // window update has to end — so counting short writes made a
+            // required census row that could never be zero and never measured
+            // what it was named for.
+            if (world.client.streams.owesBlocked()) {
+                world.census.writes_refused_by_flow_control += 1;
+            }
             world.written += @intCast(taken);
             if (taken > 0) world.busy_until_ns = world.now_ns;
         }
@@ -676,7 +711,11 @@ fn injectAdversary(world: *World, random: std.Random) void {
     // rather than test it.
     if (random.uintLessThan(u8, 8) != 0) return;
 
-    const direction = random.uintLessThan(usize, 2);
+    // `u8` rather than `usize`: `uintLessThan` consumes `@sizeOf(T)` octets per
+    // attempt, so drawing through a `usize` makes the whole PRNG stream — and
+    // therefore the run — depend on the pointer width. A seed is meant to be a
+    // complete description of a run on any target.
+    const direction: usize = random.uintLessThan(u8, 2);
     const length = world.adversary.seen_len[direction];
     if (length == 0) return;
     const link = if (direction == 0) &world.to_server else &world.to_client;
@@ -947,6 +986,7 @@ fn drainEvents(world: *World) void {
 fn recordClose(world: *World, err: anyerror) void {
     std.debug.assert(@errorName(err).len > 0);
     world.census.closes_observed += 1;
+    if (world.closed_at_step == null) world.closed_at_step = world.step;
 }
 
 /// Everything this endpoint has framed and not yet had acknowledged, across the
@@ -1011,10 +1051,19 @@ fn runSeed(seed: u64, census: *Census) ?Failure {
     // "nothing having gone wrong" is what keeps a legitimate connection error
     // out of it: a lossy path plus an adversarial schedule may end a connection,
     // and that is the endpoint behaving.
-    if (world.failure == null and world.census.closes_observed == 0 and
-        world.received != world.payload_len)
-    {
-        fail(&world, "the transfer stopped and neither endpoint reported anything", world.received);
+    // A close exempts the run only if it arrived *after* the transfer finished.
+    // `closes_observed` on its own was a blanket exemption for the rest of the
+    // run: one close at virtual second three and the remaining hundred and
+    // seventeen proved nothing, while the sweep reported a pass. The adversary
+    // and the flow-control paths added in the same change are both ways to
+    // produce that close.
+    if (world.failure == null and world.received != world.payload_len) {
+        if (world.closed_at_step) |at| {
+            census.runs_ended_by_close += 1;
+            _ = at;
+        } else {
+            fail(&world, "the transfer stopped and neither endpoint reported anything", world.received);
+        }
     }
 
     if (world.received == world.payload_len and world.payload_len > 0) {
@@ -1139,6 +1188,7 @@ fn printCensus(census: *const Census) void {
         .{ .name = "datagrams duplicated", .value = census.link_duplicated },
         .{ .name = "amplification limit binding", .value = census.amplification_binding },
         .{ .name = "connection errors seen", .value = census.closes_observed },
+        .{ .name = "runs excused by a close", .value = census.runs_ended_by_close },
         .{ .name = "streams fully delivered", .value = census.streams_delivered },
         .{ .name = "datagrams whole", .value = census.datagrams_whole },
         .{ .name = "datagrams with loose padding", .value = census.datagrams_with_loose_padding },
@@ -1151,7 +1201,6 @@ fn printCensus(census: *const Census) void {
         .{ .name = "clock jumps", .value = census.clock_jumps },
     };
     for (rows) |row| std.debug.print("  {s:<32} {d}\n", .{ row.name, row.value });
-
 }
 
 const testing = std.testing;

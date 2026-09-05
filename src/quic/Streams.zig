@@ -392,11 +392,6 @@ pub fn Streams(comptime config: Config) type {
         /// the first eight and waited out the idle timeout.
         advertised_bidi: u64 = streams_max,
         advertised_uni: u64 = streams_max,
-        /// The base each of those started from, which is what the transport
-        /// parameters carried. Kept because a MAX_STREAMS is only worth sending
-        /// against the credit the peer is actually working through.
-        advertised_bidi_base: u64 = streams_max,
-        advertised_uni_base: u64 = streams_max,
         /// What has already gone out in a MAX_STREAMS, so the frame is not
         /// repeated. Starts at the base for the reason `max_data_sent` does:
         /// the peer has already been told that much.
@@ -501,6 +496,21 @@ pub fn Streams(comptime config: Config) type {
         pub fn reoweBlocked(self: *Self) void {
             // Bounded by `count`.
             for (self.streams[0..self.count]) |*stream| {
+                // Section 3.3 forbids a STREAM_DATA_BLOCKED once the stream has
+                // been abandoned, and this loop read no send state at all — so
+                // a lost flow-control packet re-armed the flag on a stream in
+                // "Reset Sent" and the writer framed the frame that MUST NOT be
+                // sent.
+                switch (stream.send_state) {
+                    .sending, .data_sent => {},
+                    .reset, .reset_recvd, .data_recvd => continue,
+                }
+                // And only a stream with something waiting is blocked. The flag
+                // means "this endpoint has octets to write and the peer's limit
+                // is what stops it"; the condition below on its own is true of
+                // every stream that has written up to its limit, including a
+                // brand-new one where both numbers are zero.
+                if (stream.framed == stream.send_len and !stream.send_fin) continue;
                 if (stream.send_offset + stream.send_len >= stream.send_limit) stream.send_blocked = true;
             }
             if (self.sent_total >= self.send_limit) self.send_blocked = true;
@@ -575,6 +585,14 @@ pub fn Streams(comptime config: Config) type {
             //# A QUIC endpoint MUST NOT reuse a stream ID within a connection.
             //= type=test
             if (self.isRetired(id)) return error.Retired;
+            // Here rather than at `receive` alone, which is where it used to
+            // be. Section 3.2's implicit creation turned an identifier into a
+            // request to allocate `index + 1` slots, and three frames reach
+            // this function without passing through `receive`: RESET_STREAM,
+            // STOP_SENDING and MAX_STREAM_DATA. One MAX_STREAM_DATA naming a
+            // high index would fill the table — this endpoint's exhaustion,
+            // reported to the next honest request as *its* STREAM_LIMIT_ERROR.
+            try self.checkAdvertisedStreamLimit(id);
 
             const kind = stream_id.kindOf(id);
             const position = stream_id.index(id);
@@ -791,11 +809,15 @@ pub fn Streams(comptime config: Config) type {
         pub fn setAdvertisedStreamLimits(self: *Self, bidi: u64, uni: u64) void {
             assert(bidi <= streams_max);
             assert(uni <= streams_max);
+            // The checkable half of the paragraph above. The two limits were
+            // asserted separately, so `bidi = uni = streams_max` passed — and
+            // that is exactly the sizing mistake the paragraph describes. What
+            // cannot be asserted here is the streams this endpoint opens
+            // itself, because the peer has not said yet how many it may.
+            assert(bidi + uni <= streams_max);
             assert(self.count == 0);
             self.advertised_bidi = bidi;
             self.advertised_uni = uni;
-            self.advertised_bidi_base = bidi;
-            self.advertised_uni_base = uni;
             self.max_streams_bidi_sent = bidi;
             self.max_streams_uni_sent = uni;
         }
@@ -862,9 +884,22 @@ pub fn Streams(comptime config: Config) type {
         //# to the "Reset Read" state, which is a terminal state.
         //= type=test
         fn finished(self: *const Self, stream: *const Stream) bool {
+            assert(stream.id <= varint.max);
             if (stream_id.sendable(stream.id, self.side)) {
                 switch (stream.send_state) {
-                    .data_recvd, .reset_recvd => {},
+                    // "Data Recvd" is not enough on its own, because this
+                    // package enters it early: `Connection` sets it when the
+                    // packet carrying the *FIN* is acknowledged, not when every
+                    // packet is. Under reordering the FIN's packet can be
+                    // acknowledged first, and retiring on that alone drops a
+                    // stream with octets still on the wire — `rewind` then finds
+                    // nothing, the peer holds everything after the hole, and
+                    // this endpoint reports the stream delivered. Silent data
+                    // loss, on the one path that reports success.
+                    .data_recvd => {
+                        if (stream.acked_to < stream.send_offset + stream.send_len) return false;
+                    },
+                    .reset_recvd => {},
                     // "Reset Sent" is not terminal: the RESET_STREAM is still
                     // owed or in flight, and retiring the stream would drop the
                     // frame the peer is waiting for.
@@ -905,9 +940,14 @@ pub fn Streams(comptime config: Config) type {
             const stream = self.find(id) orelse return false;
             if (!self.finished(stream)) return false;
 
-            const at = (@intFromPtr(stream) - @intFromPtr(&self.streams[0])) / @sizeOf(Stream);
+            const offset = @intFromPtr(stream) - @intFromPtr(&self.streams[0]);
+            assert(offset % @sizeOf(Stream) == 0);
+            const at = @divExact(offset, @sizeOf(Stream));
             assert(at < self.count);
-            self.streams[at] = self.streams[self.count - 1];
+            // Not when the victim *is* the last slot: a struct assignment of
+            // this size lowers to a `memcpy`, and a `memcpy` whose source and
+            // destination are the same object is undefined.
+            if (at != self.count - 1) self.streams[at] = self.streams[self.count - 1];
             self.count -= 1;
             self.retired[@intFromEnum(kind)] = next + 1;
 
@@ -1017,6 +1057,7 @@ pub fn Streams(comptime config: Config) type {
         //# An endpoint MUST terminate a connection with an error of type
         //# STREAM_LIMIT_ERROR if a peer opens more streams than was permitted.
         fn checkAdvertisedStreamLimit(self: *const Self, id: u64) Error!void {
+            assert(id <= varint.max);
             const kind = stream_id.kindOf(id);
             if (kind.initiator() == self.side) return;
             const limit = if (kind.bidirectional()) self.advertised_bidi else self.advertised_uni;
@@ -1364,7 +1405,15 @@ pub fn Streams(comptime config: Config) type {
                 // asked us to stop and we kept writing.
                 switch (stream.send_state) {
                     .sending, .data_sent => {},
-                    .reset, .reset_recvd, .data_recvd => continue,
+                    .reset, .reset_recvd => continue,
+                    // Not skipped, for the reason `Connection.writeStream`
+                    // gives at length and this used to contradict: "Data Recvd"
+                    // is entered when the FIN's packet is acknowledged rather
+                    // than when every packet is, so a later loss rewinds the
+                    // watermark on a stream in that state — and an accessor
+                    // that answered false while the writer would have framed is
+                    // a stream that stalls with nothing armed to wake it.
+                    .data_recvd => {},
                 }
                 if (stream.framed < stream.send_len) return true;
                 // A FIN is owed once, not once per poll.

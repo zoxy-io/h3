@@ -1269,14 +1269,19 @@ pub fn Recovery(comptime config: Config) type {
             return null;
         }
 
-        /// Every context still outstanding in a space, oldest first.
+        /// Every packet still *recorded* in a space, oldest first —
+        /// acknowledgement-only ones included, because those are recorded too.
+        /// The name said "in flight" and the doc comment said "outstanding",
+        /// and neither was true: `earliestContext` twelve lines above was
+        /// rewritten for exactly that confusion, so a caller filtering on
+        /// `Sent.in_flight` is doing what both names promised.
         ///
         /// A slice rather than an interpretation: this file never learns what a
         /// packet contained — `Context` is the caller's opaque token — so a
         /// caller that needs to ask "which of my octets are still in the air"
         /// has to do the asking. `Connection` uses it to decide how much of a
         /// stream's send buffer can be given back.
-        pub fn inFlight(self: *const Self, space: Space) []const Sent {
+        pub fn recorded(self: *const Self, space: Space) []const Sent {
             const state = &self.spaces[@intFromEnum(space)];
             return state.sent[0..state.count];
         }

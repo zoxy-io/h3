@@ -11,6 +11,12 @@ name: nightly-sim
 # is a behaviour the sweep did not exercise, and confidence drawn from a sweep
 # about a behaviour it never reached is unearned. `sim` exits non-zero on that,
 # so a silent gap fails the job rather than reading as a pass.
+# Least privilege, as every per-change gate declares it: a nightly that
+# inherits the repository default is one whose permissions change when that
+# default does, silently.
+permissions:
+  contents: read
+
 on:
   schedule:
     # 04:00 UTC, which is outside the working day in the time zones this is
@@ -34,6 +40,9 @@ jobs:
           - name: ReleaseFast, assertions off
             flags: "-Doptimize=ReleaseFast -Dassertions=false"
     runs-on: ubuntu-latest
+    # Sixteen times the per-change sweep, with room over. A hung run should end
+    # as a failure somebody sees rather than as six hours of a shared runner.
+    timeout-minutes: 60
     name: Sweep ${{ matrix.name }}
     steps:
       - name: Checkout

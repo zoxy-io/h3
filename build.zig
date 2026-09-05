@@ -314,7 +314,7 @@ pub fn build(b: *std.Build) void {
     // The format gate. A build step rather than a documented `zig fmt --check`
     // incantation, so that the list of formatted paths lives in exactly one
     // place and CI cannot check a different set than a developer does.
-    const fmt_paths = &.{ "src", "scripts", "bench", "fuzz", "example", "checks", "corpus/all.zig", "corpus/rfc9001.zig", "corpus/qifs.zig", "interop", "build.zig", "build.zig.zon" };
+    const fmt_paths = &.{ "src", "scripts", "bench", "fuzz", "example", "checks", "corpus/all.zig", "corpus/rfc9001.zig", "corpus/qifs.zig", "interop", "sim", "build.zig", "build.zig.zon" };
     const fmt_check = b.addFmt(.{ .paths = fmt_paths, .check = true });
     const fmt_step = b.step("fmt", "Check formatting (zig build fmt-fix rewrites)");
     fmt_step.dependOn(&fmt_check.step);

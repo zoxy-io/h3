@@ -268,7 +268,7 @@ pub fn run(io: Io, gpa: std.mem.Allocator, log: *Io.Writer, options: Options) !v
             if (options.verbose) try note(log, "receive: {s}", .{@errorName(err)});
             peer.connection.close(Connection.errorCode(err));
             _ = flush(io, &socket, peer, now) catch {};
-            peer.live = false;
+            release(io, peer);
             continue;
         };
 
@@ -391,20 +391,28 @@ fn accept(
         for (peers) |*peer| {
             if (!peer.live) break :free peer;
         }
-        // Full: take the connection nobody has heard from in longest. A server
-        // that answers nothing looks exactly like a server that failed the test
-        // under way, so refusing here is the worst of the options — and the
-        // peer being evicted is, by construction, the one least likely to still
-        // be waiting for an answer.
+        // Full: take a connection somebody has stopped talking to. Refusing is
+        // the worst of the options, because a server that answers nothing looks
+        // exactly like a server that failed the test under way.
+        //
+        // Ranked by state before recency, which the comment on `idle_ns` claims
+        // and a purely-recency rank does not deliver: on a lossy path the peer
+        // that has been silent longest is often a *handshaking* one waiting out
+        // a backed-off probe timeout, so recency alone makes the connection
+        // least able to survive eviction the one most likely to be chosen.
         var oldest: *Peer = &peers[0];
         for (peers) |*peer| {
-            if (peer.last_ns < oldest.last_ns) oldest = peer;
+            if (rank(peer) < rank(oldest)) {
+                oldest = peer;
+                continue;
+            }
+            if (rank(peer) == rank(oldest) and peer.last_ns < oldest.last_ns) oldest = peer;
         }
         try note(log, "evicting {x}, silent {d}ms", .{
             oldest.local.bytes(),
             (now_ns -| oldest.last_ns) / std.time.ns_per_ms,
         });
-        oldest.trace.finish(io);
+        release(io, oldest);
         break :free oldest;
     };
 
@@ -462,6 +470,17 @@ fn accept(
     slot.connection.streams.setAdvertisedStreamLimits(requests_max, unidirectional_max);
     try note(log, "accepted a connection as {x}", .{source.bytes()});
     return slot;
+}
+
+/// How willing this server is to give a peer's slot away, lowest first. A
+/// connection that is over costs nothing; one still handshaking has the most to
+/// lose, because it has not yet had a single round trip go right.
+fn rank(peer: *const Peer) u8 {
+    return switch (peer.connection.state) {
+        .closing, .draining => 0,
+        .established => 1,
+        .handshaking => 2,
+    };
 }
 
 /// The versions this endpoint speaks, which is one.
@@ -614,7 +633,7 @@ fn transportParameters(
         // what it said it would do. It advertised nothing here while dropping
         // connections after five seconds, which is a server telling its peer
         // the connection never times out and then behaving as though it does.
-        .max_idle_timeout_ms = idle_ns / std.time.ns_per_ms,
+        .max_idle_timeout_ms = @divExact(idle_ns, std.time.ns_per_ms),
         .max_udp_payload_size = Connection.datagram_octets,
         .active_connection_id_limit = 2,
         .initial_source_connection_id = source,
@@ -1034,6 +1053,25 @@ fn flushAll(
 /// framed and sent by the flush that precedes every call here, and section
 /// 10.2.1 says an endpoint sends one close and then nothing. Keeping the slot
 /// afterwards is keeping it for a connection that will never speak again.
+/// Give back everything a connection held: its trace, its open answer files,
+/// and its slot.
+///
+/// One function because there are three ways a peer ends — a receive error, an
+/// eviction, and the idle sweep — and each of them used to release a different
+/// subset. The receive path released nothing at all, which is the dominant path
+/// under h3spec, where thirty-three of forty-nine cases *are* protocol errors:
+/// every one of them left a file handle open and a buffered trace unwritten.
+fn release(io: Io, peer: *Peer) void {
+    peer.trace.finish(io);
+    // Bounded by `answers_len`, which is bounded by `requests_max`.
+    for (peer.answers[0..peer.answers_len]) |*answer| {
+        if (answer.file) |file| file.close(io);
+        answer.file = null;
+    }
+    peer.answers_len = 0;
+    peer.live = false;
+}
+
 fn retire(io: Io, peers: []Peer, now_ns: u64) void {
     for (peers) |*peer| {
         if (!peer.live) continue;
@@ -1041,13 +1079,10 @@ fn retire(io: Io, peers: []Peer, now_ns: u64) void {
             .closing, .draining => true,
             .handshaking, .established => now_ns -| peer.last_ns > idle_ns,
         };
-        if (over) {
-            // Flushed and closed here rather than when the slot is reused: a
-            // trace that is still open when the process exits is a trace whose
-            // last records are in a buffer nobody wrote.
-            peer.trace.finish(io);
-            peer.live = false;
-        }
+        // Released here rather than when the slot is reused: a trace still
+        // open when the process exits is one whose last records are in a
+        // buffer nobody wrote, and an answer still open is a descriptor.
+        if (over) release(io, peer);
     }
 }
 

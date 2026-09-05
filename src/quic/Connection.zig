@@ -3679,6 +3679,11 @@ pub fn Connection(comptime config: Config) type {
         //# of the stream in the opposite direction.
         //= type=test
         pub fn resetStream(self: *Self, id: u64, code: u64) ConnectionStreams.Error!void {
+            // Bounded here rather than truncated at the writer. The code goes
+            // out as a variable-length integer, and a `@truncate` on the way
+            // there is how a consumer's number becomes a *different* number on
+            // the wire with nothing said about it.
+            if (code > varint.max) return error.Protocol;
             try self.streams.resetSend(id, code);
         }
 
@@ -3688,6 +3693,7 @@ pub fn Connection(comptime config: Config) type {
         /// abandons what this endpoint sends; this abandons what it receives,
         /// and neither implies the other.
         pub fn stopSending(self: *Self, id: u64, code: u64) ConnectionStreams.Error!void {
+            if (code > varint.max) return error.Protocol;
             try self.streams.stopSending(id, code);
         }
 
@@ -3738,7 +3744,11 @@ pub fn Connection(comptime config: Config) type {
             var oldest: ?u64 = null;
             // Bounded by `sent_max`, which is the same order of work loss
             // detection already does on every acknowledgement.
-            for (self.recovery.inFlight(.application)) |sent| {
+            for (self.recovery.recorded(.application)) |sent| {
+                // Only packets that were in flight can still be holding octets:
+                // an acknowledgement-only one is recorded here too and carries
+                // no range.
+                if (!sent.in_flight) continue;
                 const context = sent.context;
                 if (context.stream != id) continue;
                 if (context.stream_end <= context.stream_start) continue;
@@ -5186,11 +5196,22 @@ pub fn Connection(comptime config: Config) type {
         //= type=test
         fn writeReset(self: *Self, target: []u8, result: *Payload) usize {
             const stream = self.streams.nextReset() orelse return 0;
+            assert(stream.reset_code <= varint.max);
+            assert(stream.reset_final_size <= varint.max);
             const written = frame.encode(target, .{ .reset_stream = .{
                 .stream = stream.id,
-                .code = @enumFromInt(@as(u62, @truncate(stream.reset_code))),
+                .code = @enumFromInt(@as(u62, @intCast(stream.reset_code))),
                 .final_size = stream.reset_final_size,
-            } }) catch return 0;
+            } }) catch |err| switch (err) {
+                // No room in this packet; the frame is still owed and goes in
+                // the next one.
+                error.OutputTooLong => return 0,
+                // Every field was bounded above, so this cannot happen — and
+                // swallowing it would be worse than a crash: `reset_framed`
+                // would stay false, `wantsSend` would stay true, and every
+                // later packet would fail to hold the frame. A spin.
+                error.ValueTooLarge => unreachable,
+            };
             if (written == 0) return 0;
             stream.reset_framed = true;
             result.stream = stream.id;
@@ -5207,10 +5228,16 @@ pub fn Connection(comptime config: Config) type {
         fn writeStopSending(self: *Self, target: []u8, result: *Payload) usize {
             const stream = self.streams.nextStopSending() orelse return 0;
             const code = stream.stop_code orelse return 0;
+            assert(code <= varint.max);
             const written = frame.encode(target, .{ .stop_sending = .{
                 .stream = stream.id,
-                .code = @enumFromInt(@as(u62, @truncate(code))),
-            } }) catch return 0;
+                .code = @enumFromInt(@as(u62, @intCast(code))),
+            } }) catch |err| switch (err) {
+                error.OutputTooLong => return 0,
+                // As in `writeReset`: bounded above, and a swallowed encoding
+                // failure here is a frame owed for ever.
+                error.ValueTooLarge => unreachable,
+            };
             if (written == 0) return 0;
             stream.stop_framed = true;
             result.stream = stream.id;
@@ -5506,6 +5533,21 @@ pub fn Connection(comptime config: Config) type {
             return event;
         }
 
+        /// Whether a 1-RTT packet carrying an ack-eliciting frame could be built
+        /// right now: the keys exist, the space is alive, and either the window
+        /// admits one or a probe is owed.
+        ///
+        /// The two conditions `writePayload` applies before it reaches any of
+        /// the frames `wantsSend` predicates on, asked in one place so that the
+        /// accessor and the writer cannot drift into disagreeing.
+        fn oneRttWritable(self: *const Self) bool {
+            const index = @intFromEnum(Level.one_rtt);
+            if (self.send_keys[index] == null) return false;
+            const space = &self.spaces[@intFromEnum(Space.application)];
+            if (space.discarded) return false;
+            return space.probes_pending > 0 or self.recovery.canSend(config.datagram_octets);
+        }
+
         pub fn wantsSend(self: *const Self) bool {
             if (self.state == .draining) return false;
             //= https://www.rfc-editor.org/rfc/rfc9000#section-10.2
@@ -5533,10 +5575,20 @@ pub fn Connection(comptime config: Config) type {
                 if (space.probes_pending > 0 and !space.discarded) return true;
             }
             if (self.streams.wantsSend()) return true;
-            if (self.owesFlowControl()) return true;
-            if (self.streams.owesReset()) return true;
-            if (self.streams.owesStopSending()) return true;
-            if (self.streams.owesBlocked()) return true;
+            // Everything below is written by `writePayload` only inside its
+            // `level == .one_rtt` block and only after the congestion window
+            // has let an ack-eliciting frame through. Answering true without
+            // asking those two questions is the spin the comment above records
+            // having fixed once already: a full window plus a receiver that has
+            // just consumed half of one gives `owesFlowControl` true, an empty
+            // payload, `send` returning zero, and an event loop that never
+            // sleeps.
+            if (self.oneRttWritable()) {
+                if (self.owesFlowControl()) return true;
+                if (self.streams.owesReset()) return true;
+                if (self.streams.owesStopSending()) return true;
+                if (self.streams.owesBlocked()) return true;
+            }
             for (0..Level.count) |index| {
                 const level: Level = @enumFromInt(index);
                 if (self.send_keys[index] == null) continue;
@@ -6430,7 +6482,7 @@ test "section 6.2.4: a probe carries data rather than an old acknowledgement" {
     try testing.expect(try server.send(&datagram, 1000) > 0);
     try server.cryptoIn(.initial, "ServerHello");
     try testing.expect(try server.send(&datagram, 2000) > 0);
-    try testing.expectEqual(@as(usize, 2), server.recovery.inFlight(.initial).len);
+    try testing.expectEqual(@as(usize, 2), server.recovery.recorded(.initial).len);
     try testing.expectEqual(@as(u32, "ServerHello".len), server.levels[0].framed);
 
     // The probe rewinds the flight, not the acknowledgement.
