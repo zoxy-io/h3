@@ -125,6 +125,7 @@ requirement list extracted from the specification.
 | The census merged into the sweep total through a hand-written list of fields, so a counter nobody remembered to add read as a behaviour no seed reached | adding two counters and watching both report zero while the sweep reached one of them eleven thousand times | It is the same shape as the defect the file already recorded — a row that is zero because the accumulator is wrong rather than because the behaviour is absent — and the second instance arrived four months after the comment about the first |
 | `src/qlog.zig`'s tests never ran. `src/root.zig` has a `test` block that names each module, and a module nobody names is a module whose tests Zig does not compile — so the file was written, wired into both roles and passing for an hour, and the first test to actually execute failed | naming the module | Nothing reports a test that was never compiled. The gate output is identical to the gate output for a module whose tests all pass |
 | What that was hiding: two `Record` variants wrote their first field with the raw text writer, which does not do the comma bookkeeping, and emitted two fields with nothing between them — balanced braces, and not JSON | the first run of those tests | The test that caught it parses each record with `std.json.validate`. The one it replaced counted braces, and counting braces would have passed |
+| The packet-report arrays were a fixed 32 while `Recovery` tracks `sent_max` per space and clamps its writes to whatever slice it is handed, so an acknowledgement retiring more than 32 packets reported a *prefix* — and both handlers act once per context, so the streams past the thirty-second were never settled, never retired, and (retirement being contiguous) pinned every stream above them | zrk, driving eight concurrent request streams over a real connection | The quantity that has to pass thirty-two is not the streams in flight — there were eight — but the *unacknowledged packets in one space*, each naming a different stream, which is what a request-per-stream workload produces once the congestion window has grown and streams turn over faster than the peer acknowledges. `sim/` reaches neither the window nor the turnover. And the constant's own comment argued the bound was sound: a loss is answered by rewinding a cursor, and the earliest lost packet decides where to. True of one stream and of the crypto level; false of every context after the first |
 
 Two things about that table.
 
@@ -137,6 +138,11 @@ found the bug the shim's own fix introduced, which is the argument for keeping
 all of them. A defect is usually visible
 to exactly one of them, which is the argument against ever calling any one of
 them sufficient.
+
+**And the newest row was found by neither** — it was found by a consumer, doing
+the ordinary thing this package exists for, at a rate no gate here runs at. That
+is not an argument for a load gate; it is the reason a package with seven kinds
+of evidence still ships to two consumers rather than to none.
 
 **Six of these were introduced by the same session that fixed the rest**, and
 four were mine. Two stale `type=todo` comments described gaps that had moved,
