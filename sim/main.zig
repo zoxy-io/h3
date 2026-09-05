@@ -68,9 +68,16 @@ const Connection = quic.Connection(.{
     .transport_parameters_octets = 1024,
     .sent_max = 64,
     .streams_max = 8,
-    .stream_receive_octets = 64 * 1024,
+    // The receive window is deliberately *smaller* than the send buffer. With
+    // it the other way round the sender always ran out of its own buffer first,
+    // so every short write was this endpoint filling up rather than the peer's
+    // window closing — and the state a MAX_STREAM_DATA exists to end was never
+    // entered. A receiver whose window is tighter than the sender's buffer is
+    // also the ordinary case: the buffer is a local choice and the window is a
+    // promise about memory.
+    .stream_receive_octets = 16 * 1024,
     .stream_send_octets = 32 * 1024,
-    .connection_receive_octets = 256 * 1024,
+    .connection_receive_octets = 64 * 1024,
 });
 
 /// Virtual time a run may take before it is called a livelock. Generous
@@ -99,7 +106,21 @@ const quiet_steps_max: u32 = 2000;
 
 /// What the application on each side does, so that "delivered equals written"
 /// has something to compare.
-const payload_octets_max: u32 = 24 * 1024;
+///
+/// Larger than the connection's own windows, and that is the point: a transfer
+/// that fits inside a receive window is one flow control never has to pace, and
+/// every window-update defect this package has had lived on the other side of
+/// that. Most seeds stay small so the sweep stays quick; `drawPayloadLength`
+/// is where the split is.
+const payload_octets_max: u32 = 192 * 1024;
+
+/// A payload size, mostly small and sometimes past the windows above.
+fn drawPayloadLength(random: std.Random) u32 {
+    if (random.uintLessThan(u8, 4) == 0) {
+        return 1 + random.uintLessThan(u32, payload_octets_max - 1);
+    }
+    return 1 + random.uintLessThan(u32, 24 * 1024);
+}
 
 const fake_secret_seeds = [_]u8{ 0x11, 0x22, 0x33, 0x44 };
 
@@ -155,6 +176,21 @@ const Census = struct {
     adversary_replays: u64 = 0,
     adversary_truncations: u64 = 0,
     adversary_corruptions: u64 = 0,
+    /// Writes the peer's flow control refused, in whole or in part.
+    ///
+    /// The sender running out of credit is the state every window-update defect
+    /// this package has had lived in, and a harness whose reader consumes the
+    /// instant anything arrives never enters it: the window is always open, so
+    /// nothing is ever owed, so a MAX_STREAM_DATA that never went out is a
+    /// MAX_STREAM_DATA nothing was waiting for.
+    writes_refused_by_flow_control: u64 = 0,
+    /// Steps where the clock moved past the next thing that could happen.
+    ///
+    /// A caller's clock is not a metronome: a process descheduled for fifty
+    /// milliseconds services its timers late, all of them at once, and a
+    /// connection that only works when serviced promptly works only on an idle
+    /// machine.
+    clock_jumps: u64 = 0,
 
     /// The counters that must move somewhere in a sweep. A zero here means the
     /// sweep did not reach the behaviour, so any confidence drawn from it about
@@ -233,6 +269,16 @@ const Census = struct {
         .{ .name = "datagrams corrupted by the adversary", .get = struct {
             fn get(c: *const Census) u64 {
                 return c.adversary_corruptions;
+            }
+        }.get },
+        .{ .name = "writes refused by flow control", .get = struct {
+            fn get(c: *const Census) u64 {
+                return c.writes_refused_by_flow_control;
+            }
+        }.get },
+        .{ .name = "clock jumps", .get = struct {
+            fn get(c: *const Census) u64 {
+                return c.clock_jumps;
             }
         }.get },
     };
@@ -315,6 +361,15 @@ const World = struct {
     /// read as the client's going backwards — an oracle that fired on every
     /// seed before it had seen a single packet.
     highest_sent: [2][3]?u64 = @splat(@splat(null)),
+
+    /// How many steps the reader waits between draining the stream, and zero
+    /// for a reader that takes everything the moment it arrives.
+    ///
+    /// A reader that never waits keeps the receive window open, and a window
+    /// that is always open is a window nothing has to reopen. Every flow
+    /// control defect this package has had lived on the other side of that.
+    read_every: u32 = 0,
+    read_countdown: u32 = 0,
 
     /// How far into the transfer this seed updates its keys, or zero for a seed
     /// that does not. Drawn rather than fixed so the update lands in different
@@ -404,7 +459,7 @@ fn buildWorld(seed: u64) World {
             .rate_octets_per_second = rate,
             .duplicate_period = 0,
         }),
-        .payload_len = 1 + random.uintLessThan(u32, payload_octets_max - 1),
+        .payload_len = drawPayloadLength(random),
     };
     // Half the seeds update their keys, somewhere in the first half of the
     // transfer. Half rather than all, because a behaviour every seed reaches is
@@ -416,6 +471,14 @@ fn buildWorld(seed: u64) World {
     // where every seed has an attacker cannot say what the attacker changed.
     if (random.uintLessThan(u8, 3) == 0) {
         world.adversary.budget = 1 + random.uintLessThan(u32, 24);
+    }
+    // A third read slowly. Bounded, and bounded on purpose: a reader that
+    // stops for ever stalls the transfer by construction, and the oracle that
+    // the transfer completes would then be measuring the harness. What this
+    // draws is a reader that is *late*, which is what closes a receive window
+    // and makes the other endpoint ask for it to be reopened.
+    if (random.uintLessThan(u8, 3) == 0) {
+        world.read_every = 1 + random.uintLessThan(u32, 8);
     }
     // Content that a partial or reordered delivery cannot accidentally satisfy.
     for (&world.payload, 0..) |*octet, index| octet.* = @truncate(index *% 31 +% 7);
@@ -529,6 +592,11 @@ fn driveApplication(world: *World) void {
         const remaining = world.payload[world.written..world.payload_len];
         if (remaining.len > 0) {
             const taken = world.client.write(stream, remaining, false) catch 0;
+            // A short write is the peer's window closing, or this endpoint's
+            // own buffer filling. Either way it is the state a window update
+            // has to end, and the census counts it because a sweep that never
+            // reaches it proves nothing about the frames that end it.
+            if (taken < remaining.len) world.census.writes_refused_by_flow_control += 1;
             world.written += @intCast(taken);
             if (taken > 0) world.busy_until_ns = world.now_ns;
         }
@@ -538,6 +606,12 @@ fn driveApplication(world: *World) void {
             world.busy_until_ns = world.now_ns;
         }
     }
+
+    if (world.read_countdown > 0) {
+        world.read_countdown -= 1;
+        return;
+    }
+    world.read_countdown = world.read_every;
 
     const readable = world.server.readable(stream);
     if (readable.len == 0) return;
@@ -772,8 +846,30 @@ fn stepOnce(world: *World) bool {
     if (world.client.timeout()) |at| next = minimum(next, at);
     if (world.server.timeout()) |at| next = minimum(next, at);
 
+    // A quiet network is not a finished run. With a reader that takes its time,
+    // everything can be delivered and acknowledged while the application still
+    // has octets buffered — nothing is owed in either direction, no timer is
+    // armed, and the loop would end with the transfer short and both endpoints
+    // blameless. The clock moves on so the reader can catch up.
+    if (next == null and world.received < world.payload_len and
+        world.server.readable(quic.stream_id.make(.client_bidirectional, 0)).len > 0)
+    {
+        world.now_ns += std.time.ns_per_ms;
+        return true;
+    }
+
     const advance = next orelse return false;
-    const target = @max(advance, world.now_ns + 1);
+    var target = @max(advance, world.now_ns + 1);
+    // A caller's clock is not a metronome. A process descheduled for a few
+    // milliseconds services every timer that came due while it was away, all at
+    // once and all late, and a connection that only works when serviced
+    // promptly works only on an idle machine. The jump is bounded so that a
+    // sweep still finishes inside its virtual deadline — what is being tested
+    // is lateness, not the idle timeout.
+    if (random.uintLessThan(u8, 16) == 0) {
+        target += random.uintLessThan(u64, 50 * std.time.ns_per_ms);
+        world.census.clock_jumps += 1;
+    }
     world.now_ns = target;
 
     // Fire whatever the clock reached, to a fixpoint. A real event loop drains
@@ -1051,6 +1147,8 @@ fn printCensus(census: *const Census) void {
         .{ .name = "adversary: replays", .value = census.adversary_replays },
         .{ .name = "adversary: truncations", .value = census.adversary_truncations },
         .{ .name = "adversary: corruptions", .value = census.adversary_corruptions },
+        .{ .name = "writes refused by flow control", .value = census.writes_refused_by_flow_control },
+        .{ .name = "clock jumps", .value = census.clock_jumps },
     };
     for (rows) |row| std.debug.print("  {s:<32} {d}\n", .{ row.name, row.value });
 

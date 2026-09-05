@@ -422,8 +422,8 @@ collapses the window and the transfer resumes".
 **Status.** `sim/Link.zig` and `sim/main.zig` exist and run as `zig build sim`.
 The link has delay, jitter, a rotating loss mask, reordering, duplication, MTU
 and a token-bucket queue with tail drop. Five oracles are live and the census
-counts twenty-two behaviours, fifteen of them required, and an off-path
-attacker is on a third of the seeds.
+counts twenty-four behaviours, seventeen of them required. A third of seeds
+are watched by an off-path attacker and a third read slowly.
 
 It is part of `zig build ci`. It was held out while the census reported
 behaviours no seed reached, because a gate that passes while saying so would be
@@ -570,8 +570,48 @@ Not modelled: forging an Initial packet. Its keys are derived from a connection
 identifier that travels in the clear, so an attacker who saw the first flight
 can seal one — and the defect that reached review by that route, a server
 adopting the Source Connection ID from any Initial it could open, is covered by
-a test in `Connection` instead. Fault injection — a seal that fails, a `now_ns`
-that jumps — is what is left.
+a test in `Connection` instead.
+
+**Fault injection — done, and two of §5.2's three items were not expressible.**
+"A seal that fails" and "a send buffer that is sometimes too small" are both
+faults *inside* the library: `send` refuses a buffer below `datagram_octets`, so
+a caller cannot pass a small one, and nothing outside can make an AEAD fail.
+Writing them down as pending for as long as they were pending was the mistake —
+they need a fault-injecting build of `src/`, not a harness. What a harness can
+inject is what a caller can do wrong, and there are two of those:
+
+- **A clock that jumps.** A process descheduled for a few milliseconds services
+  every timer that came due while it was away, all at once and all late. One
+  step in sixteen now advances past the next event, and a sweep of 4096 seeds
+  takes about twenty thousand of them.
+- **A reader that is late.** A third of seeds drain the stream every few steps
+  instead of the instant anything arrives. This is the one that mattered: the
+  receive window is what closes when nobody reads, and every window-update
+  defect this package has had lived on the other side of that.
+
+Reaching that state needed two changes beyond the reader. The payload
+distribution now goes past the connection's own windows — a transfer that fits
+inside a receive window is one flow control never has to pace — and the receive
+window is deliberately *smaller* than the send buffer, because with it the other
+way round every short write was this endpoint filling up rather than the peer's
+window closing. Writes refused by flow control went from zero to about 292,000
+in a 4096-seed sweep.
+
+One honest limit. The sweep now enters the state the window-update deadlock
+lived in and does **not** reproduce the deadlock: removing both §4.1's blocked
+frames and §13.3's re-owing leaves 256 of 256 seeds passing. The escape is that
+the receiver keeps consuming, so its window keeps moving, so the next threshold
+crossing sends a fresh MAX_STREAM_DATA even though the lost one was never
+repaired. That deadlock needs a receiver that has *stopped* owing updates while
+the sender is blocked, which is a narrower schedule than a random sweep finds.
+It is a scenario test rather than a seed, and it is written down here rather
+than left as an assumption that the sweep covers it.
+
+It also cost one harness defect, of the kind this file keeps recording. A run
+ended when the network went quiet — and with a late reader, everything can be
+delivered and acknowledged while the application still has octets buffered.
+Nothing owed, no timer armed, and the loop ended with the transfer short and
+both endpoints blameless. Four seeds in the first 256.
 
 ### 5.3 Events out — **done**
 
