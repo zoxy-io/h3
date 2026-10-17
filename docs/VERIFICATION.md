@@ -22,7 +22,7 @@ particular list.
 the part worth reading. The ledger, the simulator, the event queue, the interop
 shim and h3spec were built to catch the eleven classes in the first table; they
 did, and they also caught classes nobody had written down. The second table is
-sixty rows against the first table's eleven, because a gate's real yield
+sixty-one rows against the first table's eleven, because a gate's real yield
 is only knowable after it runs.
 
 Each finding, with the gate that would have caught it first:
@@ -128,6 +128,7 @@ requirement list extracted from the specification.
 | The packet-report arrays were a fixed 32 while `Recovery` tracks `sent_max` per space and clamps its writes to whatever slice it is handed, so an acknowledgement retiring more than 32 packets reported a *prefix* — and both handlers act once per context, so the streams past the thirty-second were never settled, never retired, and (retirement being contiguous) pinned every stream above them | zrk, driving eight concurrent request streams over a real connection | The quantity that has to pass thirty-two is not the streams in flight — there were eight — but the *unacknowledged packets in one space*, each naming a different stream, which is what a request-per-stream workload produces once the congestion window has grown and streams turn over faster than the peer acknowledges. `sim/` reaches neither the window nor the turnover. And the constant's own comment argued the bound was sound: a loss is answered by rewinding a cursor, and the earliest lost packet decides where to. True of one stream and of the crypto level; false of every context after the first |
 | A packet built while `Recovery`'s table was full went out unrecorded — `onPacketSent(...) catch {}` — so its loss could never be detected, and `reclaimStream`, which reads the table as the list of packets still holding octets, released its range on the next acknowledgement. The stream carried a 1401-octet hole and both endpoints exchanged PINGs about it until the deadline | the nightly sweep, seed 155905, in all three builds | The table is sized in packets and the congestion window in octets, and nothing related them: it takes a receiver reopening its window a few octets at a time, so the sender fills sixty-four slots with twelve kilobytes. The 256-seed sweep never fills a table at all, which is why the seed is now a pinned test and the state a census row |
 | MAX_DATA and MAX_STREAM_DATA were framed without marking the packet ack-eliciting, so one carrying nothing else was recorded as acknowledgement-only: not in flight, never a probe's target, arming no PTO. Its loss could only be declared once a *later* packet was acknowledged — and a receiver that has just reopened its window and has nothing else to say sends none. Fixing it exposed a second defect: `rollback` re-owed every cursor `writePayload` commits except the flow-control ones, so a packet that failed to seal after framing a window update left the limit recorded as sent | reading `writePayload` while fixing the row above | The peer classifies frames with `frame.Type.ackEliciting` and acknowledged these packets correctly; only the sender's own accounting disagreed, and an acknowledgement-only packet that happens to be acknowledged looks exactly like a correct one |
+| `wantsSend` answered true while `send` built nothing: stream data, HANDSHAKE_DONE and CRYPTO queued behind a full congestion window or recovery table, and an unvalidated server with a few octets of amplification allowance — more than zero, less than any packet — and a probe owed. An event loop polling the pair never sleeps. The first fix tested the room below the closing state's early return, so a server that closed near its limit still spun | a new simulator oracle, written before the fix, which failed five of the first ten seeds; the closing case by review, since the sweep rarely closes an unvalidated server | Every other oracle watches what goes on the wire, and nothing went on the wire. The flow-control half of the same disagreement had been fixed already, and its comment named the spin; the fix gated the frames it was looking at and not the ones beside them |
 
 Two things about that table.
 
@@ -190,7 +191,7 @@ that crossing, and §5.2 is what it became.
 | `zig build lint` | No I/O, no allocator, no unbounded loop | Nothing about behaviour |
 | The `tiger-style-reviewer` agent | Assertion density, function length, named bounds | It is a reader, not a gate: it found the twenty above, and it will not find the same class twice at the same cost |
 | `zig build requirements` | That every RFC quote in the source is in the section it cites, that every exception states a reason, and that no `//=` URL is silently unreadable | Coverage — the sentence extraction is a heuristic, so the count is a trend rather than a threshold. And "cited" is not "correct": a citation says someone looked, not that they were right |
-| `zig build sim` | 256 seeded runs of two connections over a modelled link — loss, reordering, duplication, MTU changes, clock jumps, a late reader, key updates, and on a third of seeds an adversary that replays, truncates and corrupts — with seven oracles and a 24-row census that fails the sweep when a required behaviour goes unreached | Anything no oracle states, and any fault that lives *inside* the library: a `seal` that fails and a send buffer that is too small are not things a harness can inject, because no caller can produce them. It also enters the state the flow-control deadlock lived in and does not reproduce it — removing both fixes leaves 256 of 256 seeds passing |
+| `zig build sim` | 256 seeded runs of two connections over a modelled link — loss, reordering, duplication, MTU changes, clock jumps, a late reader, key updates, and on a third of seeds an adversary that replays, truncates and corrupts — with eight oracles and a 27-row census that fails the sweep when a required behaviour goes unreached | Anything no oracle states, and any fault that lives *inside* the library: a `seal` that fails and a send buffer that is too small are not things a harness can inject, because no caller can produce them. It also enters the state the flow-control deadlock lived in and does not reproduce it — removing both fixes leaves 256 of 256 seeds passing |
 | The interop shim, against quic-go: 9 of 9 as a client, 8 of 8 as a server | That two independent implementations of the same RFCs agree over a lossy link, on the cases the runner has | Only what the runner tests — nine named scenarios, not a specification. And it is run by hand: `interop.yml` builds the shims and stops |
 | h3spec, 49 of 49 | That 49 specific violations are answered with the specific error code the RFC names | The positive path — every case is a negative one. Run by hand, like the interop matrix |
 | `zig build corpus` | RFC 9001 appendix A's worked packets octet for octet — key schedule, AEAD, nonce, sampling offset and mask, right at once — and QPACK field sections four other encoders produced | Anything after the first flight; and only the capacity-zero QPACK encodings, because the decoder is static-table-only |
@@ -378,7 +379,7 @@ first run while the sweep was reaching one of them eleven thousand times, and a
 row that is zero because the accumulator is wrong looks exactly like a
 behaviour the seeds never reached.
 
-Seven oracles, numbered here because `sim/main.zig`'s comments cite them by
+Eight oracles, numbered here because `sim/main.zig`'s comments cite them by
 number:
 
 1. Once the application has nothing left to do, the pair goes quiet within
@@ -390,6 +391,7 @@ number:
 5. Delivered octets equal written octets, in order, per stream.
 6. `timeout()` is never in the past while `wantsSend()` is false.
 7. A datagram is the packets in it and nothing else.
+8. Once `send` returns zero, `wantsSend()` answers false.
 
 Two of them are deliberately *not* in `checkInvariants`, and the comments there
 are the record of why.

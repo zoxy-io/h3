@@ -36,6 +36,9 @@
 //!     wrote is what the peer reads, byte for byte.
 //!  6. **A timer is never in the past** while the connection claims to have
 //!     nothing to send.
+//!  7. **A datagram is the packets in it** and nothing else.
+//!  8. **`wantsSend` agrees with `send`.** Once `send` returns zero,
+//!     `wantsSend` answers false, or an event loop polling it never sleeps.
 //!
 //! ## The census
 //!
@@ -945,12 +948,24 @@ fn stepOnce(world: *World) bool {
         const peer_id_octets: u8 = pair[2];
         const direction: usize = pair[3];
         var guard: u32 = 0;
+        var drained = false;
         while (guard < 16) : (guard += 1) {
             const octets = connection.send(&datagram, world.now_ns) catch break;
-            if (octets == 0) break;
+            if (octets == 0) {
+                drained = true;
+                break;
+            }
             inspectDatagram(world, datagram[0..octets], peer_id_octets);
             world.adversary.capture(direction, datagram[0..octets]);
             link.send(datagram[0..octets], world.now_ns, random);
+        }
+        // Oracle eight: `send` has just said there is nothing to send, so
+        // `wantsSend` has to agree. An event loop that polls it and calls
+        // `send` while it answers true never sleeps when the two disagree,
+        // and the disagreement is invisible to every other oracle here —
+        // the connection is behaving, it is only lying about it.
+        if (drained and connection.wantsSend()) {
+            fail(world, "wantsSend answered true after send produced nothing", direction);
         }
     }
 
