@@ -48,6 +48,23 @@ const Side = @import("crypto.zig").Side;
 //# [RFC5681].
 pub const packet_threshold: u64 = 3;
 
+/// Slots in a space's `sent` table that only a PTO probe may fill.
+///
+/// The table is sized in packets and the congestion window in octets, and
+/// nothing relates the two: a sender framing five-octet slivers through a
+/// nearly closed flow-control window filled sixty-four slots with twelve
+/// kilobytes while the window still had room. A packet sent with the table
+/// full could not be recorded, so its loss was never detected — and
+/// `Connection.reclaimStream`, which trusts the table to name every packet
+/// still holding octets, released the lost range from the send buffer. The
+/// stream then carried a hole nothing would ever fill. `sim/` seed 155905.
+///
+/// `hasRoom` is therefore asked *before* a packet is built, and the last two
+/// slots are held for the probes section 6.2.4 obliges a PTO to send: two,
+/// because that is the most one expiry sends — `onLossDetectionTimeout`
+/// asks for exactly this many, so the two cannot drift apart.
+pub const probe_slots: u8 = 2;
+
 /// Section 6.1.2: reordering tolerated in time, as an RTT multiplier of 9/8.
 pub const time_threshold_numerator: u64 = 9;
 pub const time_threshold_denominator: u64 = 8;
@@ -137,7 +154,11 @@ pub const Config = struct {
 
 pub fn Recovery(comptime config: Config) type {
     comptime {
-        assert(config.sent_max >= packet_threshold + 1);
+        // What an ordinary packet may fill has to leave room for the packet
+        // threshold to be reached: three packets after a lost one is what
+        // declares it lost, and a table that refused the third would wait for
+        // the timer instead.
+        assert(config.sent_max >= packet_threshold + 1 + probe_slots);
         assert(config.max_datagram_size >= 1200);
     }
 
@@ -1180,7 +1201,7 @@ pub fn Recovery(comptime config: Config) type {
             //# When a PTO timer expires, the PTO backoff MUST be increased,
             //# resulting in the PTO period being set to twice its current value.
             self.pto_count += 1;
-            return .{ .probe = .{ .space = pto.space, .packets = 2 } };
+            return .{ .probe = .{ .space = pto.space, .packets = probe_slots } };
         }
 
         /// Section 6.2.3: the connection has just discarded a packet number
@@ -1210,6 +1231,26 @@ pub fn Recovery(comptime config: Config) type {
             }
             state.* = .{};
             self.pto_count = 0;
+        }
+
+        /// Whether `onPacketSent` could record one more packet in `space` —
+        /// asked before the packet is built, because a packet that carries
+        /// anything a loss would have to repair may not go out unrecorded. A
+        /// probe may take the last `probe_slots`; anything else may not.
+        ///
+        /// A false answer is not a deadlock. Every recorded packet leaves the
+        /// table by acknowledgement or by loss detection, and a full table is
+        /// a table whose packets the PTO is already waiting on: a probe with
+        /// no slot at all goes out as a bare PING, which needs no record, and
+        /// the acknowledgement it elicits is what empties the table.
+        pub fn hasRoom(self: *const Self, space: Space, probe: bool) bool {
+            const count = self.spaces[@intFromEnum(space)].count;
+            assert(count <= config.sent_max);
+            const reserved: u32 = if (probe) 0 else probe_slots;
+            // The comptime relation at the top of `Recovery`, restated where
+            // the subtraction it licenses is implied.
+            assert(reserved < config.sent_max);
+            return count + reserved < config.sent_max;
         }
 
         /// Outstanding packets in one space, for a caller deciding whether to
@@ -1647,6 +1688,27 @@ test "more outstanding packets than the bound is refused rather than overrun" {
     var recovery: TestRecovery = .{};
     for (0..32) |number| try recovery.onPacketSent(.initial, sentPacket(number, 0));
     try testing.expectError(error.TooManyOutstanding, recovery.onPacketSent(.initial, sentPacket(32, 0)));
+}
+
+test "the last slots of the table are a probe's, and the answer comes before the send" {
+    var recovery: TestRecovery = .{};
+    // An ordinary packet may fill all but `probe_slots`.
+    for (0..32 - probe_slots) |number| {
+        try testing.expect(recovery.hasRoom(.application, false));
+        try recovery.onPacketSent(.application, sentPacket(number, 0));
+    }
+    try testing.expect(!recovery.hasRoom(.application, false));
+    // A probe may take the rest, and every "yes" is a send that succeeds:
+    // `onPacketSent` refusing a packet `hasRoom` admitted would be the
+    // unrecorded packet this exists to prevent.
+    for (32 - probe_slots..32) |number| {
+        try testing.expect(recovery.hasRoom(.application, true));
+        try recovery.onPacketSent(.application, sentPacket(number, 0));
+    }
+    try testing.expect(!recovery.hasRoom(.application, true));
+    try testing.expectError(error.TooManyOutstanding, recovery.onPacketSent(.application, sentPacket(32, 0)));
+    // Per space: the full one says nothing about the others.
+    try testing.expect(recovery.hasRoom(.handshake, false));
 }
 
 test "a caller's lost slice may be shorter than the truth" {

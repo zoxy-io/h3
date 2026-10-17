@@ -248,6 +248,16 @@ const Census = struct {
     /// connection that only works when serviced promptly works only on an idle
     /// machine.
     clock_jumps: u64 = 0,
+    /// Steps that ended with an endpoint's recovery table full to its probe
+    /// slots, so that only an ACK or a probe could go out.
+    ///
+    /// The table is sized in packets and the window in octets, and a sender
+    /// pushing slivers through a nearly closed flow-control window fills the
+    /// first long before the second. A packet sent past that point went out
+    /// unrecorded, its loss was undetectable, and the send buffer released its
+    /// octets on the next acknowledgement: seed 155905, a stream with a hole
+    /// and two endpoints exchanging PINGs about it for two minutes.
+    recovery_table_full: u64 = 0,
 
     /// The counters that must move somewhere in a sweep. A zero here means the
     /// sweep did not reach the behaviour, so any confidence drawn from it about
@@ -1082,6 +1092,11 @@ fn runSeed(seed: u64, census: *Census) ?Failure {
             window_seen_high = false;
         }
         if (!stepOnce(&world)) break;
+        if (!world.client.recovery.hasRoom(.application, false) or
+            !world.server.recovery.hasRoom(.application, false))
+        {
+            world.census.recovery_table_full += 1;
+        }
 
         // Oracle one: once the application has nothing left to do, the pair
         // has a bounded window in which to go quiet. A FIN re-framed into every
@@ -1280,6 +1295,7 @@ fn printCensus(census: *const Census) void {
         .{ .name = "adversary: corruptions", .value = census.adversary_corruptions },
         .{ .name = "writes refused by flow control", .value = census.writes_refused_by_flow_control },
         .{ .name = "clock jumps", .value = census.clock_jumps },
+        .{ .name = "steps with a full recovery table", .value = census.recovery_table_full },
     };
     for (rows) |row| std.debug.print("  {s:<32} {d}\n", .{ row.name, row.value });
 }
@@ -1295,6 +1311,21 @@ test "a clean path completes a transfer and goes quiet" {
         std.debug.print("seed 1 failed: {s}\n", .{one.what});
         return error.SimulationFailed;
     }
+}
+
+test "a sender that fills its recovery table with slivers still finishes" {
+    // Seed 155905, from the nightly sweep: a 3 ms path with a quarter of the
+    // acknowledgements lost and a receiver whose window reopened a few octets
+    // at a time. Pinned because the 256-seed sweep never fills a table, so
+    // without this nothing `zig build ci` runs reaches the state at all — and
+    // the census assertion is what says the seed still does.
+    var census: Census = .{};
+    const failure = runSeed(155905, &census);
+    if (failure) |one| {
+        std.debug.print("seed 155905 failed: {s}\n", .{one.what});
+        return error.SimulationFailed;
+    }
+    try testing.expect(census.recovery_table_full > 0);
 }
 
 test "the same seed produces the same run" {
