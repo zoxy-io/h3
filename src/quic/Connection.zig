@@ -4001,12 +4001,7 @@ pub fn Connection(comptime config: Config) type {
                 //# lost or when the limit is updated, with care taken to prevent the
                 //# frame from being sent too often.
                 //= type=test
-                if (context.flow_control) {
-                    self.max_data_sent = 0;
-                    self.streams.reoweFlowControl();
-                    self.streams.reoweBlocked();
-                    self.streams.reoweStreamCredit();
-                }
+                if (context.flow_control) self.reoweAllFlowControl();
             }
         }
 
@@ -4851,13 +4846,37 @@ pub fn Connection(comptime config: Config) type {
             }
             if (written.stream_reset) self.streams.reoweReset(written.stream);
             if (written.stop_sending) self.streams.reoweStopSending(written.stream);
+            // A packet that never existed is a packet lost before it was
+            // sent, and the repair is the same. It was missing here, so a
+            // rolled-back window update left `max_data_sent` past a limit the
+            // peer was never told — the deadlock `reoweAllFlowControl` exists
+            // to break, reached without a loss for anything to detect.
+            if (written.flow_control) self.reoweAllFlowControl();
+        }
+
+        /// Owe every window update, blocked report and stream credit again —
+        /// the repair for a packet carrying any of them that is lost, or that
+        /// was built and then rolled back. Limits only rise, so the next
+        /// packet re-advertising the current ones is at least what was lost.
+        fn reoweAllFlowControl(self: *Self) void {
+            assert(self.streams.count <= ConnectionStreams.streams_max);
+            self.max_data_sent = 0;
+            self.streams.reoweFlowControl();
+            self.streams.reoweBlocked();
+            self.streams.reoweStreamCredit();
+            // `Streams` owns the per-stream watermarks; what is owed again is
+            // checked here, where a missed one would be a lost update.
+            for (self.streams.streams[0..self.streams.count]) |stream| {
+                assert(stream.max_data_sent == 0);
+            }
         }
 
         const Payload = struct {
             octets: usize = 0,
             /// Section 2 of RFC 9002: whether anything here obliges the peer to
-            /// acknowledge. An ACK-only packet does not, and must not count
-            /// against the congestion window.
+            /// acknowledge — any frame but ACK, PADDING and CONNECTION_CLOSE,
+            /// window updates included. An ACK-only packet does not, and must
+            /// not count against the congestion window.
             ack_eliciting: bool = false,
             /// The CRYPTO range this packet carried, so losing it can rewind.
             crypto_start: u32 = 0,
@@ -5170,9 +5189,23 @@ pub fn Connection(comptime config: Config) type {
                         result.ack_eliciting = true;
                     }
                 }
+                // Ack-eliciting, like every frame but three. This set only
+                // `flow_control`, so a packet carrying nothing but a window
+                // update was recorded as acknowledgement-only: not in flight,
+                // never a probe's target, and arming no PTO — the one timer
+                // that repairs a lost packet with nothing sent after it. That
+                // is exactly the packet a receiver whose window has just
+                // reopened sends, and losing it is the deadlock section 4.1
+                // warns of. The peer, reading the same frame, acknowledged it.
+                //= https://www.rfc-editor.org/rfc/rfc9002#section-2
+                //# Ack-eliciting frames:  All frames other than ACK, PADDING, and
+                //# CONNECTION_CLOSE are considered ack-eliciting.
                 const credit = self.writeFlowControl(payload[offset..]);
                 offset += credit;
-                if (credit > 0) result.flow_control = true;
+                if (credit > 0) {
+                    result.flow_control = true;
+                    result.ack_eliciting = true;
+                }
                 const blocked = self.writeBlocked(payload[offset..]);
                 offset += blocked;
                 if (blocked > 0) {
@@ -7252,6 +7285,90 @@ test "the window is raised as the application reads" {
     // it — otherwise a stream stalls forever at its initial window.
     try testing.expect(server.max_data_sent > before);
     try testing.expect(client.streams.send_limit > 0);
+}
+
+/// Exchange datagrams until neither side has anything to say, so a test that
+/// asks about the timer afterwards is asking about what it did next rather
+/// than about what the handshake left in flight.
+fn settle(client: *TestConnection, server: *TestConnection, now_ns: *u64) !void {
+    var rounds: u32 = 0;
+    while (rounds < 16) : (rounds += 1) {
+        now_ns.* += 1000;
+        const sent = try deliver(client, server, now_ns.*) + try deliver(server, client, now_ns.*);
+        if (sent == 0) return;
+    }
+    return error.NeverSettled;
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9002#section-2
+//# Ack-eliciting frames:  All frames other than ACK, PADDING, and
+//# CONNECTION_CLOSE are considered ack-eliciting.
+//= type=test
+test "a lost window update with nothing sent after it is repaired by the PTO" {
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+    var now: u64 = 1000;
+    try settle(&client, &server, &now);
+    // Nothing in flight on the server, so no timer: whatever arms one below
+    // is the window update.
+    try testing.expectEqual(@as(?u64, null), server.timeout());
+
+    // Past half the stream window, read at once, so the server owes a
+    // MAX_STREAM_DATA and nothing else.
+    var body: [5000]u8 = @splat('x');
+    try testing.expectEqual(body.len, try client.write(0, &body, false));
+    var rounds: u32 = 0;
+    while (client.wantsSend()) : (rounds += 1) {
+        try testing.expect(rounds < 16);
+        now += 1000;
+        _ = try deliver(&client, &server, now);
+    }
+    try server.consume(0, server.readable(0).len);
+
+    // The packet carrying it is lost.
+    var datagram: [TestConnection.datagram_octets]u8 = @splat(0);
+    now += 1000;
+    try testing.expect(try server.send(&datagram, now) > 0);
+    const recorded = server.recovery.recorded(.application);
+    const update = recorded[recorded.len - 1];
+    try testing.expect(update.context.flow_control);
+    try testing.expect(update.in_flight);
+    try testing.expect(update.ack_eliciting);
+
+    // It used to be recorded as acknowledgement-only, so no timer was armed
+    // and the client waited at its old limit with nothing to say.
+    const at = server.timeout() orelse return error.NoTimerArmed;
+    server.onTimeout(at);
+    try testing.expect(try server.send(&datagram, at) > 0);
+    // The probe carries the window update again, and is itself marked for
+    // repair should it be lost too.
+    const again = server.recovery.recorded(.application);
+    try testing.expect(again[again.len - 1].context.flow_control);
+}
+
+test "a window update rolled back with its packet is owed again" {
+    // `rollback` put back every cursor `writePayload` commits but this one.
+    // A packet that fails to seal after a MAX_DATA was framed left
+    // `max_data_sent` at a limit the peer was never told.
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+    _ = try client.write(0, "x", false);
+    _ = try deliver(&client, &server, 1000);
+    server.max_data_sent = 1 << 20;
+    server.findStream(0).?.max_data_sent = 1 << 20;
+
+    const space = &server.spaces[@intFromEnum(Space.application)];
+    server.rollback(.one_rtt, .{
+        .ack_eliciting_pending = space.received.ack_eliciting_pending,
+        .probes_pending = space.probes_pending,
+        .close_pending = false,
+        .crypto_framed = server.levels[@intFromEnum(Level.one_rtt)].framed,
+        .handshake_done_framed = server.handshake_done_framed,
+    }, .{ .flow_control = true, .ack_eliciting = true });
+    try testing.expectEqual(@as(u64, 0), server.max_data_sent);
+    try testing.expectEqual(@as(u64, 0), server.findStream(0).?.max_data_sent);
 }
 
 test "a lost stream packet is sent again" {
