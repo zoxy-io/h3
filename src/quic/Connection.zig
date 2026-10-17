@@ -4586,11 +4586,11 @@ pub fn Connection(comptime config: Config) type {
             // surfaced it.
             //
             // A probe is exempt (section 6.2.4 requires it to be ack-eliciting)
-            // and so is a level with no congestion state of its own.
+            // and so is a level with no congestion state of its own. The
+            // window is not the only question: see `admission`.
             const probes_before = space.probes_pending;
-            const window_open = space.probes_pending > 0 or
-                self.recovery.canSend(config.datagram_octets);
-            const written = self.writePayload(buffer[header.header_octets..][0..payload_room], level, now_ns, window_open);
+            const admits = self.admission(level.space());
+            const written = self.writePayload(buffer[header.header_octets..][0..payload_room], level, now_ns, admits);
             const payload_octets = written.octets;
             // An empty payload is not a packet: the header is abandoned rather
             // than sealed over nothing.
@@ -4755,7 +4755,17 @@ pub fn Connection(comptime config: Config) type {
                     .handshake_done = written.handshake_done,
                     .flow_control = written.flow_control,
                 },
-            }) catch {};
+            }) catch |err| switch (err) {
+                // Reached only with the table full, and `admission` answers
+                // `.ack_only` or `.ping` long before that: what is refused here
+                // is an acknowledgement, or a probe's bare PING, and neither
+                // leaves anything for a loss to repair. This was `catch {}`
+                // over every packet, and a stream range that went out
+                // unrecorded was one no loss could ever rewind — see
+                // `admission` for what that cost. The assertion restates the
+                // invariant; `admission` is what keeps it.
+                error.TooManyOutstanding => assert(!written.repairable()),
+            };
             return total;
         }
 
@@ -4869,6 +4879,18 @@ pub fn Connection(comptime config: Config) type {
             stop_sending: bool = false,
             /// Likewise for HANDSHAKE_DONE.
             handshake_done: bool = false,
+
+            /// Whether losing this packet would leave something to send
+            /// again — every field `onPacketsLost` reads. A packet for which
+            /// this is true may not go out unrecorded; see `admission`.
+            fn repairable(self: Payload) bool {
+                assert(self.crypto_end >= self.crypto_start);
+                assert(self.stream_end >= self.stream_start);
+                return self.crypto_end > self.crypto_start or
+                    self.stream_end > self.stream_start or
+                    self.stream_fin or self.stream_reset or self.stop_sending or
+                    self.flow_control or self.handshake_done;
+            }
         };
 
         /// Fill a payload: an ACK if one is owed, then whatever handshake bytes
@@ -4969,7 +4991,63 @@ pub fn Connection(comptime config: Config) type {
             return result.*;
         }
 
-        fn writePayload(self: *Self, payload: []u8, level: Level, now_ns: u64, window_open: bool) Payload {
+        /// What `writePayload` may put in a packet besides an acknowledgement.
+        const Admission = enum {
+            /// The acknowledgement alone: the window is closed, or the
+            /// recovery table has no slot outside the ones held for probes.
+            ack_only,
+            /// The acknowledgement and a PING: a probe is owed and the table
+            /// has no slot at all. Section 6.2.4 asks only that a probe be
+            /// ack-eliciting, and a PING is the one ack-eliciting frame whose
+            /// loss nobody has to repair — so this is the packet that may go
+            /// out unrecorded, and the acknowledgement it elicits is what
+            /// frees the table.
+            ping,
+            /// Anything owed.
+            everything,
+        };
+
+        /// Whether the next packet in `space` may carry more than an ACK.
+        ///
+        /// Two limits, and the second was missing. The congestion window is
+        /// in octets; `Recovery`'s table is in packets, and a packet built
+        /// when it was full went out unrecorded — its loss undetectable, and
+        /// its stream octets released from the send buffer as soon as a later
+        /// packet was acknowledged, because `reclaimStream` reads the table
+        /// as the list of packets still holding octets. A peer that keeps a
+        /// flow-control window open by a few octets at a time is enough to
+        /// fill the table with slivers while the window still has room. Found
+        /// by `sim/` seed 155905: a stream with a 1401-octet hole, both
+        /// endpoints exchanging PINGs for the remaining two minutes.
+        fn admission(self: *const Self, space_id: Space) Admission {
+            const space = &self.spaces[@intFromEnum(space_id)];
+            const probe = space.probes_pending > 0;
+            if (!self.recovery.hasRoom(space_id, probe)) {
+                return if (probe) .ping else .ack_only;
+            }
+            if (probe or self.recovery.canSend(config.datagram_octets)) return .everything;
+            return .ack_only;
+        }
+
+        /// The `.ping` admission's payload: whatever acknowledgement is
+        /// already in `payload[0..offset]`, then a PING, and nothing that
+        /// `Payload.repairable` would count.
+        ///
+        /// The encode can fail only for want of room, when the ACK has taken
+        /// the whole payload. The packet then goes out acknowledgement-only,
+        /// `ack_eliciting` stays false so the probe is not spent, and the next
+        /// packet carries it — the same outcome the PING in `writePayload`
+        /// has always had.
+        fn writeBareProbe(payload: []u8, offset: usize, probes_pending: u8) Payload {
+            assert(probes_pending > 0);
+            assert(offset <= payload.len);
+            const ping = frame.encode(payload[offset..], .ping) catch 0;
+            const result: Payload = .{ .octets = offset + ping, .ack_eliciting = ping > 0 };
+            assert(!result.repairable());
+            return result;
+        }
+
+        fn writePayload(self: *Self, payload: []u8, level: Level, now_ns: u64, admits: Admission) Payload {
             var result: Payload = .{};
             var offset: usize = 0;
             const space = &self.spaces[@intFromEnum(level.space())];
@@ -5043,9 +5121,18 @@ pub fn Connection(comptime config: Config) type {
 
             // Nothing below this point is ACK-only, so a closed window stops
             // here and the packet goes out carrying the acknowledgement alone.
-            if (!window_open) {
-                result.octets = offset;
-                return result;
+            switch (admits) {
+                .ack_only => {
+                    result.octets = offset;
+                    return result;
+                },
+                // Section 6.2.4's probe with no slot to record it in: a PING
+                // and nothing else, because nothing else may go out unrecorded.
+                // Every field of `result` but `ack_eliciting` stays at its
+                // default, which is what `sendPacket` checks before it lets
+                // the record be refused.
+                .ping => return writeBareProbe(payload, offset, space.probes_pending),
+                .everything => {},
             }
 
             // Section 6.2.4: a probe must be ack-eliciting, and a PING is the
@@ -5656,19 +5743,19 @@ pub fn Connection(comptime config: Config) type {
         }
 
         /// Whether a 1-RTT packet carrying an ack-eliciting frame could be built
-        /// right now: the keys exist, the space is alive, and either the window
-        /// admits one or a probe is owed.
+        /// right now: the keys exist, the space is alive, and `admission`
+        /// lets more than an ACK and a PING through.
         ///
-        /// The two conditions `writePayload` applies before it reaches any of
-        /// the frames `wantsSend` predicates on, asked in one place so that the
-        /// accessor and the writer cannot drift into disagreeing.
+        /// The conditions `writePayload` applies before it reaches any of the
+        /// frames `wantsSend` predicates on, asked through the same function so
+        /// that the accessor and the writer cannot drift into disagreeing.
         fn oneRttWritable(self: *const Self) bool {
             const index = @intFromEnum(Level.one_rtt);
             assert(index < self.send_keys.len);
             if (self.send_keys[index] == null) return false;
             const space = &self.spaces[@intFromEnum(Space.application)];
             if (space.discarded) return false;
-            return space.probes_pending > 0 or self.recovery.canSend(config.datagram_octets);
+            return self.admission(.application) == .everything;
         }
 
         pub fn wantsSend(self: *const Self) bool {
@@ -7741,6 +7828,68 @@ test "a full window does not throttle acknowledgements" {
     const octets = try server.send(&datagram, 2000);
     try testing.expect(octets > 0);
     try testing.expect(!server.spaces[@intFromEnum(Space.application)].received.ack_eliciting_pending);
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9002#section-6.2.4
+//# All probe packets sent on a PTO MUST be ack-eliciting.
+//= type=test
+test "a full recovery table holds stream data back instead of sending it unrecorded" {
+    // `sim/` seed 155905: one-octet slivers filled the table while the window
+    // had room, the next packet's range went out unrecorded and was lost, and
+    // the send buffer released it on the next acknowledgement. The stream
+    // carried a hole for the rest of the connection.
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+    const app = Space.application;
+    const table: u32 = @typeInfo(@TypeOf(client.recovery.spaces[0].sent)).array.len;
+    var datagram: [TestConnection.datagram_octets]u8 = @splat(0);
+
+    // Slivers, sent and never delivered, until only the probes' slots remain.
+    // Bounded by the table: each send records one packet or the loop fails.
+    var now: u64 = 1000;
+    var sent: u32 = 0;
+    while (client.recovery.hasRoom(app, false)) : (sent += 1) {
+        try testing.expect(sent < table);
+        _ = try client.write(0, "x", false);
+        now += 1;
+        try testing.expect(try client.send(&datagram, now) > 0);
+    }
+    try testing.expect(client.recovery.canSend(1452));
+    const stream = client.streams.find(0).?;
+    const framed_before = stream.framed;
+    const recorded_before = client.recovery.outstanding(app);
+
+    // The window has room and the table does not: the data stays queued.
+    _ = try client.write(0, "held back", false);
+    _ = try client.send(&datagram, now + 1);
+    try testing.expectEqual(framed_before, client.streams.find(0).?.framed);
+    try testing.expect(client.streams.wantsSend());
+    try testing.expect(!client.oneRttWritable());
+
+    // A probe may use the reserved slots, and its packets carry the data.
+    client.spaces[@intFromEnum(app)].probes_pending = 2;
+    _ = try client.send(&datagram, now + 2);
+    try testing.expect(client.streams.find(0).?.framed > framed_before);
+    try testing.expect(client.recovery.outstanding(app) > recorded_before);
+
+    // With no slot at all a probe is still sent — section 6.2.4 — as a bare
+    // PING that needs no record, and the queued data still waits.
+    var probes: u32 = 0;
+    while (client.recovery.hasRoom(app, true)) : (probes += 1) {
+        try testing.expect(probes < table);
+        client.spaces[@intFromEnum(app)].probes_pending = 1;
+        _ = try client.write(0, "x", false);
+        now += 1;
+        _ = try client.send(&datagram, now);
+    }
+    const framed_full = client.streams.find(0).?.framed;
+    client.spaces[@intFromEnum(app)].probes_pending = 1;
+    _ = try client.write(0, "more", false);
+    try testing.expect(try client.send(&datagram, now + 1) > 0);
+    try testing.expectEqual(@as(u8, 0), client.spaces[@intFromEnum(app)].probes_pending);
+    try testing.expectEqual(framed_full, client.streams.find(0).?.framed);
+    try testing.expectEqual(table, client.recovery.outstanding(app));
 }
 
 //= https://www.rfc-editor.org/rfc/rfc9000#section-10.2.2

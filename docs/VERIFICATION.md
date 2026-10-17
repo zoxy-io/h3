@@ -22,7 +22,7 @@ particular list.
 the part worth reading. The ledger, the simulator, the event queue, the interop
 shim and h3spec were built to catch the eleven classes in the first table; they
 did, and they also caught classes nobody had written down. The second table is
-fifty-seven rows against the first table's eleven, because a gate's real yield
+fifty-nine rows against the first table's eleven, because a gate's real yield
 is only knowable after it runs.
 
 Each finding, with the gate that would have caught it first:
@@ -126,6 +126,7 @@ requirement list extracted from the specification.
 | `src/qlog.zig`'s tests never ran. `src/root.zig` has a `test` block that names each module, and a module nobody names is a module whose tests Zig does not compile — so the file was written, wired into both roles and passing for an hour, and the first test to actually execute failed | naming the module | Nothing reports a test that was never compiled. The gate output is identical to the gate output for a module whose tests all pass |
 | What that was hiding: two `Record` variants wrote their first field with the raw text writer, which does not do the comma bookkeeping, and emitted two fields with nothing between them — balanced braces, and not JSON | the first run of those tests | The test that caught it parses each record with `std.json.validate`. The one it replaced counted braces, and counting braces would have passed |
 | The packet-report arrays were a fixed 32 while `Recovery` tracks `sent_max` per space and clamps its writes to whatever slice it is handed, so an acknowledgement retiring more than 32 packets reported a *prefix* — and both handlers act once per context, so the streams past the thirty-second were never settled, never retired, and (retirement being contiguous) pinned every stream above them | zrk, driving eight concurrent request streams over a real connection | The quantity that has to pass thirty-two is not the streams in flight — there were eight — but the *unacknowledged packets in one space*, each naming a different stream, which is what a request-per-stream workload produces once the congestion window has grown and streams turn over faster than the peer acknowledges. `sim/` reaches neither the window nor the turnover. And the constant's own comment argued the bound was sound: a loss is answered by rewinding a cursor, and the earliest lost packet decides where to. True of one stream and of the crypto level; false of every context after the first |
+| A packet built while `Recovery`'s table was full went out unrecorded — `onPacketSent(...) catch {}` — so its loss could never be detected, and `reclaimStream`, which reads the table as the list of packets still holding octets, released its range on the next acknowledgement. The stream carried a 1401-octet hole and both endpoints exchanged PINGs about it until the deadline | the nightly sweep, seed 155905, in all three builds | The table is sized in packets and the congestion window in octets, and nothing related them: it takes a receiver reopening its window a few octets at a time, so the sender fills sixty-four slots with twelve kilobytes. The 256-seed sweep never fills a table at all, which is why the seed is now a pinned test and the state a census row |
 
 Two things about that table.
 
