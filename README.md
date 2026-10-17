@@ -114,7 +114,10 @@ Datagrams move through caller-owned buffers, and time is passed in:
 ```zig
 var buffer: [Connection.datagram_octets]u8 = undefined;
 
-// Outbound. Each call fills at most one datagram.
+// Outbound. Each call fills at most one datagram. `wantsSend` answers false
+// whenever `send` would build nothing — a full congestion window, or an
+// unvalidated server at its amplification limit — so an event loop can sleep
+// on it until a datagram arrives or the timer fires.
 while (connection.wantsSend()) {
     const octets = try connection.send(&buffer, now_ns);
     if (octets == 0) break;

@@ -92,12 +92,17 @@ comptime {
     assert(retry_token_octets_max < initial_datagram_min / 2);
 }
 
+/// What every long header starts with, at its widest: a first octet, a
+/// version, and two length-prefixed connection identifiers. Shared by the
+/// bounds below that are built from it, so they cannot drift apart.
+const long_header_prefix_octets_max: usize = 1 + 4 +
+    2 * (1 + @as(usize, ConnectionId.octets_max));
+
 /// The largest Retry packet whose integrity tag this endpoint will compute: a
 /// first octet, a version, two length-prefixed identifiers, the token, and the
 /// tag. Derived from the token bound rather than chosen, so that raising one
 /// raises the other.
-const retry_octets_max: usize = 1 + 4 +
-    2 * (1 + @as(usize, ConnectionId.octets_max)) +
+const retry_octets_max: usize = long_header_prefix_octets_max +
     retry_token_octets_max + crypto.tag_octets;
 
 /// RFC 9001 section 5.8's pseudo-packet: a one-octet length, the original
@@ -279,6 +284,44 @@ pub fn Connection(comptime config: Config) type {
     // nothing here has to be touched for it.
     const length_field_octets: u8 = varint.encodedLength(config.datagram_octets);
 
+    // The smallest send room `send` will build a datagram in, and below which
+    // `wantsSend` answers false. Only an unvalidated server's room is ever
+    // below `datagram_octets`, and its room is three times what the peer sent
+    // less what it has spent — a number the peer chooses to the octet.
+    //
+    // Below this neither tries: a packet might fit or might not, depending on
+    // which level is owed, how wide its packet number is and how many ACK
+    // ranges it carries, and answering that exactly in `wantsSend` would be a
+    // second copy of `sendPacket`. The two used to disagree on it — room for
+    // thirteen octets, a probe owed, `wantsSend` true and `send` building
+    // nothing — so an event loop polling the pair spun until the client spoke
+    // again. Sending less than the allowance is always permitted, and a server
+    // this close to section 8.1's limit is waiting for the client anyway.
+    //
+    // Derived from the largest packet that must fit: a server's long header
+    // (it never sends a token, so the token's length is one octet), the AEAD
+    // tag, the fixed head of an ACK frame — `AckRanges.write` drops low
+    // ranges to fit, but not below the type, Largest, Delay, the reserved
+    // range count and the first range — and a PING.
+    const long_header_octets_max: usize = long_header_prefix_octets_max +
+        1 + length_field_octets + packet_number.octets_max;
+    // The frame type, then four varints at their widest: Largest
+    // Acknowledged, ACK Delay, the range count `write` reserves, and the
+    // First ACK Range.
+    const ack_frame_head_octets_max: usize = 1 + 4 * @as(usize, varint.octets_max);
+    const room_min: u64 = long_header_octets_max + crypto.tag_octets +
+        ack_frame_head_octets_max + 1;
+    comptime {
+        // A validated endpoint's room is a whole datagram, so the threshold
+        // can only ever bind on an amplification-limited server — and it must
+        // not bind on a first flight.
+        assert(room_min < initial_datagram_min);
+        assert(room_min <= config.datagram_octets);
+        // The sample floor of RFC 9001 section 5.4.2 fits inside it too.
+        assert(room_min >= long_header_octets_max +
+            crypto.protect.sample_offset + crypto.protect.sample_octets);
+    }
+
     // What a sent packet carried, so that losing it can be undone. RFC 9002
     // tracks a packet's number, size and send time and deliberately never
     // learns what was *in* it; this is the token `Recovery.Context` hands back
@@ -399,6 +442,10 @@ pub fn Connection(comptime config: Config) type {
         const Self = @This();
 
         pub const datagram_octets: u32 = config.datagram_octets;
+        /// The smallest send room `send` builds a datagram in; see `room_min`.
+        /// Public so a consumer can tell "nothing owed" from "an
+        /// amplification-limited server waiting for its peer" if it needs to.
+        pub const send_room_min: u64 = room_min;
 
         /// Events this connection holds between polls, and so the most a
         /// consumer's drain loop can need in one pass.
@@ -4155,7 +4202,7 @@ pub fn Connection(comptime config: Config) type {
             if (self.state == .draining) return 0;
 
             const room = self.sendRoom();
-            if (room == 0) return 0;
+            if (room < send_room_min) return 0;
             const limit = @min(room, config.datagram_octets);
 
             var offset: usize = 0;
@@ -5811,22 +5858,32 @@ pub fn Connection(comptime config: Config) type {
             for (0..Level.count) |index| {
                 if (self.close_pending[index] and self.send_keys[index] != null) owes_close = true;
             }
+            // `send`'s first refusal, and it refuses everything, the close
+            // included: an unvalidated server at section 8.1's limit — or
+            // within `send_room_min` of it — sends nothing until the peer
+            // sends more. Answering true here is a spin that only the peer can
+            // end. It sat below the closing test at first, so a server that
+            // closed near its limit still spun; review found it.
+            if (self.sendRoom() < send_room_min) return false;
             if (self.state == .closing) return owes_close;
-            if (owes_close) return true;
-            if (self.handshake_done_pending and !self.handshake_done_framed) return true;
+            // `close_pending` is set only by `close`, which enters the closing
+            // state in the same call, so nothing below can owe one.
+            assert(!owes_close);
             for (self.spaces) |space| {
                 if (space.probes_pending > 0 and !space.discarded) return true;
             }
-            if (self.streams.wantsSend()) return true;
-            // Everything below is written by `writePayload` only inside its
-            // `level == .one_rtt` block and only after the congestion window
-            // has let an ack-eliciting frame through. Answering true without
-            // asking those two questions is the spin the comment above records
-            // having fixed once already: a full window plus a receiver that has
-            // just consumed half of one gives `owesFlowControl` true, an empty
-            // payload, `send` returning zero, and an event loop that never
-            // sleeps.
+            // Everything below is written by `writePayload` only once
+            // `admission` has let more than an ACK through — the window, and
+            // a slot in the recovery table. Answering true without asking is
+            // the spin the comment above records having fixed once already:
+            // stream data queued behind a full window, an ACK-only packet or
+            // none, `send` returning zero, and an event loop that never
+            // sleeps. That fix gated the flow-control frames and left the
+            // stream data, HANDSHAKE_DONE and CRYPTO out; `sim/`'s eighth
+            // oracle found the gap on the first sweep.
             if (self.oneRttWritable()) {
+                if (self.handshake_done_pending and !self.handshake_done_framed) return true;
+                if (self.streams.wantsSend()) return true;
                 if (self.owesFlowControl()) return true;
                 if (self.streams.owesReset()) return true;
                 if (self.streams.owesStopSending()) return true;
@@ -5835,10 +5892,13 @@ pub fn Connection(comptime config: Config) type {
             for (0..Level.count) |index| {
                 const level: Level = @enumFromInt(index);
                 if (self.send_keys[index] == null) continue;
-                if (self.spaces[@intFromEnum(level.space())].discarded) continue;
+                const space = &self.spaces[@intFromEnum(level.space())];
+                if (space.discarded) continue;
+                // Acknowledgements go out whatever the window says.
+                if (space.received.ack_eliciting_pending) return true;
                 const stream = &self.levels[index];
-                if (stream.framed < stream.pending_len) return true;
-                if (self.spaces[@intFromEnum(level.space())].received.ack_eliciting_pending) return true;
+                if (stream.framed < stream.pending_len and
+                    self.admission(level.space()) == .everything) return true;
             }
             return false;
         }
@@ -7566,6 +7626,42 @@ test "the amplification limit cannot be tuned into an underflow" {
     }
 }
 
+test "within send_room_min of the amplification limit, wantsSend and send agree" {
+    // `sim/` seeds 193 and 226: an unvalidated server with thirteen octets of
+    // allowance and a probe owed. `wantsSend` answered true, `send` could fit
+    // no packet, and an event loop polling the pair spun until the client
+    // spoke again.
+    var client = testClient();
+    var server = testServer();
+    try client.cryptoIn(.initial, "ClientHello");
+    _ = try deliver(&client, &server, 0);
+    try server.cryptoIn(.initial, "ServerHello");
+    const allowance = server.received_octets * amplification_factor;
+
+    var spare: u64 = 0;
+    while (spare <= TestConnection.send_room_min) : (spare += 1) {
+        var probe = server;
+        probe.sent_octets = allowance - spare;
+        var datagram: [TestConnection.datagram_octets]u8 = @splat(0);
+        const wanted = probe.wantsSend();
+        const octets = try probe.send(&datagram, 1000);
+        // Below the threshold neither tries; at it, both do.
+        try testing.expectEqual(spare >= TestConnection.send_room_min, wanted);
+        try testing.expectEqual(wanted, octets > 0);
+        try testing.expect(octets <= spare);
+
+        // And the same for a server that closes there. The closing test sat
+        // above the room test in `wantsSend` at first, so this one spun.
+        var closing = server;
+        closing.sent_octets = allowance - spare;
+        closing.close(.no_error);
+        const close_wanted = closing.wantsSend();
+        const close_octets = try closing.send(&datagram, 1000);
+        try testing.expectEqual(spare >= TestConnection.send_room_min, close_wanted);
+        try testing.expectEqual(close_wanted, close_octets > 0);
+    }
+}
+
 test "an inflated ACK delay is clamped rather than overflowing" {
     // The Delay field is an unbounded varint, and scaling it overflows `u64`
     // long before 2^62. Section 18.2 caps what the field can mean at 2^14 ms.
@@ -7921,6 +8017,10 @@ test "RFC 9002 section 7: a full congestion window stops the sender" {
     // rather than lost — `rollback` put the send cursor back.
     try testing.expectEqual(@as(usize, 0), octets);
     try testing.expect(client.streams.wantsSend());
+    // And the connection says so: data is queued, but nothing can be sent
+    // until an acknowledgement opens the window, so an event loop polling
+    // this sleeps rather than spinning.
+    try testing.expect(!client.wantsSend());
 
     // Room again, and it flows.
     client.recovery.bytes_in_flight = 0;
@@ -7983,6 +8083,7 @@ test "a full recovery table holds stream data back instead of sending it unrecor
     try testing.expectEqual(framed_before, client.streams.find(0).?.framed);
     try testing.expect(client.streams.wantsSend());
     try testing.expect(!client.oneRttWritable());
+    try testing.expect(!client.wantsSend());
 
     // A probe may use the reserved slots, and its packets carry the data.
     client.spaces[@intFromEnum(app)].probes_pending = 2;
