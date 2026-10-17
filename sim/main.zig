@@ -227,6 +227,9 @@ const Census = struct {
     /// sweep where loss recovery is one round trip slower than it reads.
     probes_carrying_data: u64 = 0,
     probes_carrying_ping: u64 = 0,
+    /// Probes pointed at a packet that carried flow-control frames, which
+    /// re-advertise the current limits rather than rewinding a watermark.
+    probes_carrying_window_update: u64 = 0,
     /// What the off-path attacker put back on the wire. It holds no key, so
     /// everything it can do is done with what it has already seen: send it
     /// again, send part of it, or send it with an octet changed.
@@ -258,6 +261,19 @@ const Census = struct {
     /// octets on the next acknowledgement: seed 155905, a stream with a hole
     /// and two endpoints exchanging PINGs about it for two minutes.
     recovery_table_full: u64 = 0,
+    /// Steps that ended with a flow-control frame in flight and no data
+    /// beside it: a window update, a stream credit or a blocked report.
+    ///
+    /// Window updates were recorded as acknowledgement-only until they were
+    /// counted as the ack-eliciting frames RFC 9002 section 2 says they are,
+    /// so before that only a blocked report could put a packet here — not in
+    /// flight, a lost MAX_DATA armed no PTO and waited on a later packet that
+    /// a receiver with nothing else to say never sends. `PacketContext` has
+    /// one flag for all of them, so this row cannot tell which; on seeds 0..255
+    /// it went from 1090 steps to 11491 with the change. The unit test "a lost
+    /// window update with nothing sent after it is repaired by the PTO" is
+    /// what pins the window update itself.
+    flow_control_alone_in_flight: u64 = 0,
 
     /// The counters that must move somewhere in a sweep. A zero here means the
     /// sweep did not reach the behaviour, so any confidence drawn from it about
@@ -306,6 +322,11 @@ const Census = struct {
         .{ .name = "amplification limit binding", .get = struct {
             fn get(c: *const Census) u64 {
                 return c.amplification_binding;
+            }
+        }.get },
+        .{ .name = "flow control alone in flight", .get = struct {
+            fn get(c: *const Census) u64 {
+                return c.flow_control_alone_in_flight;
             }
         }.get },
         .{ .name = "datagrams accounted for by their packets", .get = struct {
@@ -1003,12 +1024,20 @@ fn advanceClock(world: *World, random: std.Random) bool {
             // acknowledgement-only packet rewinds nothing and goes out empty.
             // That was a real defect and it was invisible from outside the
             // library, which is what this row is for.
+            //
+            // A window update is the third case: it rewinds no watermark, so
+            // it read as a bare PING here once window updates became
+            // ack-eliciting and a probe could be pointed at one. The probe
+            // re-advertises the current limits instead, which is a repair.
             const framed_before = framedTotal(connection);
+            const probed = connection.recovery.earliestContext(.application);
             connection.onTimeout(world.now_ns);
             if (connection.recovery.pto_count > before) {
                 world.census.ptos_fired += 1;
                 if (framedTotal(connection) < framed_before) {
                     world.census.probes_carrying_data += 1;
+                } else if (probed != null and probed.?.flow_control) {
+                    world.census.probes_carrying_window_update += 1;
                 } else {
                     world.census.probes_carrying_ping += 1;
                 }
@@ -1078,6 +1107,19 @@ fn minimum(current: ?u64, candidate: u64) u64 {
     return if (current) |value| @min(value, candidate) else candidate;
 }
 
+/// Whether `connection` has a packet in flight carrying flow-control frames
+/// and neither stream nor CRYPTO data. Bounded by the recovery table.
+fn flowControlAloneInFlight(connection: *const Connection) bool {
+    for (connection.recovery.recorded(.application)) |sent| {
+        const context = sent.context;
+        if (!sent.in_flight or !context.flow_control) continue;
+        if (context.stream_end > context.stream_start) continue;
+        if (context.crypto_end > context.crypto_start) continue;
+        return true;
+    }
+    return false;
+}
+
 fn runSeed(seed: u64, census: *Census) ?Failure {
     var world = buildWorld(seed);
     census.runs += 1;
@@ -1096,6 +1138,9 @@ fn runSeed(seed: u64, census: *Census) ?Failure {
             !world.server.recovery.hasRoom(.application, false))
         {
             world.census.recovery_table_full += 1;
+        }
+        if (flowControlAloneInFlight(&world.client) or flowControlAloneInFlight(&world.server)) {
+            world.census.flow_control_alone_in_flight += 1;
         }
 
         // Oracle one: once the application has nothing left to do, the pair
@@ -1290,12 +1335,14 @@ fn printCensus(census: *const Census) void {
         .{ .name = "datagrams with loose padding", .value = census.datagrams_with_loose_padding },
         .{ .name = "probes carrying data", .value = census.probes_carrying_data },
         .{ .name = "probes carrying a bare PING", .value = census.probes_carrying_ping },
+        .{ .name = "probes carrying a window update", .value = census.probes_carrying_window_update },
         .{ .name = "adversary: replays", .value = census.adversary_replays },
         .{ .name = "adversary: truncations", .value = census.adversary_truncations },
         .{ .name = "adversary: corruptions", .value = census.adversary_corruptions },
         .{ .name = "writes refused by flow control", .value = census.writes_refused_by_flow_control },
         .{ .name = "clock jumps", .value = census.clock_jumps },
         .{ .name = "steps with a full recovery table", .value = census.recovery_table_full },
+        .{ .name = "flow control alone in flight", .value = census.flow_control_alone_in_flight },
     };
     for (rows) |row| std.debug.print("  {s:<32} {d}\n", .{ row.name, row.value });
 }
