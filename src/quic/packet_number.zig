@@ -64,7 +64,7 @@ pub const Space = enum(u2) {
 };
 
 comptime {
-    assert(Space.count == @typeInfo(Space).@"enum".fields.len);
+    assert(Space.count == @typeInfo(Space).@"enum".field_names.len);
 }
 
 /// Appendix A.2: how many octets `full` needs, given the largest number the

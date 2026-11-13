@@ -448,7 +448,7 @@ comptime {
 pub const MessageValidator = struct {
     kind: Kind,
     extended_connect: bool,
-    seen: std.EnumSet(Pseudo) = .initEmpty(),
+    seen: std.EnumSet(Pseudo) = .empty,
     ordinary_seen: bool = false,
     /// Derived from values while they were in hand, never from a kept slice.
     method_is_connect: bool = false,

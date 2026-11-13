@@ -184,7 +184,7 @@ test "a Retry that names a different original connection is rejected" {
 }
 
 test "the buffers are checked rather than assumed" {
-    const original: [8]u8 = .{1} ** 8;
+    const original: [8]u8 = @splat(1);
     var retry: [32]u8 = @splat(0);
     var small: [8]u8 = undefined;
     try std.testing.expectError(error.ScratchTooSmall, tag(&small, &original, &retry));

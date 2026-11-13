@@ -39,7 +39,7 @@ pub fn main(init: std.process.Init) !void {
         if (h3.assertions.enabled) "on" else "off",
     });
     std.debug.print("{s:<32} {s:>12} {s:>12}\n", .{ "workload", "mean ns/op", "best ns/op" });
-    std.debug.print("{s}\n", .{"-" ** 58});
+    std.debug.print("{s}\n", .{&@as([58]u8, @splat('-'))});
 
     run(io, "varint decode", benchVarintDecode);
     run(io, "quic frame parse", benchFrameParse);
@@ -91,7 +91,7 @@ fn benchVarintDecode(iterations: u64) u64 {
 fn benchFrameParse(iterations: u64) u64 {
     // A STREAM frame with offset, length and FIN — the shape a response body
     // arrives in.
-    var wire = [_]u8{ 0x0f, 0x04, 0x44, 0x00, 0x10 } ++ [_]u8{0xab} ** 16;
+    var wire = [_]u8{ 0x0f, 0x04, 0x44, 0x00, 0x10 } ++ @as([16]u8, @splat(0xab));
     var sink: u64 = 0;
     var index: u64 = 0;
     while (index < iterations) : (index += 1) {

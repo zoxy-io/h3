@@ -334,7 +334,7 @@ pub fn Recovery(comptime config: Config) type {
         //# flight, since these packets add network load without establishing
         //# packet loss.
         pub fn onPacketSent(self: *Self, space: Space, sent: Sent) SentError!void {
-            const state = &self.spaces[@intFromEnum(space)];
+            const state = &self.spaces[@backingInt(space)];
             // Appendix A.8's "the anti-deadlock PTO starts from the current
             // time". `ptoTimeAndSpace` is `*const` and takes no clock, so every
             // entry point that carries one stamps it here instead — the probe
@@ -403,7 +403,7 @@ pub fn Recovery(comptime config: Config) type {
             /// that only wants the congestion accounting passes `&.{}`.
             delivered: []Context,
         ) AckError!AckResult {
-            const state = &self.spaces[@intFromEnum(space)];
+            const state = &self.spaces[@backingInt(space)];
             if (state.largest_acked) |previous| {
                 state.largest_acked = @max(previous, ack.largest);
             } else {
@@ -493,7 +493,7 @@ pub fn Recovery(comptime config: Config) type {
             result: *AckResult,
             acked: *[config.sent_max]AckedPacket,
         ) AckError!?Sent {
-            const state = &self.spaces[@intFromEnum(space)];
+            const state = &self.spaces[@backingInt(space)];
             var ranges = ack.iterate();
             var largest: ?Sent = null;
 
@@ -565,7 +565,7 @@ pub fn Recovery(comptime config: Config) type {
         fn peerCompletedAddressValidation(self: *const Self) bool {
             if (self.side == .server) return true;
             if (self.handshake_confirmed) return true;
-            return self.spaces[@intFromEnum(Space.handshake)].largest_acked != null;
+            return self.spaces[@backingInt(Space.handshake)].largest_acked != null;
         }
 
         fn updateRtt(self: *Self, sample: u64, ack_delay_ns: u64, now_ns: u64) void {
@@ -674,7 +674,7 @@ pub fn Recovery(comptime config: Config) type {
             lost: []Context,
             acked: []const AckedPacket,
         ) u32 {
-            const state = &self.spaces[@intFromEnum(space)];
+            const state = &self.spaces[@backingInt(space)];
             const largest_acked = state.largest_acked orelse return 0;
             state.loss_time = null;
 
@@ -1075,7 +1075,7 @@ pub fn Recovery(comptime config: Config) type {
             if (!self.peerCompletedAddressValidation()) {
                 var any_in_flight = false;
                 for (0..Space.count) |index| {
-                    const space: Space = @enumFromInt(index);
+                    const space: Space = @fromBackingInt(@intCast(index));
                     if (self.hasAckEliciting(space)) any_in_flight = true;
                 }
                 if (!any_in_flight) {
@@ -1087,7 +1087,7 @@ pub fn Recovery(comptime config: Config) type {
 
             var earliest: ?PtoTime = null;
             for (0..Space.count) |index| {
-                const space: Space = @enumFromInt(index);
+                const space: Space = @fromBackingInt(@intCast(index));
                 const state = &self.spaces[index];
                 if (!self.hasAckEliciting(space)) continue;
                 // Section 6.2.1: an application-data PTO waits for the
@@ -1114,7 +1114,7 @@ pub fn Recovery(comptime config: Config) type {
         }
 
         fn hasAckEliciting(self: *const Self, space: Space) bool {
-            const state = &self.spaces[@intFromEnum(space)];
+            const state = &self.spaces[@backingInt(space)];
             for (state.sent[0..state.count]) |packet| {
                 if (packet.ack_eliciting) return true;
             }
@@ -1177,7 +1177,7 @@ pub fn Recovery(comptime config: Config) type {
                 const at = state.loss_time orelse continue;
                 if (earliest == null or at < earliest.?) {
                     earliest = at;
-                    earliest_space = @enumFromInt(index);
+                    earliest_space = @fromBackingInt(@intCast(index));
                 }
             }
             if (earliest_space) |space| {
@@ -1222,7 +1222,7 @@ pub fn Recovery(comptime config: Config) type {
         //# progress and the loss detection timer might have been set for a now-
         //# discarded packet number space.
         pub fn discardSpace(self: *Self, space: Space) void {
-            const state = &self.spaces[@intFromEnum(space)];
+            const state = &self.spaces[@backingInt(space)];
             for (state.sent[0..state.count]) |packet| {
                 if (packet.in_flight) {
                     assert(self.bytes_in_flight >= packet.octets);
@@ -1244,7 +1244,7 @@ pub fn Recovery(comptime config: Config) type {
         /// no slot at all goes out as a bare PING, which needs no record, and
         /// the acknowledgement it elicits is what empties the table.
         pub fn hasRoom(self: *const Self, space: Space, probe: bool) bool {
-            const count = self.spaces[@intFromEnum(space)].count;
+            const count = self.spaces[@backingInt(space)].count;
             assert(count <= config.sent_max);
             const reserved: u32 = if (probe) 0 else probe_slots;
             // The comptime relation at the top of `Recovery`, restated where
@@ -1256,7 +1256,7 @@ pub fn Recovery(comptime config: Config) type {
         /// Outstanding packets in one space, for a caller deciding whether to
         /// probe.
         pub fn outstanding(self: *const Self, space: Space) u32 {
-            return self.spaces[@intFromEnum(space)].count;
+            return self.spaces[@backingInt(space)].count;
         }
 
         /// The context of the earliest packet still outstanding in a space.
@@ -1288,7 +1288,7 @@ pub fn Recovery(comptime config: Config) type {
         //# a PING or other ack-eliciting frame in a single packet, rearming the
         //# PTO timer.
         pub fn earliestContext(self: *const Self, space: Space) ?Context {
-            const state = &self.spaces[@intFromEnum(space)];
+            const state = &self.spaces[@backingInt(space)];
             assert(state.count <= config.sent_max);
             // The earliest *in flight*, not the earliest recorded. Every packet
             // is recorded here, acknowledgement-only ones included, and an
@@ -1324,7 +1324,7 @@ pub fn Recovery(comptime config: Config) type {
         /// has to do the asking. `Connection` uses it to decide how much of a
         /// stream's send buffer can be given back.
         pub fn recorded(self: *const Self, space: Space) []const Sent {
-            const state = &self.spaces[@intFromEnum(space)];
+            const state = &self.spaces[@backingInt(space)];
             assert(state.count <= config.sent_max);
             return state.sent[0..state.count];
         }

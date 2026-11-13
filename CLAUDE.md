@@ -1,6 +1,6 @@
 # h3
 
-QUIC (RFC 9000, 9001, 9002), QPACK (RFC 9204) and HTTP/3 (RFC 9114) in Zig 0.16.
+QUIC (RFC 9000, 9001, 9002), QPACK (RFC 9204) and HTTP/3 (RFC 9114) in Zig 0.17.
 A library, not a program: it is consumed by
 [zoxy](https://github.com/zoxy-io/zoxy) (reverse proxy, libxev completion
 callbacks) and [zrk](https://github.com/zoxy-io/zrk) (load generator, zio green

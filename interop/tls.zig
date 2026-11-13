@@ -124,7 +124,7 @@ const group_x25519: u16 = 0x001d;
 const hello_retry_request_random: [32]u8 = .{
     0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02,
     0x1e, 0x65, 0xb8, 0x91,
-} ++ .{0} ** 16;
+} ++ @as([16]u8, @splat(0));
 
 pub const Error = error{
     /// A message, extension or length field that does not parse, or a length
@@ -243,10 +243,7 @@ pub const Client = struct {
     pub fn init(options: Options) Client {
         return .{
             .random = options.random,
-            // X25519 accepts any 32 octets as a private key: it clamps, and
-            // the only failure `generateDeterministic` reports is an identity
-            // element, which a seed cannot produce.
-            .key_pair = X25519.KeyPair.generateDeterministic(options.key_seed) catch unreachable,
+            .key_pair = X25519.KeyPair.generateDeterministic(options.key_seed),
             .server_name = options.server_name,
             .alpn = options.alpn,
             .transport_parameters = options.transport_parameters,
@@ -261,7 +258,7 @@ pub const Client = struct {
     pub fn clientHello(self: *Client, buffer: []u8) Error![]const u8 {
         var out: Writer = .{ .buffer = buffer };
 
-        try out.byte(@intFromEnum(MessageType.client_hello));
+        try out.byte(@backingInt(MessageType.client_hello));
         const body = try out.beginLength(3);
         {
             // `legacy_version` is 1.2 on the wire for every TLS 1.3 hello; the
@@ -273,7 +270,7 @@ pub const Client = struct {
             try out.byte(0);
 
             const suites = try out.beginLength(2);
-            for (self.offer) |one| try out.int(u16, @intFromEnum(one));
+            for (self.offer) |one| try out.int(u16, @backingInt(one));
             try out.endLength(suites);
 
             // One compression method, `null`. TLS 1.3 permits nothing else.
@@ -293,7 +290,7 @@ pub const Client = struct {
 
     fn writeExtensions(self: *Client, out: *Writer) Error!void {
         // server_name: a list of one, of type `host_name`.
-        try out.int(u16, @intFromEnum(Extension.server_name));
+        try out.int(u16, @backingInt(Extension.server_name));
         var extension = try out.beginLength(2);
         {
             const list = try out.beginLength(2);
@@ -306,7 +303,7 @@ pub const Client = struct {
         try out.endLength(extension);
 
         // supported_groups: X25519 alone. See the module comment on HRR.
-        try out.int(u16, @intFromEnum(Extension.supported_groups));
+        try out.int(u16, @backingInt(Extension.supported_groups));
         extension = try out.beginLength(2);
         {
             const list = try out.beginLength(2);
@@ -319,7 +316,7 @@ pub const Client = struct {
         // verifies a signature, its contents only have to be wide enough that
         // no server refuses for lack of an algorithm it holds a certificate
         // for. These are the five the runner's servers use between them.
-        try out.int(u16, @intFromEnum(Extension.signature_algorithms));
+        try out.int(u16, @backingInt(Extension.signature_algorithms));
         extension = try out.beginLength(2);
         {
             const list = try out.beginLength(2);
@@ -334,7 +331,7 @@ pub const Client = struct {
 
         // ALPN. RFC 9001 section 8.1 requires one over QUIC, and the runner
         // decides which by test case.
-        try out.int(u16, @intFromEnum(Extension.alpn));
+        try out.int(u16, @backingInt(Extension.alpn));
         extension = try out.beginLength(2);
         {
             const list = try out.beginLength(2);
@@ -346,7 +343,7 @@ pub const Client = struct {
         try out.endLength(extension);
 
         // supported_versions: 1.3 alone.
-        try out.int(u16, @intFromEnum(Extension.supported_versions));
+        try out.int(u16, @backingInt(Extension.supported_versions));
         extension = try out.beginLength(2);
         {
             const list = try out.beginLength(1);
@@ -356,7 +353,7 @@ pub const Client = struct {
         try out.endLength(extension);
 
         // key_share, so the handshake finishes in one round trip.
-        try out.int(u16, @intFromEnum(Extension.key_share));
+        try out.int(u16, @backingInt(Extension.key_share));
         extension = try out.beginLength(2);
         {
             const list = try out.beginLength(2);
@@ -371,7 +368,7 @@ pub const Client = struct {
         // quic_transport_parameters, whose body the caller built with
         // `transport_parameters.encode`. This is the extension docs/DESIGN.md
         // section 4 says is assembled on this side of the seam.
-        try out.int(u16, @intFromEnum(Extension.quic_transport_parameters));
+        try out.int(u16, @backingInt(Extension.quic_transport_parameters));
         extension = try out.beginLength(2);
         try out.bytes(self.transport_parameters);
         try out.endLength(extension);
@@ -400,7 +397,7 @@ pub const Client = struct {
     /// One message, header included. `body` below is the message without it.
     fn message(self: *Client, level: Level, whole: []const u8) Error!void {
         std.debug.assert(whole.len >= 4);
-        const kind: MessageType = @enumFromInt(whole[0]);
+        const kind: MessageType = @fromBackingInt(@intCast(whole[0]));
         const body = whole[4..];
 
         switch (kind) {
@@ -479,7 +476,7 @@ pub const Client = struct {
 
         const suite = try in.int(u16);
         self.suite = for (self.offer) |one| {
-            if (@intFromEnum(one) == suite) break one;
+            if (@backingInt(one) == suite) break one;
         } else return error.Unsupported;
 
         if (try in.byte() != 0) return error.Unsupported; // compression
@@ -490,7 +487,7 @@ pub const Client = struct {
         // Bounded by the extensions block: `extension` consumes its own length
         // every iteration.
         while (!extensions.done()) {
-            const id: Extension = @enumFromInt(try extensions.int(u16));
+            const id: Extension = @fromBackingInt(@intCast(try extensions.int(u16)));
             const value = try extensions.lengthPrefixed(2);
             switch (id) {
                 .supported_versions => {
@@ -520,7 +517,7 @@ pub const Client = struct {
         var extensions: Reader = .{ .buffer = try (Reader{ .buffer = body }).lengthPrefixedOf(2) };
         // Bounded by the block, as in `serverHello`.
         while (!extensions.done()) {
-            const id: Extension = @enumFromInt(try extensions.int(u16));
+            const id: Extension = @fromBackingInt(@intCast(try extensions.int(u16)));
             const value = try extensions.lengthPrefixed(2);
             if (id != .quic_transport_parameters) continue;
             if (value.len > self.peer_parameters.len) return error.TooLarge;
@@ -548,7 +545,7 @@ pub const Client = struct {
     fn writeFinished(self: *Client) void {
         var verify: [Hmac.mac_length]u8 = undefined;
         self.finishedData(&self.client_handshake_traffic, &verify);
-        self.finished[0] = @intFromEnum(MessageType.finished);
+        self.finished[0] = @backingInt(MessageType.finished);
         writeInt(u24, self.finished[1..4], @intCast(verify.len));
         @memcpy(self.finished[4..][0..verify.len], &verify);
         self.finished_len = @intCast(4 + verify.len);
@@ -815,7 +812,7 @@ test "the ClientHello parses as one handshake message of the length it declares"
     });
     const hello = try client.clientHello(&buffer);
 
-    try testing.expectEqual(@as(u8, @intFromEnum(MessageType.client_hello)), hello[0]);
+    try testing.expectEqual(@as(u8, @backingInt(MessageType.client_hello)), hello[0]);
     try testing.expectEqual(hello.len - 4, readInt(u24, hello[1..4]));
     try testing.expectEqual(@as(u16, 0x0303), readInt(u16, hello[4..6]));
     // The session ID is empty, which RFC 9001 section 8.4 requires over QUIC.
@@ -878,7 +875,7 @@ test "a HelloRetryRequest is refused by name rather than parsed as a ServerHello
         .key_seed = @splat(1),
     });
     var message: [4 + 2 + 32 + 1]u8 = @splat(0);
-    message[0] = @intFromEnum(MessageType.server_hello);
+    message[0] = @backingInt(MessageType.server_hello);
     writeInt(u24, message[1..4], message.len - 4);
     writeInt(u16, message[4..6], 0x0303);
     @memcpy(message[6..38], &hello_retry_request_random);
@@ -989,7 +986,7 @@ pub const Server = struct {
     pub fn init(options: Server.Options) Server {
         return .{
             .random = options.random,
-            .key_pair = X25519.KeyPair.generateDeterministic(options.key_seed) catch unreachable, // Any 32 octets are a private key.
+            .key_pair = X25519.KeyPair.generateDeterministic(options.key_seed),
             .certificates = options.certificates,
             .private_key = options.private_key,
             .protocols = options.protocols,
@@ -1013,7 +1010,7 @@ pub const Server = struct {
 
     fn message(self: *Server, level: Level, whole: []const u8) Error!void {
         std.debug.assert(whole.len >= 4);
-        const kind: MessageType = @enumFromInt(whole[0]);
+        const kind: MessageType = @fromBackingInt(@intCast(whole[0]));
         switch (kind) {
             .client_hello => {
                 if (level != .initial) return error.Unsupported;
@@ -1049,7 +1046,7 @@ pub const Server = struct {
             for ([_]CipherSuite{ .aes_128_gcm_sha256, .chacha20_poly1305_sha256 }) |wanted| {
                 var index: usize = 0;
                 while (index < suites.len) : (index += 2) {
-                    if (readInt(u16, suites[index..][0..2]) == @intFromEnum(wanted)) break :suite wanted;
+                    if (readInt(u16, suites[index..][0..2]) == @backingInt(wanted)) break :suite wanted;
                 }
             }
             return error.Unsupported;
@@ -1062,7 +1059,7 @@ pub const Server = struct {
         var extensions: Reader = .{ .buffer = try in.lengthPrefixed(2) };
         // Bounded by the extensions block.
         while (!extensions.done()) {
-            const id: Extension = @enumFromInt(try extensions.int(u16));
+            const id: Extension = @fromBackingInt(@intCast(try extensions.int(u16)));
             const value = try extensions.lengthPrefixed(2);
             switch (id) {
                 .supported_versions => {
@@ -1162,21 +1159,21 @@ pub const Server = struct {
     }
 
     fn writeServerHello(self: *Server, out: *Writer) Error!void {
-        try out.byte(@intFromEnum(MessageType.server_hello));
+        try out.byte(@backingInt(MessageType.server_hello));
         const body = try out.beginLength(3);
         try out.int(u16, 0x0303);
         try out.bytes(&self.random);
         try out.byte(0); // The echoed session ID, empty over QUIC.
-        try out.int(u16, @intFromEnum(self.suite));
+        try out.int(u16, @backingInt(self.suite));
         try out.byte(0); // Compression.
 
         const extensions = try out.beginLength(2);
-        try out.int(u16, @intFromEnum(Extension.supported_versions));
+        try out.int(u16, @backingInt(Extension.supported_versions));
         var extension = try out.beginLength(2);
         try out.int(u16, 0x0304);
         try out.endLength(extension);
 
-        try out.int(u16, @intFromEnum(Extension.key_share));
+        try out.int(u16, @backingInt(Extension.key_share));
         extension = try out.beginLength(2);
         try out.int(u16, group_x25519);
         const key = try out.beginLength(2);
@@ -1188,11 +1185,11 @@ pub const Server = struct {
     }
 
     fn writeEncryptedExtensions(self: *Server, out: *Writer) Error!void {
-        try out.byte(@intFromEnum(MessageType.encrypted_extensions));
+        try out.byte(@backingInt(MessageType.encrypted_extensions));
         const body = try out.beginLength(3);
         const extensions = try out.beginLength(2);
 
-        try out.int(u16, @intFromEnum(Extension.alpn));
+        try out.int(u16, @backingInt(Extension.alpn));
         var extension = try out.beginLength(2);
         const list = try out.beginLength(2);
         const protocol = try out.beginLength(1);
@@ -1201,7 +1198,7 @@ pub const Server = struct {
         try out.endLength(list);
         try out.endLength(extension);
 
-        try out.int(u16, @intFromEnum(Extension.quic_transport_parameters));
+        try out.int(u16, @backingInt(Extension.quic_transport_parameters));
         extension = try out.beginLength(2);
         try out.bytes(self.transport_parameters);
         try out.endLength(extension);
@@ -1211,7 +1208,7 @@ pub const Server = struct {
     }
 
     fn writeCertificate(self: *Server, out: *Writer) Error!void {
-        try out.byte(@intFromEnum(MessageType.certificate));
+        try out.byte(@backingInt(MessageType.certificate));
         const body = try out.beginLength(3);
         try out.byte(0); // certificate_request_context, empty outside client auth.
         const list = try out.beginLength(3);
@@ -1249,7 +1246,7 @@ pub const Server = struct {
         var der: [Ecdsa.Signature.der_encoded_length_max]u8 = undefined;
         const encoded = signature.toDer(&der);
 
-        try out.byte(@intFromEnum(MessageType.certificate_verify));
+        try out.byte(@backingInt(MessageType.certificate_verify));
         const body = try out.beginLength(3);
         try out.int(u16, 0x0403); // ecdsa_secp256r1_sha256
         const bytes = try out.beginLength(2);
@@ -1261,7 +1258,7 @@ pub const Server = struct {
     fn writeFinished(self: *Server, out: *Writer) Error!void {
         var verify: [Hmac.mac_length]u8 = undefined;
         finishedData(&self.transcript, &self.server_handshake_traffic, &verify);
-        try out.byte(@intFromEnum(MessageType.finished));
+        try out.byte(@backingInt(MessageType.finished));
         const body = try out.beginLength(3);
         try out.bytes(&verify);
         try out.endLength(body);

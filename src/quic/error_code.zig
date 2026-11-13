@@ -42,12 +42,12 @@ pub const Transport = enum(u62) {
     pub const crypto_error_base: u62 = 0x0100;
 
     pub fn fromAlert(tls_alert: u8) Transport {
-        return @enumFromInt(crypto_error_base + tls_alert);
+        return @fromBackingInt(@intCast(crypto_error_base + tls_alert));
     }
 
     /// The TLS alert inside a crypto error, or null for anything else.
     pub fn alert(code: Transport) ?u8 {
-        const value = @intFromEnum(code);
+        const value = @backingInt(code);
         if (value < crypto_error_base or value > crypto_error_base + 0xff) return null;
         return @intCast(value - crypto_error_base);
     }
@@ -91,11 +91,11 @@ pub fn isReserved(value: u62) bool {
 }
 
 comptime {
-    assert(@intFromEnum(Transport.protocol_violation) == 0x0a);
-    assert(@intFromEnum(Application.no_error) == 0x0100);
+    assert(@backingInt(Transport.protocol_violation) == 0x0a);
+    assert(@backingInt(Application.no_error) == 0x0100);
     // The overlap the module comment warns about, made a proof rather than a
     // claim: the same number names different things in the two registries.
-    assert(@intFromEnum(Application.stream_creation_error) != @intFromEnum(Transport.internal_error));
+    assert(@backingInt(Application.stream_creation_error) != @backingInt(Transport.internal_error));
     assert(isReserved(0x1b));
     assert(isReserved(0x1b + 0x1f));
     assert(!isReserved(0x1c));
@@ -103,18 +103,18 @@ comptime {
 
 test "a crypto error carries the alert it was built from" {
     const code = Transport.fromAlert(48); // unknown_ca
-    try std.testing.expectEqual(@as(u62, 0x0130), @intFromEnum(code));
+    try std.testing.expectEqual(@as(u62, 0x0130), @backingInt(code));
     try std.testing.expectEqual(@as(?u8, 48), code.alert());
     try std.testing.expectEqual(@as(?u8, null), Transport.protocol_violation.alert());
-    try std.testing.expectEqual(@as(?u8, null), @as(Transport, @enumFromInt(0x0200)).alert());
+    try std.testing.expectEqual(@as(?u8, null), @as(Transport, @fromBackingInt(@intCast(0x0200))).alert());
 }
 
 test "an unknown code keeps its value rather than becoming an error" {
     // Section 20 requires an unknown code to be treated as `INTERNAL_ERROR` by
     // the receiver, which is the *consumer's* decision; the enum's job is to
     // carry the number without losing it.
-    const unknown: Transport = @enumFromInt(0x4242);
-    try std.testing.expectEqual(@as(u62, 0x4242), @intFromEnum(unknown));
+    const unknown: Transport = @fromBackingInt(@intCast(0x4242));
+    try std.testing.expectEqual(@as(u62, 0x4242), @backingInt(unknown));
 }
 
 test "the reserved pattern matches what section 22.5 describes" {

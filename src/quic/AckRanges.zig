@@ -459,7 +459,7 @@ pub fn AckRanges(comptime config: Config) type {
             const delay = delay_us >> ack_delay_exponent;
 
             var writer: Writer = .{ .target = target };
-            try writer.writeVarint(@intFromEnum(frame.Type.ack));
+            try writer.writeVarint(@backingInt(frame.Type.ack));
             try writer.writeVarint(self.ranges[0].largest);
             try writer.writeVarint(@min(delay, varint.max));
             // The range count is written before the ranges are known to fit, so

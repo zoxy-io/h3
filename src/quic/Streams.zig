@@ -453,7 +453,7 @@ pub fn Streams(comptime config: Config) type {
             const kind = stream_id.kindOf(id);
             // The low two bits are the type tag, so every identifier has a
             // kind; there is no such thing as an unrecognised one to reject.
-            assert(@intFromEnum(kind) == id & 0b11);
+            assert(@backingInt(kind) == id & 0b11);
             return kind.bidirectional() or kind.initiator() != self.side;
         }
 
@@ -598,7 +598,7 @@ pub fn Streams(comptime config: Config) type {
             const position = stream_id.index(id);
             // From the watermark rather than from zero: everything below it has
             // been created already and then given up.
-            var lower = self.retired[@intFromEnum(kind)];
+            var lower = self.retired[@backingInt(kind)];
             // Bounded by the advertised limit, which `checkAdvertisedStreamLimit`
             // has already applied to `id` — and by `streams_max` in any case,
             // because `create` refuses past it.
@@ -795,8 +795,8 @@ pub fn Streams(comptime config: Config) type {
         pub fn isRetired(self: *const Self, id: u64) bool {
             assert(id <= varint.max);
             const kind = stream_id.kindOf(id);
-            assert(self.retired[@intFromEnum(kind)] <= stream_id.count_max);
-            return stream_id.index(id) < self.retired[@intFromEnum(kind)];
+            assert(self.retired[@backingInt(kind)] <= stream_id.count_max);
+            return stream_id.index(id) < self.retired[@backingInt(kind)];
         }
 
         /// The stream credit this endpoint puts in its transport parameters.
@@ -939,7 +939,7 @@ pub fn Streams(comptime config: Config) type {
             assert(self.count <= streams_max);
             defer assert(self.count <= streams_max);
             for (0..stream_id.kind_count) |raw| {
-                const kind: stream_id.Kind = @enumFromInt(raw);
+                const kind: stream_id.Kind = @fromBackingInt(@intCast(raw));
                 // Bounded: each pass gives up one stream, and the table holds
                 // `streams_max`.
                 for (0..streams_max) |_| {
@@ -949,7 +949,7 @@ pub fn Streams(comptime config: Config) type {
         }
 
         fn retireOne(self: *Self, kind: stream_id.Kind) bool {
-            const next = self.retired[@intFromEnum(kind)];
+            const next = self.retired[@backingInt(kind)];
             if (next >= stream_id.count_max) return false;
             const id = stream_id.make(kind, next);
             const stream = self.find(id) orelse return false;
@@ -964,7 +964,7 @@ pub fn Streams(comptime config: Config) type {
             // destination are the same object is undefined.
             if (at != self.count - 1) self.streams[at] = self.streams[self.count - 1];
             self.count -= 1;
-            self.retired[@intFromEnum(kind)] = next + 1;
+            self.retired[@backingInt(kind)] = next + 1;
 
             // Only the peer's own kinds earn it credit. A slot freed by a
             // stream this endpoint opened is room in the table and nothing the

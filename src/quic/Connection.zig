@@ -1027,8 +1027,8 @@ pub fn Connection(comptime config: Config) type {
             // Section 5.2 of RFC 9001: both sides can compute both halves from
             // the client's first Destination Connection ID.
             const bytes = options.original_destination.bytes();
-            self.send_keys[@intFromEnum(Level.initial)] = .initial(bytes, options.side);
-            self.receive_keys[@intFromEnum(Level.initial)] = .initial(bytes, options.side.peer());
+            self.send_keys[@backingInt(Level.initial)] = .initial(bytes, options.side);
+            self.receive_keys[@backingInt(Level.initial)] = .initial(bytes, options.side.peer());
             return self;
         }
 
@@ -1129,8 +1129,8 @@ pub fn Connection(comptime config: Config) type {
             //# PROTOCOL_VIOLATION.
             //= type=todo
             switch (direction) {
-                .send => self.send_keys[@intFromEnum(level)] = keys,
-                .receive => self.receive_keys[@intFromEnum(level)] = keys,
+                .send => self.send_keys[@backingInt(level)] = keys,
+                .receive => self.receive_keys[@backingInt(level)] = keys,
             }
             // Section 4.9.1: Initial keys are discarded as soon as a Handshake
             // packet can be sent. Holding them longer is holding keys anyone who
@@ -1330,8 +1330,8 @@ pub fn Connection(comptime config: Config) type {
         //= reason=version negotiation is out of scope; a connection here speaks QUIC version 1 and the packet types that would begin a different one are the consumer's, per docs/DESIGN.md section 2. The rule is in any case addressed to a future version of QUIC rather than to an implementation of this one.
         /// Queue handshake bytes for sending at `level`.
         pub fn cryptoIn(self: *Self, level: Level, data: []const u8) error{CryptoBufferExceeded}!void {
-            assert(@intFromEnum(level) < self.levels.len);
-            const stream = &self.levels[@intFromEnum(level)];
+            assert(@backingInt(level) < self.levels.len);
+            const stream = &self.levels[@backingInt(level)];
             assert(stream.pending_len <= config.crypto_octets);
             if (stream.pending_len + data.len > config.crypto_octets) {
                 return error.CryptoBufferExceeded;
@@ -1348,20 +1348,20 @@ pub fn Connection(comptime config: Config) type {
         /// Handshake bytes received at `level`, in order. Borrows until the next
         /// `receive`.
         pub fn cryptoOut(self: *const Self, level: Level) []const u8 {
-            assert(@intFromEnum(level) < self.levels.len);
-            const out = self.levels[@intFromEnum(level)].received.readable();
+            assert(@backingInt(level) < self.levels.len);
+            const out = self.levels[@backingInt(level)].received.readable();
             assert(out.len <= config.crypto_octets);
             return out;
         }
 
         /// Release handshake bytes a TLS engine has taken.
         pub fn cryptoConsumed(self: *Self, level: Level, octets: usize) void {
-            assert(@intFromEnum(level) < self.levels.len);
+            assert(@backingInt(level) < self.levels.len);
             // A consumer cannot give back more than it was handed, and
             // `Reassembler.consume` would otherwise move the read cursor past
             // data that was never delivered.
-            assert(octets <= self.levels[@intFromEnum(level)].received.readable().len);
-            self.levels[@intFromEnum(level)].received.consume(octets);
+            assert(octets <= self.levels[@backingInt(level)].received.readable().len);
+            self.levels[@backingInt(level)].received.consume(octets);
         }
 
         // The extension crosses this seam as octets in both directions, and its
@@ -1775,9 +1775,9 @@ pub fn Connection(comptime config: Config) type {
             // rather than from `installSecret`, because this is the moment the
             // rule names.
             if (self.side == .server) self.handshake_done_pending = true;
-            if (self.spaces[@intFromEnum(Space.handshake)].discarded) return;
+            if (self.spaces[@backingInt(Space.handshake)].discarded) return;
             self.discard(.handshake);
-            assert(self.spaces[@intFromEnum(Space.handshake)].discarded);
+            assert(self.spaces[@backingInt(Space.handshake)].discarded);
         }
 
         // QUIC's key update is this function and nothing else. The TLS message of
@@ -1846,16 +1846,16 @@ pub fn Connection(comptime config: Config) type {
             //# described in Section 6.3. By generating new keys before a
             //# key update is received, receipt of packets will not create
             //# timing signals that leak the value of the Key Phase.
-            const current_send = self.send_keys[@intFromEnum(Level.one_rtt)] orelse return;
-            const current_receive = self.receive_keys[@intFromEnum(Level.one_rtt)] orelse return;
+            const current_send = self.send_keys[@backingInt(Level.one_rtt)] orelse return;
+            const current_receive = self.receive_keys[@backingInt(Level.one_rtt)] orelse return;
 
             // Every generation below is built with `nextGeneration`, which
             // carries the header protection key forward. Section 6.1 does not
             // update it, and a fresh one makes the peer unable to unmask the
             // very bit that announces the update.
             one.previous_receive = current_receive;
-            self.send_keys[@intFromEnum(Level.one_rtt)] = current_send.nextGeneration(one.suite, &next_send);
-            self.receive_keys[@intFromEnum(Level.one_rtt)] = one.next_receive orelse
+            self.send_keys[@backingInt(Level.one_rtt)] = current_send.nextGeneration(one.suite, &next_send);
+            self.receive_keys[@backingInt(Level.one_rtt)] = one.next_receive orelse
                 current_receive.nextGeneration(one.suite, &next_receive);
 
             one.send_secret = next_send;
@@ -2268,8 +2268,8 @@ pub fn Connection(comptime config: Config) type {
             if (header == .retry) return self.receiveRetry(bytes, header.retry);
             const level = header.level() orelse return; // Version Negotiation: not this slice.
             const offset = header.packetNumberOffset() orelse return;
-            const index = @intFromEnum(level);
-            if (self.spaces[@intFromEnum(level.space())].discarded) return;
+            const index = @backingInt(level);
+            if (self.spaces[@backingInt(level.space())].discarded) return;
             // For a client the TLS engine is the gate: a 1-RTT read key exists
             // only once the consumer's engine has handed one over, and it does
             // that when the handshake completes.
@@ -2361,7 +2361,7 @@ pub fn Connection(comptime config: Config) type {
             //# authenticated.
             const keys = self.receive_keys[index] orelse return; // No keys yet: discard.
 
-            const space = &self.spaces[@intFromEnum(level.space())];
+            const space = &self.spaces[@backingInt(level.space())];
             const opened = self.openPacket(level, keys, bytes, offset, space.received.largest()) catch |err| switch (err) {
                 // Section 5.4: a packet that fails to authenticate is discarded,
                 // never a connection error — an off-path attacker can inject
@@ -2412,7 +2412,7 @@ pub fn Connection(comptime config: Config) type {
             //# successfully processes a Handshake packet.
             //= type=test
             if (level == .handshake and self.side == .server and
-                !self.spaces[@intFromEnum(Space.initial)].discarded)
+                !self.spaces[@backingInt(Space.initial)].discarded)
             {
                 self.discard(.initial);
             }
@@ -2649,11 +2649,11 @@ pub fn Connection(comptime config: Config) type {
             //# Connection ID is selected by the server.
             //= type=test
             const identifier = header.source.bytes();
-            self.send_keys[@intFromEnum(Level.initial)] = .initial(identifier, .client);
-            self.receive_keys[@intFromEnum(Level.initial)] = .initial(identifier, .server);
+            self.send_keys[@backingInt(Level.initial)] = .initial(identifier, .client);
+            self.receive_keys[@backingInt(Level.initial)] = .initial(identifier, .server);
 
             // The first flight goes again, from the same octets.
-            self.levels[@intFromEnum(Level.initial)].framed = 0;
+            self.levels[@backingInt(Level.initial)].framed = 0;
 
             // RFC 9002 section 6.3: a Retry says the Initial was received and
             // not processed, so the packet it acknowledges nothing about is
@@ -3500,12 +3500,12 @@ pub fn Connection(comptime config: Config) type {
                 //# account for all bytes sent on the stream in its connection-level flow
                 //# controller.
                 .reset_stream => |value| {
-                    self.streams.reset(value.stream, @intFromEnum(value.code), value.final_size) catch |err| {
+                    self.streams.reset(value.stream, @backingInt(value.code), value.final_size) catch |err| {
                         return streamError(err);
                     };
                     self.emit(.{ .stream_reset = .{
                         .stream = value.stream,
-                        .code = @intFromEnum(value.code),
+                        .code = @backingInt(value.code),
                     } });
                 },
                 // Section 3.5: the peer wants us to stop sending. Recorded as a
@@ -3567,12 +3567,12 @@ pub fn Connection(comptime config: Config) type {
                     //# frame to the RESET_STREAM frame it sends, but it can use any
                     //# application error code.
                     //= type=test
-                    self.streams.resetSend(value.stream, @intFromEnum(value.code)) catch |err| {
+                    self.streams.resetSend(value.stream, @backingInt(value.code)) catch |err| {
                         return streamError(err);
                     };
                     self.emit(.{ .stream_stopped = .{
                         .stream = value.stream,
-                        .code = @intFromEnum(value.code),
+                        .code = @backingInt(value.code),
                     } });
                 },
             }
@@ -3615,7 +3615,7 @@ pub fn Connection(comptime config: Config) type {
             //= https://www.rfc-editor.org/rfc/rfc9000#section-12.5
             //# ACK frames MAY appear in any packet number space but can only
             //# acknowledge packets that appeared in that packet number space.
-            const space = &self.spaces[@intFromEnum(level.space())];
+            const space = &self.spaces[@backingInt(level.space())];
 
             // A peer cannot acknowledge a number we never sent; doing so would
             // move our packet number encoding window somewhere we never were.
@@ -3675,8 +3675,8 @@ pub fn Connection(comptime config: Config) type {
         /// stream that is separate per encryption level.
         fn receiveCrypto(self: *Self, level: Level, value: frame.Crypto) ReceiveError!void {
             assert(frame.Type.crypto.allowedIn(level));
-            assert(@intFromEnum(level) < self.levels.len);
-            const stream = &self.levels[@intFromEnum(level)];
+            assert(@backingInt(level) < self.levels.len);
+            const stream = &self.levels[@backingInt(level)];
             //= https://www.rfc-editor.org/rfc/rfc9000#section-19.6
             //# The largest offset delivered on a stream -- the sum of the offset and
             //# data length -- cannot exceed 2^62-1.  Receipt of a frame that exceeds
@@ -3866,8 +3866,8 @@ pub fn Connection(comptime config: Config) type {
 
         /// Section 4.9: drop a level's keys and its packet number space.
         fn discard(self: *Self, level: Level) void {
-            assert(@intFromEnum(level) < self.send_keys.len);
-            assert(@intFromEnum(level) < self.receive_keys.len);
+            assert(@backingInt(level) < self.send_keys.len);
+            assert(@backingInt(level) < self.receive_keys.len);
             // Section 4.9 of RFC 9001: discarding is one-way. A level whose
             // keys came back would be one where a packet number could repeat,
             // and a repeated number in a space is a repeated AEAD nonce.
@@ -3881,9 +3881,9 @@ pub fn Connection(comptime config: Config) type {
             //# and retransmissions of data in CRYPTO frames are sent at a previous
             //# encryption level.
             assert(level != .one_rtt);
-            self.send_keys[@intFromEnum(level)] = null;
-            self.receive_keys[@intFromEnum(level)] = null;
-            self.spaces[@intFromEnum(level.space())].discarded = true;
+            self.send_keys[@backingInt(level)] = null;
+            self.receive_keys[@backingInt(level)] = null;
+            self.spaces[@backingInt(level.space())].discarded = true;
             // A probe owed by a space that no longer exists is a number nothing
             // will ever act on: `wantsSend` skips a discarded space and
             // `sendPacket` refuses one. Left set, it is a fact about the
@@ -3891,7 +3891,7 @@ pub fn Connection(comptime config: Config) type {
             // `handshakeloss` case is where that turned up — a stalled
             // connection reporting probes owed on two spaces it had discarded,
             // which cost an hour of looking at the wrong thing.
-            self.spaces[@intFromEnum(level.space())].probes_pending = 0;
+            self.spaces[@backingInt(level.space())].probes_pending = 0;
             // Section 6.2.3 of RFC 9002: what was outstanding there is neither
             // lost nor acknowledged, and leaving its octets in flight would
             // hold the congestion window down for the rest of the connection.
@@ -4010,8 +4010,8 @@ pub fn Connection(comptime config: Config) type {
                 assert(context.crypto_end >= context.crypto_start);
                 assert(context.stream_end >= context.stream_start);
                 if (context.crypto_end > context.crypto_start) {
-                    assert(@intFromEnum(context.level) < self.levels.len);
-                    const level = &self.levels[@intFromEnum(context.level)];
+                    assert(@backingInt(context.level) < self.levels.len);
+                    const level = &self.levels[@backingInt(context.level)];
                     // Rewinding is what makes a lost packet retransmittable, so
                     // it may only ever move the cursor back.
                     assert(@min(level.framed, context.crypto_start) <= level.framed);
@@ -4128,7 +4128,7 @@ pub fn Connection(comptime config: Config) type {
                     // Section 6.2.4 asks for at least one and allows two; a
                     // probe of zero packets is a timer that fired for nothing.
                     assert(probe.packets >= 1);
-                    self.spaces[@intFromEnum(probe.space)].probes_pending = probe.packets;
+                    self.spaces[@backingInt(probe.space)].probes_pending = probe.packets;
                     if (self.recovery.earliestContext(probe.space)) |context| {
                         self.onPacketsLost(&.{context});
                     }
@@ -4152,7 +4152,7 @@ pub fn Connection(comptime config: Config) type {
                     //# possible.
                     //= type=test
                     for (0..Space.count) |index| {
-                        const space: Space = @enumFromInt(index);
+                        const space: Space = @fromBackingInt(@intCast(index));
                         if (space == probe.space) continue;
                         if (self.spaces[index].discarded) continue;
                         //= https://www.rfc-editor.org/rfc/rfc9002#section-6.2.1
@@ -4240,8 +4240,8 @@ pub fn Connection(comptime config: Config) type {
             // after the loop is for.
             var pad_level: Level = .initial;
             for ([_]Level{ .initial, .handshake, .one_rtt }) |level| {
-                if (self.send_keys[@intFromEnum(level)] == null) continue;
-                if (self.spaces[@intFromEnum(level.space())].discarded) continue;
+                if (self.send_keys[@backingInt(level)] == null) continue;
+                if (self.spaces[@backingInt(level.space())].discarded) continue;
                 // The 1-RTT level is skipped while the handshake is still
                 // running, and skipping it is what makes this a useful guess
                 // rather than an idle one. A server installs 1-RTT *send* keys
@@ -4262,8 +4262,8 @@ pub fn Connection(comptime config: Config) type {
                 // own level and the fallback below covers it: a guess that is
                 // wrong costs trailing zeroes, never a short datagram.
                 if (level != .initial) {
-                    const stream = &self.levels[@intFromEnum(level)];
-                    const state = &self.spaces[@intFromEnum(level.space())];
+                    const stream = &self.levels[@backingInt(level)];
+                    const state = &self.spaces[@backingInt(level.space())];
                     const owes = stream.framed < stream.pending_len or
                         state.probes_pending > 0 or
                         state.received.ack_eliciting_pending;
@@ -4349,7 +4349,7 @@ pub fn Connection(comptime config: Config) type {
             //# Handshake packet
             //= type=test
             if (self.side == .client and handshake_sent and
-                !self.spaces[@intFromEnum(Space.initial)].discarded)
+                !self.spaces[@backingInt(Space.initial)].discarded)
             {
                 self.discard(.initial);
             }
@@ -4395,11 +4395,11 @@ pub fn Connection(comptime config: Config) type {
             //# keys.
             // Kept because exceeding the confidentiality limit is a break rather
             // than a degradation.
-            assert(@intFromEnum(level) < self.sealed.len);
+            assert(@backingInt(level) < self.sealed.len);
             if (level != .one_rtt) {
-                assert(self.sealed[@intFromEnum(level)] < std.math.maxInt(u64));
-                self.sealed[@intFromEnum(level)] += 1;
-                if (self.sealed[@intFromEnum(level)] >= crypto.confidentialityLimit(secrets_suite_initial)) {
+                assert(self.sealed[@backingInt(level)] < std.math.maxInt(u64));
+                self.sealed[@backingInt(level)] += 1;
+                if (self.sealed[@backingInt(level)] >= crypto.confidentialityLimit(secrets_suite_initial)) {
                     self.close(.aead_limit_reached);
                 }
                 return;
@@ -4570,9 +4570,9 @@ pub fn Connection(comptime config: Config) type {
         /// function writes lands under the AEAD, and everything written after
         /// it returns does not.
         fn sendPacket(self: *Self, buffer: []u8, level: Level, now_ns: u64, ack_eliciting_out: *bool, datagram_floor: usize) !usize {
-            const index = @intFromEnum(level);
+            const index = @backingInt(level);
             const keys = self.send_keys[index] orelse return error.Empty;
-            const space = &self.spaces[@intFromEnum(level.space())];
+            const space = &self.spaces[@backingInt(level.space())];
             if (space.discarded) return error.Empty;
 
             const number = space.next;
@@ -4882,11 +4882,11 @@ pub fn Connection(comptime config: Config) type {
         /// Put back everything `writePayload` committed. Called on every path
         /// out of `sendPacket` that does not produce a packet.
         fn rollback(self: *Self, level: Level, undo: Undo, written: Payload) void {
-            const space = &self.spaces[@intFromEnum(level.space())];
+            const space = &self.spaces[@backingInt(level.space())];
             space.received.ack_eliciting_pending = undo.ack_eliciting_pending;
             space.probes_pending = undo.probes_pending;
-            self.close_pending[@intFromEnum(level)] = undo.close_pending;
-            self.levels[@intFromEnum(level)].framed = undo.crypto_framed;
+            self.close_pending[@backingInt(level)] = undo.close_pending;
+            self.levels[@backingInt(level)].framed = undo.crypto_framed;
             self.handshake_done_framed = undo.handshake_done_framed;
             if (written.stream_end > written.stream_start or written.stream_fin) {
                 self.streams.rewind(written.stream, written.stream_start, written.stream_fin);
@@ -4978,7 +4978,7 @@ pub fn Connection(comptime config: Config) type {
             //# An endpoint SHOULD limit the rate at which it generates packets in
             //# the closing state.
             //= type=todo
-            if (!self.close_pending[@intFromEnum(level)]) return result.*;
+            if (!self.close_pending[@backingInt(level)]) return result.*;
             // Section 19.19: a transport close carries the frame type that
             // triggered it and an application close does not. Writing `null`
             // for both makes a type 0x1c frame that omits a field the peer's
@@ -5050,7 +5050,7 @@ pub fn Connection(comptime config: Config) type {
             //= type=exception
             //= reason=one close and then silence is deliberate. `close_pending` is cleared when the CONNECTION_CLOSE is framed and is never set again, so a closing endpoint answers further packets with nothing rather than with a repeat — stricter than section 10.2.1's rate limit and needing no timer to be, which is what lets this package own no clock. A peer that loses the one close falls back to its own idle timeout.
             const written = frame.encode(payload, self.closeFrameFor(level)) catch return result.*;
-            self.close_pending[@intFromEnum(level)] = false;
+            self.close_pending[@backingInt(level)] = false;
             result.octets = written;
             result.ack_eliciting = false;
             assert(result.octets <= payload.len);
@@ -5086,7 +5086,7 @@ pub fn Connection(comptime config: Config) type {
         /// by `sim/` seed 155905: a stream with a 1401-octet hole, both
         /// endpoints exchanging PINGs for the remaining two minutes.
         fn admission(self: *const Self, space_id: Space) Admission {
-            const space = &self.spaces[@intFromEnum(space_id)];
+            const space = &self.spaces[@backingInt(space_id)];
             const probe = space.probes_pending > 0;
             if (!self.recovery.hasRoom(space_id, probe)) {
                 return if (probe) .ping else .ack_only;
@@ -5116,7 +5116,7 @@ pub fn Connection(comptime config: Config) type {
         fn writePayload(self: *Self, payload: []u8, level: Level, now_ns: u64, admits: Admission) Payload {
             var result: Payload = .{};
             var offset: usize = 0;
-            const space = &self.spaces[@intFromEnum(level.space())];
+            const space = &self.spaces[@backingInt(level.space())];
 
             // Section 10.2: an endpoint in the closing state "retains only
             // enough information to generate a packet containing a
@@ -5206,14 +5206,14 @@ pub fn Connection(comptime config: Config) type {
             // there is any, which is why this runs before the CRYPTO below and
             // only claims the space when it has nothing to say.
             if (space.probes_pending > 0 and stream_has_nothing: {
-                const stream = &self.levels[@intFromEnum(level)];
+                const stream = &self.levels[@backingInt(level)];
                 break :stream_has_nothing stream.framed >= stream.pending_len;
             }) {
                 offset += frame.encode(payload[offset..], .ping) catch 0;
                 result.ack_eliciting = true;
             }
 
-            const stream = &self.levels[@intFromEnum(level)];
+            const stream = &self.levels[@backingInt(level)];
             if (stream.framed < stream.pending_len) {
                 result.crypto_start = stream.framed;
                 offset += self.writeCrypto(payload[offset..], stream);
@@ -5279,9 +5279,9 @@ pub fn Connection(comptime config: Config) type {
                 }
             }
 
-            if (self.close_pending[@intFromEnum(level)] and offset < payload.len) {
+            if (self.close_pending[@backingInt(level)] and offset < payload.len) {
                 offset += frame.encode(payload[offset..], self.closeFrameFor(level)) catch 0;
-                self.close_pending[@intFromEnum(level)] = false;
+                self.close_pending[@backingInt(level)] = false;
             }
             result.octets = offset;
             return result;
@@ -5471,7 +5471,7 @@ pub fn Connection(comptime config: Config) type {
             assert(stream.reset_final_size <= varint.max);
             const written = frame.encode(target, .{ .reset_stream = .{
                 .stream = stream.id,
-                .code = @enumFromInt(@as(u62, @intCast(stream.reset_code))),
+                .code = @fromBackingInt(@intCast(@as(u62, @intCast(stream.reset_code)))),
                 .final_size = stream.reset_final_size,
             } }) catch |err| switch (err) {
                 // No room in this packet; the frame is still owed and goes in
@@ -5504,7 +5504,7 @@ pub fn Connection(comptime config: Config) type {
             assert(code <= varint.max);
             const written = frame.encode(target, .{ .stop_sending = .{
                 .stream = stream.id,
-                .code = @enumFromInt(@as(u62, @intCast(code))),
+                .code = @fromBackingInt(@intCast(@as(u62, @intCast(code)))),
             } }) catch |err| switch (err) {
                 error.OutputTooLong => return 0,
                 // As in `writeReset`: bounded above, and a swallowed encoding
@@ -5714,7 +5714,7 @@ pub fn Connection(comptime config: Config) type {
                 .connection_close = .{
                     .application = application,
                     .code = if (convert)
-                        @intFromEnum(error_code.Transport.application_error)
+                        @backingInt(error_code.Transport.application_error)
                     else
                         self.close_code,
                     // Section 19.19: a transport close carries the frame type that
@@ -5741,7 +5741,7 @@ pub fn Connection(comptime config: Config) type {
             // discarded, and `sendPacket` refuses a level with none. Before
             // confirmation a server owes it at both Handshake and Initial,
             // because it cannot know which the client can read.
-            self.closeWith(@intFromEnum(code), false);
+            self.closeWith(@backingInt(code), false);
         }
 
         /// Section 10.2's close, with a code from the *application's* registry:
@@ -5830,10 +5830,10 @@ pub fn Connection(comptime config: Config) type {
         /// frames `wantsSend` predicates on, asked through the same function so
         /// that the accessor and the writer cannot drift into disagreeing.
         fn oneRttWritable(self: *const Self) bool {
-            const index = @intFromEnum(Level.one_rtt);
+            const index = @backingInt(Level.one_rtt);
             assert(index < self.send_keys.len);
             if (self.send_keys[index] == null) return false;
-            const space = &self.spaces[@intFromEnum(Space.application)];
+            const space = &self.spaces[@backingInt(Space.application)];
             if (space.discarded) return false;
             return self.admission(.application) == .everything;
         }
@@ -5890,9 +5890,9 @@ pub fn Connection(comptime config: Config) type {
                 if (self.streams.owesBlocked()) return true;
             }
             for (0..Level.count) |index| {
-                const level: Level = @enumFromInt(index);
+                const level: Level = @fromBackingInt(@intCast(index));
                 if (self.send_keys[index] == null) continue;
-                const space = &self.spaces[@intFromEnum(level.space())];
+                const space = &self.spaces[@backingInt(level.space())];
                 if (space.discarded) continue;
                 // Acknowledgements go out whatever the window says.
                 if (space.received.ack_eliciting_pending) return true;
@@ -6025,7 +6025,7 @@ test "the server's reply completes the Initial exchange in both directions" {
 
     // The server's packet carried an ACK for the client's Initial, which is
     // what moves the client's packet number encoding window.
-    try testing.expectEqual(@as(?u64, 0), client.spaces[@intFromEnum(Space.initial)].largest_acked);
+    try testing.expectEqual(@as(?u64, 0), client.spaces[@backingInt(Space.initial)].largest_acked);
 }
 
 //= https://www.rfc-editor.org/rfc/rfc9001#section-4.9.1
@@ -6049,8 +6049,8 @@ test "a handshake reaches 1-RTT through all three levels" {
     now_ns += 1000;
     try installBoth(&server, &client, .handshake, 0x11);
     try installBoth(&client, &server, .handshake, 0x22);
-    try testing.expect(client.send_keys[@intFromEnum(Level.initial)] != null);
-    try testing.expect(server.receive_keys[@intFromEnum(Level.initial)] != null);
+    try testing.expect(client.send_keys[@backingInt(Level.initial)] != null);
+    try testing.expect(server.receive_keys[@backingInt(Level.initial)] != null);
 
     try server.cryptoIn(.handshake, "EncryptedExtensions, Certificate, Finished");
     _ = try deliver(&server, &client, now_ns);
@@ -6064,8 +6064,8 @@ test "a handshake reaches 1-RTT through all three levels" {
     _ = try deliver(&client, &server, now_ns);
     try testing.expectEqualStrings("Finished", server.cryptoOut(.handshake));
     // And now, at the two points section 4.9.1 names.
-    try testing.expect(client.send_keys[@intFromEnum(Level.initial)] == null);
-    try testing.expect(server.receive_keys[@intFromEnum(Level.initial)] == null);
+    try testing.expect(client.send_keys[@backingInt(Level.initial)] == null);
+    try testing.expect(server.receive_keys[@backingInt(Level.initial)] == null);
 
     // HANDSHAKE_DONE is the server's alone, and it is what establishes the
     // connection for the client.
@@ -6194,7 +6194,7 @@ test "a datagram that cannot be decrypted is discarded, not fatal" {
     datagram[9] = 0x00;
     try server.receive(&datagram, 0);
     try testing.expectEqual(State.handshaking, server.state);
-    try testing.expectEqual(@as(u32, 0), server.spaces[@intFromEnum(Space.initial)].received.count);
+    try testing.expectEqual(@as(u32, 0), server.spaces[@backingInt(Space.initial)].received.count);
 }
 
 //= https://www.rfc-editor.org/rfc/rfc9000#section-12.3
@@ -6219,7 +6219,7 @@ test "a duplicate packet is not processed twice" {
     // would be pushed again — harmless here because the reassembler treats a
     // duplicate as free, which is exactly why both checks exist.
     try server.receive(copy[0..octets], 0);
-    try testing.expectEqual(@as(u32, 1), server.spaces[@intFromEnum(Space.initial)].received.count);
+    try testing.expectEqual(@as(u32, 1), server.spaces[@backingInt(Space.initial)].received.count);
     try testing.expectEqualStrings("ClientHello", server.cryptoOut(.initial));
 }
 
@@ -6238,7 +6238,7 @@ test "a CONNECTION_CLOSE puts the receiver in draining" {
     _ = try deliver(&client, &server, 1000);
 
     try testing.expectEqual(State.draining, server.state);
-    try testing.expectEqual(@intFromEnum(error_code.Transport.protocol_violation), server.close_code);
+    try testing.expectEqual(@backingInt(error_code.Transport.protocol_violation), server.close_code);
     // Section 10.2.2: a draining endpoint sends nothing further.
     var datagram: [TestConnection.datagram_octets]u8 = @splat(0);
     try testing.expectEqual(@as(usize, 0), try server.send(&datagram, 2000));
@@ -6398,9 +6398,9 @@ test "the timer is only about what is outstanding, except when it is not" {
 
     // And once the handshake is confirmed there is nothing left to unblock.
     client.confirmHandshake();
-    client.recovery.spaces[@intFromEnum(Space.initial)].count = 0;
-    client.recovery.spaces[@intFromEnum(Space.handshake)].count = 0;
-    client.recovery.spaces[@intFromEnum(Space.application)].count = 0;
+    client.recovery.spaces[@backingInt(Space.initial)].count = 0;
+    client.recovery.spaces[@backingInt(Space.handshake)].count = 0;
+    client.recovery.spaces[@backingInt(Space.application)].count = 0;
     try testing.expectEqual(@as(?u64, null), client.timeout());
 }
 
@@ -6607,12 +6607,12 @@ test "section 3.2: an abandoned stream still gives its credit back" {
     var offset: usize = 0;
     offset += try frame.encode(payload[offset..], .{ .reset_stream = .{
         .stream = 0,
-        .code = @enumFromInt(0x10c),
+        .code = @fromBackingInt(@intCast(0x10c)),
         .final_size = 5,
     } });
     offset += try frame.encode(payload[offset..], .{ .stop_sending = .{
         .stream = 0,
-        .code = @enumFromInt(0x10c),
+        .code = @fromBackingInt(@intCast(0x10c)),
     } });
     _ = try server.receiveFrames(.one_rtt, payload[0..offset], 0);
 
@@ -6704,7 +6704,7 @@ test "section 5.7: a server does not process 1-RTT before its handshake complete
     // And it owes no acknowledgement for it, which is the half that matters:
     // acknowledging tells the peer everything arrived, and a peer that believes
     // that stops retransmitting the Finished this endpoint is still waiting for.
-    try testing.expect(!server.spaces[@intFromEnum(Space.application)].received.ack_eliciting_pending);
+    try testing.expect(!server.spaces[@backingInt(Space.application)].received.ack_eliciting_pending);
 
     // Once the handshake completes, the peer's retransmission is taken. The
     // client's own loss detection is what brings it back on a real path.
@@ -6753,8 +6753,8 @@ test "section 6.2.4: a probe repairs every space with data in flight" {
     // rather than half of it, and both spaces owe an ack-eliciting packet.
     try testing.expectEqual(@as(u32, 0), server.levels[0].framed);
     try testing.expectEqual(@as(u32, 0), server.levels[2].framed);
-    try testing.expect(server.spaces[@intFromEnum(Space.initial)].probes_pending > 0);
-    try testing.expect(server.spaces[@intFromEnum(Space.handshake)].probes_pending > 0);
+    try testing.expect(server.spaces[@backingInt(Space.initial)].probes_pending > 0);
+    try testing.expect(server.spaces[@backingInt(Space.handshake)].probes_pending > 0);
 }
 
 //= https://www.rfc-editor.org/rfc/rfc9002#section-6.2.4
@@ -6853,7 +6853,7 @@ test "section 13.3: a lost STOP_SENDING is sent again" {
     var payload: [32]u8 = @splat(0);
     const written = try frame.encode(&payload, .{ .reset_stream = .{
         .stream = 0,
-        .code = @enumFromInt(0x10c),
+        .code = @fromBackingInt(@intCast(0x10c)),
         .final_size = 0,
     } });
     _ = try client.receiveFrames(.one_rtt, payload[0..written], 0);
@@ -6907,7 +6907,7 @@ test "section 3.5: no STOP_SENDING for a stream the peer already reset" {
     var payload: [32]u8 = @splat(0);
     const written = try frame.encode(&payload, .{ .reset_stream = .{
         .stream = 0,
-        .code = @enumFromInt(0x10c),
+        .code = @fromBackingInt(@intCast(0x10c)),
         .final_size = 0,
     } });
     _ = try client.receiveFrames(.one_rtt, payload[0..written], 0);
@@ -6938,7 +6938,7 @@ test "section 3.5: STOP_SENDING is answered with a RESET_STREAM carrying its cod
     var payload: [32]u8 = @splat(0);
     const written = try frame.encode(&payload, .{ .stop_sending = .{
         .stream = 0,
-        .code = @enumFromInt(0x10c),
+        .code = @fromBackingInt(@intCast(0x10c)),
     } });
     _ = try server.receiveFrames(.one_rtt, payload[0..written], 0);
 
@@ -7419,12 +7419,12 @@ test "a window update rolled back with its packet is owed again" {
     server.max_data_sent = 1 << 20;
     server.findStream(0).?.max_data_sent = 1 << 20;
 
-    const space = &server.spaces[@intFromEnum(Space.application)];
+    const space = &server.spaces[@backingInt(Space.application)];
     server.rollback(.one_rtt, .{
         .ack_eliciting_pending = space.received.ack_eliciting_pending,
         .probes_pending = space.probes_pending,
         .close_pending = false,
-        .crypto_framed = server.levels[@intFromEnum(Level.one_rtt)].framed,
+        .crypto_framed = server.levels[@backingInt(Level.one_rtt)].framed,
         .handshake_done_framed = server.handshake_done_framed,
     }, .{ .flow_control = true, .ack_eliciting = true });
     try testing.expectEqual(@as(u64, 0), server.max_data_sent);
@@ -7867,7 +7867,7 @@ test "section 6.6: the confidentiality limit closes when no update is possible" 
     var datagram: [TestConnection.datagram_octets]u8 = @splat(0);
     _ = try client.send(&datagram, 1000);
     try testing.expectEqual(State.closing, client.state);
-    try testing.expectEqual(@intFromEnum(error_code.Transport.aead_limit_reached), client.close_code);
+    try testing.expectEqual(@backingInt(error_code.Transport.aead_limit_reached), client.close_code);
 }
 
 //= https://www.rfc-editor.org/rfc/rfc9001#section-6.6
@@ -7907,7 +7907,7 @@ test "section 6.6: forgeries past the integrity limit close the connection" {
     var again = datagram;
     try testing.expectError(error.AeadLimitReached, server.receive(again[0..octets], 2000));
     try testing.expectEqual(State.closing, server.state);
-    try testing.expectEqual(@intFromEnum(error_code.Transport.aead_limit_reached), server.close_code);
+    try testing.expectEqual(@backingInt(error_code.Transport.aead_limit_reached), server.close_code);
 }
 
 //= https://www.rfc-editor.org/rfc/rfc9000#section-7.2
@@ -7930,7 +7930,7 @@ test "section 7.2: a client's source connection id is fixed for the connection" 
     // A packet number the server has not already seen, or duplicate suppression
     // discards it before the identifier is ever looked at — which is a real
     // defence, and would have made this test pass without the fix.
-    impostor.spaces[@intFromEnum(Space.initial)].next = 9;
+    impostor.spaces[@backingInt(Space.initial)].next = 9;
     try impostor.cryptoIn(.initial, "ClientHello");
     var datagram: [TestConnection.datagram_octets]u8 = @splat(0);
     const octets = try impostor.send(&datagram, 1000);
@@ -8038,13 +8038,13 @@ test "a full window does not throttle acknowledgements" {
 
     _ = try client.write(0, "data", false);
     _ = try deliver(&client, &server, 1000);
-    try testing.expect(server.spaces[@intFromEnum(Space.application)].received.ack_eliciting_pending);
+    try testing.expect(server.spaces[@backingInt(Space.application)].received.ack_eliciting_pending);
 
     server.recovery.bytes_in_flight = server.recovery.congestion_window;
     var datagram: [TestConnection.datagram_octets]u8 = @splat(0);
     const octets = try server.send(&datagram, 2000);
     try testing.expect(octets > 0);
-    try testing.expect(!server.spaces[@intFromEnum(Space.application)].received.ack_eliciting_pending);
+    try testing.expect(!server.spaces[@backingInt(Space.application)].received.ack_eliciting_pending);
 }
 
 //= https://www.rfc-editor.org/rfc/rfc9002#section-6.2.4
@@ -8086,7 +8086,7 @@ test "a full recovery table holds stream data back instead of sending it unrecor
     try testing.expect(!client.wantsSend());
 
     // A probe may use the reserved slots, and its packets carry the data.
-    client.spaces[@intFromEnum(app)].probes_pending = 2;
+    client.spaces[@backingInt(app)].probes_pending = 2;
     _ = try client.send(&datagram, now + 2);
     try testing.expect(client.streams.find(0).?.framed > framed_before);
     try testing.expect(client.recovery.outstanding(app) > recorded_before);
@@ -8096,16 +8096,16 @@ test "a full recovery table holds stream data back instead of sending it unrecor
     var probes: u32 = 0;
     while (client.recovery.hasRoom(app, true)) : (probes += 1) {
         try testing.expect(probes < table);
-        client.spaces[@intFromEnum(app)].probes_pending = 1;
+        client.spaces[@backingInt(app)].probes_pending = 1;
         _ = try client.write(0, "x", false);
         now += 1;
         _ = try client.send(&datagram, now);
     }
     const framed_full = client.streams.find(0).?.framed;
-    client.spaces[@intFromEnum(app)].probes_pending = 1;
+    client.spaces[@backingInt(app)].probes_pending = 1;
     _ = try client.write(0, "more", false);
     try testing.expect(try client.send(&datagram, now + 1) > 0);
-    try testing.expectEqual(@as(u8, 0), client.spaces[@intFromEnum(app)].probes_pending);
+    try testing.expectEqual(@as(u8, 0), client.spaces[@backingInt(app)].probes_pending);
     try testing.expectEqual(framed_full, client.streams.find(0).?.framed);
     try testing.expectEqual(table, client.recovery.outstanding(app));
 }
@@ -8125,7 +8125,7 @@ test "section 10.2: a closing endpoint sends only CONNECTION_CLOSE" {
     // acknowledgement it would otherwise owe.
     _ = try client.write(0, "never sent", false);
     _ = try deliver(&server, &client, 1000);
-    try testing.expect(client.spaces[@intFromEnum(Space.application)].received.ack_eliciting_pending);
+    try testing.expect(client.spaces[@backingInt(Space.application)].received.ack_eliciting_pending);
 
     client.close(.protocol_violation);
     var datagram: [TestConnection.datagram_octets]u8 = @splat(0);
@@ -8286,7 +8286,7 @@ test "section 5.4.2: a packet with a one-octet payload is padded to the sample" 
     }
 
     // A probe with nothing to carry is a PING, and a PING is the whole payload.
-    client.spaces[@intFromEnum(Space.application)].probes_pending = 1;
+    client.spaces[@backingInt(Space.application)].probes_pending = 1;
     var datagram: [TestConnection.datagram_octets]u8 = @splat(0);
     const octets = try client.send(&datagram, 0);
     try testing.expect(octets > 0);
@@ -8340,7 +8340,7 @@ test "RFC 9002 section 6.2.4: a probe carrying data still spends its credit" {
     var server = testServer();
     try client.cryptoIn(.initial, "ClientHello");
 
-    const space = &client.spaces[@intFromEnum(Space.initial)];
+    const space = &client.spaces[@backingInt(Space.initial)];
     space.probes_pending = 2;
     var datagram: [TestConnection.datagram_octets]u8 = @splat(0);
     // The client has CRYPTO to send, so the probe carries it rather than a PING.
@@ -8370,19 +8370,19 @@ test "RFC 9001 section 4.9.2: a server discards its Handshake keys on confirmati
     try installBoth(&client, &server, .one_rtt, 0x44);
 
     // Still live: the client's Finished has not been processed yet.
-    try testing.expect(server.send_keys[@intFromEnum(Level.handshake)] != null);
-    try testing.expect(!server.spaces[@intFromEnum(Space.handshake)].discarded);
+    try testing.expect(server.send_keys[@backingInt(Level.handshake)] != null);
+    try testing.expect(!server.spaces[@backingInt(Space.handshake)].discarded);
 
     server.confirmHandshake();
-    try testing.expect(server.send_keys[@intFromEnum(Level.handshake)] == null);
-    try testing.expect(server.receive_keys[@intFromEnum(Level.handshake)] == null);
-    try testing.expect(server.spaces[@intFromEnum(Space.handshake)].discarded);
+    try testing.expect(server.send_keys[@backingInt(Level.handshake)] == null);
+    try testing.expect(server.receive_keys[@backingInt(Level.handshake)] == null);
+    try testing.expect(server.spaces[@backingInt(Space.handshake)].discarded);
     try testing.expectEqual(State.established, server.state);
 
     // Idempotent: a consumer that calls it twice, or a client that already
     // discarded on HANDSHAKE_DONE, must not discard a space twice.
     server.confirmHandshake();
-    try testing.expect(server.spaces[@intFromEnum(Space.handshake)].discarded);
+    try testing.expect(server.spaces[@backingInt(Space.handshake)].discarded);
 }
 
 //= https://www.rfc-editor.org/rfc/rfc9000#section-19.7
@@ -8424,7 +8424,7 @@ test "section 19.5: STOP_SENDING may not create a stream or stop a read-only one
     var payload: [64]u8 = @splat(0);
     var written = try frame.encode(&payload, .{ .stop_sending = .{
         .stream = uncreated,
-        .code = @enumFromInt(0),
+        .code = @fromBackingInt(@intCast(0)),
     } });
     try testing.expectError(
         error.StreamState,
@@ -8440,7 +8440,7 @@ test "section 19.5: STOP_SENDING may not create a stream or stop a read-only one
     const theirs = stream_id.make(.server_unidirectional, 0);
     written = try frame.encode(&payload, .{ .stop_sending = .{
         .stream = theirs,
-        .code = @enumFromInt(0),
+        .code = @fromBackingInt(@intCast(0)),
     } });
     try testing.expectError(
         error.StreamState,
@@ -8622,13 +8622,13 @@ test "section 10.2.3: a close is owed at every level that can still seal" {
 
     // Only Initial keys so far, so that is where the close is owed.
     server.close(.protocol_violation);
-    try testing.expect(server.close_pending[@intFromEnum(Level.initial)]);
-    try testing.expect(!server.close_pending[@intFromEnum(Level.handshake)]);
+    try testing.expect(server.close_pending[@backingInt(Level.initial)]);
+    try testing.expect(!server.close_pending[@backingInt(Level.handshake)]);
 
     var datagram: [TestConnection.datagram_octets]u8 = @splat(0);
     const octets = try server.send(&datagram, 1000);
     try testing.expect(octets > 0);
-    try testing.expect(!server.close_pending[@intFromEnum(Level.initial)]);
+    try testing.expect(!server.close_pending[@backingInt(Level.initial)]);
     // One close per level, then silence.
     try testing.expect(!server.wantsSend());
     _ = try client.receive(datagram[0..octets], 1001);
@@ -8649,9 +8649,9 @@ test "section 10.2.3: after confirmation the close is 1-RTT only" {
     server.confirmHandshake();
 
     server.close(.protocol_violation);
-    try testing.expect(!server.close_pending[@intFromEnum(Level.initial)]);
-    try testing.expect(!server.close_pending[@intFromEnum(Level.handshake)]);
-    try testing.expect(server.close_pending[@intFromEnum(Level.one_rtt)]);
+    try testing.expect(!server.close_pending[@backingInt(Level.initial)]);
+    try testing.expect(!server.close_pending[@backingInt(Level.handshake)]);
+    try testing.expect(server.close_pending[@backingInt(Level.one_rtt)]);
 
     var datagram: [TestConnection.datagram_octets]u8 = @splat(0);
     const octets = try server.send(&datagram, 2000);
@@ -8863,7 +8863,7 @@ test "section 4.9.1: a client keeps Initial keys until it sends a Handshake pack
     _ = try deliver(&client, &server, 0);
     try server.cryptoIn(.initial, "ServerHello");
     _ = try deliver(&server, &client, 1000);
-    const initial_space = @intFromEnum(Space.initial);
+    const initial_space = @backingInt(Space.initial);
     try testing.expect(client.spaces[initial_space].received.ack_eliciting_pending);
 
     // Handshake keys arrive. This is where the Initial keys used to go, and
@@ -8875,7 +8875,7 @@ test "section 4.9.1: a client keeps Initial keys until it sends a Handshake pack
     // package ever completed with an implementation it did not write.
     try installBoth(&server, &client, .handshake, 0x11);
     try testing.expect(!client.spaces[initial_space].discarded);
-    try testing.expect(client.send_keys[@intFromEnum(Level.initial)] != null);
+    try testing.expect(client.send_keys[@backingInt(Level.initial)] != null);
 
     // Now there is something to send at Handshake, so the next datagram
     // carries both the Initial ACK and a Handshake packet — and only then are
@@ -8885,7 +8885,7 @@ test "section 4.9.1: a client keeps Initial keys until it sends a Handshake pack
     const octets = try deliver(&client, &server, 2000);
     try testing.expect(octets > 0);
     try testing.expect(client.spaces[initial_space].discarded);
-    try testing.expect(client.send_keys[@intFromEnum(Level.initial)] == null);
+    try testing.expect(client.send_keys[@backingInt(Level.initial)] == null);
 
     // And the acknowledgement arrived: the server's Initial packet 0 is
     // acknowledged, which is the whole point of keeping the keys.
@@ -8899,7 +8899,7 @@ test "section 4.9.1: a client keeps Initial keys until it sends a Handshake pack
 test "section 4.9.1: a server discards Initial keys on the first Handshake packet it opens" {
     var client = testClient();
     var server = testServer();
-    const initial_space = @intFromEnum(Space.initial);
+    const initial_space = @backingInt(Space.initial);
 
     try client.cryptoIn(.initial, "ClientHello");
     _ = try deliver(&client, &server, 0);
@@ -8992,7 +8992,7 @@ test "section 14.1: a datagram carrying no Initial packet is not padded" {
     try installBoth(&client, &server, .handshake, 0x22);
     try installBoth(&server, &client, .one_rtt, 0x33);
     try installBoth(&client, &server, .one_rtt, 0x44);
-    try testing.expect(client.send_keys[@intFromEnum(Level.initial)] != null);
+    try testing.expect(client.send_keys[@backingInt(Level.initial)] != null);
     // Section 5.7: a server discards a 1-RTT packet until its own handshake is
     // complete, and this test is about the padding rather than about that.
     server.confirmHandshake();
@@ -9062,8 +9062,8 @@ test "section 17.2.5: a Retry restarts the attempt under the server's identifier
     try client.cryptoIn(.initial, "ClientHello");
     const first = try client.send(&datagram, 0);
     try testing.expect(first > 0);
-    try testing.expectEqual(@as(u64, 1), client.spaces[@intFromEnum(Space.initial)].next);
-    const before = client.send_keys[@intFromEnum(Level.initial)].?;
+    try testing.expectEqual(@as(u64, 1), client.spaces[@backingInt(Space.initial)].next);
+    const before = client.send_keys[@backingInt(Level.initial)].?;
 
     var buffer: [256]u8 = @splat(0);
     const retry = try writeRetry(
@@ -9085,7 +9085,7 @@ test "section 17.2.5: a Retry restarts the attempt under the server's identifier
     try testing.expect(!std.mem.eql(
         u8,
         &before.key_storage,
-        &client.send_keys[@intFromEnum(Level.initial)].?.key_storage,
+        &client.send_keys[@backingInt(Level.initial)].?.key_storage,
     ));
 
     // The next Initial carries both, at the *next* packet number: section
@@ -9100,11 +9100,11 @@ test "section 17.2.5: a Retry restarts the attempt under the server's identifier
     // The Source Connection ID did not change, which section 17.2.5.2 requires
     // because a server may have built its token out of it.
     try testing.expectEqualSlices(u8, &client_source, initial.source.bytes());
-    try testing.expectEqual(@as(u64, 2), client.spaces[@intFromEnum(Space.initial)].next);
+    try testing.expectEqual(@as(u64, 2), client.spaces[@backingInt(Space.initial)].next);
 
     // And the same handshake message went out again: `framed` rewound, the
     // buffer did not.
-    try testing.expectEqualStrings("ClientHello", client.levels[@intFromEnum(Level.initial)].pending[0.."ClientHello".len]);
+    try testing.expectEqualStrings("ClientHello", client.levels[@backingInt(Level.initial)].pending[0.."ClientHello".len]);
 }
 
 test "a Retry that does not authenticate is discarded rather than fatal" {
@@ -9388,7 +9388,7 @@ test "every event the connection declares is one the connection produces" {
     _ = try server.receiveFrames(.one_rtt, payload[0..written], 2000);
     const reset = firstEvent(&server, .stream_reset) orelse return error.TestUnexpectedResult;
     try testing.expectEqual(@as(u64, 0), reset.stream);
-    try testing.expectEqual(@intFromEnum(error_code.Application.request_cancelled), reset.code);
+    try testing.expectEqual(@backingInt(error_code.Application.request_cancelled), reset.code);
 
     // And a peer's STOP_SENDING, which is the same question about the other
     // half of the stream.
@@ -9399,7 +9399,7 @@ test "every event the connection declares is one the connection produces" {
     _ = try client.receiveFrames(.one_rtt, payload[0..written], 3000);
     const stopped = firstEvent(&client, .stream_stopped) orelse return error.TestUnexpectedResult;
     try testing.expectEqual(@as(u64, 0), stopped.stream);
-    try testing.expectEqual(@intFromEnum(error_code.Application.request_rejected), stopped.code);
+    try testing.expectEqual(@backingInt(error_code.Application.request_rejected), stopped.code);
 
     // A key update this endpoint starts.
     try testing.expect(client.canUpdateKeys());
@@ -9408,7 +9408,7 @@ test "every event the connection declares is one the connection produces" {
 
     // And the close, from both directions: the peer's, and this endpoint's own.
     written = try frame.encode(&payload, .{ .connection_close = .{
-        .code = @intFromEnum(error_code.Transport.no_error),
+        .code = @backingInt(error_code.Transport.no_error),
         .application = false,
         .triggered_by = 0,
         .reason = "",
@@ -9420,7 +9420,7 @@ test "every event the connection declares is one the connection produces" {
 
     client.close(.internal_error);
     const ours = firstEvent(&client, .closed) orelse return error.TestUnexpectedResult;
-    try testing.expectEqual(@intFromEnum(error_code.Transport.internal_error), ours.code);
+    try testing.expectEqual(@backingInt(error_code.Transport.internal_error), ours.code);
 }
 
 //= https://www.rfc-editor.org/rfc/rfc9000#section-19.10
@@ -9452,20 +9452,20 @@ test "section 19.10: no MAX_STREAM_DATA for a stream this endpoint cannot receiv
 
 test "section 10.2.3: an application close becomes a transport close below 1-RTT" {
     var client = testClient();
-    client.closeApplication(@intFromEnum(error_code.Application.frame_unexpected));
+    client.closeApplication(@backingInt(error_code.Application.frame_unexpected));
 
     // Below 1-RTT the peer has no application to attribute a code to, and a
     // type 0x1d frame omits a field its parser requires.
     const initial = client.closeFrameFor(.initial).connection_close;
     try testing.expect(!initial.application);
-    try testing.expectEqual(@intFromEnum(error_code.Transport.application_error), initial.code);
+    try testing.expectEqual(@backingInt(error_code.Transport.application_error), initial.code);
     try testing.expectEqual(@as(?u64, 0), initial.triggered_by);
     try testing.expectEqual(@as(usize, 0), initial.reason.len);
 
     // At 1-RTT it goes out as itself.
     const one_rtt = client.closeFrameFor(.one_rtt).connection_close;
     try testing.expect(one_rtt.application);
-    try testing.expectEqual(@intFromEnum(error_code.Application.frame_unexpected), one_rtt.code);
+    try testing.expectEqual(@backingInt(error_code.Application.frame_unexpected), one_rtt.code);
     try testing.expectEqual(@as(?u64, null), one_rtt.triggered_by);
 
     // And a transport close is the same frame at every level.
@@ -9474,7 +9474,7 @@ test "section 10.2.3: an application close becomes a transport close below 1-RTT
     for ([_]Level{ .initial, .handshake, .one_rtt }) |level| {
         const converted = other.closeFrameFor(level).connection_close;
         try testing.expect(!converted.application);
-        try testing.expectEqual(@intFromEnum(error_code.Transport.protocol_violation), converted.code);
+        try testing.expectEqual(@backingInt(error_code.Transport.protocol_violation), converted.code);
     }
 }
 
@@ -9501,13 +9501,13 @@ test "section 10.2.3: a server that confirmed the handshake closes at 1-RTT only
     // `confirmHandshake` now does for a server too. The level choice below is
     // therefore belt and braces, and it is worth having: the two rules are
     // independent, and one holding is not a reason to leave the other implicit.
-    try testing.expect(server.send_keys[@intFromEnum(Level.handshake)] == null);
+    try testing.expect(server.send_keys[@backingInt(Level.handshake)] == null);
 
-    server.closeApplication(@intFromEnum(error_code.Application.frame_unexpected));
-    try testing.expect(!server.close_pending[@intFromEnum(Level.initial)]);
-    try testing.expect(server.close_pending[@intFromEnum(Level.one_rtt)]);
-    try testing.expect(!server.close_pending[@intFromEnum(Level.handshake)]);
-    try testing.expect(server.close_pending[@intFromEnum(Level.one_rtt)]);
+    server.closeApplication(@backingInt(error_code.Application.frame_unexpected));
+    try testing.expect(!server.close_pending[@backingInt(Level.initial)]);
+    try testing.expect(server.close_pending[@backingInt(Level.one_rtt)]);
+    try testing.expect(!server.close_pending[@backingInt(Level.handshake)]);
+    try testing.expect(server.close_pending[@backingInt(Level.one_rtt)]);
 
     // And the code survives, because a 1-RTT close is the only one that can
     // carry an application code at all.
@@ -9516,7 +9516,7 @@ test "section 10.2.3: a server that confirmed the handshake closes at 1-RTT only
     try testing.expect(octets > 0);
     _ = try client.receive(datagram[0..octets], 2001);
     try testing.expectEqual(State.draining, client.state);
-    try testing.expectEqual(@intFromEnum(error_code.Application.frame_unexpected), client.close_code);
+    try testing.expectEqual(@backingInt(error_code.Application.frame_unexpected), client.close_code);
     try testing.expect(client.close_is_application);
 }
 
@@ -9781,9 +9781,9 @@ test "a probe owed on a discarded space does not silence the connection" {
     var client = testClient();
     var server = testServer();
     try established(&client, &server);
-    const initial = @intFromEnum(Space.initial);
-    const handshake = @intFromEnum(Space.handshake);
-    const application = @intFromEnum(Space.application);
+    const initial = @backingInt(Space.initial);
+    const handshake = @backingInt(Space.handshake);
+    const application = @backingInt(Space.application);
     try testing.expect(client.spaces[initial].discarded);
     try testing.expect(client.spaces[handshake].discarded);
 

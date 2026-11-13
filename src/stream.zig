@@ -310,7 +310,7 @@ pub const Type = enum(u64) {
     //= type=exception
     //= reason=resetting a stream is a QUIC RESET_STREAM and the code on it is that frame's field, both the consumer's per docs/DESIGN.md section 3; isReserved is what tells it that the stream it is resetting is one of the reserved family this sentence is about
     pub fn isReserved(stream_type: Type) bool {
-        const value = @intFromEnum(stream_type);
+        const value = @backingInt(stream_type);
         if (value < 0x21) return false;
         return (value - 0x21) % 0x1f == 0;
     }
@@ -369,7 +369,7 @@ pub fn parse(source: []const u8) ParseError!Parsed {
     };
     assert(decoded.octets >= 1);
     assert(decoded.octets <= varint.octets_max);
-    return .{ .stream_type = @enumFromInt(decoded.value), .octets = decoded.octets };
+    return .{ .stream_type = @fromBackingInt(@intCast(decoded.value)), .octets = decoded.octets };
 }
 
 pub const WriteError = error{
@@ -384,7 +384,7 @@ pub const WriteError = error{
 //= type=exception
 //= reason=knowing whether a peer supports a stream type needs its SETTINGS, which `Http3.zig` holds; write() encodes a type and decides nothing about when to send it
 pub fn write(target: []u8, stream_type: Type) WriteError!u8 {
-    return varint.encode(target, @intFromEnum(stream_type)) catch |err| switch (err) {
+    return varint.encode(target, @backingInt(stream_type)) catch |err| switch (err) {
         error.OutputTooLong => error.OutputTooLong,
         // A `Type` is a `u64` and the enum's own values are all far below the
         // 62-bit ceiling, but a caller can build one from any integer. Mapping
@@ -435,7 +435,7 @@ test "a type split across packets is incomplete, not malformed" {
 test "the reserved family is unknown but not an error" {
     var n: u64 = 0;
     while (n < 8) : (n += 1) {
-        const stream_type: Type = @enumFromInt(0x1f * n + 0x21);
+        const stream_type: Type = @fromBackingInt(@intCast(0x1f * n + 0x21));
         try testing.expect(stream_type.isReserved());
         try testing.expect(!stream_type.known());
         try testing.expect(!stream_type.critical());

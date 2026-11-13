@@ -1223,11 +1223,11 @@ fn runSeed(seed: u64, census: *Census) ?Failure {
     // a variable that stayed zero, not only because the library could not
     // report it. Two reasons for one symptom, and the second outlived the first
     // fix.
-    inline for (@typeInfo(Census).@"struct".fields) |field| {
+    inline for (@typeInfo(Census).@"struct".field_names) |name| {
         // `runs` is counted per call rather than per world, and the link and
         // window rows below are drawn from somewhere other than `world.census`.
-        if (comptime std.mem.eql(u8, field.name, "runs")) continue;
-        @field(census, field.name) += @field(&world.census, field.name);
+        if (comptime std.mem.eql(u8, name, "runs")) continue;
+        @field(census, name) += @field(&world.census, name);
     }
     census.link_dropped += world.to_server.counters.dropped_loss + world.to_client.counters.dropped_loss;
     census.link_queue_dropped += world.to_server.counters.dropped_queue + world.to_client.counters.dropped_queue;

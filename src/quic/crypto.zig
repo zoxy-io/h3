@@ -232,7 +232,7 @@ pub const Level = enum(u2) {
 };
 
 comptime {
-    assert(Level.count == @typeInfo(Level).@"enum".fields.len);
+    assert(Level.count == @typeInfo(Level).@"enum".field_names.len);
     // The pairing that makes the comment above true rather than merely stated.
     assert(Level.zero_rtt.space() == Level.one_rtt.space());
     assert(Level.initial.space() != Level.handshake.space());
