@@ -926,7 +926,7 @@ fn fuzzStreams(_: void, smith: *std.testing.Smith) !void {
         // above it that exists is present — which is what makes `find`
         // returning null mean "retired" rather than "never seen".
         for (0..h3.quic.stream_id.kind_count) |raw| {
-            const kind: h3.quic.stream_id.Kind = @enumFromInt(raw);
+            const kind: h3.quic.stream_id.Kind = @fromBackingInt(@intCast(raw));
             const watermark = set.retired[raw];
             if (watermark == 0) continue;
             assert(set.find(h3.quic.stream_id.make(kind, watermark - 1)) == null);

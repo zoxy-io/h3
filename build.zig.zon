@@ -2,7 +2,7 @@
     .name = .h3,
     .version = "0.0.0",
     .fingerprint = 0x532d9246f2291944, // Changing this has security and trust implications.
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     // One dependency, and the policy it replaces is worth stating rather than
     // quietly dropping. This package used to say "zero dependencies beyond the
     // Zig toolchain"; it now says **no dependency outside the organisation, and
@@ -22,8 +22,8 @@
     // is deliberately not here; see README.md, "Where TLS attaches".
     .dependencies = .{
         .hpack = .{
-            .url = "git+https://github.com/zoxy-io/hpack#e627db06ae0c8e13269ff0b1408f5bb95edaca31",
-            .hash = "hpack-0.0.0-rFnmJ56YAwB60V75llyS-laQLcbknwnHJH2yHIVoHI3U",
+            .url = "git+https://github.com/zoxy-io/hpack#2fd3820c199de0399f3b829eecc933f8b818d2dd",
+            .hash = "hpack-0.0.0-rFnmJ4OjAwA-jppLCaKRg4DQCJooEkRQNjPQhOU3RG4R",
         },
     },
     // What ships to a consumer. `fuzz/`, `bench/`, `checks/`, `example/` and

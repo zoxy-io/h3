@@ -80,7 +80,7 @@ pub const Type = enum(u64) {
     /// The type with STREAM's flag bits cleared, so a `switch` has one arm for
     /// the eight spellings of one frame.
     pub fn canonical(frame_type: Type) Type {
-        const value = @intFromEnum(frame_type);
+        const value = @backingInt(frame_type);
         if (value >= stream_first and value <= stream_last) return .stream;
         return frame_type;
     }
@@ -543,7 +543,7 @@ pub fn parse(payload: []const u8) ParseError!Parsed {
         error.NotMinimal => error.UnknownType,
     };
     cursor.offset = decoded.octets;
-    const frame_type: Type = @enumFromInt(decoded.value);
+    const frame_type: Type = @fromBackingInt(@intCast(decoded.value));
 
     const frame = try parseBody(&cursor, frame_type, payload);
     assert(cursor.offset <= payload.len);
@@ -567,12 +567,12 @@ fn parseBody(cursor: *Cursor, frame_type: Type, payload: []const u8) ParseError!
         .ack, .ack_ecn => .{ .ack = try parseAck(cursor, frame_type == .ack_ecn) },
         .reset_stream => .{ .reset_stream = .{
             .stream = try cursor.varint(),
-            .code = @enumFromInt(try cursor.varint()),
+            .code = @fromBackingInt(@intCast(try cursor.varint())),
             .final_size = try cursor.varint(),
         } },
         .stop_sending => .{ .stop_sending = .{
             .stream = try cursor.varint(),
-            .code = @enumFromInt(try cursor.varint()),
+            .code = @fromBackingInt(@intCast(try cursor.varint())),
         } },
         .crypto => try parseCrypto(cursor),
         // A zero-length token parses here rather than being refused, which is
@@ -680,7 +680,7 @@ fn parseCrypto(cursor: *Cursor) ParseError!Frame {
 }
 
 fn parseStream(cursor: *Cursor, frame_type: Type) ParseError!Frame {
-    const bits = @intFromEnum(frame_type);
+    const bits = @backingInt(frame_type);
     assert(bits >= Type.stream_first);
     assert(bits <= Type.stream_last);
 
@@ -821,19 +821,19 @@ pub const EncodeError = error{
 /// find it does not fit, and move on to the next packet without unwinding.
 pub fn encode(target: []u8, frame: Frame) EncodeError!usize {
     var writer: Writer = .{ .target = target };
-    try writer.varint(@intFromEnum(frame.frameType()));
+    try writer.varint(@backingInt(frame.frameType()));
     switch (frame) {
         .padding => |value| try writer.zeroes(value.octets - 1),
         .ping, .handshake_done => {},
         .ack => |value| try encodeAck(&writer, value),
         .reset_stream => |value| {
             try writer.varint(value.stream);
-            try writer.varint(@intFromEnum(value.code));
+            try writer.varint(@backingInt(value.code));
             try writer.varint(value.final_size);
         },
         .stop_sending => |value| {
             try writer.varint(value.stream);
-            try writer.varint(@intFromEnum(value.code));
+            try writer.varint(@backingInt(value.code));
         },
         .crypto => |value| {
             try writer.varint(value.offset);
@@ -1038,10 +1038,10 @@ test "an ACK claiming more ranges than the payload holds is truncated" {
 //= type=test
 test "NEW_CONNECTION_ID refuses to retire more than it issued" {
     // Sequence 1, retire_prior_to 5.
-    const wire = [_]u8{ 0x18, 0x01, 0x05, 0x02, 0xaa, 0xbb } ++ [_]u8{0x11} ** 16;
+    const wire = [_]u8{ 0x18, 0x01, 0x05, 0x02, 0xaa, 0xbb } ++ @as([16]u8, @splat(0x11));
     try testing.expectError(error.Malformed, parse(&wire));
 
-    const ok = [_]u8{ 0x18, 0x05, 0x01, 0x02, 0xaa, 0xbb } ++ [_]u8{0x11} ** 16;
+    const ok = [_]u8{ 0x18, 0x05, 0x01, 0x02, 0xaa, 0xbb } ++ @as([16]u8, @splat(0x11));
     const parsed = try parse(&ok);
     const new_id = parsed.frame.new_connection_id;
     try testing.expectEqual(@as(u64, 5), new_id.sequence);
@@ -1050,7 +1050,7 @@ test "NEW_CONNECTION_ID refuses to retire more than it issued" {
 
     // A zero-length identifier is a NEW_CONNECTION_ID that says nothing, which
     // section 19.15 forbids outright.
-    const empty = [_]u8{ 0x18, 0x01, 0x00, 0x00 } ++ [_]u8{0x11} ** 16;
+    const empty = [_]u8{ 0x18, 0x01, 0x00, 0x00 } ++ @as([16]u8, @splat(0x11));
     try testing.expectError(error.Malformed, parse(&empty));
 }
 
@@ -1154,7 +1154,7 @@ test "ack-eliciting is everything but ACK, PADDING and CONNECTION_CLOSE" {
     // Every STREAM spelling, not just the canonical one.
     var bits: u64 = Type.stream_first;
     while (bits <= Type.stream_last) : (bits += 1) {
-        const frame_type: Type = @enumFromInt(bits);
+        const frame_type: Type = @fromBackingInt(@intCast(bits));
         try testing.expect(frame_type.ackEliciting());
         try testing.expectEqual(Type.stream, frame_type.canonical());
     }

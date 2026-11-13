@@ -265,7 +265,7 @@ pub const Type = enum(u64) {
     //# types MUST NOT be sent, and their receipt MUST be treated as a
     //# connection error of type H3_FRAME_UNEXPECTED.
     pub fn isHttp2Reserved(frame_type: Type) bool {
-        return switch (@intFromEnum(frame_type)) {
+        return switch (@backingInt(frame_type)) {
             0x02, 0x06, 0x08, 0x09 => true,
             else => false,
         };
@@ -293,7 +293,7 @@ pub const Type = enum(u64) {
     //= type=exception
     //= reason=the features section 10.5 names are server push, which is not implemented, unknown protocol elements, and field compression. Counting how many unknown frame types, settings or stream types a peer has sent is per-connection accounting `Http3.zig` would keep; isReserved and known are the classification it would count with. Field compression's limit is the one this package does enforce — qpack.field_line.iterate refuses a section past the advertised SETTINGS_MAX_FIELD_SECTION_SIZE
     pub fn isReserved(frame_type: Type) bool {
-        const value = @intFromEnum(frame_type);
+        const value = @backingInt(frame_type);
         if (value < 0x21) return false;
         return (value - 0x21) % 0x1f == 0;
     }
@@ -447,7 +447,7 @@ pub fn parseHeader(source: []const u8) ParseError!Header {
         error.Incomplete => error.Incomplete,
         error.NotMinimal => error.NotMinimal,
     };
-    const frame_type: Type = @enumFromInt(type_decoded.value);
+    const frame_type: Type = @fromBackingInt(@intCast(type_decoded.value));
     if (frame_type.isHttp2Reserved()) return error.Http2Reserved;
 
     const length_decoded = varint.decodeMinimal(source[type_decoded.octets..]) catch |err| return switch (err) {
@@ -472,7 +472,7 @@ pub const EncodeError = error{
 /// is what lets a DATA frame's body be streamed rather than buffered.
 pub fn writeHeader(target: []u8, frame_type: Type, length: u64) EncodeError!u8 {
     if (length > varint.max) return error.ValueTooLarge;
-    const type_value = @intFromEnum(frame_type);
+    const type_value = @backingInt(frame_type);
     if (type_value > varint.max) return error.ValueTooLarge;
 
     const octets = varint.encodedLength(type_value) + varint.encodedLength(length);
@@ -596,7 +596,7 @@ pub const Setting = enum(u64) {
     //# their receipt MUST be treated as a connection error of type
     //# H3_SETTINGS_ERROR.
     pub fn isHttp2Reserved(setting: Setting) bool {
-        return switch (@intFromEnum(setting)) {
+        return switch (@backingInt(setting)) {
             0x02, 0x03, 0x04, 0x05 => true,
             else => false,
         };
@@ -619,7 +619,7 @@ pub const Setting = enum(u64) {
     //= type=exception
     //= reason=greasing a SETTINGS frame means choosing a reserved identifier and putting it in a frame this package does not assemble: the SETTINGS exchange needs the control stream, which `Http3.zig` now does. isReserved is how a connection layer would pick one, and writeSetting is what would encode it
     pub fn isReserved(setting: Setting) bool {
-        const value = @intFromEnum(setting);
+        const value = @backingInt(setting);
         if (value < 0x21) return false;
         return (value - 0x21) % 0x1f == 0;
     }
@@ -669,7 +669,7 @@ pub const SettingsIterator = struct {
 
         const identifier = try self.varint();
         const value = try self.varint();
-        const setting: Setting = @enumFromInt(identifier);
+        const setting: Setting = @fromBackingInt(@intCast(identifier));
         if (setting.isHttp2Reserved()) return error.Invalid;
         return .{ .identifier = setting, .value = value };
     }
@@ -686,7 +686,7 @@ pub const SettingsIterator = struct {
 
 /// Write one setting into a SETTINGS payload, returning its length.
 pub fn writeSetting(target: []u8, setting: Setting, value: u64) EncodeError!u8 {
-    return writeHeader(target, @enumFromInt(@intFromEnum(setting)), value);
+    return writeHeader(target, @fromBackingInt(@intCast(@backingInt(setting))), value);
 }
 
 /// The payload of a frame whose whole body is one variable-length integer:
@@ -769,7 +769,7 @@ test "an unknown type is skippable because it carries its length" {
 test "the reserved family is what section 7.2.8 describes" {
     var n: u64 = 0;
     while (n < 8) : (n += 1) {
-        const frame_type: Type = @enumFromInt(0x1f * n + 0x21);
+        const frame_type: Type = @fromBackingInt(@intCast(0x1f * n + 0x21));
         try testing.expect(frame_type.isReserved());
         try testing.expect(!frame_type.known());
     }
@@ -804,7 +804,7 @@ test "where a frame is allowed depends on the stream it arrived on" {
     try testing.expect(Type.headers.allowedOnRequestStream());
     try testing.expect(!Type.goaway.allowedOnRequestStream());
     // An unknown type is ignored wherever it lands.
-    const unknown: Type = @enumFromInt(0x21);
+    const unknown: Type = @fromBackingInt(@intCast(0x21));
     try testing.expect(unknown.allowedOnControlStream());
     try testing.expect(unknown.allowedOnRequestStream());
 }

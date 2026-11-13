@@ -63,7 +63,7 @@ comptime {
 
 /// How many kinds there are, for a caller sizing a per-kind array. Named here
 /// so the array and the enum cannot drift.
-pub const kind_count: usize = @typeInfo(Kind).@"enum".fields.len;
+pub const kind_count: usize = @typeInfo(Kind).@"enum".field_names.len;
 
 comptime {
     assert(kind_count == 4);
@@ -71,7 +71,7 @@ comptime {
 
 pub fn kindOf(id: u64) Kind {
     assert(id <= varint.max);
-    return @enumFromInt(@as(u2, @truncate(id)));
+    return @fromBackingInt(@intCast(@as(u2, @truncate(id))));
 }
 
 /// The position of this stream among those of its kind, counting from zero.
@@ -92,7 +92,7 @@ pub fn index(id: u64) u64 {
 //# A QUIC endpoint MUST NOT reuse a stream ID within a connection.
 pub fn make(stream_kind: Kind, position: u64) u64 {
     assert(position < count_max);
-    const id = (position << 2) | @intFromEnum(stream_kind);
+    const id = (position << 2) | @backingInt(stream_kind);
     assert(id <= varint.max);
     assert(index(id) == position);
     assert(kindOf(id) == stream_kind);

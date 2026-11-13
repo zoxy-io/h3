@@ -897,7 +897,7 @@ const Session = struct {
                 try note(log, "http3 on stream {d}: {s} (0x{x})", .{
                     id,
                     @errorName(err),
-                    @intFromEnum(h3.http3.code(err)),
+                    @backingInt(h3.http3.code(err)),
                 });
                 return err;
             };
