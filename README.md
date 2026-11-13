@@ -2,7 +2,7 @@
 
 ![GitHub License](https://img.shields.io/github/license/zoxy-io/h3?color=orange)
 
-QUIC, QPACK and HTTP/3 for Zig 0.16.
+QUIC, QPACK and HTTP/3 for Zig 0.17.
 
 h3 is a sans-I/O protocol library. It parses and builds QUIC datagrams,
 runs the connection state machine, loss recovery and congestion control,

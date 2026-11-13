@@ -2,7 +2,7 @@
     .name = .h3,
     .version = "0.0.0",
     .fingerprint = 0x532d9246f2291944, // Changing this has security and trust implications.
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     // One dependency, and the policy it replaces is worth stating rather than
     // quietly dropping. This package used to say "zero dependencies beyond the
     // Zig toolchain"; it now says **no dependency outside the organisation, and

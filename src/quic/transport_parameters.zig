@@ -207,7 +207,7 @@ pub const ParseError = error{
 /// two implementations disagreeing about which copy counts.
 pub fn parse(source: []const u8) ParseError!Parameters {
     var parameters: Parameters = .{};
-    var seen: std.EnumSet(Known) = .initEmpty();
+    var seen: std.EnumSet(Known) = .empty;
     var offset: usize = 0;
 
     // Bounded: every parameter costs at least two octets — an identifier and a
@@ -258,12 +258,12 @@ const Known = enum {
 comptime {
     // The two enums have to stay in step, or an identifier would be understood
     // by one and ignored by the other.
-    assert(@typeInfo(Known).@"enum".fields.len == @typeInfo(Id).@"enum".fields.len);
+    assert(@typeInfo(Known).@"enum".field_names.len == @typeInfo(Id).@"enum".field_names.len);
 }
 
 fn toKnown(value: u64) ?Known {
     if (value > 0x10) return null;
-    return @enumFromInt(@as(u5, @intCast(value)));
+    return @fromBackingInt(@intCast(@as(u5, @intCast(value))));
 }
 
 fn apply(parameters: *Parameters, known: Known, value: []const u8) ParseError!void {
@@ -448,7 +448,7 @@ const Writer = struct {
     }
 
     fn octets(self: *Writer, id: Id, value: []const u8) EncodeError!void {
-        try self.varintValue(@intFromEnum(id));
+        try self.varintValue(@backingInt(id));
         try self.varintValue(value.len);
         const slice = try self.room(value.len);
         @memcpy(slice, value);
@@ -457,7 +457,7 @@ const Writer = struct {
     fn integerIfNot(self: *Writer, id: Id, value: u64, default: u64) EncodeError!void {
         if (value == default) return;
         if (value > varint.max) return error.ValueTooLarge;
-        try self.varintValue(@intFromEnum(id));
+        try self.varintValue(@backingInt(id));
         try self.varintValue(varint.encodedLength(value));
         try self.varintValue(value);
     }

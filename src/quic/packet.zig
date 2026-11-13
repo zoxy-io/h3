@@ -403,7 +403,7 @@ fn parseLong(datagram: []const u8) ParseError!Parsed {
         };
     }
 
-    const long_type: LongType = @enumFromInt((datagram[0] & long_type_mask) >> long_type_shift);
+    const long_type: LongType = @fromBackingInt(@intCast((datagram[0] & long_type_mask) >> long_type_shift));
     return switch (long_type) {
         .initial => parseInitial(datagram, cursor, destination, source),
         .zero_rtt, .handshake => parseLengthPrefixed(datagram, cursor, destination, source, long_type),
@@ -693,7 +693,7 @@ pub fn writeRetry(target: []u8, scratch: []u8, options: RetryOptions) RetryError
     // Section 17.2.5: the four Unused bits are the server's to choose, and a
     // client ignores them. Zero is a choice.
     target[0] = header_form_long | fixed_bit |
-        (@as(u8, @intFromEnum(LongType.retry)) << long_type_shift);
+        (@as(u8, @backingInt(LongType.retry)) << long_type_shift);
     try put(target, &cursor, 4);
     std.mem.writeInt(u32, target[1..5], options.version, .big);
 
@@ -761,7 +761,7 @@ pub fn writeLong(target: []u8, options: LongOptions) WriteError!Written {
     //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2
     //# The value included prior to protection MUST be set to 0.
     target[0] = header_form_long | fixed_bit |
-        (@as(u8, @intFromEnum(options.long_type)) << long_type_shift) |
+        (@as(u8, @backingInt(options.long_type)) << long_type_shift) |
         (options.number_octets - 1);
     try put(target, &cursor, 4);
     std.mem.writeInt(u32, target[1..5], options.version, .big);
@@ -898,7 +898,7 @@ test "an Initial header parses to the offset header protection samples from" {
         0xc3, 0x00, 0x00, 0x00, 0x01,
         0x04, 0xaa, 0xbb, 0xcc, 0xdd,
         0x00, 0x00, 0x14,
-    } ++ [_]u8{0} ** 20;
+    } ++ @as([20]u8, @splat(0));
 
     const parsed = try parse(&datagram, 0);
     try testing.expectEqual(Kind.initial, @as(Kind, parsed.header));
@@ -913,7 +913,7 @@ test "an Initial header parses to the offset header protection samples from" {
 }
 
 test "a short header needs the local identifier length to find its number" {
-    const datagram = [_]u8{ 0x40, 0x11, 0x22, 0x33, 0x44 } ++ [_]u8{0xee} ** 40;
+    const datagram = [_]u8{ 0x40, 0x11, 0x22, 0x33, 0x44 } ++ @as([40]u8, @splat(0xee));
     const parsed = try parse(&datagram, 4);
     const short = parsed.header.short;
     try testing.expectEqualSlices(u8, &.{ 0x11, 0x22, 0x33, 0x44 }, short.destination.bytes());
@@ -950,7 +950,7 @@ test "an unknown version keeps its identifiers so a server can answer" {
     const datagram = [_]u8{
         0xc0, 0xff, 0x00, 0x00, 0x21,
         0x02, 0x01, 0x02, 0x00,
-    } ++ [_]u8{0} ** 8;
+    } ++ @as([8]u8, @splat(0));
     const parsed = try parse(&datagram, 0);
     const unsupported = parsed.header.unsupported_version;
     try testing.expectEqual(@as(u32, 0xff00_0021), unsupported.version);
@@ -960,7 +960,7 @@ test "an unknown version keeps its identifiers so a server can answer" {
 
 test "a Retry ends in its integrity tag" {
     const datagram = [_]u8{ 0xf0, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00 } ++
-        [_]u8{ 0x74, 0x6f, 0x6b } ++ [_]u8{0x5a} ** crypto.tag_octets;
+        [_]u8{ 0x74, 0x6f, 0x6b } ++ @as([crypto.tag_octets]u8, @splat(0x5a));
     const parsed = try parse(&datagram, 0);
     const retry = parsed.header.retry;
     try testing.expectEqualStrings("tok", retry.token);
@@ -993,9 +993,9 @@ test "a short header with no room for a packet number is truncated" {
 //# version and MUST be discarded.
 //= type=test
 test "the fixed bit is what tells QUIC from anything else on the port" {
-    const long = [_]u8{ 0x80 | 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x04 } ++ [_]u8{0} ** 4;
+    const long = [_]u8{ 0x80 | 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x04 } ++ @as([4]u8, @splat(0));
     try testing.expectError(error.FixedBitUnset, parse(&long, 0));
-    const short = [_]u8{0x00} ++ [_]u8{0} ** 40;
+    const short = [_]u8{0x00} ++ @as([40]u8, @splat(0));
     try testing.expectError(error.FixedBitUnset, parse(&short, 0));
 }
 
@@ -1003,7 +1003,7 @@ test "a length past the end of the datagram is truncation, not a short read" {
     const datagram = [_]u8{
         0xc3, 0x00, 0x00, 0x00, 0x01,
         0x00, 0x00, 0x00, 0x44, 0x00,
-    } ++ [_]u8{0} ** 4;
+    } ++ @as([4]u8, @splat(0));
     try testing.expectError(error.Truncated, parse(&datagram, 0));
 }
 
@@ -1013,7 +1013,7 @@ test "a length past the end of the datagram is truncation, not a short read" {
 //# MUST drop the packet.
 //= type=test
 test "a connection identifier past twenty octets is a protocol violation" {
-    const datagram = [_]u8{ 0xc3, 0x00, 0x00, 0x00, 0x01, 21 } ++ [_]u8{0xaa} ** 32;
+    const datagram = [_]u8{ 0xc3, 0x00, 0x00, 0x00, 0x01, 21 } ++ @as([32]u8, @splat(0xaa));
     try testing.expectError(error.ConnectionIdTooLong, parse(&datagram, 0));
 }
 

@@ -119,11 +119,11 @@ comptime {
     // dispatch that classified it — so the two have to agree, which is what
     // makes this a proof rather than a restatement.
     @setEvalBranchQuota(20_000);
-    var counts = [_]u32{0} ** 5;
+    var counts: [5]u32 = @splat(0);
     for (0..256) |value| {
         const first: u8 = @intCast(value);
         const which = Representation.of(first);
-        counts[@intFromEnum(which)] += 1;
+        counts[@backingInt(which)] += 1;
 
         // The independent statement of each arm: exactly the octets with this
         // prefix of high bits and no higher one.
@@ -817,7 +817,7 @@ test "a reference to the dynamic table is refused" {
 //= type=test
 test "an index past the static table is a decompression failure" {
     var buffer: [64]u8 = undefined;
-    var wire: [16]u8 = .{ 0x00, 0x00 } ++ [_]u8{0} ** 14;
+    var wire: [16]u8 = .{ 0x00, 0x00 } ++ @as([14]u8, @splat(0));
     _ = try integer.encode(wire[2..], @intCast(static_table.count), indexed_prefix_bits, indexed_tag | indexed_static_bit);
     var iterator = try iterate(&wire, &buffer, 1 << 20);
     try testing.expectError(error.DecompressionFailed, iterator.next());

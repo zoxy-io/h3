@@ -237,7 +237,7 @@ test "the queue drops at its tail rather than growing without bound" {
         .rate_octets_per_second = 1000,
         .queue_octets_max = 200,
     });
-    for (0..40) |_| link.send(&[_]u8{0} ** 100, 0, prng.random());
+    for (0..40) |_| link.send(&@as([100]u8, @splat(0)), 0, prng.random());
     try testing.expect(link.counters.dropped_queue > 0);
     try testing.expect(link.count > 0);
     try testing.expectEqual(

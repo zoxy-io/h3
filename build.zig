@@ -121,7 +121,7 @@ pub fn build(b: *std.Build) void {
     const sim_tests = b.addRunArtifact(b.addTest(.{ .root_module = sim_exe.root_module }));
 
     const sim_run = b.addRunArtifact(sim_exe);
-    if (b.args) |args| sim_run.addArgs(args);
+    sim_run.addPassthruArgs();
     const sim_step = b.step("sim", "Seeded network simulation over two connections");
     sim_step.dependOn(&sim_run.step);
 
@@ -138,11 +138,6 @@ pub fn build(b: *std.Build) void {
     });
     const fuzz_tests = b.addTest(.{
         .root_module = fuzz_module,
-        // Patched copy of the default test runner; the stock one fails to
-        // compile in fuzz mode (`-ffuzz`) on Zig 0.16.0. Vendored from
-        // zoxy-io/h2, which vendored it from zoxy-io/hparse, and deletable
-        // together with this override once upstream ships the fix.
-        .test_runner = .{ .path = b.path("fuzz/test_runner.zig"), .mode = .server },
         // The self-hosted x86_64 backend emits no fuzz coverage
         // instrumentation: the build runner's coverage thread panics on an
         // empty PC table.
@@ -171,7 +166,7 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("bench/main.zig"),
             .target = target,
-            .optimize = .ReleaseFast,
+            .optimize = .fast,
             .imports = &.{
                 .{ .name = "h3", .module = h3_module },
                 .{ .name = "bench_options", .module = bench_options.createModule() },
@@ -179,7 +174,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const bench_run = b.addRunArtifact(bench_exe);
-    if (b.args) |args| bench_run.addArgs(args);
+    bench_run.addPassthruArgs();
     const bench_step = b.step("bench", "Run the packet-protection and codec microbenchmarks (ReleaseFast)");
     bench_step.dependOn(&bench_run.step);
 
@@ -314,7 +309,7 @@ pub fn build(b: *std.Build) void {
     // The format gate. A build step rather than a documented `zig fmt --check`
     // incantation, so that the list of formatted paths lives in exactly one
     // place and CI cannot check a different set than a developer does.
-    const fmt_paths = &.{ "src", "scripts", "bench", "fuzz", "example", "checks", "corpus/all.zig", "corpus/rfc9001.zig", "corpus/qifs.zig", "interop", "sim", "build.zig", "build.zig.zon" };
+    const fmt_paths = b.pathList(&.{ "src", "scripts", "bench", "fuzz", "example", "checks", "corpus/all.zig", "corpus/rfc9001.zig", "corpus/qifs.zig", "interop", "sim", "build.zig", "build.zig.zon" });
     const fmt_check = b.addFmt(.{ .paths = fmt_paths, .check = true });
     const fmt_step = b.step("fmt", "Check formatting (zig build fmt-fix rewrites)");
     fmt_step.dependOn(&fmt_check.step);

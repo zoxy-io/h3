@@ -745,9 +745,9 @@ fn drive(io: Io, log: *Io.Writer, peer: *Peer, now_ns: u64, shared: *const Share
             try note(log, "http3 on stream {d}: {s} (0x{x})", .{
                 id,
                 @errorName(err),
-                @intFromEnum(application),
+                @backingInt(application),
             });
-            peer.connection.closeApplication(@intFromEnum(application));
+            peer.connection.closeApplication(@backingInt(application));
             return;
         };
         for (events[0..result.events]) |event| {
@@ -756,9 +756,9 @@ fn drive(io: Io, log: *Io.Writer, peer: *Peer, now_ns: u64, shared: *const Share
                 try note(log, "response on stream {d}: {s} (0x{x})", .{
                     id,
                     @errorName(err),
-                    @intFromEnum(application),
+                    @backingInt(application),
                 });
-                peer.connection.closeApplication(@intFromEnum(application));
+                peer.connection.closeApplication(@backingInt(application));
                 return;
             };
         }

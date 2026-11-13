@@ -1029,7 +1029,7 @@ test "a stream type split across two reads is not consumed until it is whole" {
 test "a push stream is refused, by the code the receiver's role gives it" {
     var events: [4]Event = undefined;
     var buffer: [8]u8 = undefined;
-    const octets = try varint.encode(&buffer, @intFromEnum(h3stream.Type.push));
+    const octets = try varint.encode(&buffer, @backingInt(h3stream.Type.push));
 
     // A client has sent no MAX_PUSH_ID, so any push stream is H3_ID_ERROR.
     var client: TestHttp3 = .init(.client);
@@ -1198,7 +1198,7 @@ test "a setting sent twice, and one of HTTP/2's, are both settings errors" {
 
     // An identifier nobody has defined is ignored rather than refused, which is
     // what makes the registry extensible.
-    offset = try frame.writeSetting(&buffer, @enumFromInt(0x4242), 1);
+    offset = try frame.writeSetting(&buffer, @fromBackingInt(@intCast(0x4242)), 1);
     _ = try parseSettings(buffer[0..offset]);
 }
 
