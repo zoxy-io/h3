@@ -1121,6 +1121,18 @@ pub fn Recovery(comptime config: Config) type {
             return false;
         }
 
+        /// RFC 9002 section 6.2.1's probe timeout period, without the backoff:
+        /// the smoothed RTT, four deviations or the timer granularity, and the
+        /// peer's maximum ACK delay. What RFC 9000 measures its idle floor and
+        /// its closing period in — "three times the current PTO" — and so a
+        /// duration rather than a deadline.
+        pub fn ptoDuration(self: *const Self) u64 {
+            const pto = self.smoothed_rtt + @max(4 * self.rttvar, granularity_ns) + self.max_ack_delay_ns;
+            assert(pto >= granularity_ns);
+            assert(pto >= self.smoothed_rtt);
+            return pto;
+        }
+
         /// Section A.8: when the caller must wake this connection.
         ///
         /// The earliest loss time if one is pending, otherwise the PTO, or null

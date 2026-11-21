@@ -193,6 +193,12 @@ fn ackDelayNs(delay_units: u64, exponent: u6) u64 {
 /// is a reflector for anyone who can spoof a source address.
 pub const amplification_factor: u32 = 3;
 
+/// RFC 9000 section 10.1's floor on the idle timeout and section 10.2's
+/// length of the closing and draining period, each in PTOs. Both sections say
+/// three; named twice because they are two rules that happen to agree.
+const idle_pto_multiple: u64 = 3;
+const close_pto_multiple: u64 = 3;
+
 pub const Config = struct {
     //= https://www.rfc-editor.org/rfc/rfc9000#section-7.5
     //# Implementations MUST support buffering at least 4096 bytes of data
@@ -997,6 +1003,24 @@ pub fn Connection(comptime config: Config) type {
         events_count: u32 = 0,
         events_dropped: u32 = 0,
 
+        /// RFC 9000 section 10.1's idle timer. `peer_idle_timeout_ms` is what
+        /// the peer advertised; `idle_since_ns` is when the timer last
+        /// restarted, or null before anything has been sent or received; and
+        /// `idle_restarted_by_send` is section 10.1's "if no other ack-eliciting
+        /// packets have been sent since last receiving", so a sender that
+        /// keeps sending into silence does not keep itself alive.
+        peer_idle_timeout_ms: u64 = 0,
+        idle_since_ns: ?u64 = null,
+        idle_restarted_by_send: bool = false,
+        /// Section 10.2's closing or draining period: when it ends, measured
+        /// from the first call that saw the state with a clock in hand — the
+        /// state can be entered from `close`, which takes no clock.
+        close_deadline_ns: ?u64 = null,
+        /// Nothing is left to do and the connection's state may be discarded:
+        /// the idle timer expired, or the closing or draining period ended.
+        /// See `isClosed`.
+        closed: bool = false,
+
         /// Set by a CONNECTION_CLOSE in either direction.
         close_code: u64 = 0,
         close_is_application: bool = false,
@@ -1059,8 +1083,10 @@ pub fn Connection(comptime config: Config) type {
             /// rather than per packet because that is what a census wants and
             /// what `Recovery` can say without keeping a list.
             packets_lost: u32,
-            /// A CONNECTION_CLOSE arrived, or this endpoint sent one.
-            closed: struct { code: u64, application: bool },
+            /// A CONNECTION_CLOSE arrived, or this endpoint sent one — or, with
+            /// `idle` set, the idle timer expired and the connection closed
+            /// silently (RFC 9000 section 10.1), with no frame either way.
+            closed: struct { code: u64, application: bool, idle: bool = false },
             /// Events were produced faster than they were polled, and this many
             /// were dropped.
             ///
@@ -2118,6 +2144,7 @@ pub fn Connection(comptime config: Config) type {
             // the RTT sample allow for, not this endpoint's own.
             self.recovery.max_ack_delay_ns = parsed.max_ack_delay_ms * std.time.ns_per_ms;
             self.peer_max_udp_payload_size = parsed.max_udp_payload_size;
+            self.peer_idle_timeout_ms = parsed.max_idle_timeout_ms;
         }
 
         /// The largest datagram `send` builds: this endpoint's comptime bound,
@@ -2162,6 +2189,10 @@ pub fn Connection(comptime config: Config) type {
         //# confirmed (Section 4.1.2).
         //= type=test
         pub fn confirmHandshake(self: *Self) void {
+            // A handshake the consumer's engine finished after the connection
+            // closed is a handshake for nothing: moving back to `established`
+            // would undo the close and leave the closing period unending.
+            if (self.closed or self.state == .closing or self.state == .draining) return;
             if (self.state != .established) self.emit(.handshake_confirmed);
             self.state = .established;
             self.recovery.handshake_confirmed = true;
@@ -2443,6 +2474,8 @@ pub fn Connection(comptime config: Config) type {
             //= type=exception
             //= reason=not done, and recorded as a gap rather than hidden: a packet here is padded to section 5.4.2's sample floor and, when it carries an Initial, to section 14.1's datagram floor, and no further. A short 1-RTT packet can therefore be smaller than a peer's Stateless Reset, which lets an observer tell the two apart — it never makes a reset unprocessable. See docs/DESIGN.md section 6.
             //
+            if (self.closed) return;
+            defer self.armClosePeriod(now_ns);
             if (self.state == .draining) return;
 
             // Section 14.1: "A server MUST discard an Initial packet that is
@@ -2611,7 +2644,7 @@ pub fn Connection(comptime config: Config) type {
             // Which is why this is handled before the packet number space is
             // reached rather than inside it: a Retry has no number to record,
             // nothing to acknowledge it with, and no payload to open.
-            if (header == .retry) return self.receiveRetry(bytes, header.retry);
+            if (header == .retry) return self.receiveRetry(bytes, header.retry, now_ns);
             const level = header.level() orelse return; // Version Negotiation: not this slice.
             const offset = header.packetNumberOffset() orelse return;
             const index = @backingInt(level);
@@ -2780,6 +2813,7 @@ pub fn Connection(comptime config: Config) type {
             //# fully revert any changes made during that processing.
             const eliciting = try self.receiveFrames(level, opened.payload, now_ns);
             space.received.record(opened.number, now_ns, eliciting);
+            self.restartIdleOnReceive(now_ns);
 
             // Section 7.2: a client's Source Connection ID is chosen once and
             // fixed for the connection, so a server adopts it from the first
@@ -2944,7 +2978,7 @@ pub fn Connection(comptime config: Config) type {
         //# A client MUST use the same cryptographic handshake message it
         //# included in this packet.
         //= type=test
-        fn receiveRetry(self: *Self, bytes: []const u8, header: @FieldType(packet.Header, "retry")) void {
+        fn receiveRetry(self: *Self, bytes: []const u8, header: @FieldType(packet.Header, "retry"), now_ns: u64) void {
             // A server acts on no Retry: it is the endpoint that would send
             // one, and this package sends none.
             if (self.side != .client) return;
@@ -2976,6 +3010,9 @@ pub fn Connection(comptime config: Config) type {
 
             // Accepted. From here the connection attempt restarts under the
             // server's identifier and token, and nothing else about it moves.
+            // A Retry that authenticated is a packet from the peer processed
+            // successfully, which is section 10.1's restart.
+            self.restartIdleOnReceive(now_ns);
             self.retry_seen = true;
             self.retry_source = header.source;
             self.destination = header.source;
@@ -4395,50 +4432,161 @@ pub fn Connection(comptime config: Config) type {
         /// two consumers arm one very differently and neither wants this
         /// package's idea of a timer wheel.
         pub fn timeout(self: *const Self) ?u64 {
-            // Only `Recovery`'s timer is reported. There is no close timer, so
-            // nothing here tells the caller when the closing or draining state
-            // is over — the connection stops answering and the consumer decides
-            // when to let go of it.
-            //= https://www.rfc-editor.org/rfc/rfc9000#section-10.2
-            //# These states SHOULD persist for at least three
-            //# times the current PTO interval as defined in [QUIC-RECOVERY].
-            //= type=todo
-            //
-            // There is no idle timer at all, so section 10.1's floor on one has nothing
-            // to raise. `max_idle_timeout` is parsed out of the peer's transport
-            // parameters and read by nobody, and a connection that stops hearing from
-            // its peer stays in `handshaking` or `established` until the consumer
-            // decides otherwise.
-            //= https://www.rfc-editor.org/rfc/rfc9000#section-10.1
-            //# To avoid excessively small idle timeout periods, endpoints MUST
-            //# increase the idle timeout period to be at least three times the
-            //# current Probe Timeout (PTO).
-            //= type=todo
-            // The same missing timer, from the other two directions: with no close timer
-            // there is nothing that ends the closing or draining state at all, so nothing
-            // can end it early and nothing discards the state when it is over.
-            //= https://www.rfc-editor.org/rfc/rfc9000#section-10.2
-            //# Servers that retain an open socket for accepting new
-            //# connections SHOULD NOT end the closing or draining state
-            //# early.
-            //= type=todo
-            //
-            //= https://www.rfc-editor.org/rfc/rfc9000#section-10.2
-            //# Once its closing or draining state ends, an endpoint SHOULD
-            //# discard all connection state.
-            //= type=todo
-            //
+            // Three timers in one deadline: `Recovery`'s, section 10.1's idle
+            // timer, and section 10.2's closing or draining period — each cited
+            // where it is kept, below.
             //= https://www.rfc-editor.org/rfc/rfc9000#section-10.1.2
             //# Application protocols that use QUIC SHOULD provide guidance
             //# on when deferring an idle timeout is appropriate.
             //= type=exception
             //= reason=a requirement on the specification of an application protocol that uses QUIC rather than on an implementation of the transport. This package carries no application protocol: what a consumer does with a stream, and how long it is willing to hold an idle connection, are decided above the seam of docs/DESIGN.md section 3. See docs/DESIGN.md section 2.
-            if (self.state == .draining) return null;
-            return self.recovery.timeoutAt();
+            if (self.closed) return null;
+            // In the closing and draining states the only thing left to wake
+            // for is the end of the period; loss recovery has nothing more to
+            // send that the state permits. Null until a clock has seen the
+            // state, which is the next `send`, `receive` or `onTimeout`.
+            if (self.state == .closing or self.state == .draining) return self.close_deadline_ns;
+            const recovery_at = self.recovery.timeoutAt();
+            const idle_at = self.idleDeadline() orelse return recovery_at;
+            const at = recovery_at orelse return idle_at;
+            return @min(at, idle_at);
         }
 
-        /// Section A.9 of RFC 9002: the timer fired.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-10.1
+        //# Each endpoint advertises a max_idle_timeout, but the effective value
+        //# at an endpoint is computed as the minimum of the two advertised
+        //# values (or the sole advertised value, if only one endpoint advertises
+        //# a non-zero value).
+        //= type=test
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-10.1
+        //# To avoid excessively small idle timeout periods, endpoints MUST
+        //# increase the idle timeout period to be at least three times the
+        //# current Probe Timeout (PTO).
+        //= type=test
+        /// The effective idle timeout, in nanoseconds, or null when neither
+        /// endpoint advertised one.
+        fn idleTimeoutNs(self: *const Self) ?u64 {
+            const local = self.local.max_idle_timeout_ms;
+            const peer = self.peer_idle_timeout_ms;
+            const effective_ms = if (local == 0) peer else if (peer == 0) local else @min(local, peer);
+            if (effective_ms == 0) return null;
+            // Both are varints, at most 2^62 - 1 milliseconds; saturate rather
+            // than overflow on the way to nanoseconds.
+            const advertised_ns = std.math.mul(u64, effective_ms, std.time.ns_per_ms) catch std.math.maxInt(u64);
+            const floor_ns = std.math.mul(u64, idle_pto_multiple, self.recovery.ptoDuration()) catch std.math.maxInt(u64);
+            assert(floor_ns > 0);
+            return @max(advertised_ns, floor_ns);
+        }
+
+        /// When the idle timer expires, or null when there is none. Until the
+        /// peer's transport parameters arrive its timeout is unknown and the
+        /// local value stands alone, which section 10.1's "sole advertised
+        /// value" already covers.
+        fn idleDeadline(self: *const Self) ?u64 {
+            const since = self.idle_since_ns orelse return null;
+            const timeout_ns = self.idleTimeoutNs() orelse return null;
+            assert(timeout_ns > 0);
+            const deadline = std.math.add(u64, since, timeout_ns) catch std.math.maxInt(u64);
+            assert(deadline > since);
+            return deadline;
+        }
+
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-10.1
+        //# An endpoint restarts its idle timer when a packet from its peer is
+        //# received and processed successfully.
+        //= type=test
+        fn restartIdleOnReceive(self: *Self, now_ns: u64) void {
+            self.idle_since_ns = now_ns;
+            self.idle_restarted_by_send = false;
+            assert(self.idle_since_ns.? == now_ns);
+            assert(!self.idle_restarted_by_send);
+        }
+
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-10.1
+        //# An endpoint also restarts its
+        //# idle timer when sending an ack-eliciting packet if no other ack-
+        //# eliciting packets have been sent since last receiving and processing
+        //# a packet.
+        //= type=test
+        fn restartIdleOnSend(self: *Self, now_ns: u64) void {
+            if (self.idle_restarted_by_send) return;
+            self.idle_since_ns = now_ns;
+            self.idle_restarted_by_send = true;
+            assert(self.idle_since_ns.? == now_ns);
+        }
+
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-10.2
+        //# These states SHOULD persist for at least three
+        //# times the current PTO interval as defined in [QUIC-RECOVERY].
+        //= type=test
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-10.2
+        //# Servers that retain an open socket for accepting new
+        //# connections SHOULD NOT end the closing or draining state
+        //# early.
+        //= type=test
+        /// Start section 10.2's period, once, the first time a clock sees the
+        /// closing or draining state. `close` takes no clock, so for an
+        /// endpoint that closes the period runs from the `send` that frames
+        /// its CONNECTION_CLOSE — which a consumer makes anyway, since
+        /// `wantsSend` answers true until the close is out. A close an
+        /// unvalidated server cannot afford to send under section 8.1 is never
+        /// sent, and the period ends without it; the peer's idle timer is what
+        /// ends the connection there.
+        fn armClosePeriod(self: *Self, now_ns: u64) void {
+            if (self.state != .closing and self.state != .draining) return;
+            if (self.close_deadline_ns != null) return;
+            const period = std.math.mul(u64, close_pto_multiple, self.recovery.ptoDuration()) catch std.math.maxInt(u64);
+            self.close_deadline_ns = std.math.add(u64, now_ns, period) catch std.math.maxInt(u64);
+            assert(self.close_deadline_ns.? > now_ns);
+        }
+
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-10.2
+        //# Once its closing or draining state ends, an endpoint SHOULD
+        //# discard all connection state.
+        //= type=test
+        /// Whether this connection is over and its state may be discarded:
+        /// its idle timer expired (RFC 9000 section 10.1), or its closing or
+        /// draining period of three PTOs ended (section 10.2). Once true it
+        /// sends nothing, takes nothing, and `timeout` answers null, so a
+        /// consumer reuses the slot.
+        pub fn isClosed(self: *const Self) bool {
+            if (self.closed) assert(self.state == .closing or self.state == .draining);
+            return self.closed;
+        }
+
+        /// Section A.9 of RFC 9002: the timer fired. And RFC 9000's two
+        /// others, which `timeout` folds into the same deadline: the idle
+        /// timer and the end of the closing or draining period.
         pub fn onTimeout(self: *Self, now_ns: u64) void {
+            if (self.closed) return;
+            if (self.state == .closing or self.state == .draining) {
+                self.armClosePeriod(now_ns);
+                if (now_ns >= self.close_deadline_ns.?) self.closed = true;
+                return;
+            }
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-10.1
+            //# If a max_idle_timeout is specified by either endpoint in its
+            //# transport parameters (Section 18.2), the connection is silently
+            //# closed and its state is discarded when it remains idle for longer
+            //# than the minimum of the max_idle_timeout value advertised by both
+            //# endpoints.
+            //= type=test
+            if (self.idleDeadline()) |at| {
+                if (now_ns >= at) {
+                    // Silently: no CONNECTION_CLOSE, so straight to the state
+                    // that sends nothing, and over at once.
+                    self.state = .draining;
+                    self.closed = true;
+                    self.emit(.{ .closed = .{ .code = 0, .application = false, .idle = true } });
+                    return;
+                }
+            }
+            self.onRecoveryTimeout(now_ns);
+        }
+
+        fn onRecoveryTimeout(self: *Self, now_ns: u64) void {
             switch (self.recovery.onLossDetectionTimeout(now_ns, &self.report_lost)) {
                 // No clamp here either, and for the reason `receiveAck` gives:
                 // a timeout cannot declare more packets lost than are tracked.
@@ -4532,6 +4680,8 @@ pub fn Connection(comptime config: Config) type {
         /// package deciding how fast to send.
         pub fn send(self: *Self, buffer: []u8, now_ns: u64) SendError!usize {
             if (buffer.len < config.datagram_octets) return error.BufferTooSmall;
+            if (self.closed) return 0;
+            self.armClosePeriod(now_ns);
             //= https://www.rfc-editor.org/rfc/rfc9000#section-10.2.2
             //# While otherwise identical to the closing state, an
             //# endpoint in the draining state MUST NOT send any packets.
@@ -4635,6 +4785,7 @@ pub fn Connection(comptime config: Config) type {
                 offset += written;
                 if (level == .initial and written > 0) initial_written = true;
                 if (level == .initial and eliciting) initial_ack_eliciting = true;
+                if (eliciting) self.restartIdleOnSend(now_ns);
                 if (level == .handshake and written > 0) handshake_sent = true;
             }
             if (offset == 0) return 0;
@@ -5384,7 +5535,7 @@ pub fn Connection(comptime config: Config) type {
             //# containing a CONNECTION_CLOSE frame if it receives more
             //# packets on a terminated connection.
             //= type=exception
-            //= reason=one close and then silence is deliberate. `close_pending` is cleared when the CONNECTION_CLOSE is framed and is never set again, so a closing endpoint answers further packets with nothing rather than with a repeat — stricter than section 10.2.1's rate limit and needing no timer to be, which is what lets this package own no clock. A peer that loses the one close falls back to its own idle timeout.
+            //= reason=one close and then silence is deliberate. `close_pending` is cleared when the CONNECTION_CLOSE is framed and is never set again, so a closing endpoint answers further packets with nothing rather than with a repeat — stricter than section 10.2.1's rate limit and needing no timer to be: the one timer a closing endpoint keeps is section 10.2's period, which ends the state rather than paces repeats. A peer that loses the one close falls back to its own idle timeout.
             const written = frame.encode(payload, self.closeFrameFor(level)) catch return result.*;
             self.close_pending[@backingInt(level)] = false;
             result.octets = written;
@@ -5467,8 +5618,9 @@ pub fn Connection(comptime config: Config) type {
             // Acknowledged as soon as there is a datagram to carry it, at every level:
             // `wantsSend` answers true while this flag is set, so a consumer that polls
             // it sends the ACK on the next turn of its loop. That is stricter than
-            // `max_ack_delay` asks for and needs no timer to be, which is what lets
-            // this package own no clock.
+            // `max_ack_delay` asks for and needs no delayed-acknowledgement timer to
+            // be; the timers this package does keep are loss recovery's, the idle
+            // timer and the closing period.
             //= https://www.rfc-editor.org/rfc/rfc9000#section-13.2.1
             //# An endpoint MUST acknowledge all ack-eliciting Initial and
             //# Handshake packets immediately and all ack-eliciting 0-RTT and
@@ -6175,6 +6327,7 @@ pub fn Connection(comptime config: Config) type {
         }
 
         pub fn wantsSend(self: *const Self) bool {
+            if (self.closed) return false;
             if (self.state == .draining) return false;
             //= https://www.rfc-editor.org/rfc/rfc9000#section-10.2
             //# After sending a CONNECTION_CLOSE frame, an endpoint immediately
@@ -10878,4 +11031,143 @@ test "a peer's parameters govern this endpoint's datagrams and its acknowledgeme
         sent += 1;
     }
     try testing.expect(sent >= 5);
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9000#section-10.1
+//# If a max_idle_timeout is specified by either endpoint in its
+//# transport parameters (Section 18.2), the connection is silently
+//# closed and its state is discarded when it remains idle for longer
+//# than the minimum of the max_idle_timeout value advertised by both
+//# endpoints.
+//= type=test
+//
+//= https://www.rfc-editor.org/rfc/rfc9000#section-10.1
+//# Each endpoint advertises a max_idle_timeout, but the effective value
+//# at an endpoint is computed as the minimum of the two advertised
+//# values (or the sole advertised value, if only one endpoint advertises
+//# a non-zero value).
+//= type=test
+test "section 10.1: a quiet connection closes silently at the smaller of the two timeouts" {
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+    server.local.max_idle_timeout_ms = 30_000;
+    server.peer_idle_timeout_ms = 10_000;
+
+    _ = try client.write(0, "ping", false);
+    const start: u64 = std.time.ns_per_s;
+    _ = try deliver(&client, &server, start);
+    const deadline = server.idleDeadline().?;
+    try testing.expectEqual(start + 10 * std.time.ns_per_s, deadline);
+    // Answering the client's packet is ack-only, so it does not restart the
+    // timer; and the deadline is what `timeout` reports once recovery is idle.
+    _ = try deliver(&server, &client, start);
+    try testing.expect(server.timeout().? <= deadline);
+
+    server.onTimeout(deadline - 1);
+    try testing.expect(!server.isClosed());
+    server.onTimeout(deadline);
+    try testing.expect(server.isClosed());
+    try testing.expectEqual(State.draining, server.state);
+    // Silently: nothing on the wire, nothing wanted, nothing to wake for.
+    var datagram: [TestConnection.datagram_octets]u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), try server.send(&datagram, deadline));
+    try testing.expect(!server.wantsSend());
+    try testing.expectEqual(@as(?u64, null), server.timeout());
+    var saw_idle = false;
+    while (server.poll()) |event| switch (event) {
+        .closed => |value| saw_idle = value.idle,
+        else => {},
+    };
+    try testing.expect(saw_idle);
+    // And a packet that arrives afterwards is the peer's to retransmit.
+    _ = try client.write(0, "late", false);
+    _ = try deliver(&client, &server, deadline + 1);
+    try testing.expect(server.isClosed());
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9000#section-10.1
+//# An endpoint also restarts its
+//# idle timer when sending an ack-eliciting packet if no other ack-
+//# eliciting packets have been sent since last receiving and processing
+//# a packet.
+//= type=test
+//
+//= https://www.rfc-editor.org/rfc/rfc9000#section-10.1
+//# An endpoint restarts its idle timer when a packet from its peer is
+//# received and processed successfully.
+//= type=test
+test "section 10.1: sending into silence restarts the timer once, receiving every time" {
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+    client.local.max_idle_timeout_ms = 60_000;
+    var datagram: [TestConnection.datagram_octets]u8 = undefined;
+
+    // A delivery restarts the client's timer, and then its first ack-eliciting
+    // send does too — but its second does not: a sender talking into a
+    // silence it cannot hear back from must not keep itself alive.
+    _ = try client.write(0, "one", false);
+    _ = try deliver(&client, &server, 1000);
+    _ = try deliver(&server, &client, 2000);
+    try testing.expectEqual(@as(?u64, 2000), client.idle_since_ns);
+    _ = try client.write(0, "two", false);
+    _ = try client.send(&datagram, 3000);
+    try testing.expectEqual(@as(?u64, 3000), client.idle_since_ns);
+    _ = try client.write(0, "three", false);
+    _ = try client.send(&datagram, 4000);
+    try testing.expectEqual(@as(?u64, 3000), client.idle_since_ns);
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9000#section-10.1
+//# To avoid excessively small idle timeout periods, endpoints MUST
+//# increase the idle timeout period to be at least three times the
+//# current Probe Timeout (PTO).
+//= type=test
+test "section 10.1: an idle timeout shorter than three PTOs is raised to three" {
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+    server.local.max_idle_timeout_ms = 1;
+    try testing.expectEqual(3 * server.recovery.ptoDuration(), server.idleTimeoutNs().?);
+    try testing.expect(server.idleTimeoutNs().? > std.time.ns_per_ms);
+    // And neither endpoint advertising one is no timer at all.
+    server.local.max_idle_timeout_ms = 0;
+    try testing.expectEqual(@as(?u64, null), server.idleTimeoutNs());
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9000#section-10.2
+//# These states SHOULD persist for at least three
+//# times the current PTO interval as defined in [QUIC-RECOVERY].
+//= type=test
+//
+//= https://www.rfc-editor.org/rfc/rfc9000#section-10.2
+//# Once its closing or draining state ends, an endpoint SHOULD
+//# discard all connection state.
+//= type=test
+test "section 10.2: the closing and draining periods last three PTOs and then end" {
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+    const pto = server.recovery.ptoDuration();
+
+    // The closer: its period starts when the close goes out.
+    server.closeApplication(0x100);
+    try testing.expectEqual(@as(?u64, null), server.timeout());
+    const sent_at: u64 = 5 * std.time.ns_per_s;
+    _ = try deliver(&server, &client, sent_at);
+    try testing.expectEqual(@as(?u64, sent_at + 3 * pto), server.timeout());
+    server.onTimeout(sent_at + 3 * pto - 1);
+    try testing.expect(!server.isClosed());
+    server.onTimeout(sent_at + 3 * pto);
+    try testing.expect(server.isClosed());
+    try testing.expectEqual(@as(?u64, null), server.timeout());
+
+    // The peer: draining from the moment the close arrived.
+    try testing.expectEqual(State.draining, client.state);
+    const client_pto = client.recovery.ptoDuration();
+    try testing.expectEqual(@as(?u64, sent_at + 3 * client_pto), client.timeout());
+    try testing.expect(!client.isClosed());
+    client.onTimeout(sent_at + 3 * client_pto);
+    try testing.expect(client.isClosed());
 }
