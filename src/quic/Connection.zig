@@ -193,6 +193,10 @@ fn ackDelayNs(delay_units: u64, exponent: u6) u64 {
 /// is a reflector for anyone who can spoof a source address.
 pub const amplification_factor: u32 = 3;
 
+/// The one connection identifier this endpoint issues is the handshake's, at
+/// sequence 0 (RFC 9000 section 5.1.1); it sends no NEW_CONNECTION_ID.
+const issued_sequence_max: u64 = 0;
+
 /// RFC 9000 section 10.1's floor on the idle timeout and section 10.2's
 /// length of the closing and draining period, each in PTOs. Both sections say
 /// three; named twice because they are two rules that happen to agree.
@@ -2343,8 +2347,9 @@ pub fn Connection(comptime config: Config) type {
 
         pub const ReceiveError = error{
             /// A frame that section 12.4 does not permit at this encryption
-            /// level, a reserved bit set, or a malformed frame.
-            /// `PROTOCOL_VIOLATION` or `FRAME_ENCODING_ERROR`.
+            /// level, a reserved bit set, or a frame the peer may not send.
+            /// `PROTOCOL_VIOLATION`. A frame that does not parse is
+            /// `FrameEncoding`.
             Protocol,
             /// More handshake data than `crypto_octets`. RFC 9001 section 4.4's
             /// `CRYPTO_BUFFER_EXCEEDED`.
@@ -2370,6 +2375,9 @@ pub fn Connection(comptime config: Config) type {
             /// honest close is `INTERNAL_ERROR` rather than a code that accuses
             /// the peer of something.
             TooFragmented,
+            /// A frame that does not parse: cut short, of an unknown type, or
+            /// carrying a field its type does not allow. `FRAME_ENCODING_ERROR`.
+            FrameEncoding,
         };
 
         /// The code a peer is told, for every error `receive` can return.
@@ -2379,13 +2387,14 @@ pub fn Connection(comptime config: Config) type {
         /// read them and choose. A server needs it on every datagram, which is
         /// why it arrived with `interop/`'s server role and not before.
         ///
-        /// `Protocol` collapses `PROTOCOL_VIOLATION` and
-        /// `FRAME_ENCODING_ERROR` into one, and this returns the first: the two
-        /// are raised from the same places here, and telling them apart would
-        /// mean splitting the error rather than guessing at the call site.
+        /// `Protocol` and `FrameEncoding` are separate. They were one, on the
+        /// strength of RFC 9000 section 11's permission to use a generic code
+        /// — and section 12.4 names FRAME_ENCODING_ERROR for a badly formatted
+        /// frame specifically, and h3spec 0.1.15 asks for exactly it.
         pub fn errorCode(err: ReceiveError) error_code.Transport {
             return switch (err) {
                 error.Protocol => .protocol_violation,
+                error.FrameEncoding => .frame_encoding_error,
                 error.CryptoBufferExceeded => .crypto_buffer_exceeded,
                 error.FlowControl => .flow_control_error,
                 error.FinalSize => .final_size_error,
@@ -3271,7 +3280,17 @@ pub fn Connection(comptime config: Config) type {
                 //= https://www.rfc-editor.org/rfc/rfc9000#section-12.4
                 //# An endpoint MUST treat the receipt of a frame of unknown type as a
                 //# connection error of type FRAME_ENCODING_ERROR.
-                const one = iterator.next() catch return error.Protocol;
+                //= type=test
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-20.1
+                //# FRAME_ENCODING_ERROR (0x07):  An endpoint received a frame that was
+                //# badly formatted -- for instance, a frame of an unknown type or an
+                //# ACK frame that has more acknowledgment ranges than the remainder
+                //# of the packet could carry.
+                //= type=test
+                const one = iterator.next() catch |err| switch (err) {
+                    error.Truncated, error.UnknownType, error.Malformed => return error.FrameEncoding,
+                };
                 const value = one orelse break;
                 // Section 12.4, Table 3. A STREAM frame in an Initial packet is
                 // application data accepted before anyone is authenticated.
@@ -3464,7 +3483,8 @@ pub fn Connection(comptime config: Config) type {
                 //# client.
                 //= type=exception
                 //= reason=connection migration is out of scope: a connection here has exactly one path and never learns an address, because the seam of docs/DESIGN.md section 3 hands over a datagram rather than a peer. There is no second path to probe, revert to or reset a controller for. See docs/DESIGN.md section 2 and section 6.
-                .new_connection_id, .retire_connection_id, .path_challenge, .path_response => {
+                .retire_connection_id => |value| return receiveRetireConnectionId(value.sequence),
+                .new_connection_id, .path_challenge, .path_response => {
                     // Migration is not this slice; the frames parse and are
                     // ignored rather than refused, because they are legal and a
                     // conforming peer may send them.
@@ -3672,7 +3692,9 @@ pub fn Connection(comptime config: Config) type {
                 // malformed rather than merely useless.
                 .new_token => |value| {
                     if (self.side == .server) return error.Protocol;
-                    if (value.token.len == 0) return error.Protocol;
+                    // Section 19.7 names the code for this one, and it is not
+                    // the generic one it used to be.
+                    if (value.token.len == 0) return error.FrameEncoding;
                 },
                 // Both take `@max`, so a limit that moved backwards under loss
                 // or reordering leaves the send window where it was.
@@ -3984,6 +4006,30 @@ pub fn Connection(comptime config: Config) type {
         }
 
         /// Section 13.2 and RFC 9002 section 5: what an acknowledgement moves.
+        /// Section 19.16, for an endpoint that issues one identifier.
+        ///
+        /// This endpoint's only connection identifier is the handshake's, at
+        /// sequence 0, and every packet the peer sends it is addressed to that
+        /// one. So a RETIRE naming a larger number names one never sent, and
+        /// one naming 0 names the packet's own Destination Connection ID —
+        /// which leaves no RETIRE a conforming peer has a reason to send.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-19.16
+        //# Receipt of a RETIRE_CONNECTION_ID frame containing a sequence number
+        //# greater than any previously sent to the peer MUST be treated as a
+        //# connection error of type PROTOCOL_VIOLATION.
+        //= type=test
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-19.16
+        //# The peer MAY treat this as a
+        //# connection error of type PROTOCOL_VIOLATION.
+        //= type=test
+        fn receiveRetireConnectionId(sequence: u64) ReceiveError!void {
+            assert(sequence <= varint.max);
+            if (sequence > issued_sequence_max) return error.Protocol;
+            assert(sequence == issued_sequence_max);
+            return error.Protocol;
+        }
+
         fn receiveAck(self: *Self, level: Level, value: frame.Ack, now_ns: u64) ReceiveError!void {
             // Section 13.4's ECN, in full. `frame.Ack.ecn` holds the counts an ACK_ECN
             // frame carried and nothing below reads it.
@@ -9014,7 +9060,7 @@ test "section 19.7: a client refuses a NEW_TOKEN with an empty token" {
     var payload: [16]u8 = @splat(0);
     payload[0] = 0x07; // NEW_TOKEN
     payload[1] = 0x00; // token length zero
-    try testing.expectError(error.Protocol, client.receiveFrames(.one_rtt, payload[0..2], 1000));
+    try testing.expectError(error.FrameEncoding, client.receiveFrames(.one_rtt, payload[0..2], 1000));
 
     // A non-empty one is still merely ignored: this package requests no token
     // and stores none, but the frame is legal.
@@ -11293,4 +11339,45 @@ test "a connection initializes in place, on a stack smaller than it" {
     try testing.expectEqualStrings("ClientHello", oversize_server.cryptoOut(.initial));
     try testing.expectEqual(Side.server, oversize_server.side);
     try testing.expect(!oversize_server.addressValidated());
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9000#section-20.1
+//# FRAME_ENCODING_ERROR (0x07):  An endpoint received a frame that was
+//# badly formatted -- for instance, a frame of an unknown type or an
+//# ACK frame that has more acknowledgment ranges than the remainder
+//# of the packet could carry.
+//= type=test
+test "a frame cut short, or of no known type, is a FRAME_ENCODING_ERROR" {
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+    // h3spec 0.1.15's own: a CRYPTO frame whose length varint is cut off. And
+    // a type no version of QUIC defines. Both were PROTOCOL_VIOLATION, which
+    // section 11 allows and section 12.4 does not ask for.
+    try testing.expectError(error.FrameEncoding, server.receiveFrames(.one_rtt, &.{ 0x01, 0x06, 0x00, 0xff }, 0));
+    try testing.expectError(error.FrameEncoding, server.receiveFrames(.one_rtt, &.{ 0x01, 0x21 }, 0));
+    try testing.expectEqual(error_code.Transport.frame_encoding_error, TestConnection.errorCode(error.FrameEncoding));
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9000#section-19.16
+//# Receipt of a RETIRE_CONNECTION_ID frame containing a sequence number
+//# greater than any previously sent to the peer MUST be treated as a
+//# connection error of type PROTOCOL_VIOLATION.
+//= type=test
+//
+//= https://www.rfc-editor.org/rfc/rfc9000#section-19.16
+//# The peer MAY treat this as a
+//# connection error of type PROTOCOL_VIOLATION.
+//= type=test
+test "RETIRE_CONNECTION_ID for a number never issued, or for the one in use, is refused" {
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+    var payload: [16]u8 = undefined;
+    // h3spec's: no endpoint has given out a hundred thousand identifiers.
+    const unissued = try frame.encode(&payload, .{ .retire_connection_id = .{ .sequence = 100_000 } });
+    try testing.expectError(error.Protocol, server.receiveFrames(.one_rtt, payload[0..unissued], 0));
+    // And the only one issued, which every packet the peer sends names.
+    const current = try frame.encode(&payload, .{ .retire_connection_id = .{ .sequence = 0 } });
+    try testing.expectError(error.Protocol, server.receiveFrames(.one_rtt, payload[0..current], 0));
 }

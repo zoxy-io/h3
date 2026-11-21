@@ -206,21 +206,21 @@ pub const stateless_reset_token_octets: usize = 16;
 //# greater than any previously sent to the peer MUST be treated as a
 //# connection error of type PROTOCOL_VIOLATION.
 //= type=exception
-//= reason=this endpoint sends no NEW_CONNECTION_ID and so has issued no sequence numbers to compare against; the frame is parsed and ignored. Migration is out of scope per docs/DESIGN.md section 2 and section 6.
+//= reason=enforced where the frame is acted on rather than where it is parsed: `Connection.receiveFrame` refuses any sequence number above 0, the only one this endpoint issues, and the test is there.
 //
 //= https://www.rfc-editor.org/rfc/rfc9000#section-19.16
 //# The sequence number specified in a RETIRE_CONNECTION_ID frame MUST
 //# NOT refer to the Destination Connection ID field of the packet in
 //# which the frame is contained.
 //= type=exception
-//= reason=no RETIRE_CONNECTION_ID frame is ever sent, so there is no sequence number of ours that could name the packet's own destination identifier; migration is out of scope per docs/DESIGN.md section 2 and section 6.
+//= reason=a rule on the sender of RETIRE_CONNECTION_ID, and this endpoint sends none. Its receiving half — the MAY that follows it — is enforced in `Connection.receiveRetireConnectionId`, which refuses a RETIRE naming the one identifier in use.
 //
 //= https://www.rfc-editor.org/rfc/rfc9000#section-19.16
 //# An endpoint that provides a zero- length connection ID MUST treat
 //# receipt of a RETIRE_CONNECTION_ID frame as a connection error of
 //# type PROTOCOL_VIOLATION.
 //= type=exception
-//= reason=migration is out of scope, so a received RETIRE_CONNECTION_ID is parsed and ignored at every identifier length rather than refused at one; see docs/DESIGN.md section 2 and section 6.
+//= reason=enforced in `Connection.receiveFrame`, which refuses every RETIRE_CONNECTION_ID at any identifier length: the endpoint issues one identifier, so a RETIRE either names a number never sent or the packet's own destination.
 
 /// Section 19.17 and 19.18: PATH_CHALLENGE and PATH_RESPONSE carry exactly
 /// eight octets of unpredictable data.

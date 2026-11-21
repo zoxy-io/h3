@@ -696,6 +696,7 @@ fn fuzzConnection(_: void, smith: *std.testing.Smith) !void {
         // rather than a shrug.
         connection.receive(buffer[0..datagram_octets], @as(u64, datagrams) * 1000) catch |err| switch (err) {
             error.Protocol,
+            error.FrameEncoding,
             error.CryptoBufferExceeded,
             error.FlowControl,
             error.FinalSize,
