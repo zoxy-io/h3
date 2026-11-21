@@ -316,6 +316,11 @@ pub fn main(init: std.process.Init) !u8 {
     // arena.
     const session = try gpa.create(Session);
     defer gpa.destroy(session);
+    // `create` hands back undefined memory, and `run` resets every field but
+    // this one, because `Trace.start` closes whatever trace it replaces — so a
+    // trace never set reads as an open file. In a Debug build the octets are
+    // 0xaa and the first `start` asserted on them, in `finish`.
+    session.trace = .{};
 
     // Resolved once, not once per connection. `multiconnect` and
     // `handshakeloss` open fifty connections to the same authority, and a name
@@ -603,6 +608,9 @@ const Session = struct {
     ) !void {
         self.verbose = verbose;
         std.debug.assert(urls.len > 0);
+        // Closed by the `defer` of the run before, or never opened: `main`
+        // sets it before the first.
+        std.debug.assert(self.trace.file == null);
         self.pending = urls;
 
         const first = try Url.parse(urls[0]);
