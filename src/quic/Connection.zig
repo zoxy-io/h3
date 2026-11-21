@@ -162,6 +162,27 @@ comptime {
     assert(ack_delay_ns_max < std.math.maxInt(u64));
 }
 
+/// An ACK frame's Delay field in nanoseconds, under the exponent its sender
+/// advertised, saturated at or just below `ack_delay_ns_max`.
+///
+/// The clamp is in the wire's units, before the shift, for the reason
+/// `ack_delay_units_max` gives at the default exponent — and per exponent,
+/// because the ceiling in units is the ceiling in time divided by the
+/// exponent's multiplier, rounded down. At an exponent of 20 one unit is about
+/// a second and the clamp is fifteen of them; at 0 it is sixteen million.
+fn ackDelayNs(delay_units: u64, exponent: u6) u64 {
+    assert(exponent <= transport_parameters.ack_delay_exponent_max);
+    const units_max: u64 = (ack_delay_ns_max / std.time.ns_per_us) >> exponent;
+    // The `u64` annotation is load-bearing. `@min` narrows its result type to
+    // fit a comptime-known bound, so a clamp written without it is a narrow
+    // integer that the shift below overflows — the clamp creating the overflow
+    // it was added to prevent, which is what the first version of it did.
+    const units: u64 = @min(delay_units, units_max);
+    const delay_ns = (units << exponent) * std.time.ns_per_us;
+    assert(delay_ns <= ack_delay_ns_max);
+    return delay_ns;
+}
+
 //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1
 //# Prior to validating the client address, servers MUST NOT send more
 //# than three times as many bytes as the number of bytes they have
@@ -426,6 +447,11 @@ pub fn Connection(comptime config: Config) type {
 
     const Recovery = RecoveryOf(.{
         .sent_max = config.sent_max,
+        // The comptime bound, not the peer's `max_udp_payload_size`: RFC 9002
+        // appendix B.2 sizes the initial and minimum windows from the datagram
+        // size in use, and a peer that caps it at 1200 gets windows sized for
+        // `datagram_octets`. Generous by the ratio of the two, never more, and
+        // recorded rather than fixed because `Recovery`'s size is comptime.
         .max_datagram_size = config.datagram_octets,
         .Context = PacketContext,
     });
@@ -550,8 +576,9 @@ pub fn Connection(comptime config: Config) type {
         //= reason=path MTU discovery is the consumer's: it needs the socket, its options and the ICMP messages the kernel delivers beside it, and none of the three crosses the seam of docs/DESIGN.md section 3. This package takes `datagram_octets` as a comptime constant that a comptime assert holds at or above section 14's 1200-octet floor. See docs/DESIGN.md section 2 and section 6.
         //
         // This half is honoured rather than excused: `send` builds into
-        // `min(sendRoom(), datagram_octets)` and there is no PMTU probe path at all, so
-        // every packet this package emits is sized to fit the maximum datagram size.
+        // `min(sendRoom(), datagramLimit())` — `datagram_octets`, and the peer's
+        // `max_udp_payload_size` once known — and there is no PMTU probe path at all,
+        // so every packet this package emits is sized to fit the maximum datagram size.
         //= https://www.rfc-editor.org/rfc/rfc9000#section-14.2
         //# All QUIC packets that are not sent in a PMTU probe SHOULD be
         //# sized to fit within the maximum datagram size to avoid the
@@ -877,6 +904,17 @@ pub fn Connection(comptime config: Config) type {
         address_validated: bool,
         received_octets: u64 = 0,
         sent_octets: u64 = 0,
+
+        /// Section 18.2's `ack_delay_exponent` the peer sent, which is what
+        /// decodes the ACK Delay field of every ACK it sends. The default until
+        /// its transport parameters arrive, because absent means 3.
+        peer_ack_delay_exponent: u6 = ack_delay_exponent_default,
+        /// Section 18.2's `max_udp_payload_size` the peer sent: the largest
+        /// datagram it will process. The default, the largest UDP payload,
+        /// until its transport parameters arrive — so until then `send` is
+        /// bounded by `datagram_octets` alone, which section 14.1's 1200-octet
+        /// floor already keeps safe for an Initial.
+        peer_max_udp_payload_size: u64 = transport_parameters.max_udp_payload_size_default,
 
         /// The peer's transport parameters, as the extension's octets. Held
         /// rather than decoded so that a consumer's TLS engine can hand them
@@ -2016,6 +2054,7 @@ pub fn Connection(comptime config: Config) type {
             //= reason=connection migration and a server's preferred address are out of scope: a connection here has one path, never learns an address, and never sends preferred_address. See docs/DESIGN.md section 2 and section 6.
             self.streams.setPeerStreamLimit(true, parsed.initial_max_streams_bidi);
             self.streams.setPeerStreamLimit(false, parsed.initial_max_streams_uni);
+            self.applyPeerTiming(&parsed);
 
             // Section 4.1: the flow control limits a connection starts with are
             // these, and until `interop/` ran, this function parsed all four of
@@ -2040,6 +2079,56 @@ pub fn Connection(comptime config: Config) type {
             @memcpy(self.peer_parameters[0..octets.len], octets);
             self.peer_parameters_len = @intCast(octets.len);
             assert(self.peer_parameters_len == octets.len);
+        }
+
+        /// The three of the peer's parameters that govern this endpoint's
+        /// sending and timing rather than its streams: how to read the delay in
+        /// its ACKs, how long it may hold one back, and how large a datagram it
+        /// will take. All three were parsed and then read by nobody, so an ACK
+        /// from a peer with a non-default exponent was mis-scaled into the RTT
+        /// estimate, the PTO assumed 25 milliseconds whatever the peer said,
+        /// and a peer that dedicated 1200 octets to each incoming packet was
+        /// sent datagrams of `datagram_octets` it would not process.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-19.3
+        //# It is decoded by
+        //# multiplying the value in the field by 2 to the power of the
+        //# ack_delay_exponent transport parameter sent by the sender of the
+        //# ACK frame; see Section 18.2.
+        //= type=test
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-14
+        //# Enforcement of the max_udp_payload_size transport parameter
+        //# (Section 18.2) might act as an additional limit on the maximum
+        //# datagram size.
+        //= type=test
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-18.2
+        //# This limit does act as an additional constraint on datagram size
+        //# in the same way as the path MTU, but it is a property of the
+        //# endpoint and not the path; see Section 14.
+        //= type=test
+        fn applyPeerTiming(self: *Self, parsed: *const transport_parameters.Parameters) void {
+            // `parse` refused anything outside section 18.2's ranges, so these
+            // bounds are guaranteed rather than hoped for.
+            assert(parsed.ack_delay_exponent <= transport_parameters.ack_delay_exponent_max);
+            assert(parsed.max_ack_delay_ms <= transport_parameters.max_ack_delay_max);
+            assert(parsed.max_udp_payload_size >= transport_parameters.max_udp_payload_size_min);
+            self.peer_ack_delay_exponent = @intCast(parsed.ack_delay_exponent);
+            // RFC 9002 section 5.3: the peer's max_ack_delay is what the PTO and
+            // the RTT sample allow for, not this endpoint's own.
+            self.recovery.max_ack_delay_ns = parsed.max_ack_delay_ms * std.time.ns_per_ms;
+            self.peer_max_udp_payload_size = parsed.max_udp_payload_size;
+        }
+
+        /// The largest datagram `send` builds: this endpoint's comptime bound,
+        /// and the peer's `max_udp_payload_size` once it is known. Never below
+        /// section 14's 1200, because section 18.2 makes a smaller value
+        /// invalid and `parse` refuses it.
+        fn datagramLimit(self: *const Self) u64 {
+            const limit = @min(@as(u64, config.datagram_octets), self.peer_max_udp_payload_size);
+            assert(limit >= initial_datagram_min);
+            assert(limit <= config.datagram_octets);
+            return limit;
         }
 
         // ------------------------------------------------------------ receive
@@ -3893,17 +3982,9 @@ pub fn Connection(comptime config: Config) type {
             if (level == .one_rtt) self.one_rtt.phase_acknowledged = true;
 
             // Section 13.2.5: the delay is in microseconds, scaled by the
-            // exponent the peer advertised. Until the transport parameters are
-            // decoded this uses section 18.2's default, which is what an absent
-            // one means. Clamped before the shift — see `ack_delay_units_max`.
-            // The `u64` annotation is load-bearing. `@min` narrows its result
-            // type to fit the comptime-known bound, so `@min(x, 2_048_000)` is
-            // a `u21` — and `u21 << 3` needs twenty-four bits and overflows.
-            // The clamp written without it *created* the overflow it was added
-            // to prevent.
-            const delay_units: u64 = @min(value.delay, ack_delay_units_max);
-            assert(delay_units <= ack_delay_units_max);
-            const delay_ns: u64 = (delay_units << ack_delay_exponent_default) * std.time.ns_per_us;
+            // exponent the peer advertised — the default, 3, until its
+            // transport parameters arrive. Clamped; see `ackDelayNs`.
+            const delay_ns = ackDelayNs(value.delay, self.peer_ack_delay_exponent);
             assert(delay_ns <= ack_delay_ns_max);
 
             const result = self.recovery.onAckReceived(
@@ -4458,7 +4539,7 @@ pub fn Connection(comptime config: Config) type {
 
             const room = self.sendRoom();
             if (room < send_room_min) return 0;
-            const limit = @min(room, config.datagram_octets);
+            const limit = @min(room, self.datagramLimit());
 
             var offset: usize = 0;
             // Section 12.2: levels are coalesced oldest first, so a peer that
@@ -4846,7 +4927,7 @@ pub fn Connection(comptime config: Config) type {
 
             // The payload goes after the header, leaving room for the tag.
             // Checked, not assumed. `send` hands this a slice whose length is
-            // `min(sendRoom(), datagram_octets)`, and for an unvalidated server
+            // `min(sendRoom(), datagramLimit())`, and for an unvalidated server
             // `sendRoom()` is `3 * received - sent` — a number the peer tunes by
             // choosing how much it sends. Land it in the sixteen-octet window
             // where a header fits but the header plus the tag does not, and the
@@ -10739,4 +10820,62 @@ test "the transport parameters bound holds at every field's widest" {
     const octets = try server.localTransportParameters(&buffer);
     try testing.expect(octets.len <= TestConnection.local_transport_parameters_octets_max);
     _ = try transport_parameters.parse(octets);
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9000#section-19.3
+//# It is decoded by
+//# multiplying the value in the field by 2 to the power of the
+//# ack_delay_exponent transport parameter sent by the sender of the
+//# ACK frame; see Section 18.2.
+//= type=test
+test "an ACK's delay is read under the exponent its sender advertised, and saturates" {
+    try testing.expectEqual(@as(u64, 10 * 8 * std.time.ns_per_us), ackDelayNs(10, 3));
+    try testing.expectEqual(@as(u64, 10 * std.time.ns_per_us), ackDelayNs(10, 0));
+    try testing.expectEqual(@as(u64, 10 * (1 << 20) * std.time.ns_per_us), ackDelayNs(10, 20));
+    // A peer's 62-bit delay never overflows, under any exponent it may send.
+    for (0..transport_parameters.ack_delay_exponent_max + 1) |exponent| {
+        const shift: u6 = @intCast(exponent);
+        // Saturated exactly at the ceiling rounded down to the exponent's
+        // unit: lower would be a clamp that discards delay a peer may claim.
+        const ceiling_us: u64 = ((ack_delay_ns_max / std.time.ns_per_us) >> shift) << shift;
+        try testing.expectEqual(ceiling_us * std.time.ns_per_us, ackDelayNs(varint.max, shift));
+    }
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9000#section-14
+//# Enforcement of the max_udp_payload_size transport parameter
+//# (Section 18.2) might act as an additional limit on the maximum
+//# datagram size.
+//= type=test
+test "a peer's parameters govern this endpoint's datagrams and its acknowledgement delay" {
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+    var parameters: [512]u8 = undefined;
+    const written = try transport_parameters.encode(&parameters, &.{
+        .initial_source_connection_id = ConnectionId.init(&client_source) catch unreachable, // Four octets.
+        .max_udp_payload_size = 1200,
+        .ack_delay_exponent = 10,
+        .max_ack_delay_ms = 7,
+        .initial_max_data = 1 << 20,
+        .initial_max_stream_data_bidi_local = 1 << 16,
+        .initial_max_streams_bidi = 4,
+    });
+    try server.transportParametersIn(parameters[0..written]);
+    try testing.expectEqual(@as(u6, 10), server.peer_ack_delay_exponent);
+    try testing.expectEqual(@as(u64, 7 * std.time.ns_per_ms), server.recovery.max_ack_delay_ns);
+
+    // A response larger than one datagram goes out in datagrams the peer said
+    // it would process, not in the 1452 this endpoint could build.
+    const body: [6000]u8 = @splat('r');
+    _ = try server.write(0, &body, true);
+    var datagram: [TestConnection.datagram_octets]u8 = undefined;
+    var sent: u32 = 0;
+    for (0..32) |_| {
+        const octets = try server.send(&datagram, 1000);
+        if (octets == 0) break;
+        try testing.expect(octets <= 1200);
+        sent += 1;
+    }
+    try testing.expect(sent >= 5);
 }
