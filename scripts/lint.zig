@@ -16,10 +16,12 @@
 //!
 //! `@cImport` is forbidden for the same reason h2, ztls and hparse forbid it:
 //! zero dependencies beyond the Zig toolchain. Packet protection is the one
-//! place that would otherwise reach for libcrypto, and `std.crypto` covers it —
-//! AES-GCM, ChaCha20-Poly1305, a raw AES block for header protection, and
-//! HKDF-SHA256. `std.crypto` is deliberately *not* a boundary: it is
-//! computation, not I/O, and it is what keeps the dependency table empty.
+//! place that would otherwise reach for libcrypto, and it reaches a comptime
+//! backend instead (`src/quic/crypto/backend.zig`): `std.crypto` by default,
+//! and a consumer's own — zoxy's is libcrypto through zssl — when it supplies
+//! one. So `std.crypto` *is* a boundary now, and the narrowest one here: it may
+//! be named in the default backend's file and nowhere else, which is what makes
+//! "every primitive goes through `Config.crypto`" a fact rather than a hope.
 //!
 //! The unbounded-loop rule is carried over from zoxy verbatim. It matters here
 //! for a reason h2 did not have: a QUIC packet payload is a run of frames with
@@ -84,6 +86,19 @@ const boundaries = [_]Boundary{
             "`if (!ok) unreachable`, which ReleaseFast and ReleaseSmall are " ++
             "entitled to delete, so a consumer building for speed would ship a " ++
             "transport with its invariant checks removed (see src/assert.zig)",
+    },
+    // The packet-protection seam of `src/quic/crypto/backend.zig`, made
+    // mechanical. A consumer that supplies its own backend is told that every
+    // primitive this package computes with goes through it, and that claim is
+    // only as good as the absence of a direct call somewhere else — which is
+    // exactly the kind of claim that drifts the first time someone needs one
+    // more hash. So the default backend is the one file that may name it.
+    .{
+        .needle = "std.crypto",
+        .confined_to = "quic/crypto/backend.zig",
+        .message = "std.crypto is the default crypto backend's, and only its: every primitive " ++
+            "goes through `Config.crypto` so a consumer's backend sees every call " ++
+            "(src/quic/crypto/backend.zig)",
     },
     .{ .needle = "std.Io", .confined_to = "", .message = no_io_message },
     .{ .needle = "std.posix", .confined_to = "", .message = no_io_message },
@@ -400,6 +415,15 @@ test "lintLine: std.debug.assert is forbidden, the package's own assert is not" 
     try std.testing.expect(lintLine("    assert(index < len);", "quic/frame.zig") == null);
     // `std.debug.print` and the rest of `std.debug` are not the target.
     try std.testing.expect(lintLine("std.debug.print(\"x\", .{});", "root.zig") == null);
+}
+
+test "lintLine: std.crypto belongs to the default backend and to nothing else" {
+    try std.testing.expect(lintLine("const Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;", "quic/crypto/backend.zig") == null);
+    try std.testing.expect(lintLine("const Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;", "quic/crypto/protect.zig") != null);
+    try std.testing.expect(lintLine("_ = std.crypto.timing_safe.eql([16]u8, a, b);", "quic/crypto/retry.zig") != null);
+    try std.testing.expect(lintLine("const h = std.crypto.hash.sha2.Sha256;", "Http3.zig") != null);
+    // Prose about it is how the boundary explains itself.
+    try std.testing.expect(lintLine("// std.crypto's AEADs scrub on failure.", "quic/crypto/protect.zig") == null);
 }
 
 test "lintLine: @cImport is forbidden" {

@@ -17,6 +17,7 @@
 const std = @import("std");
 
 const assert = @import("../../assert.zig").assert;
+const backend = @import("backend.zig");
 const crypto = @import("../crypto.zig");
 
 //= https://www.rfc-editor.org/rfc/rfc9001#section-4.7
@@ -80,67 +81,86 @@ pub fn pseudoPacketOctets(original_destination_connection_id_octets: usize, retr
     return 1 + original_destination_connection_id_octets + (retry_octets - tag_octets);
 }
 
-/// Compute the tag for a Retry packet.
-///
-/// `retry` is the Retry packet with its tag field either absent or ignored —
-/// only `retry[0 .. retry.len - tag_octets]` is read. `scratch` is caller-owned
-/// working space of at least `pseudoPacketOctets` octets; it holds the
-/// pseudo-packet, which is the AEAD's associated data.
-pub fn tag(
-    scratch: []u8,
-    original_destination_connection_id: []const u8,
-    retry: []const u8,
-) Error![tag_octets]u8 {
-    if (original_destination_connection_id.len > 20) return error.ConnectionIdTooLong;
-    if (retry.len < tag_octets) return error.Truncated;
+/// Section 5.8 over a chosen backend. The key, the nonce and the pseudo-packet
+/// are this file's; the AEAD that turns them into a tag is the backend's.
+pub fn Integrity(comptime Backend: type) type {
+    comptime backend.check(Backend);
+    return struct {
+        const Self = @This();
 
-    const needed = pseudoPacketOctets(original_destination_connection_id.len, retry.len);
-    if (scratch.len < needed) return error.ScratchTooSmall;
+        /// Compute the tag for a Retry packet.
+        ///
+        /// `retry` is the Retry packet with its tag field either absent or ignored —
+        /// only `retry[0 .. retry.len - tag_octets]` is read. `scratch` is caller-owned
+        /// working space of at least `pseudoPacketOctets` octets; it holds the
+        /// pseudo-packet, which is the AEAD's associated data.
+        pub fn tag(
+            scratch: []u8,
+            original_destination_connection_id: []const u8,
+            retry: []const u8,
+        ) Error![tag_octets]u8 {
+            if (original_destination_connection_id.len > 20) return error.ConnectionIdTooLong;
+            if (retry.len < tag_octets) return error.Truncated;
 
-    //= https://www.rfc-editor.org/rfc/rfc9001#section-5.8
-    //# ODCID Length: The ODCID Length field contains the length in bytes of
-    //# the Original Destination Connection ID field that follows it,
-    //# encoded as an 8-bit unsigned integer.
-    scratch[0] = @intCast(original_destination_connection_id.len);
-    @memcpy(scratch[1..][0..original_destination_connection_id.len], original_destination_connection_id);
-    const body = retry[0 .. retry.len - tag_octets];
-    @memcpy(scratch[1 + original_destination_connection_id.len ..][0..body.len], body);
-    assert(1 + original_destination_connection_id.len + body.len == needed);
+            const needed = pseudoPacketOctets(original_destination_connection_id.len, retry.len);
+            if (scratch.len < needed) return error.ScratchTooSmall;
+            // The length octet and the identifier come first, and a Retry of
+            // exactly a tag adds nothing after them: the prefix is the floor.
+            assert(needed >= 1 + original_destination_connection_id.len);
 
-    // The plaintext is empty: the tag authenticates the pseudo-packet and
-    // encrypts nothing, which is why the key can be published.
-    //= https://www.rfc-editor.org/rfc/rfc9001#section-5.8
-    //# The plaintext, P, is empty.
-    //
-    //= https://www.rfc-editor.org/rfc/rfc9001#section-5.8
-    //# The associated data, A, is the contents of the Retry Pseudo- Packet,
-    //# as illustrated in Figure 8:
-    var computed: [tag_octets]u8 = undefined;
-    std.crypto.aead.aes_gcm.Aes128Gcm.encrypt(&.{}, &computed, &.{}, scratch[0..needed], nonce_v1, key_v1);
-    return computed;
+            //= https://www.rfc-editor.org/rfc/rfc9001#section-5.8
+            //# ODCID Length: The ODCID Length field contains the length in bytes of
+            //# the Original Destination Connection ID field that follows it,
+            //# encoded as an 8-bit unsigned integer.
+            scratch[0] = @intCast(original_destination_connection_id.len);
+            @memcpy(scratch[1..][0..original_destination_connection_id.len], original_destination_connection_id);
+            const body = retry[0 .. retry.len - tag_octets];
+            @memcpy(scratch[1 + original_destination_connection_id.len ..][0..body.len], body);
+            assert(1 + original_destination_connection_id.len + body.len == needed);
+
+            // The plaintext is empty: the tag authenticates the pseudo-packet and
+            // encrypts nothing, which is why the key can be published.
+            //= https://www.rfc-editor.org/rfc/rfc9001#section-5.8
+            //# The plaintext, P, is empty.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9001#section-5.8
+            //# The associated data, A, is the contents of the Retry Pseudo- Packet,
+            //# as illustrated in Figure 8:
+            var computed: [tag_octets]u8 = undefined;
+            var empty: [0]u8 = .{};
+            Backend.aes128GcmSeal(&empty, &computed, scratch[0..needed], &nonce_v1, &key_v1);
+            return computed;
+        }
+
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-5.8
+        //# Retry packets (see Section 17.2.5 of [QUIC-TRANSPORT]) carry a Retry
+        //# Integrity Tag that provides two properties: it allows the discarding of
+        //# packets that have accidentally been corrupted by the network, and only
+        //# an entity that observes an Initial packet can send a valid Retry packet.
+        /// Verify the tag a Retry packet arrived with.
+        ///
+        /// The comparison is constant-time. Not because the tag is a secret — it
+        /// travels in the clear — but because a timing oracle on a 16-octet check is a
+        /// forgery oracle, and there is no reason to leave one lying around.
+        pub fn verify(
+            scratch: []u8,
+            original_destination_connection_id: []const u8,
+            retry: []const u8,
+        ) Error!void {
+            const computed = try Self.tag(scratch, original_destination_connection_id, retry);
+            const received = retry[retry.len - tag_octets ..][0..tag_octets];
+            if (!backend.tagsEqual(&computed, received)) {
+                return error.IntegrityFailed;
+            }
+        }
+    };
 }
 
-//= https://www.rfc-editor.org/rfc/rfc9001#section-5.8
-//# Retry packets (see Section 17.2.5 of [QUIC-TRANSPORT]) carry a Retry
-//# Integrity Tag that provides two properties: it allows the discarding of
-//# packets that have accidentally been corrupted by the network, and only
-//# an entity that observes an Initial packet can send a valid Retry packet.
-/// Verify the tag a Retry packet arrived with.
-///
-/// The comparison is constant-time. Not because the tag is a secret — it
-/// travels in the clear — but because a timing oracle on a 16-octet check is a
-/// forgery oracle, and there is no reason to leave one lying around.
-pub fn verify(
-    scratch: []u8,
-    original_destination_connection_id: []const u8,
-    retry: []const u8,
-) Error!void {
-    const computed = try tag(scratch, original_destination_connection_id, retry);
-    const received = retry[retry.len - tag_octets ..][0..tag_octets];
-    if (!std.crypto.timing_safe.eql([tag_octets]u8, computed, received.*)) {
-        return error.IntegrityFailed;
-    }
-}
+/// Section 5.8 over `backend.Std`, under the names this file exported before
+/// the backend became a parameter.
+const std_integrity = Integrity(backend.Std);
+pub const tag = std_integrity.tag;
+pub const verify = std_integrity.verify;
 
 test "a tag this module computes is a tag this module accepts" {
     // A structural round-trip. The known-answer test against RFC 9001 appendix

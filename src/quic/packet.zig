@@ -688,6 +688,13 @@ pub const RetryError = WriteError || error{
 //# A Retry packet does not contain any protected fields.
 //= type=test
 pub fn writeRetry(target: []u8, scratch: []u8, options: RetryOptions) RetryError!usize {
+    return writeRetryWith(crypto.backend.Std, target, scratch, options);
+}
+
+/// `writeRetry`, with the integrity tag computed by a chosen crypto backend —
+/// the one a consumer's `Connection` is configured with, so that a server that
+/// takes every primitive from one library takes this one from it too.
+pub fn writeRetryWith(comptime Backend: type, target: []u8, scratch: []u8, options: RetryOptions) RetryError!usize {
     var cursor: usize = 0;
     try put(target, &cursor, 1);
     // Section 17.2.5: the four Unused bits are the server's to choose, and a
@@ -710,7 +717,7 @@ pub fn writeRetry(target: []u8, scratch: []u8, options: RetryOptions) RetryError
         total,
     );
     if (scratch.len < needed) return error.ScratchTooSmall;
-    const tag = crypto.retry.tag(
+    const tag = crypto.retry.Integrity(Backend).tag(
         scratch[0..needed],
         options.original_destination.bytes(),
         target[0..total],

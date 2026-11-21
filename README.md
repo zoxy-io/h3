@@ -33,7 +33,7 @@ The full ledger is in [docs/DESIGN.md §6](docs/DESIGN.md#6-what-is-built-and-wh
 | RFC | Coverage |
 |---|---|
 | [9000](https://www.rfc-editor.org/rfc/rfc9000) QUIC transport | Variable-length integers, long and short headers, version negotiation, packet numbers, all twenty frame types, transport parameters, stream identifiers, error codes, the connection state machine, streams, stream- and connection-level flow control, address validation and the amplification limit |
-| [9001](https://www.rfc-editor.org/rfc/rfc9001) QUIC TLS | Initial secrets, AEAD packet protection, header protection, Retry integrity tag, key update, AEAD confidentiality and integrity limits. AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305 via `std.crypto` |
+| [9001](https://www.rfc-editor.org/rfc/rfc9001) QUIC TLS | Initial secrets, AEAD packet protection, header protection, Retry integrity tag, key update, AEAD confidentiality and integrity limits. AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305 through a comptime crypto backend: `std.crypto` by default, or the consumer's own |
 | [9002](https://www.rfc-editor.org/rfc/rfc9002) Loss detection | RTT estimation, packet- and time-threshold loss detection, probe timeout with backoff, NewReno with persistent congestion |
 | [9204](https://www.rfc-editor.org/rfc/rfc9204) QPACK | Static table, field line representations in both directions. Prefixed integers and Huffman coding come from [hpack](https://github.com/zoxy-io/hpack) |
 | [9114](https://www.rfc-editor.org/rfc/rfc9114) HTTP/3 | Frame layer, unidirectional stream types, the connection layer — control stream, SETTINGS exchange, GOAWAY and §4.1's frame sequence — and request and response validation per §4.2 and §4.3, including RFC 9220 extended CONNECT and RFC 9110 `content-length` syntax. No server push and no QPACK dynamic table |
@@ -158,7 +158,10 @@ then parses and opens it again. It is compiled and run as part of
   connection identifiers and other random values are arguments. A connection
   can be replayed deterministically.
 - **No TLS engine.** Handshake messages and secrets cross the API as data.
-  Packet protection is inside the library, using `std.crypto` only.
+  Packet protection is inside the library. Its primitives come from a
+  comptime backend (`Config.crypto`): `std.crypto` by default, or one the
+  consumer supplies, checked against the contract in
+  [`src/quic/crypto/backend.zig`](src/quic/crypto/backend.zig).
 - **Assertions are a build option.** They are on by default in every
   optimize mode and removed with `-Dassertions=false`. See
   [`src/assert.zig`](src/assert.zig).

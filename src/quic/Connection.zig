@@ -219,6 +219,14 @@ pub const Config = struct {
     stream_receive_octets: u32 = 64 * 1024,
     stream_send_octets: u32 = 16 * 1024,
     connection_receive_octets: u64 = 1 << 20,
+    /// The packet-protection backend: every AEAD, header protection cipher
+    /// and HKDF this connection computes with. `std.crypto` unless a consumer
+    /// supplies its own; `crypto/backend.zig` is the contract one has to meet,
+    /// and `crypto.conformance.check` is how to test that it does.
+    ///
+    /// A type, so `Config` exists only at compile time — which it always did,
+    /// since every field here sizes something.
+    crypto: type = crypto.backend.Std,
 };
 
 /// Where the connection is, in the terms section 10 uses.
@@ -245,6 +253,13 @@ pub fn Connection(comptime config: Config) type {
         assert(config.datagram_octets >= initial_datagram_min);
         assert(config.datagram_octets <= udp_payload_octets_max);
     }
+
+    comptime crypto.backend.check(config.crypto);
+    // The three places the backend reaches: packet protection, the key
+    // schedule a key update runs, and the Retry integrity tag a client checks.
+    const Keys = crypto.KeysOf(config.crypto);
+    const Schedule = crypto.secrets.Schedule(config.crypto);
+    const Integrity = crypto.retry.Integrity(config.crypto);
 
     const CryptoLevel = struct {
         /// Handshake bytes from the peer, reassembled in order.
@@ -374,12 +389,12 @@ pub fn Connection(comptime config: Config) type {
         phase: bool = false,
         /// The generation before the current one, kept so packets reordered
         /// across an update still decrypt (section 6.3).
-        previous_receive: ?crypto.Keys = null,
+        previous_receive: ?Keys = null,
         /// The generation after, derived in advance rather than on demand.
         /// Section 6.3: deriving keys inside the receive path is a timing
         /// signal that leaks when an update happened, and therefore the
         /// value of a bit that is otherwise protected.
-        next_receive: ?crypto.Keys = null,
+        next_receive: ?Keys = null,
         /// Packets sealed under the current send key, for section 6.6's
         /// confidentiality limit. Reset by an update, because the limit is
         /// per key rather than per connection.
@@ -690,8 +705,8 @@ pub fn Connection(comptime config: Config) type {
         /// connection, across all keys" — so one counter, not one per key.
         forgeries: u64 = 0,
 
-        send_keys: [Level.count]?crypto.Keys = @splat(null),
-        receive_keys: [Level.count]?crypto.Keys = @splat(null),
+        send_keys: [Level.count]?Keys = @splat(null),
+        receive_keys: [Level.count]?Keys = @splat(null),
         levels: [Level.count]CryptoLevel = @splat(.{}),
         spaces: [Space.count]PacketSpace = @splat(.{}),
 
@@ -1116,7 +1131,7 @@ pub fn Connection(comptime config: Config) type {
             suite: crypto.Suite,
         ) SecretError!void {
             if (secret.length != suite.hashOctets()) return error.Rejected;
-            const keys: crypto.Keys = .fromSecret(suite, secret);
+            const keys: Keys = .fromSecret(suite, secret);
 
             // Nothing checks the level below before installing this one. A peer that
             // sends a CRYPTO frame at Initial, then hands over Handshake keys before the
@@ -1212,7 +1227,7 @@ pub fn Connection(comptime config: Config) type {
                         //# Endpoints responding to an apparent key update MUST NOT generate a
                         //# timing side-channel signal that might indicate that the Key Phase bit
                         //# was invalid (see Section 9.5).
-                        const next = crypto.secrets.update(suite, secret);
+                        const next = Schedule.update(suite, secret);
                         self.one_rtt.next_receive = keys.nextGeneration(suite, &next);
                     },
                 }
@@ -1802,8 +1817,8 @@ pub fn Connection(comptime config: Config) type {
             const send_secret = one.send_secret orelse return;
             const receive_secret = one.receive_secret orelse return;
 
-            const next_send = crypto.secrets.update(one.suite, &send_secret);
-            const next_receive = crypto.secrets.update(one.suite, &receive_secret);
+            const next_send = Schedule.update(one.suite, &send_secret);
+            const next_receive = Schedule.update(one.suite, &receive_secret);
 
             // The outgoing generation is kept for reading, not for writing:
             // section 6.3 expects reordered packets from the old phase for up
@@ -1860,7 +1875,7 @@ pub fn Connection(comptime config: Config) type {
 
             one.send_secret = next_send;
             one.receive_secret = next_receive;
-            const after = crypto.secrets.update(one.suite, &next_receive);
+            const after = Schedule.update(one.suite, &next_receive);
             one.next_receive = current_receive.nextGeneration(one.suite, &after);
 
             one.phase = !one.phase;
@@ -2622,7 +2637,7 @@ pub fn Connection(comptime config: Config) type {
                 bytes.len,
             );
             if (needed > scratch.len) return;
-            crypto.retry.verify(
+            Integrity.verify(
                 scratch[0..needed],
                 self.original_destination.bytes(),
                 bytes,
@@ -2689,11 +2704,11 @@ pub fn Connection(comptime config: Config) type {
         fn openPacket(
             self: *Self,
             level: Level,
-            keys: crypto.Keys,
+            keys: Keys,
             bytes: []u8,
             offset: usize,
             largest: ?u64,
-        ) error{ Discard, AeadLimitReached, ReservedBits }!crypto.Keys.Opened {
+        ) error{ Discard, AeadLimitReached, ReservedBits }!crypto.protect.Opened {
             // Header protection first and on its own: RFC 9001 section 6.1
             // keeps the header protection key across an update, so this works
             // whichever generation protected the payload.
@@ -9981,4 +9996,193 @@ test "three streams at once each get through a lossy path" {
         }
         try testing.expectEqual(@as(usize, body.len), one);
     }
+}
+
+/// A backend that forwards to `std.crypto` and counts what it was asked for, so
+/// a test can tell a connection that went through `Config.crypto` from one that
+/// reached past it. Counters rather than a flag, because "every primitive was
+/// reached" is twelve separate claims.
+const CountingBackend = struct {
+    const Std = crypto.backend.Std;
+    const Primitive = enum {
+        aes128_gcm_seal,
+        aes128_gcm_open,
+        aes256_gcm_seal,
+        aes256_gcm_open,
+        chacha20_poly1305_seal,
+        chacha20_poly1305_open,
+        aes128_block,
+        aes256_block,
+        chacha20_keystream,
+        hkdf_sha256_extract,
+        hkdf_sha256_expand,
+        hkdf_sha384_expand,
+    };
+    var calls: std.EnumArray(Primitive, u32) = .initFill(0);
+
+    fn count(primitive: Primitive) void {
+        calls.getPtr(primitive).* += 1;
+    }
+
+    pub fn aes128GcmSeal(data: []u8, tag: *[16]u8, ad: []const u8, nonce: *const [12]u8, key: *const [16]u8) void {
+        count(.aes128_gcm_seal);
+        Std.aes128GcmSeal(data, tag, ad, nonce, key);
+    }
+    pub fn aes128GcmOpen(data: []u8, tag: *const [16]u8, ad: []const u8, nonce: *const [12]u8, key: *const [16]u8) crypto.backend.AuthenticationError!void {
+        count(.aes128_gcm_open);
+        return Std.aes128GcmOpen(data, tag, ad, nonce, key);
+    }
+    pub fn aes256GcmSeal(data: []u8, tag: *[16]u8, ad: []const u8, nonce: *const [12]u8, key: *const [32]u8) void {
+        count(.aes256_gcm_seal);
+        Std.aes256GcmSeal(data, tag, ad, nonce, key);
+    }
+    pub fn aes256GcmOpen(data: []u8, tag: *const [16]u8, ad: []const u8, nonce: *const [12]u8, key: *const [32]u8) crypto.backend.AuthenticationError!void {
+        count(.aes256_gcm_open);
+        return Std.aes256GcmOpen(data, tag, ad, nonce, key);
+    }
+    pub fn chacha20Poly1305Seal(data: []u8, tag: *[16]u8, ad: []const u8, nonce: *const [12]u8, key: *const [32]u8) void {
+        count(.chacha20_poly1305_seal);
+        Std.chacha20Poly1305Seal(data, tag, ad, nonce, key);
+    }
+    pub fn chacha20Poly1305Open(data: []u8, tag: *const [16]u8, ad: []const u8, nonce: *const [12]u8, key: *const [32]u8) crypto.backend.AuthenticationError!void {
+        count(.chacha20_poly1305_open);
+        return Std.chacha20Poly1305Open(data, tag, ad, nonce, key);
+    }
+    pub fn aes128EncryptBlock(out: *[16]u8, in: *const [16]u8, key: *const [16]u8) void {
+        count(.aes128_block);
+        Std.aes128EncryptBlock(out, in, key);
+    }
+    pub fn aes256EncryptBlock(out: *[16]u8, in: *const [16]u8, key: *const [32]u8) void {
+        count(.aes256_block);
+        Std.aes256EncryptBlock(out, in, key);
+    }
+    pub fn chacha20Keystream(out: []u8, key: *const [32]u8, counter: u32, nonce: *const [12]u8) void {
+        count(.chacha20_keystream);
+        Std.chacha20Keystream(out, key, counter, nonce);
+    }
+    pub fn hkdfSha256Extract(prk: *[32]u8, salt: []const u8, ikm: []const u8) void {
+        count(.hkdf_sha256_extract);
+        Std.hkdfSha256Extract(prk, salt, ikm);
+    }
+    pub fn hkdfSha256Expand(out: []u8, prk: *const [32]u8, info: []const u8) void {
+        count(.hkdf_sha256_expand);
+        Std.hkdfSha256Expand(out, prk, info);
+    }
+    pub fn hkdfSha384Expand(out: []u8, prk: *const [48]u8, info: []const u8) void {
+        count(.hkdf_sha384_expand);
+        Std.hkdfSha384Expand(out, prk, info);
+    }
+};
+
+const CountedConnection = Connection(.{
+    .crypto_octets = 4096,
+    .ack_ranges_max = 8,
+    .sent_max = 32,
+    .streams_max = 4,
+    .stream_receive_octets = 8 * 1024,
+    .stream_send_octets = 8 * 1024,
+    .connection_receive_octets = 32 * 1024,
+    .crypto = CountingBackend,
+});
+
+fn countedDeliver(from: *CountedConnection, to: *CountedConnection, now_ns: u64) !usize {
+    var datagram: [CountedConnection.datagram_octets]u8 = @splat(0);
+    const octets = try from.send(&datagram, now_ns);
+    if (octets == 0) return 0;
+    try to.receive(datagram[0..octets], now_ns);
+    return octets;
+}
+
+fn countedInstall(a: *CountedConnection, b: *CountedConnection, level: Level, suite: crypto.Suite, seed: u8) !void {
+    const raw: [crypto.secret_octets_max]u8 = @splat(seed);
+    const secret = try crypto.secrets.Secret.init(raw[0..suite.hashOctets()]);
+    try a.installSecret(level, .send, &secret, suite);
+    try b.installSecret(level, .receive, &secret, suite);
+}
+
+test "every primitive a connection computes with comes from its configured backend" {
+    // The claim `Config.crypto` makes to a consumer is that nothing reaches
+    // past it, and `zig build lint` holds the source half of that — no
+    // `std.crypto` outside the default backend. This is the behavioural half:
+    // a handshake through all three suites and both header protection ciphers,
+    // then a key update, and every one of the twelve primitives was asked for
+    // through the backend the connection was configured with.
+    CountingBackend.calls = .initFill(0);
+    var client: CountedConnection = .init(.{
+        .side = .client,
+        .original_destination = ConnectionId.init(&client_cid) catch unreachable, // Eight octets.
+        .source = ConnectionId.init(&client_source) catch unreachable, // Four octets.
+    });
+    var server: CountedConnection = .init(.{
+        .side = .server,
+        .original_destination = ConnectionId.init(&client_cid) catch unreachable, // As above.
+        .source = ConnectionId.init(&server_source) catch unreachable, // Eight octets.
+    });
+    // RFC 9001 section 5.2: Initial keys are AES-128-GCM under HKDF-SHA256,
+    // derived in `init` from the client's Destination Connection ID.
+    try testing.expect(CountingBackend.calls.get(.hkdf_sha256_extract) >= 2);
+
+    try client.cryptoIn(.initial, "ClientHello");
+    _ = try countedDeliver(&client, &server, 0);
+    // The Handshake level under AES-256-GCM and SHA-384, which is the only way
+    // a test reaches the wide hash and the wide AES block.
+    try countedInstall(&server, &client, .handshake, .aes_256_gcm_sha384, 0x11);
+    try countedInstall(&client, &server, .handshake, .aes_256_gcm_sha384, 0x22);
+    try server.cryptoIn(.initial, "ServerHello");
+    try server.cryptoIn(.handshake, "EncryptedExtensions");
+    _ = try countedDeliver(&server, &client, 1000);
+    try client.cryptoIn(.handshake, "ClientFinished");
+    _ = try countedDeliver(&client, &server, 2000);
+
+    // And 1-RTT under ChaCha20-Poly1305, with its own header protection.
+    try countedInstall(&server, &client, .one_rtt, .chacha20_poly1305_sha256, 0x33);
+    try countedInstall(&client, &server, .one_rtt, .chacha20_poly1305_sha256, 0x44);
+    server.confirmHandshake();
+    _ = try countedDeliver(&server, &client, 3000);
+    try testing.expectEqual(State.established, client.state);
+    _ = try countedDeliver(&client, &server, 4000);
+
+    // Section 6.1's next generation is an HKDF-Expand too, through the same
+    // backend: both 1-RTT installs above derived one in advance.
+    try testing.expect(server.canUpdateKeys());
+    server.updateKeys();
+    server.closeApplication(0);
+    _ = try countedDeliver(&server, &client, 5000);
+
+    for (std.enums.values(CountingBackend.Primitive)) |primitive| {
+        if (CountingBackend.calls.get(primitive) == 0) {
+            std.debug.print("\nthe backend was never asked for {s}\n", .{@tagName(primitive)});
+        }
+        try testing.expect(CountingBackend.calls.get(primitive) > 0);
+    }
+}
+
+test "a client checks a Retry's integrity tag with its configured backend" {
+    CountingBackend.calls = .initFill(0);
+    var client: CountedConnection = .init(.{
+        .side = .client,
+        .original_destination = ConnectionId.init(&client_cid) catch unreachable, // Eight octets.
+        .source = ConnectionId.init(&client_source) catch unreachable, // Four octets.
+    });
+    try client.cryptoIn(.initial, "ClientHello");
+    var first: [CountedConnection.datagram_octets]u8 = undefined;
+    _ = try client.send(&first, 0);
+
+    var retry: [256]u8 = undefined;
+    var scratch: [512]u8 = undefined;
+    const sealed_before_retry = CountingBackend.calls.get(.aes128_gcm_seal);
+    const written = try packet.writeRetryWith(CountingBackend, &retry, &scratch, .{
+        .destination = ConnectionId.init(&client_source) catch unreachable, // As above.
+        .source = ConnectionId.init(&server_source) catch unreachable, // Eight octets.
+        .token = "a token",
+        .original_destination = ConnectionId.init(&client_cid) catch unreachable, // As above.
+    });
+    // One seal to write the tag, through the backend `writeRetryWith` named.
+    try testing.expectEqual(sealed_before_retry + 1, CountingBackend.calls.get(.aes128_gcm_seal));
+    const before = CountingBackend.calls.get(.aes128_gcm_seal);
+    try client.receive(retry[0..written], 1000);
+    // And one more to check it: section 5.8's tag is an AES-128-GCM seal over
+    // an empty plaintext, and verifying one is computing it again.
+    try testing.expectEqual(before + 1, CountingBackend.calls.get(.aes128_gcm_seal));
+    try testing.expect(client.retry_seen);
 }

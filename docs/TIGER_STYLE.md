@@ -125,7 +125,8 @@ unreachable — never an assertion.
 Half-true here. QPACK and the frame codecs are CPU-bound the way HPACK is, but
 the packet path is dominated by two things h2 has neither of: **the AEAD**, and
 **syscalls per datagram**. The second is the consumer's to amortise (GSO,
-`sendmmsg`), and the seam is shaped to let it. The first is `std.crypto`'s, and
+`sendmmsg`), and the seam is shaped to let it. The first is the crypto
+backend's — `std.crypto` unless the consumer chose another — and
 the honest position is that this package's contribution to it is the framing
 around the primitive, not the primitive — which is exactly what `zig build
 bench`'s two protection rows measure.

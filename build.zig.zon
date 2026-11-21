@@ -17,9 +17,11 @@
     // fixed in one stays live in the other. See docs/DESIGN.md section 7.
     //
     // `scripts/lint.zig` still forbids `@cImport`, and packet protection still
-    // reaches no further than `std.crypto` — AES-GCM, ChaCha20-Poly1305, a raw
-    // AES block for header protection, and HKDF-SHA256/384. The TLS *handshake*
-    // is deliberately not here; see README.md, "Where TLS attaches".
+    // reaches no further than its comptime crypto backend — AES-GCM,
+    // ChaCha20-Poly1305, a raw AES block for header protection, and
+    // HKDF-SHA256/384 — which is `std.crypto` unless a consumer supplies its
+    // own (src/quic/crypto/backend.zig). The TLS *handshake* is deliberately
+    // not here; see README.md, "Where TLS attaches".
     .dependencies = .{
         .hpack = .{
             .url = "git+https://github.com/zoxy-io/hpack#2fd3820c199de0399f3b829eecc933f8b818d2dd",

@@ -145,6 +145,22 @@ nonce construction, the header protection sampling offset and the key update
 accounting are where QUIC's cryptographic mistakes live, and they belong beside
 the packet parser that produces their inputs.
 
+**The primitives are a comptime backend, and the construction is not.** None of
+the argument above is about *whose* AES it is, and a consumer can have a reason
+of its own to care: zoxy takes every primitive from libcrypto, through zssl,
+because constant-time code wants the most-watched assembly there is. So
+`Connection.Config.crypto` names a backend type — twelve functions, the three
+AEADs sealing and opening in place, one AES block at each width, the ChaCha20
+keystream, HKDF-SHA256 extract and HKDF-SHA256/384 expand — and
+`crypto/backend.zig` states the contract exactly, signatures and aliasing rules
+included, and checks a backend against it at compile time. `std.crypto` is the
+default (`crypto.backend.Std`) and the only backend in this tree, so zrk is
+unaffected and the dependency table is still empty. What stays above the seam
+is everything this section says belongs here: the nonce, the associated data,
+the sample, the mask, the labels, the key update and the AEAD limits. `zig
+build lint` confines `std.crypto` to the default backend's file, so no
+primitive can reach past the seam.
+
 ## 5. No allocator, with a QUIC-sized asterisk
 
 h2's rule — no `std.mem.Allocator` anywhere in `src/`, every buffer caller-owned
