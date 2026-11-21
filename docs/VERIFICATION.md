@@ -187,7 +187,7 @@ that crossing, and §5.2 is what it became.
 | Gate | What it proves | What it cannot prove |
 |---|---|---|
 | 371 `test` blocks | Each function does what its author meant | That the author read the RFC correctly, or that anything calls the function |
-| 16 fuzz targets, run in all three build legs | Decoders reject or parse with no third outcome | Anything a `u16` draw cannot reach; and — until `b9c796d` — whether a target reaches its accept path at all, which two of them did not |
+| 17 fuzz targets, run in all three build legs | Decoders reject or parse with no third outcome | Anything a `u16` draw cannot reach; and — until `b9c796d` — whether a target reaches its accept path at all, which two of them did not |
 | `zig build lint` | No I/O, no allocator, no unbounded loop | Nothing about behaviour |
 | The `tiger-style-reviewer` agent | Assertion density, function length, named bounds | It is a reader, not a gate: it found the twenty above, and it will not find the same class twice at the same cost |
 | `zig build requirements` | That every RFC quote in the source is in the section it cites, that every exception states a reason, and that no `//=` URL is silently unreadable | Coverage — the sentence extraction is a heuristic, so the count is a trend rather than a threshold. And "cited" is not "correct": a citation says someone looked, not that they were right |
@@ -428,7 +428,7 @@ its input reports success either way.
 
 ### 5.4 Fuzz where it ships
 
-16 targets in `fuzz/`, run in all three build legs rather than in Debug alone,
+17 targets in `fuzz/`, run in all three build legs rather than in Debug alone,
 which is what makes a `catch unreachable` guarded by an elided assertion
 reachable. Fields are drawn at their wire width — the recovery target used to
 draw a 62-bit `delay` as a `u16`, so the overflow in it was unreachable by
@@ -501,9 +501,10 @@ failure, not a measurement anything takes.
 
 ### What is left
 
-- **Accept-path tests for fourteen of the sixteen fuzz targets.** §5.4 planned
+- **Accept-path tests for fourteen of the seventeen fuzz targets.** §5.4 planned
   a deterministic test per target proving its *accepted* input really is
-  accepted; two exist, for the connection and recovery targets. §1's third
+  accepted; three exist, for the connection, recovery and endpoint targets —
+  the last written with its target rather than after it. §1's third
   pattern is the argument that the other fourteen may be proving nothing, and
   it is the largest open item here.
 - **A `seal` that fails, and a send buffer that is too small** — the two faults

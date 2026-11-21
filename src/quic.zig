@@ -16,6 +16,8 @@ const std = @import("std");
 pub const AckRanges = @import("quic/AckRanges.zig").AckRanges;
 pub const ConnectionId = @import("quic/ConnectionId.zig");
 pub const crypto = @import("quic/crypto.zig");
+/// What a server does with a datagram before a connection exists for it.
+pub const endpoint = @import("quic/endpoint.zig");
 pub const error_code = @import("quic/error_code.zig");
 pub const frame = @import("quic/frame.zig");
 pub const connection = @import("quic/Connection.zig");
@@ -34,6 +36,7 @@ test {
     _ = @import("quic/AckRanges.zig");
     _ = ConnectionId;
     _ = crypto;
+    _ = endpoint;
     _ = error_code;
     _ = frame;
     _ = connection;

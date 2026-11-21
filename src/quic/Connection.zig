@@ -962,12 +962,14 @@ pub fn Connection(comptime config: Config) type {
         close_pending: [Level.count]bool = @splat(false),
 
         // The client's first Destination Connection ID arrives here already chosen,
-        // and its length is never checked against section 7.2's floor: an eight-octet
-        // minimum is what makes the identifier hard to guess for an off-path attacker
-        // who wants to forge an Initial, and `ConnectionId.octets_min` is zero.
+        // and a `Connection` does not check it against section 7.2's floor: an
+        // eight-octet minimum is what makes the identifier hard to guess for an
+        // off-path attacker who wants to forge an Initial, and the place a server
+        // first sees it is before any connection exists.
         //= https://www.rfc-editor.org/rfc/rfc9000#section-7.2
         //# This Destination Connection ID MUST be at least 8 bytes in length.
-        //= type=todo
+        //= type=exception
+        //= reason=held where a server decides to create a connection: `endpoint.Datagram.mayStart` refuses a first Initial whose Destination Connection ID is shorter than eight octets, which is the only Initial the rule binds. A `Connection` is built from an identifier its consumer already accepted. See quic/endpoint.zig.
         //= https://www.rfc-editor.org/rfc/rfc9000#section-3.1
         //# Once all stream data has been successfully acknowledged, the sending
         //# part of the stream enters the "Data Recvd" state, which is a terminal
@@ -1291,7 +1293,7 @@ pub fn Connection(comptime config: Config) type {
         //# than the server to correlate connections; see Appendix C.4 of
         //# [TLS13].
         //= type=exception
-        //= reason=session tickets and address validation tokens are out of scope: this package sends no Retry, issues no NEW_TOKEN and resumes no session, so it neither writes nor reads either kind of token. See docs/DESIGN.md section 2 and section 6.
+        //= reason=a session ticket is a TLS 1.3 NewSessionTicket the consumer's TLS engine issues and stores; this package resumes no session, issues no NEW_TOKEN and keeps nothing between connections. See docs/DESIGN.md section 4.
         //
         //= https://www.rfc-editor.org/rfc/rfc9001#section-8.4
         //# A server SHOULD treat the receipt of a TLS ClientHello with a
@@ -1305,7 +1307,7 @@ pub fn Connection(comptime config: Config) type {
         //# address verification, QUIC implementations SHOULD instead use
         //# the Retry feature; see Section 8.1 of [QUIC-TRANSPORT].
         //= type=exception
-        //= reason=neither mechanism this sentence weighs is available here: HelloRetryRequest is a TLS handshake message the consumer's engine owns, and Retry needs a token with a server key and a clock behind it, which is why section 8.1.4 is excused elsewhere in this file. A server here validates an address the third way section 8.1 allows, by opening a Handshake packet, and holds the amplification limit until it can. See docs/DESIGN.md section 2 and section 4.
+        //= reason=HelloRetryRequest is a TLS handshake message the consumer's engine owns, so it is never this package's to use for address validation. Retry is what this package provides instead — `endpoint.writeRetry` builds one for a classified Initial — and when to send one, and what its token proves, is the consumer's policy.
         //
         // The 0-RTT pair, on the same footing as every other 0-RTT rule here: no
         // early-data key is installed, so there is no 0-RTT packet to have sent, to stop
@@ -1329,20 +1331,20 @@ pub fn Connection(comptime config: Config) type {
         //# Future versions of QUIC SHOULD generate a new salt value, thus
         //# ensuring that the keys are different for each version of QUIC.
         //= type=exception
-        //= reason=version negotiation is out of scope; a connection here speaks QUIC version 1 and the packet types that would begin a different one are the consumer's, per docs/DESIGN.md section 2. The rule is in any case addressed to a future version of QUIC rather than to an implementation of this one.
+        //= reason=addressed to whoever specifies a future version of QUIC rather than to an implementation of this one. This package speaks version 1, and `endpoint.classify` answers a long header in any other version with Version Negotiation.
         //
         //= https://www.rfc-editor.org/rfc/rfc9001#section-9.6
         //# To preserve this separation, a new version of QUIC SHOULD define
         //# new labels for key derivation for packet protection key and IV,
         //# plus the header protection keys.
         //= type=exception
-        //= reason=version negotiation is out of scope; a connection here speaks QUIC version 1 and the packet types that would begin a different one are the consumer's, per docs/DESIGN.md section 2. The rule is in any case addressed to a future version of QUIC rather than to an implementation of this one.
+        //= reason=addressed to whoever specifies a future version of QUIC rather than to an implementation of this one. This package speaks version 1, and `endpoint.classify` answers a long header in any other version with Version Negotiation.
         //
         //= https://www.rfc-editor.org/rfc/rfc9001#section-9.6
         //# New QUIC versions SHOULD define a new salt value used in
         //# calculating initial secrets.
         //= type=exception
-        //= reason=version negotiation is out of scope; a connection here speaks QUIC version 1 and the packet types that would begin a different one are the consumer's, per docs/DESIGN.md section 2. The rule is in any case addressed to a future version of QUIC rather than to an implementation of this one.
+        //= reason=addressed to whoever specifies a future version of QUIC rather than to an implementation of this one. This package speaks version 1, and `endpoint.classify` answers a long header in any other version with Version Negotiation.
         /// Queue handshake bytes for sending at `level`.
         pub fn cryptoIn(self: *Self, level: Level, data: []const u8) error{CryptoBufferExceeded}!void {
             assert(@backingInt(level) < self.levels.len);
@@ -1979,54 +1981,47 @@ pub fn Connection(comptime config: Config) type {
             //# in an incoming datagram either cannot be associated with a
             //# connection or cannot be decrypted.
             //= type=exception
-            //= reason=stateless reset is out of scope: it needs a static key and a token this package neither holds nor advertises, and detecting one means recognising a datagram that belongs to no connection — a decision made by whatever routes datagrams to a Connection, which is the consumer's, per docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //= reason=detecting a Stateless Reset needs the peer's reset token, and a server never holds one: RFC 9000 section 18.2 forbids a client's stateless_reset_token, and this endpoint takes no token from a NEW_CONNECTION_ID frame. The client side of detection is not implemented. Generating a reset is `endpoint.writeStatelessReset`. See docs/DESIGN.md section 6.
             //
             //= https://www.rfc-editor.org/rfc/rfc9000#section-10.3.1
             //# An endpoint MUST NOT check for any stateless reset tokens
             //# associated with connection IDs it has not used or for connection
             //# IDs that have been retired.
             //= type=exception
-            //= reason=stateless reset is out of scope: it needs a static key and a token this package neither holds nor advertises, and detecting one means recognising a datagram that belongs to no connection — a decision made by whatever routes datagrams to a Connection, which is the consumer's, per docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //= reason=detecting a Stateless Reset needs the peer's reset token, and a server never holds one: RFC 9000 section 18.2 forbids a client's stateless_reset_token, and this endpoint takes no token from a NEW_CONNECTION_ID frame. The client side of detection is not implemented. Generating a reset is `endpoint.writeStatelessReset`. See docs/DESIGN.md section 6.
             //
             //= https://www.rfc-editor.org/rfc/rfc9000#section-10.3.1
             //# When comparing a datagram to stateless reset token values,
             //# endpoints MUST perform the comparison without leaking
             //# information about the value of the token.
             //= type=exception
-            //= reason=stateless reset is out of scope: it needs a static key and a token this package neither holds nor advertises, and detecting one means recognising a datagram that belongs to no connection — a decision made by whatever routes datagrams to a Connection, which is the consumer's, per docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //= reason=detecting a Stateless Reset needs the peer's reset token, and a server never holds one: RFC 9000 section 18.2 forbids a client's stateless_reset_token, and this endpoint takes no token from a NEW_CONNECTION_ID frame. The client side of detection is not implemented. Generating a reset is `endpoint.writeStatelessReset`. See docs/DESIGN.md section 6.
             //
             //= https://www.rfc-editor.org/rfc/rfc9000#section-10.3.1
             //# If the last 16 bytes of the datagram are identical in value to a
             //# stateless reset token, the endpoint MUST enter the draining
             //# period and not send any further packets on this connection.
             //= type=exception
-            //= reason=stateless reset is out of scope: it needs a static key and a token this package neither holds nor advertises, and detecting one means recognising a datagram that belongs to no connection — a decision made by whatever routes datagrams to a Connection, which is the consumer's, per docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
-            //
-            //= https://www.rfc-editor.org/rfc/rfc9000#section-10.3
-            //# An endpoint MUST NOT send a Stateless Reset that is three times
-            //# or more larger than the packet it receives to avoid being used
-            //# for amplification.
-            //= type=exception
-            //= reason=stateless reset is out of scope: it needs a static key and a token this package neither holds nor advertises, and detecting one means recognising a datagram that belongs to no connection — a decision made by whatever routes datagrams to a Connection, which is the consumer's, per docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //= reason=detecting a Stateless Reset needs the peer's reset token, and a server never holds one: RFC 9000 section 18.2 forbids a client's stateless_reset_token, and this endpoint takes no token from a NEW_CONNECTION_ID frame. The client side of detection is not implemented. Generating a reset is `endpoint.writeStatelessReset`. See docs/DESIGN.md section 6.
             //
             //= https://www.rfc-editor.org/rfc/rfc9000#section-10.3.2
             //# The stateless reset token MUST be difficult to guess.
             //= type=exception
-            //= reason=stateless reset is out of scope: it needs a static key and a token this package neither holds nor advertises, and detecting one means recognising a datagram that belongs to no connection — a decision made by whatever routes datagrams to a Connection, which is the consumer's, per docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //= reason=the reset token is derived by the consumer from a static key it holds, and reaches this package as data: `endpoint.writeStatelessReset` writes it, and the consumer advertises it in the transport parameters it builds. How hard it is to guess, which identifiers share a key and whether a pair is ever reused are decided where the key is, outside the seam of docs/DESIGN.md section 3.
             //
             //= https://www.rfc-editor.org/rfc/rfc9000#section-10.3.2
             //# An endpoint that uses this design MUST either use the same
             //# connection ID length for all connections or encode the length of
             //# the connection ID such that it can be recovered without state.
             //= type=exception
-            //= reason=stateless reset is out of scope: it needs a static key and a token this package neither holds nor advertises, and detecting one means recognising a datagram that belongs to no connection — a decision made by whatever routes datagrams to a Connection, which is the consumer's, per docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //= reason=the consumer's: it chooses the identifiers this server issues, and `endpoint.classify` routes a short header by the single length it is told — so a server issuing more than one length could neither route by them nor reset them. See quic/endpoint.zig.
             //
             //= https://www.rfc-editor.org/rfc/rfc9000#section-10.3.2
             //# This method for choosing the stateless reset token means that
             //# the combination of connection ID and static key MUST NOT be used
             //# for another connection.
             //= type=exception
-            //= reason=stateless reset is out of scope: it needs a static key and a token this package neither holds nor advertises, and detecting one means recognising a datagram that belongs to no connection — a decision made by whatever routes datagrams to a Connection, which is the consumer's, per docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //= reason=the reset token is derived by the consumer from a static key it holds, and reaches this package as data: `endpoint.writeStatelessReset` writes it, and the consumer advertises it in the transport parameters it builds. How hard it is to guess, which identifiers share a key and whether a pair is ever reused are decided where the key is, outside the seam of docs/DESIGN.md section 3.
             //
             //= https://www.rfc-editor.org/rfc/rfc9000#section-10.3.2
             //# A denial-of-service attack is possible if the same connection ID
@@ -2037,20 +2032,14 @@ pub fn Connection(comptime config: Config) type {
             //# token MUST NOT be reused for new connections at nodes that share
             //# a static key.
             //= type=exception
-            //= reason=stateless reset is out of scope: it needs a static key and a token this package neither holds nor advertises, and detecting one means recognising a datagram that belongs to no connection — a decision made by whatever routes datagrams to a Connection, which is the consumer's, per docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //= reason=a deployment's question rather than this code's: which instances share a static key, and whether a connection identifier could be active on another of them, are facts above a single `Connection`. `endpoint.writeStatelessReset` is only ever called on a datagram the consumer's own table could not route. See quic/endpoint.zig.
             //
             //= https://www.rfc-editor.org/rfc/rfc9000#section-10.3.2
             //# The same stateless reset token MUST NOT be used for multiple
             //# connection IDs.
             //= type=exception
-            //= reason=stateless reset is out of scope: it needs a static key and a token this package neither holds nor advertises, and detecting one means recognising a datagram that belongs to no connection — a decision made by whatever routes datagrams to a Connection, which is the consumer's, per docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //= reason=the reset token is derived by the consumer from a static key it holds, and reaches this package as data: `endpoint.writeStatelessReset` writes it, and the consumer advertises it in the transport parameters it builds. How hard it is to guess, which identifiers share a key and whether a pair is ever reused are decided where the key is, outside the seam of docs/DESIGN.md section 3.
             //
-            //= https://www.rfc-editor.org/rfc/rfc9000#section-10.3.3
-            //# An endpoint MUST ensure that every Stateless Reset that it sends
-            //# is smaller than the packet that triggered it, unless it
-            //# maintains state sufficient to prevent looping.
-            //= type=exception
-            //= reason=stateless reset is out of scope: it needs a static key and a token this package neither holds nor advertises, and detecting one means recognising a datagram that belongs to no connection — a decision made by whatever routes datagrams to a Connection, which is the consumer's, per docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
             //= https://www.rfc-editor.org/rfc/rfc9000#section-21.11
             //# To defend against this style of denial of service, endpoints
             //# that share a static key for stateless resets (see Section
@@ -2058,38 +2047,24 @@ pub fn Connection(comptime config: Config) type {
             //# ID always arrive at an instance that has connection state,
             //# unless that connection is no longer active.
             //= type=exception
-            //= reason=stateless reset is out of scope: this endpoint holds no static key and no reset token, advertises none, and generates no reset — so it cannot be the oracle this section describes. How instances share connection state behind a load balancer is a deployment's question and outside the seam of docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //= reason=a deployment's question rather than this code's: which instances share a static key, and whether a connection identifier could be active on another of them, are facts above a single `Connection`. `endpoint.writeStatelessReset` is only ever called on a datagram the consumer's own table could not route. See quic/endpoint.zig.
             //
             //= https://www.rfc-editor.org/rfc/rfc9000#section-21.11
             //# More generally, servers MUST NOT generate a stateless reset if a
             //# connection with the corresponding connection ID could be active
             //# on any endpoint using the same static key.
             //= type=exception
-            //= reason=stateless reset is out of scope: this endpoint holds no static key and no reset token, advertises none, and generates no reset — so it cannot be the oracle this section describes. How instances share connection state behind a load balancer is a deployment's question and outside the seam of docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //= reason=a deployment's question rather than this code's: which instances share a static key, and whether a connection identifier could be active on another of them, are facts above a single `Connection`. `endpoint.writeStatelessReset` is only ever called on a datagram the consumer's own table could not route. See quic/endpoint.zig.
             // The three advisory rules about the shape of a Stateless Reset, which follow
             // the mandatory ones above and are out for the same reason: none is ever built.
-            //= https://www.rfc-editor.org/rfc/rfc9000#section-10.3
-            //# The remainder of the first byte and an arbitrary number of
-            //# bytes following it are set to values that SHOULD be
-            //# indistinguishable from random.
-            //= type=exception
-            //= reason=stateless reset is out of scope: it needs a static key and a token this package neither holds nor advertises, and detecting one means recognising a datagram that belongs to no connection — a decision made by whatever routes datagrams to a Connection, which is the consumer's, per docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
-            //
             //= https://www.rfc-editor.org/rfc/rfc9000#section-10.3
             //# To achieve that end, the endpoint SHOULD ensure that all
             //# packets it sends are at least 22 bytes longer than the
             //# minimum connection ID length that it requests the peer to
             //# include in its packets, adding PADDING frames as necessary.
             //= type=exception
-            //= reason=stateless reset is out of scope: it needs a static key and a token this package neither holds nor advertises, and detecting one means recognising a datagram that belongs to no connection — a decision made by whatever routes datagrams to a Connection, which is the consumer's, per docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //= reason=not done, and recorded as a gap rather than hidden: a packet here is padded to section 5.4.2's sample floor and, when it carries an Initial, to section 14.1's datagram floor, and no further. A short 1-RTT packet can therefore be smaller than a peer's Stateless Reset, which lets an observer tell the two apart — it never makes a reset unprocessable. See docs/DESIGN.md section 6.
             //
-            //= https://www.rfc-editor.org/rfc/rfc9000#section-10.3
-            //# An endpoint that sends a Stateless Reset in response to a
-            //# packet that is 43 bytes or shorter SHOULD send a Stateless
-            //# Reset that is one byte shorter than the packet it responds
-            //# to.
-            //= type=exception
-            //= reason=stateless reset is out of scope: it needs a static key and a token this package neither holds nor advertises, and detecting one means recognising a datagram that belongs to no connection — a decision made by whatever routes datagrams to a Connection, which is the consumer's, per docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
             if (self.state == .draining) return;
 
             // Section 14.1: "A server MUST discard an Initial packet that is
@@ -2172,26 +2147,20 @@ pub fn Connection(comptime config: Config) type {
             //# current connection attempt if it receives a Version Negotiation
             //# packet, with the following two exceptions.
             //= type=exception
-            //= reason=version negotiation is out of scope for this slice; a connection here speaks one version. See docs/DESIGN.md section 2, which puts the QUIC connection state machine in this package and leaves the packet types that begin a *different* connection to the consumer.
-            //
-            //= https://www.rfc-editor.org/rfc/rfc9000#section-6.1
-            //# An endpoint MUST NOT send a Version Negotiation packet in
-            //# response to receiving a Version Negotiation packet.
-            //= type=exception
-            //= reason=version negotiation is out of scope; a connection here speaks QUIC version 1, and a Version Negotiation packet has no encryption level, so it leaves `receivePacket` discarded. Deciding to try another version means beginning a different connection, which is the consumer's, per docs/DESIGN.md section 2 and section 6.
+            //= reason=a rule on a client receiving Version Negotiation. A client here speaks one version and holds no keys for such a packet, which has no encryption level and so leaves `receivePacket` discarded; abandoning the attempt and trying another version is beginning a different connection, which is the consumer's. The server half is `endpoint.classify`.
             //
             //= https://www.rfc-editor.org/rfc/rfc9000#section-6.2
             //# A client MUST discard any Version Negotiation packet if it has
             //# received and successfully processed any other packet, including
             //# an earlier Version Negotiation packet.
             //= type=exception
-            //= reason=version negotiation is out of scope; a connection here speaks QUIC version 1, and a Version Negotiation packet has no encryption level, so it leaves `receivePacket` discarded. Deciding to try another version means beginning a different connection, which is the consumer's, per docs/DESIGN.md section 2 and section 6.
+            //= reason=a rule on a client receiving Version Negotiation. A client here speaks one version and holds no keys for such a packet, which has no encryption level and so leaves `receivePacket` discarded; abandoning the attempt and trying another version is beginning a different connection, which is the consumer's. The server half is `endpoint.classify`.
             //
             //= https://www.rfc-editor.org/rfc/rfc9000#section-6.2
             //# A client MUST discard a Version Negotiation packet that lists
             //# the QUIC version selected by the client.
             //= type=exception
-            //= reason=version negotiation is out of scope; a connection here speaks QUIC version 1, and a Version Negotiation packet has no encryption level, so it leaves `receivePacket` discarded. Deciding to try another version means beginning a different connection, which is the consumer's, per docs/DESIGN.md section 2 and section 6.
+            //= reason=a rule on a client receiving Version Negotiation. A client here speaks one version and holds no keys for such a packet, which has no encryption level and so leaves `receivePacket` discarded; abandoning the attempt and trying another version is beginning a different connection, which is the consumer's. The server half is `endpoint.classify`.
             //
             // Retry is no longer refused here — `receiveRetry` above is the whole
             // of section 17.2.5's client half, and this comment claimed the
@@ -2221,32 +2190,16 @@ pub fn Connection(comptime config: Config) type {
             //# MUST avoid the creation of a stateless reset oracle; see Section
             //# 21.11.
             //= type=exception
-            //= reason=stateless reset is out of scope; nothing here holds a reset token or recognises one, and a load balancer's addressing is outside the seam of docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //= reason=a deployment's question rather than this code's: which instances share a static key, and whether a connection identifier could be active on another of them, are facts above a single `Connection`. `endpoint.writeStatelessReset` is only ever called on a datagram the consumer's own table could not route. See quic/endpoint.zig.
             //= https://www.rfc-editor.org/rfc/rfc9000#section-21.12
             //# Future versions of QUIC that use Version Negotiation packets
             //# MUST define a mechanism that is robust against version downgrade
             //# attacks.
             //= type=exception
-            //= reason=version negotiation is out of scope; a connection here speaks QUIC version 1 and the packet types that would begin a different one are the consumer's, per docs/DESIGN.md section 2. The rule is in any case addressed to a future version of QUIC rather than to an implementation of this one.
+            //= reason=addressed to whoever specifies a future version of QUIC rather than to an implementation of this one. This package speaks version 1, and `endpoint.classify` answers a long header in any other version with Version Negotiation.
             // Section 5.2.2's advisory half. The mandatory drops are cited above and are what
             // this package does; the two sentences that ask a server to *answer* with a
             // Version Negotiation packet are the ones it declines.
-            //= https://www.rfc-editor.org/rfc/rfc9000#section-5.2.2
-            //# If a server receives a packet that indicates an unsupported
-            //# version and if the packet is large enough to initiate a new
-            //# connection for any supported version, the server SHOULD send
-            //# a Version Negotiation packet as described in Section 6.1. A
-            //# server MAY limit the number of packets to which it responds
-            //# with a Version Negotiation packet.
-            //= type=exception
-            //= reason=version negotiation is out of scope; a connection here speaks QUIC version 1, and a Version Negotiation packet has no encryption level, so it leaves `receivePacket` discarded. Deciding to try another version means beginning a different connection, which is the consumer's, per docs/DESIGN.md section 2 and section 6.
-            //
-            //= https://www.rfc-editor.org/rfc/rfc9000#section-5.2.2
-            //# Servers SHOULD respond with a Version Negotiation packet,
-            //# provided that the datagram is sufficiently long.
-            //= type=exception
-            //= reason=version negotiation is out of scope; a connection here speaks QUIC version 1, and a Version Negotiation packet has no encryption level, so it leaves `receivePacket` discarded. Deciding to try another version means beginning a different connection, which is the consumer's, per docs/DESIGN.md section 2 and section 6.
-            //
             // Vacuous here and excused rather than claimed: this client supports one version,
             // so "the largest of the minimum datagram sizes" is section 14.1's 1200 octets,
             // which `send` pads every client Initial datagram to.
@@ -2256,7 +2209,7 @@ pub fn Connection(comptime config: Config) type {
             //# largest of the minimum datagram sizes from all versions they
             //# support, using PADDING frames (Section 19.1) as necessary.
             //= type=exception
-            //= reason=version negotiation is out of scope; a connection here speaks QUIC version 1, and a Version Negotiation packet has no encryption level, so it leaves `receivePacket` discarded. Deciding to try another version means beginning a different connection, which is the consumer's, per docs/DESIGN.md section 2 and section 6.
+            //= reason=vacuous here and excused rather than claimed: a client of this package speaks one version, so the largest of the minimum datagram sizes is section 14.1's 1200 octets, which `send` pads every client Initial datagram to.
             //
             //= https://www.rfc-editor.org/rfc/rfc9000#section-5.2.2
             //# If a server refuses to accept a new connection, it SHOULD
@@ -3111,33 +3064,31 @@ pub fn Connection(comptime config: Config) type {
                 //# constructed in a way that allows the server to identify how
                 //# it was provided to a client.
                 //= type=exception
-                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //= reason=the token is the consumer's: a server mints it, checks it and decides what it binds — `endpoint.writeRetry` carries it as opaque octets and nothing here reads it — because a sound token needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 keeps outside. This package issues no NEW_TOKEN, and a client here keeps no token across connections.
                 //
                 //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.2
                 //# This token MUST be repeated by the client in all Initial
                 //# packets it sends for that connection after it receives the
                 //# Retry packet.
-                //= type=exception
-                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
                 //
                 //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.3
                 //# The client MUST include the token in all Initial packets it
                 //# sends, unless a Retry replaces the token with a newer one.
                 //= type=exception
-                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //= reason=the token is the consumer's: a server mints it, checks it and decides what it binds — `endpoint.writeRetry` carries it as opaque octets and nothing here reads it — because a sound token needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 keeps outside. This package issues no NEW_TOKEN, and a client here keeps no token across connections.
                 //
                 //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.3
                 //# The client MUST NOT use the token provided in a Retry for
                 //# future connections.
                 //= type=exception
-                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //= reason=the token is the consumer's: a server mints it, checks it and decides what it binds — `endpoint.writeRetry` carries it as opaque octets and nothing here reads it — because a sound token needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 keeps outside. This package issues no NEW_TOKEN, and a client here keeps no token across connections.
                 //
                 //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.3
                 //# A token issued with NEW_TOKEN MUST NOT include information
                 //# that would allow values to be linked by an observer to the
                 //# connection on which it was issued.
                 //= type=exception
-                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //= reason=the token is the consumer's: a server mints it, checks it and decides what it binds — `endpoint.writeRetry` carries it as opaque octets and nothing here reads it — because a sound token needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 keeps outside. This package issues no NEW_TOKEN, and a client here keeps no token across connections.
                 //
                 //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.3
                 //# A client MUST NOT include a token that is not applicable to
@@ -3146,40 +3097,40 @@ pub fn Connection(comptime config: Config) type {
                 //# server the client is connecting to are jointly managing the
                 //# tokens.
                 //= type=exception
-                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //= reason=the token is the consumer's: a server mints it, checks it and decides what it binds — `endpoint.writeRetry` carries it as opaque octets and nothing here reads it — because a sound token needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 keeps outside. This package issues no NEW_TOKEN, and a client here keeps no token across connections.
                 //
                 //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.3
                 //# In comparison, a token obtained in a Retry packet MUST be
                 //# used immediately during the connection attempt and cannot be
                 //# used in subsequent connection attempts.
                 //= type=exception
-                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //= reason=the token is the consumer's: a server mints it, checks it and decides what it binds — `endpoint.writeRetry` carries it as opaque octets and nothing here reads it — because a sound token needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 keeps outside. This package issues no NEW_TOKEN, and a client here keeps no token across connections.
                 //
                 //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.3
                 //# When a server receives an Initial packet with an address
                 //# validation token, it MUST attempt to validate the token,
                 //# unless it has already completed address validation.
                 //= type=exception
-                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //= reason=the token is the consumer's: a server mints it, checks it and decides what it binds — `endpoint.writeRetry` carries it as opaque octets and nothing here reads it — because a sound token needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 keeps outside. This package issues no NEW_TOKEN, and a client here keeps no token across connections.
                 //
                 //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.4
                 //# An address validation token MUST be difficult to guess.
                 //= type=exception
-                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //= reason=the token is the consumer's: a server mints it, checks it and decides what it binds — `endpoint.writeRetry` carries it as opaque octets and nothing here reads it — because a sound token needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 keeps outside. This package issues no NEW_TOKEN, and a client here keeps no token across connections.
                 //
                 //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.4
                 //# For this design to work, the token MUST be covered by
                 //# integrity protection against modification or falsification
                 //# by clients.
                 //= type=exception
-                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //= reason=the token is the consumer's: a server mints it, checks it and decides what it binds — `endpoint.writeRetry` carries it as opaque octets and nothing here reads it — because a sound token needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 keeps outside. This package issues no NEW_TOKEN, and a client here keeps no token across connections.
                 //
                 //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.4
                 //# Tokens sent in NEW_TOKEN frames MUST include information
                 //# that allows the server to verify that the client IP address
                 //# has not changed from when the token was issued.
                 //= type=exception
-                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //= reason=the token is the consumer's: a server mints it, checks it and decides what it binds — `endpoint.writeRetry` carries it as opaque octets and nothing here reads it — because a sound token needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 keeps outside. This package issues no NEW_TOKEN, and a client here keeps no token across connections.
                 //
                 //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.4
                 //# If the client IP address has changed, the server MUST adhere
@@ -3188,13 +3139,13 @@ pub fn Connection(comptime config: Config) type {
                 //# to protect other hosts that share the NAT from amplification
                 //# attacks.
                 //= type=exception
-                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //= reason=the token is the consumer's: a server mints it, checks it and decides what it binds — `endpoint.writeRetry` carries it as opaque octets and nothing here reads it — because a sound token needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 keeps outside. This package issues no NEW_TOKEN, and a client here keeps no token across connections.
                 //
                 //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.4
                 //# To protect against such attacks, servers MUST ensure that
                 //# replay of tokens is prevented or limited.
                 //= type=exception
-                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //= reason=the token is the consumer's: a server mints it, checks it and decides what it binds — `endpoint.writeRetry` carries it as opaque octets and nothing here reads it — because a sound token needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 keeps outside. This package issues no NEW_TOKEN, and a client here keeps no token across connections.
                 // The advisory half of the same lifecycle. Every one of these describes a token
                 // this package neither builds, carries, nor checks, so each fails for the reason
                 // the mandatory ones above do rather than for a new one.
@@ -3202,7 +3153,7 @@ pub fn Connection(comptime config: Config) type {
                 //# Instead, the server SHOULD immediately close (Section
                 //# 10.2) the connection with an INVALID_TOKEN error.
                 //= type=exception
-                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //= reason=the consumer's call, and the mechanism is here: a server that finds a Retry token invalid can construct the connection and `close(.invalid_token)`, which frames the CONNECTION_CLOSE into an Initial packet. Whether a token is invalid is the consumer's verdict, for the reason the other token rules give.
                 //
                 //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.3
                 //# Thus, a token SHOULD have an expiration time, which
@@ -3210,27 +3161,27 @@ pub fn Connection(comptime config: Config) type {
                 //# timestamp that can be used to dynamically calculate the
                 //# expiration time.
                 //= type=exception
-                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //= reason=the token is the consumer's: a server mints it, checks it and decides what it binds — `endpoint.writeRetry` carries it as opaque octets and nothing here reads it — because a sound token needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 keeps outside. This package issues no NEW_TOKEN, and a client here keeps no token across connections.
                 //
                 //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.3
                 //# When connecting to a server for which the client retains
                 //# an applicable and unused token, it SHOULD include that
                 //# token in the Token field of its Initial packet.
                 //= type=exception
-                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //= reason=the token is the consumer's: a server mints it, checks it and decides what it binds — `endpoint.writeRetry` carries it as opaque octets and nothing here reads it — because a sound token needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 keeps outside. This package issues no NEW_TOKEN, and a client here keeps no token across connections.
                 //
                 //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.3
                 //# A client SHOULD NOT reuse a token from a NEW_TOKEN frame
                 //# for different connection attempts.
                 //= type=exception
-                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //= reason=the token is the consumer's: a server mints it, checks it and decides what it binds — `endpoint.writeRetry` carries it as opaque octets and nothing here reads it — because a sound token needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 keeps outside. This package issues no NEW_TOKEN, and a client here keeps no token across connections.
                 //
                 //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.3
                 //# If the token is invalid, then the server SHOULD proceed
                 //# as if the client did not have a validated address,
                 //# including potentially sending a Retry packet.
                 //= type=exception
-                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //= reason=the token is the consumer's: a server mints it, checks it and decides what it binds — `endpoint.writeRetry` carries it as opaque octets and nothing here reads it — because a sound token needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 keeps outside. This package issues no NEW_TOKEN, and a client here keeps no token across connections.
                 //
                 //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.3
                 //# If the validation succeeds, the server SHOULD then allow
@@ -3242,35 +3193,35 @@ pub fn Connection(comptime config: Config) type {
                 //# might be unable to | validate the token at all, leading
                 //# to connection failure if the | packet is discarded.
                 //= type=exception
-                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //= reason=the token is the consumer's: a server mints it, checks it and decides what it binds — `endpoint.writeRetry` carries it as opaque octets and nothing here reads it — because a sound token needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 keeps outside. This package issues no NEW_TOKEN, and a client here keeps no token across connections.
                 //
                 //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.4
                 //# Tokens sent in Retry packets SHOULD include information
                 //# that allows the server to verify that the source IP
                 //# address and port in client packets remain constant.
                 //= type=exception
-                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //= reason=the token is the consumer's: a server mints it, checks it and decides what it binds — `endpoint.writeRetry` carries it as opaque octets and nothing here reads it — because a sound token needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 keeps outside. This package issues no NEW_TOKEN, and a client here keeps no token across connections.
                 //
                 //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.4
                 //# Servers SHOULD ensure that tokens sent in Retry packets
                 //# are only accepted for a short time, as they are returned
                 //# immediately by clients.
                 //= type=exception
-                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //= reason=the token is the consumer's: a server mints it, checks it and decides what it binds — `endpoint.writeRetry` carries it as opaque octets and nothing here reads it — because a sound token needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 keeps outside. This package issues no NEW_TOKEN, and a client here keeps no token across connections.
                 //
                 //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.4
                 //# Tokens that are provided in NEW_TOKEN frames (Section
                 //# 19.7) need to be valid for longer but SHOULD NOT be
                 //# accepted multiple times.
                 //= type=exception
-                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //= reason=the token is the consumer's: a server mints it, checks it and decides what it binds — `endpoint.writeRetry` carries it as opaque octets and nothing here reads it — because a sound token needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 keeps outside. This package issues no NEW_TOKEN, and a client here keeps no token across connections.
                 //
                 //= https://www.rfc-editor.org/rfc/rfc9000#section-21.3
                 //# Servers SHOULD provide mitigations for this attack by
                 //# limiting the usage and lifetime of address validation
                 //# tokens; see Section 8.1.3.
                 //= type=exception
-                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //= reason=the token is the consumer's: a server mints it, checks it and decides what it binds — `endpoint.writeRetry` carries it as opaque octets and nothing here reads it — because a sound token needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 keeps outside. This package issues no NEW_TOKEN, and a client here keeps no token across connections.
                 //
                 //= https://www.rfc-editor.org/rfc/rfc9000#section-19.7
                 //# The token MUST NOT be empty.  A client MUST treat receipt
@@ -3478,7 +3429,7 @@ pub fn Connection(comptime config: Config) type {
                     //# semantics between endpoints; clients MUST treat them as
                     //# opaque values.
                     //= type=exception
-                    //= reason=session tickets and address validation tokens are out of scope: this package sends no Retry, issues no NEW_TOKEN and resumes no session, so it neither writes nor reads either kind of token. See docs/DESIGN.md section 2 and section 6.
+                    //= reason=this package issues no session ticket and no NEW_TOKEN frame, so it defines the contents of neither; the Retry token it does carry is the consumer's octets, copied into every Initial after the Retry without being read.
                     if (level != .one_rtt and level != .zero_rtt) return error.Protocol;
                     // Section 19.8's two state rules, which nothing checked: a
                     // STREAM frame for a stream this endpoint cannot receive on
@@ -5660,7 +5611,7 @@ pub fn Connection(comptime config: Config) type {
         //# valid stateless reset token as a Stateless Reset, as other QUIC
         //# versions might allow the use of a long header.
         //= type=exception
-        //= reason=stateless reset is out of scope; it is the answer of an endpoint that has *lost* the connection state, which is the consumer's lookup table rather than this type, and its token needs randomness that docs/DESIGN.md section 3 keeps outside the package. See docs/DESIGN.md section 2 and section 6.
+        //= reason=the sending half is `endpoint.writeStatelessReset`, which writes a short header and is cited there; the receiving half — treating any packet that ends in a valid token as a reset — needs the peer's token, which a server never holds (RFC 9000 section 18.2 forbids a client's stateless_reset_token), and the client side of detection is not implemented. See docs/DESIGN.md section 6.
         //
         // The single entry point for section 11.1's connection error, and the only
         // thing that sets `closing`. Every `ReceiveError` the caller sees is meant to

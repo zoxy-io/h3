@@ -139,6 +139,143 @@ test "packet: a header never points past its own datagram" {
     try std.testing.fuzz({}, fuzzPacketHeader, .{});
 }
 
+/// A datagram's shape, drawn rather than its octets: a long header's version,
+/// type and identifier lengths, a token, and a total that may sit either side
+/// of section 14.1's 1200. Random octets almost never form a long header that
+/// parses *and* reaches 1200, so a byte-only draw would leave `classify`'s two
+/// accept paths — `initial` and `version_negotiation` — unreached.
+const DatagramShape = struct {
+    version: u32,
+    long_type: u2,
+    destination_octets: u8,
+    source_octets: u8,
+    token_octets: u8,
+    total: u16,
+};
+
+/// The versions worth drawing from: this package's, Version Negotiation's, and
+/// one it does not speak.
+const shape_versions = [_]u32{ quic.packet.version_1, quic.packet.version_negotiation, 0x1a2a_3a4a };
+
+/// Lay a shape out as RFC 8999's long header followed by a version 1 body
+/// wherever the version is 1, and zeroes elsewhere. Written by hand rather than
+/// through `packet.writeLong`, because a shape may carry a 30-octet identifier,
+/// which version 1's writer rightly refuses.
+fn buildDatagram(target: []u8, shape: DatagramShape) []const u8 {
+    assert(target.len >= input_max);
+    const total = @min(@as(usize, shape.total), input_max);
+    @memset(target[0..total], 0);
+    var cursor: usize = 0;
+    const header = 1 + 4 + 2 + @as(usize, shape.destination_octets) + shape.source_octets;
+    if (total < header + 1 + shape.token_octets + 2 + 1) return target[0..total];
+    target[0] = quic.packet.header_form_long | quic.packet.fixed_bit | (@as(u8, shape.long_type) << 4);
+    std.mem.writeInt(u32, target[1..5], shape.version, .big);
+    cursor = 5;
+    target[cursor] = shape.destination_octets;
+    @memset(target[cursor + 1 ..][0..shape.destination_octets], 0xd5);
+    cursor += 1 + shape.destination_octets;
+    target[cursor] = shape.source_octets;
+    @memset(target[cursor + 1 ..][0..shape.source_octets], 0x5c);
+    cursor += 1 + shape.source_octets;
+    if (shape.long_type == 0) {
+        // An Initial's token, a one-octet varint length while it is under 64.
+        target[cursor] = shape.token_octets & 0x3f;
+        cursor += 1 + (shape.token_octets & 0x3f);
+    }
+    // A two-octet Length covering the rest of the datagram.
+    const rest = total - cursor - 2;
+    if (rest > 0x3fff) return target[0..total];
+    std.mem.writeInt(u16, target[cursor..][0..2], @as(u16, @intCast(rest)) | 0x4000, .big);
+    assert(cursor + 2 + rest == total);
+    return target[0..total];
+}
+
+fn drawShape(smith: *std.testing.Smith) DatagramShape {
+    return .{
+        .version = shape_versions[smith.valueRangeAtMost(u8, 0, shape_versions.len - 1)],
+        .long_type = smith.value(u2),
+        .destination_octets = smith.valueRangeAtMost(u8, 0, 30),
+        .source_octets = smith.valueRangeAtMost(u8, 0, 30),
+        .token_octets = smith.valueRangeAtMost(u8, 0, 63),
+        .total = smith.valueRangeAtMost(u16, 0, input_max),
+    };
+}
+
+/// What `classify` promises about whatever it is handed: never an error, an
+/// action that agrees with the rules it states, and slices that stay inside the
+/// datagram they borrow from.
+fn checkClassified(datagram: []const u8, local: u8) void {
+    const classified = quic.endpoint.classify(datagram, local);
+    assert(classified.octets == datagram.len);
+    switch (classified.action) {
+        .drop => {},
+        .route => {
+            if (classified.version == null) assert(classified.destination.length == local);
+            assert(classified.destination.length <= quic.ConnectionId.octets_max);
+        },
+        .initial => {
+            // Section 14.1's floor and section 7.2's, both held.
+            assert(classified.octets >= quic.endpoint.initial_datagram_min);
+            assert(classified.version.? == quic.packet.version_1);
+            // Section 7.2's floor decides creation, never routing.
+            assert(classified.mayStart() == (classified.destination.length >= quic.endpoint.initial_destination_octets_min));
+            assert(inside(datagram, classified.token));
+        },
+        .version_negotiation => {
+            assert(classified.octets >= quic.endpoint.initial_datagram_min);
+            assert(classified.version.? != quic.packet.version_1);
+            assert(classified.version.? != quic.packet.version_negotiation);
+            assert(inside(datagram, classified.long_destination));
+            assert(inside(datagram, classified.long_source));
+            // And the answer is always buildable, and always smaller: two
+            // identifiers of at most 255 octets and one version.
+            var answer: [1 + 4 + 2 * 256 + 4]u8 = undefined;
+            const written = quic.endpoint.writeVersionNegotiation(&answer, &classified) catch unreachable; // Sized for the largest identifiers RFC 8999 allows.
+            assert(written < classified.octets);
+        },
+    }
+}
+
+fn inside(datagram: []const u8, part: []const u8) bool {
+    if (part.len == 0) return true;
+    const start = @intFromPtr(part.ptr);
+    return start >= @intFromPtr(datagram.ptr) and start + part.len <= @intFromPtr(datagram.ptr) + datagram.len;
+}
+
+fn fuzzClassify(_: void, smith: *std.testing.Smith) !void {
+    const local = smith.valueRangeAtMost(u8, 0, local_connection_id_octets_max);
+    var buffer: [input_max]u8 = undefined;
+    if (smith.value(bool)) {
+        checkClassified(buildDatagram(&buffer, drawShape(smith)), local);
+    } else {
+        const length = smith.slice(&buffer);
+        checkClassified(buffer[0..length], local);
+    }
+}
+
+test "endpoint: a datagram is routed, started, answered or dropped, and never more" {
+    try std.testing.fuzz({}, fuzzClassify, .{});
+}
+
+test "endpoint: the shapes the target draws reach every action" {
+    // The accept paths, pinned. A target whose draw could not form an Initial
+    // of 1200 octets would pass for ever having covered nothing but `drop`.
+    var buffer: [input_max]u8 = undefined;
+    const Case = struct { shape: DatagramShape, action: quic.endpoint.Action };
+    const cases = [_]Case{
+        .{ .shape = .{ .version = quic.packet.version_1, .long_type = 0, .destination_octets = 8, .source_octets = 4, .token_octets = 5, .total = 1200 }, .action = .initial },
+        .{ .shape = .{ .version = quic.packet.version_1, .long_type = 0, .destination_octets = 8, .source_octets = 4, .token_octets = 0, .total = 1199 }, .action = .drop },
+        .{ .shape = .{ .version = quic.packet.version_1, .long_type = 2, .destination_octets = 8, .source_octets = 4, .token_octets = 0, .total = 300 }, .action = .route },
+        .{ .shape = .{ .version = 0x1a2a_3a4a, .long_type = 0, .destination_octets = 30, .source_octets = 4, .token_octets = 0, .total = 1200 }, .action = .version_negotiation },
+        .{ .shape = .{ .version = quic.packet.version_negotiation, .long_type = 0, .destination_octets = 8, .source_octets = 4, .token_octets = 0, .total = 1200 }, .action = .drop },
+    };
+    for (cases) |case| {
+        const datagram = buildDatagram(&buffer, case.shape);
+        try std.testing.expectEqual(case.action, quic.endpoint.classify(datagram, 8).action);
+        checkClassified(datagram, 8);
+    }
+}
+
 /// A payload's frames consume it exactly once, and an ACK's ranges walk down
 /// without underflowing or looping.
 ///
