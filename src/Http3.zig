@@ -384,8 +384,24 @@ pub fn Http3(comptime config: Config) type {
             fin: bool,
             events: []Event,
         ) Error!Received {
+            return self.receiveBounded(id, data, fin, events, std.math.maxInt(u64));
+        }
+
+        /// `receive`, delivering at most `data_room` octets of DATA payload on
+        /// a request stream. What follows them stays unconsumed — a partial
+        /// DATA frame is already something this layer resumes — so a caller
+        /// with somewhere to put only so much body takes only so much, and the
+        /// stream's flow control window holds the peer back for it.
+        pub fn receiveBounded(
+            self: *Self,
+            id: u64,
+            data: []const u8,
+            fin: bool,
+            events: []Event,
+            data_room: u64,
+        ) Error!Received {
             const kind = stream_id.kindOf(id);
-            if (kind.bidirectional()) return self.receiveRequest(id, data, fin, events);
+            if (kind.bidirectional()) return self.receiveRequest(id, data, fin, events, data_room);
             // A unidirectional stream this endpoint opened is one it cannot
             // receive on; QUIC refuses the frame before this layer sees it.
             assert(kind.initiator() != self.side);
@@ -672,18 +688,22 @@ pub fn Http3(comptime config: Config) type {
             data: []const u8,
             fin: bool,
             events: []Event,
+            data_room: u64,
         ) Error!Received {
             const request = try self.requestFor(id);
             var consumed: usize = 0;
             var produced: usize = 0;
+            var room = data_room;
             // Bounded by `data`, as in `receiveControl`.
             while (consumed < data.len) {
                 if (produced == events.len) break;
 
                 // The tail of a DATA frame whose header arrived earlier.
                 if (request.data_remaining > 0) {
+                    if (room == 0) break;
                     const available = data.len - consumed;
-                    const take = @min(request.data_remaining, available);
+                    const take = @min(@min(request.data_remaining, available), room);
+                    room -= take;
                     events[produced] = .{ .data = .{
                         .stream = id,
                         .payload = data[consumed..][0..@intCast(take)],
@@ -798,6 +818,18 @@ pub fn Http3(comptime config: Config) type {
                 self.requests_count -= 1;
                 return;
             }
+        }
+
+        /// Whether a request stream has sequencing state here: it has been read
+        /// and not yet released. `Http3Server` uses it to tell a stream it has
+        /// already finished from one it has never seen.
+        pub fn tracks(self: *const Self, id: u64) bool {
+            assert(stream_id.kindOf(id).bidirectional());
+            // Bounded by `requests_count`.
+            for (self.requests[0..self.requests_count]) |*one| {
+                if (one.id == id) return true;
+            }
+            return false;
         }
 
         /// Whether the peer's SETTINGS have arrived.

@@ -1376,6 +1376,28 @@ pub fn Streams(comptime config: Config) type {
         //# limited SHOULD periodically send a STREAM_DATA_BLOCKED or DATA_BLOCKED
         //# frame when it has no ack-eliciting packets in flight.
         //= type=todo
+        /// How many octets `write(id, ...)` would take now, without writing
+        /// any: the send buffer's room, and the stream's and the connection's
+        /// credit — zero when those are what is short. Null for a stream that
+        /// cannot be written on at all: one this endpoint may not send on,
+        /// one that does not exist yet (`write` would open it, and an embedder
+        /// asking how much fits frames for a stream it already has), or one
+        /// whose send half is finished or reset.
+        pub fn writableOctets(self: *const Self, id: u64) ?u64 {
+            if (!self.weMaySend(id)) return null;
+            for (self.streams[0..self.count]) |*stream| {
+                if (stream.id != id) continue;
+                if (!stream.writable()) return null;
+                const buffer_room: u64 = config.send_octets - stream.send_len;
+                const stream_room = sendRoom(stream.send_limit, stream.send_offset + stream.send_len);
+                const connection_room = sendRoom(self.send_limit, self.sent_total);
+                const room = @min(buffer_room, @min(stream_room, connection_room));
+                assert(room <= config.send_octets);
+                return room;
+            }
+            return null;
+        }
+
         fn sendRoom(limit: u64, at: u64) u64 {
             // The comparison is the guard on the subtraction. `limit` is the
             // peer's advertised window and `at` is how far we have written, and

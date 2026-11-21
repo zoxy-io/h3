@@ -4186,6 +4186,31 @@ pub fn Connection(comptime config: Config) type {
             return out;
         }
 
+        /// How many octets `write(id, ...)` would accept now on a stream that
+        /// exists, without writing: the send buffer's room and both levels of
+        /// flow control, so zero means "wait for credit or an acknowledgement".
+        /// Null means the stream cannot be written on at all — not this
+        /// endpoint's to send on, not open yet, or its send half finished or
+        /// reset. What a framing layer checks before writing a frame it may not
+        /// split: `Http3Server` writes a HEADERS frame whole or not at all.
+        pub fn writable(self: *const Self, id: u64) ?u64 {
+            const room = self.streams.writableOctets(id) orelse return null;
+            assert(room <= config.stream_send_octets);
+            return room;
+        }
+
+        /// Whether the peer's FIN sits at the end of what `readable(id)`
+        /// returns, so that consuming all of it reads the stream to its end.
+        /// False for a stream that was reset, whose octets are not readable.
+        pub fn readableFin(self: *Self, id: u64) bool {
+            const stream = self.streams.find(id) orelse return false;
+            if (stream.receive_state == .reset) return false;
+            const final_size = stream.received.final_size orelse return false;
+            const end = stream.consumed + stream.readable().len;
+            assert(end <= final_size);
+            return end == final_size;
+        }
+
         /// Release bytes the application has read, which is what moves the flow
         /// control window forward.
         pub fn consume(self: *Self, id: u64, octets: usize) ConnectionStreams.Error!void {

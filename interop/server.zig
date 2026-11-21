@@ -71,15 +71,13 @@ const Connection = quic.Connection(.{
     .connection_receive_octets = connection_receive_octets,
 });
 
-const Http3 = h3.Http3(.{
+/// The server side of HTTP/3, which this file used to write by hand: the three
+/// unidirectional streams pushed as credit opens, the FIN read off the stream's
+/// internals, the response framed into one write. All of it is the library's.
+const Session = h3.Http3Server(Connection, .{
     .requests_max = requests_max,
     .unidirectional_max = unidirectional_max,
 });
-
-/// RFC 9000 section 2.1: server-initiated unidirectional streams are 3, 7, 11.
-const control_stream: u64 = 3;
-const qpack_encoder_stream: u64 = 7;
-const qpack_decoder_stream: u64 = 11;
 
 const receive_octets: usize = 2048;
 const connection_id_octets: usize = 8;
@@ -156,7 +154,7 @@ const Peer = struct {
     /// and none is: the table is fixed and slots are reused in place.
     trace: qlog_file.Trace,
     server: tls.Server,
-    http3: Http3,
+    session: Session,
     /// The identifier this endpoint chose, which is what a client addresses
     /// once it has seen a packet from here.
     local: quic.ConnectionId,
@@ -171,16 +169,6 @@ const Peer = struct {
     address: Io.net.IpAddress,
     started_ns: u64,
     last_ns: u64,
-    /// Whether this endpoint's unidirectional streams have been *produced*.
-    /// Not whether they have been sent: `writeControl` may be called once, and
-    /// a peer that has not yet granted stream credit takes fewer octets than
-    /// it is offered — so the octets are held here and pushed until they are
-    /// gone. Calling `writeControl` again instead is an assertion failure, and
-    /// was.
-    http3_started: bool,
-    uni_out: [3][256]u8,
-    uni_len: [3]usize,
-    uni_sent: [3]usize,
     /// Streams the connection has reported data on.
     readable: [streams_max]u64,
     readable_len: usize,
@@ -197,6 +185,9 @@ const Answer = struct {
     stream: u64,
     /// The file the path resolved to, or null for the built-in body.
     file: ?Io.File,
+    /// Whether the body goes out as HTTP/3 DATA frames, or bare as
+    /// `hq-interop` sends it.
+    framed: bool,
     /// Octets handed to `write` so far, and how many there are.
     offset: u64,
     total: u64,
@@ -435,16 +426,12 @@ fn accept(
             },
         }),
         .server = undefined,
-        .http3 = .init(.server),
+        .session = .init(),
         .local = source,
         .original = datagram.destination,
         .address = message.from,
         .started_ns = now_ns,
         .last_ns = now_ns,
-        .http3_started = false,
-        .uni_out = undefined,
-        .uni_len = @splat(0),
-        .uni_sent = @splat(0),
         .readable = undefined,
         .readable_len = 0,
         .answers = undefined,
@@ -672,34 +659,24 @@ fn drive(io: Io, log: *Io.Writer, peer: *Peer, now_ns: u64, shared: *const Share
         return;
     }
 
-    if (!peer.http3_started) try startHttp3(peer);
-    try pushUnidirectional(peer);
+    peer.session.flush(&peer.connection);
 
     var index: usize = 0;
     // Bounded by `readable_len`, which is bounded by the stream table.
     while (index < peer.readable_len) : (index += 1) {
         const id = peer.readable[index];
-        const stream = peer.connection.findStream(id) orelse continue;
-        if (stream.receive_state == .reset) continue;
-        const data = peer.connection.readable(id);
-        const fin = if (stream.received.final_size) |size|
-            size == stream.consumed + data.len
-        else
-            false;
-        if (data.len == 0 and !fin) continue;
-
         var events: [16]h3.http3.Event = undefined;
-        const result = peer.http3.receive(id, data, fin, &events) catch |err| {
-            const application = h3.http3.code(err);
+        // A connection error has already been closed on, with the code RFC
+        // 9114 names; what is left here is to say so.
+        const read = peer.session.receive(&peer.connection, id, &events, std.math.maxInt(u64)) catch |err| {
             try note(log, "http3 on stream {d}: {s} (0x{x})", .{
                 id,
                 @errorName(err),
-                @backingInt(application),
+                @backingInt(h3.http3.code(err)),
             });
-            peer.connection.closeApplication(@backingInt(application));
             return;
         };
-        for (events[0..result.events]) |event| {
+        for (events[0..read.events]) |event| {
             respond(io, peer, shared, event) catch |err| {
                 const application = respondCode(err);
                 try note(log, "response on stream {d}: {s} (0x{x})", .{
@@ -711,31 +688,10 @@ fn drive(io: Io, log: *Io.Writer, peer: *Peer, now_ns: u64, shared: *const Share
                 return;
             };
         }
-        if (result.consumed > 0) try peer.connection.consume(id, result.consumed);
+        peer.session.consume(&peer.connection, id, read);
     }
     compactReadable(peer);
     try pushAnswers(io, peer, scratch);
-}
-
-const unidirectional_streams = [3]u64{ control_stream, qpack_encoder_stream, qpack_decoder_stream };
-
-/// Produce this endpoint's three unidirectional streams, once.
-fn startHttp3(peer: *Peer) !void {
-    peer.uni_len[0] = try peer.http3.writeControl(&peer.uni_out[0]);
-    peer.uni_len[1] = try h3.stream.write(&peer.uni_out[1], .qpack_encoder);
-    peer.uni_len[2] = try h3.stream.write(&peer.uni_out[2], .qpack_decoder);
-    peer.http3_started = true;
-}
-
-/// Push what is left of them. A stream this endpoint has no credit for takes
-/// nothing and is tried again on the next pass, which is what a MAX_STREAM_DATA
-/// from the peer is for.
-fn pushUnidirectional(peer: *Peer) !void {
-    for (unidirectional_streams, 0..) |id, index| {
-        if (peer.uni_sent[index] == peer.uni_len[index]) continue;
-        const rest = peer.uni_out[index][peer.uni_sent[index]..peer.uni_len[index]];
-        peer.uni_sent[index] += peer.connection.write(id, rest, false) catch 0;
-    }
 }
 
 /// One event, and the response a HEADERS on a request stream earns.
@@ -761,53 +717,47 @@ fn respond(io: Io, peer: *Peer, shared: *const Shared, event: h3.http3.Event) Re
             // decides whether a field section is a message at all, and a server
             // that skipped it would be the request-smuggling surface
             // `fields.zig` exists to close.
-            var buffer: [16 * 1024]u8 = undefined;
-            var iterator = h3.qpack.field_line.iterate(value.section, &buffer, 1 << 20) catch
-                return error.GeneralProtocolError;
-            var validator: h3.fields.MessageValidator = .init(.{
+            var decoder: [16 * 1024]u8 = undefined;
+            var storage: [16 * 1024]u8 = undefined;
+            var list: [64]h3.qpack.Field = undefined;
+            const decoded = h3.http3_server.decodeSection(value.section, .{
                 .kind = if (value.trailers) .trailer else .request,
-            });
-            var path: [256]u8 = undefined;
-            var path_len: usize = 0;
-            while (iterator.next() catch return error.GeneralProtocolError) |field| {
-                validator.field(&field) catch return error.MessageError;
-                if (std.mem.eql(u8, field.name, ":path") and field.value.len <= path.len) {
-                    @memcpy(path[0..field.value.len], field.value);
-                    path_len = field.value.len;
-                }
+            }, 1 << 20, &decoder, &storage, &list) catch |err| return switch (err) {
+                error.DecompressionFailed => error.GeneralProtocolError,
+                error.MessageError => error.MessageError,
+                error.TooLarge => error.ExcessiveLoad,
+            };
+            var path: []const u8 = "";
+            for (decoded.fields) |field| {
+                if (std.mem.eql(u8, field.name, ":path")) path = field.value;
             }
-            validator.finish() catch return error.MessageError;
             if (value.trailers) return;
 
             // Answered once. A second HEADERS on the same stream is trailers,
             // which is legal and is not a second request.
             if (findAnswer(peer, value.stream) != null) return;
-            const answer = openAnswer(io, peer, shared, value.stream, path[0..path_len]) orelse
+            const answer = openAnswer(io, peer, shared, value.stream, path, true) orelse
                 return error.ExcessiveLoad;
 
             var out: [512]u8 = undefined;
             var length: [24]u8 = undefined;
-            var offset = try peer.http3.writeHeaders(&out, &.{
+            // The headers whole; the body follows through `pushAnswers` as the
+            // peer's window opens, in DATA frames `writeData` sizes to fit — a
+            // megabyte does not fit in one write, and a server that assumed it
+            // did would truncate every large response and call it a success.
+            peer.session.writeHeaders(&peer.connection, value.stream, &.{
                 .{ .name = ":status", .value = "200" },
                 .{
                     .name = "content-length",
                     .value = std.fmt.bufPrint(&length, "{d}", .{answer.total}) catch
                         return error.GeneralProtocolError,
                 },
-            });
-            offset += try Http3.writeData(out[offset..], answer.total);
-            // The frame header only. The body follows through `pushAnswers` as
-            // the peer's window opens — a megabyte does not fit in one write,
-            // and a server that assumed it did would truncate every large
-            // response and call it a success.
-            const written = peer.connection.write(value.stream, out[0..offset], false) catch
-                return error.GeneralProtocolError;
-            if (written != offset) return error.GeneralProtocolError;
+            }, &out, false) catch return error.GeneralProtocolError;
         },
         .settings => {},
         .goaway => {},
         .data => {},
-        .finished => |id| peer.http3.release(id),
+        .finished => |id| peer.session.release(id),
     }
 }
 
@@ -831,10 +781,11 @@ fn openAnswer(
     shared: *const Shared,
     stream: u64,
     path: []const u8,
+    framed: bool,
 ) ?*Answer {
     if (peer.answers_len == peer.answers.len) return null;
     const answer = &peer.answers[peer.answers_len];
-    answer.* = .{ .stream = stream, .file = null, .offset = 0, .total = body.len };
+    answer.* = .{ .stream = stream, .file = null, .framed = framed, .offset = 0, .total = body.len };
 
     open: {
         const www = shared.www orelse break :open;
@@ -878,7 +829,10 @@ fn pushAnswers(io: Io, peer: *Peer, scratch: []u8) !void {
                 body[@intCast(answer.offset)..@intCast(answer.total)];
             if (chunk.len > 0) {
                 const fin = answer.offset + chunk.len == answer.total;
-                const taken = peer.connection.write(answer.stream, chunk, fin) catch 0;
+                const taken = if (answer.framed)
+                    peer.session.writeData(&peer.connection, answer.stream, chunk, fin) catch 0
+                else
+                    peer.connection.write(answer.stream, chunk, fin) catch 0;
                 answer.offset += taken;
                 // A short write is ordinary: it means the window closed, and
                 // the FIN went with the last octet only if all of them fit.
@@ -891,6 +845,14 @@ fn pushAnswers(io: Io, peer: *Peer, scratch: []u8) !void {
         if (answer.offset < answer.total) {
             index += 1;
             continue;
+        }
+        // An empty HTTP/3 body never reached a write that could carry the
+        // FIN, so it goes on its own; and until it does the slot stays.
+        if (answer.framed and answer.total == 0) {
+            peer.session.finish(&peer.connection, answer.stream) catch {
+                index += 1;
+                continue;
+            };
         }
         // Finished. The slot goes back, which for a `multiconnect` run is what
         // keeps the table from filling.
@@ -910,7 +872,7 @@ fn respondHq(io: Io, peer: *Peer, shared: *const Shared, stream: u64) !void {
     try peer.connection.consume(stream, end + 2);
 
     const space = std.mem.indexOfScalar(u8, line, ' ') orelse return;
-    _ = openAnswer(io, peer, shared, stream, line[space + 1 ..]) orelse return;
+    _ = openAnswer(io, peer, shared, stream, line[space + 1 ..], false) orelse return;
 }
 
 /// Drop the identifiers whose streams are gone.
