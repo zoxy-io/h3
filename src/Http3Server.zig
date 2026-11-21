@@ -597,7 +597,7 @@ fn connect(client: *TestConnection, server: *TestConnection) !void {
     var first: [TestConnection.datagram_octets]u8 = undefined;
     const octets = try client.send(&first, 0);
     const datagram = endpoint.classify(first[0..octets], server_source.len);
-    server.* = try TestConnection.initServer(.{
+    try server.initServer(.{
         .initial_destination = datagram.destination,
         .source = try ConnectionId.init(&server_source),
         .advertised = .{ .max_streams_bidirectional = 4, .max_streams_unidirectional = 6, .streams_opened_max = 3 },

@@ -399,46 +399,48 @@ fn accept(
         break :free oldest;
     };
 
-    slot.* = .{
-        // RFC 9001 section 5.2: the Initial keys come from the Destination
-        // Connection ID of the packet that just arrived — the client's own
-        // choice on a first flight, and *this server's* Retry Source
-        // Connection ID on a retried one. `retried` carries the other value,
-        // the one section 7.3 has the transport parameters repeat.
-        .connection = try Connection.initServer(.{
-            .initial_destination = datagram.destination,
-            .source = source,
-            .retry = retried,
-            .advertised = .{
-                // The same number `idle_ns` retires on, so what this server
-                // does is what it said it would do. It advertised nothing
-                // while dropping connections after five seconds, which is a
-                // server telling its peer the connection never times out and
-                // then behaving as though it does.
-                .max_idle_timeout_ms = @divExact(idle_ns, std.time.ns_per_ms),
-                // What the stream layer enforces: the table is shared between
-                // four kinds of stream, so `streams_max` is never the per-kind
-                // limit.
-                .max_streams_bidirectional = requests_max,
-                .max_streams_unidirectional = unidirectional_max,
-                // Control and QPACK's two.
-                .streams_opened_max = 3,
-            },
-        }),
-        .server = undefined,
-        .session = .init(),
-        .local = source,
-        .original = datagram.destination,
-        .address = message.from,
-        .started_ns = now_ns,
-        .last_ns = now_ns,
-        .readable = undefined,
-        .readable_len = 0,
-        .answers = undefined,
-        .answers_len = 0,
-        .trace = .{},
-        .live = true,
-    };
+    // The connection first, in place: it is megabytes at this file's
+    // configuration, and building it anywhere but its slot put two copies of
+    // it on the stack and overflowed it on the first connection. A free slot
+    // and an evicted one are both not live, and this one becomes live only
+    // once everything below has succeeded.
+    assert(!slot.live);
+    // RFC 9001 section 5.2: the Initial keys come from the Destination
+    // Connection ID of the packet that just arrived — the client's own choice
+    // on a first flight, and *this server's* Retry Source Connection ID on a
+    // retried one. `retried` carries the other value, the one section 7.3 has
+    // the transport parameters repeat.
+    try slot.connection.initServer(.{
+        .initial_destination = datagram.destination,
+        .source = source,
+        .retry = retried,
+        .advertised = .{
+            // The same number `idle_ns` retires on, so what this server
+            // does is what it said it would do. It advertised nothing
+            // while dropping connections after five seconds, which is a
+            // server telling its peer the connection never times out and
+            // then behaving as though it does.
+            .max_idle_timeout_ms = @divExact(idle_ns, std.time.ns_per_ms),
+            // What the stream layer enforces: the table is shared between
+            // four kinds of stream, so `streams_max` is never the per-kind
+            // limit.
+            .max_streams_bidirectional = requests_max,
+            .max_streams_unidirectional = unidirectional_max,
+            // Control and QPACK's two.
+            .streams_opened_max = 3,
+        },
+    });
+    // Every other field by name, so nothing here builds a `Peer` value — whose
+    // first field is the connection — anywhere but in the slot.
+    slot.session = .init();
+    slot.local = source;
+    slot.original = datagram.destination;
+    slot.address = message.from;
+    slot.started_ns = now_ns;
+    slot.last_ns = now_ns;
+    slot.readable_len = 0;
+    slot.answers_len = 0;
+    slot.trace = .{};
     // The extension is the connection's own, built from what it enforces, so
     // it is encoded once the connection exists and handed to the TLS engine.
     slot.server = .init(.{
@@ -455,6 +457,7 @@ fn accept(
     // value both endpoints agree on before either has chosen anything — so a
     // client's trace and this one can be put side by side.
     slot.trace.start(io, shared.qlog, datagram.destination.bytes(), .server);
+    slot.live = true;
     try note(log, "accepted a connection as {x}", .{source.bytes()});
     return slot;
 }

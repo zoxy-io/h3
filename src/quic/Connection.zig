@@ -1247,14 +1247,23 @@ pub fn Connection(comptime config: Config) type {
         /// section 7.3 requires of a server follow from these options, and
         /// `localTransportParameters` encodes them for the consumer's TLS
         /// engine to carry.
-        pub fn initServer(options: ServerOptions) InitError!Self {
+        ///
+        /// In place, into the connection's own storage, because a connection
+        /// is not a stack value: `footprint_octets` is hundreds of kilobytes at
+        /// a modest configuration and megabytes at the defaults, and a
+        /// constructor that returned `Self` — inside an error union, at that —
+        /// held a copy of it in the caller's frame and another in its own. The
+        /// interop server overflowed an 8 MiB stack on its first connection
+        /// that way. Everything is checked before `self` is touched, so a
+        /// refusal leaves the storage as it was.
+        pub fn initServer(self: *Self, options: ServerOptions) InitError!void {
             try validateAdvertised(.server, options.advertised);
             if (options.retry) |retried| {
                 if (retried.original_destination.eql(&options.initial_destination)) {
                     return error.RetryIdentifierReused;
                 }
             }
-            var self: Self = .init(.{
+            self.initInPlace(.{
                 .side = .server,
                 .original_destination = options.initial_destination,
                 .source = options.source,
@@ -1268,11 +1277,25 @@ pub fn Connection(comptime config: Config) type {
             }
             assert(self.side == .server);
             assert(self.local.original_destination != null);
+        }
+
+        /// A connection by value, for a configuration small enough to hold on
+        /// a stack — tests and the simulator. Anything sized like a real
+        /// connection is built where it lives, with `initInPlace` or
+        /// `initServer`, which make no copy: a by-value return may.
+        pub fn init(options: Options) Self {
+            var self: Self = undefined;
+            self.initInPlace(options);
             return self;
         }
 
-        pub fn init(options: Options) Self {
-            var self: Self = .{
+        /// Initialize the connection where it lives, with no copy of `Self`
+        /// on the stack: the assignment below is a struct literal written
+        /// straight into `self`, which is the result location Zig gives it.
+        /// `test "a connection initializes in place, on a stack smaller than
+        /// it"` is what holds that true.
+        pub fn initInPlace(self: *Self, options: Options) void {
+            self.* = .{
                 .side = options.side,
                 .destination = options.original_destination,
                 .source = options.source,
@@ -1295,7 +1318,8 @@ pub fn Connection(comptime config: Config) type {
             // it when there was a Retry.
             if (options.side == .server) self.local.original_destination = options.original_destination;
             if (options.advertised) |advertised| self.advertise(advertised);
-            return self;
+            assert(self.side == options.side);
+            assert(self.state == .handshaking);
         }
 
         fn advertise(self: *Self, advertised: Advertised) void {
@@ -10696,8 +10720,8 @@ const test_advertised: TestConnection.Advertised = .{
 
 /// A server built the way a consumer builds one: from the first Initial it
 /// classified, with what it advertises.
-fn testServerFrom(datagram: *const endpoint_module.Datagram, retry: ?TestConnection.Retried) TestConnection {
-    return TestConnection.initServer(.{
+fn testServerFrom(server: *TestConnection, datagram: *const endpoint_module.Datagram, retry: ?TestConnection.Retried) void {
+    server.initServer(.{
         .initial_destination = datagram.destination,
         .source = ConnectionId.init(&server_source) catch unreachable, // Eight octets.
         .retry = retry,
@@ -10733,7 +10757,8 @@ test "a server's own transport parameters are what it enforces, and a client acc
     const datagram = endpoint_module.classify(first[0..sent], server_source.len);
     try testing.expect(datagram.mayStart());
 
-    var server = testServerFrom(&datagram, null);
+    var server: TestConnection = undefined;
+    testServerFrom(&server, &datagram, null);
     try server.receive(first[0..sent], 0);
     try testing.expect(!server.addressValidated());
 
@@ -10797,7 +10822,8 @@ test "after a Retry the server repeats both identifiers, and its address is vali
     try testing.expectEqualSlices(u8, &client_cid, retried.token);
     try testing.expectEqualSlices(u8, retry_source.bytes(), retried.destination.bytes());
 
-    var server = testServerFrom(&retried, .{ .original_destination = try ConnectionId.init(retried.token) });
+    var server: TestConnection = undefined;
+    testServerFrom(&server, &retried, .{ .original_destination = try ConnectionId.init(retried.token) });
     try testing.expect(server.addressValidated());
     try server.receive(second[0..second_octets], 200);
     try testing.expectEqualStrings("ClientHello", server.cryptoOut(.initial));
@@ -10815,7 +10841,8 @@ test "after a Retry the server repeats both identifiers, and its address is vali
 
     // A server that forgot the Retry repeats the wrong original identifier
     // and none for the Retry, and the client refuses on the first of the two.
-    var forgetful = testServerFrom(&retried, null);
+    var forgetful: TestConnection = undefined;
+    testServerFrom(&forgetful, &retried, null);
     const wrong = try forgetful.localTransportParameters(&buffer);
     var other = testClient();
     other.retry_seen = true;
@@ -10844,8 +10871,8 @@ fn flightClient() FlightConnection {
     });
 }
 
-fn flightServer(datagram: *const endpoint_module.Datagram, retry: ?FlightConnection.Retried) FlightConnection {
-    return FlightConnection.initServer(.{
+fn flightServer(server: *FlightConnection, datagram: *const endpoint_module.Datagram, retry: ?FlightConnection.Retried) void {
+    server.initServer(.{
         .initial_destination = datagram.destination,
         .source = ConnectionId.init(&server_source) catch unreachable, // Eight octets.
         .retry = retry,
@@ -10886,7 +10913,8 @@ test "section 8.1: a validated Retry lifts the amplification limit, and without 
         const octets = try client.send(&first, 0);
         const datagram = endpoint_module.classify(first[0..octets], server_source.len);
         // The validation itself is the consumer's: here, a token it accepted.
-        var server = flightServer(&datagram, if (retried)
+        var server: FlightConnection = undefined;
+        flightServer(&server, &datagram, if (retried)
             .{ .original_destination = ConnectionId.init(&.{ 1, 2, 3, 4, 5, 6, 7, 8 }) catch unreachable } // Eight octets.
         else
             null);
@@ -10934,7 +10962,8 @@ test "section 8.1: a first flight of two datagrams buys allowance for both" {
     try testing.expect(first.destination.eql(&second.destination));
     try testing.expectEqual(endpoint_module.Action.initial, second.action);
 
-    var server = flightServer(&first, null);
+    var server: FlightConnection = undefined;
+    flightServer(&server, &first, null);
     try server.receive(datagrams[0][0..lengths[0]], 0);
     try server.receive(datagrams[1][0..lengths[1]], 0);
     try testing.expectEqual(@as(u64, lengths[0] + lengths[1]), server.received_octets);
@@ -10973,7 +11002,8 @@ test "what a consumer advertises is checked against what the connection holds" {
 
     // And a Retry naming the identifier it was supposed to replace.
     const same = ConnectionId.init(&client_cid) catch unreachable; // Eight octets.
-    try testing.expectError(error.RetryIdentifierReused, TestConnection.initServer(.{
+    var refused: TestConnection = undefined;
+    try testing.expectError(error.RetryIdentifierReused, refused.initServer(.{
         .initial_destination = same,
         .source = ConnectionId.init(&server_source) catch unreachable, // As above.
         .retry = .{ .original_destination = same },
@@ -10982,7 +11012,8 @@ test "what a consumer advertises is checked against what the connection holds" {
 }
 
 test "the transport parameters bound holds at every field's widest" {
-    var server = try TestConnection.initServer(.{
+    var server: TestConnection = undefined;
+    try server.initServer(.{
         .initial_destination = ConnectionId.init(&@as([20]u8, @splat(1))) catch unreachable, // Twenty octets.
         .source = ConnectionId.init(&@as([20]u8, @splat(2))) catch unreachable, // As above.
         .retry = .{ .original_destination = ConnectionId.init(&@as([20]u8, @splat(3))) catch unreachable }, // As above.
@@ -11195,4 +11226,71 @@ test "section 10.2: the closing and draining periods last three PTOs and then en
     try testing.expect(!client.isClosed());
     client.onTimeout(sent_at + 3 * client_pto);
     try testing.expect(client.isClosed());
+}
+
+/// More than twice the stack of the thread below, so a copy of `Self` anywhere on
+/// the construction path is a crash rather than a pass. Static, because it is
+/// the point of the test that it lives nowhere a stack frame could.
+const OversizeConnection = Connection(.{
+    .streams_max = 16,
+    .stream_receive_octets = 128 * 1024,
+    .stream_send_octets = 64 * 1024,
+});
+var oversize_server: OversizeConnection = undefined;
+/// The stack the constructor runs on, under half the connection it builds.
+/// A thread is test-only here: it is the one way to give a test a stack of a
+/// known size, and it touches nothing the seam keeps out.
+const oversize_stack_octets: usize = 1 << 20;
+
+comptime {
+    assert(OversizeConnection.footprint_octets > 2 * oversize_stack_octets);
+}
+
+const OversizeOutcome = struct {
+    init_error: ?OversizeConnection.InitError = null,
+    receive_error: ?OversizeConnection.ReceiveError = null,
+    received_octets: u64 = 0,
+    done: bool = false,
+};
+
+fn initOversize(outcome: *OversizeOutcome) void {
+    defer outcome.done = true;
+    const destination = ConnectionId.init(&client_cid) catch unreachable; // Eight octets.
+    oversize_server.initServer(.{
+        .initial_destination = destination,
+        .source = ConnectionId.init(&server_source) catch unreachable, // Eight octets.
+        .advertised = .{ .max_streams_bidirectional = 8, .max_streams_unidirectional = 4, .streams_opened_max = 3 },
+    }) catch |err| {
+        outcome.init_error = err;
+        return;
+    };
+    // And a datagram through it, the other path a consumer takes straight
+    // after: nothing in `receive` may hold a connection either. A real
+    // client Initial of 1200 octets, so the whole receive path runs.
+    var client: TestConnection = testClient();
+    client.cryptoIn(.initial, "ClientHello") catch unreachable; // Eleven octets into a 4096-octet buffer.
+    var first: [TestConnection.datagram_octets]u8 = undefined;
+    const octets = client.send(&first, 0) catch unreachable; // The buffer is `datagram_octets`.
+    oversize_server.receive(first[0..octets], 0) catch |err| {
+        outcome.receive_error = err;
+    };
+    outcome.received_octets = oversize_server.received_octets;
+}
+
+test "a connection initializes in place, on a stack smaller than it" {
+    // The interop server segfaulted on its first connection: `initServer`
+    // returned `InitError!Self`, so the caller held an error union of a
+    // multi-megabyte connection and `init` held another, both on an 8 MiB
+    // stack. A thread with a stack under half the connection's size makes any
+    // such copy fatal on every machine, whatever its `ulimit -s`.
+    var outcome: OversizeOutcome = .{};
+    const thread = try std.Thread.spawn(.{ .stack_size = oversize_stack_octets }, initOversize, .{&outcome});
+    thread.join();
+    try testing.expect(outcome.done);
+    try testing.expectEqual(@as(?OversizeConnection.InitError, null), outcome.init_error);
+    try testing.expectEqual(@as(?OversizeConnection.ReceiveError, null), outcome.receive_error);
+    try testing.expectEqual(@as(u64, initial_datagram_min), outcome.received_octets);
+    try testing.expectEqualStrings("ClientHello", oversize_server.cryptoOut(.initial));
+    try testing.expectEqual(Side.server, oversize_server.side);
+    try testing.expect(!oversize_server.addressValidated());
 }

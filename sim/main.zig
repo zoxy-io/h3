@@ -1040,7 +1040,7 @@ fn startServer(world: *World, datagram: []u8, random: std.Random) bool {
         const original = ConnectionId.init(classified.token) catch return false;
         retried = .{ .original_destination = original };
     }
-    world.server = Connection.initServer(.{
+    world.server.initServer(.{
         .initial_destination = classified.destination,
         .source = ConnectionId.init(&server_source) catch unreachable, // Eight octets.
         .retry = retried,

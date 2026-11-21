@@ -626,7 +626,9 @@ const Session = struct {
 
         const destination = try quic.ConnectionId.init(identifiers[0..connection_id_octets]);
         const source = try quic.ConnectionId.init(identifiers[connection_id_octets..]);
-        self.connection = .init(.{
+        // In place: at this file's configuration a connection is megabytes,
+        // and one returned by value is a copy on the stack.
+        self.connection.initInPlace(.{
             .side = .client,
             .original_destination = destination,
             .source = source,
