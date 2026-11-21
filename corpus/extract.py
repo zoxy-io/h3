@@ -23,7 +23,7 @@ block disagrees with the HKDF output rather than merely being the right length.
 This script's job is to make that comparison possible without anyone typing
 1200 octets by hand.
 
-Usage: python3 extract.py rfc9001.txt > rfc9001_vectors.zig
+Usage: python3 extract.py rfc9001.txt > ../src/quic/crypto/rfc9001_vectors.zig
 """
 import re
 import sys
@@ -82,7 +82,11 @@ def field(name, hex_text, expect_octets=None):
     if expect_octets is not None and octets != expect_octets:
         raise SystemExit(f'{name}: extracted {octets} octets, RFC states {expect_octets}')
     grouped = [hex_text[i:i + 32] for i in range(0, len(hex_text), 32)]
-    body = '\n'.join('    "' + g + '" ++' for g in grouped)
+    # `zig fmt` indents every operand after the first of a `++` chain one level
+    # further, and the file this writes lives under `src/`, which the format
+    # gate checks — so the output is formatted as it is written rather than
+    # reformatted after.
+    body = '\n'.join(('    "' if i == 0 else '        "') + g + '" ++' for i, g in enumerate(grouped))
     # `rstrip(' ++')` would strip a *character set* — every trailing space and
     # `+` — rather than the suffix. It happens to be right here only because a
     # quote terminates every line, so there is nothing else for it to eat; make
@@ -110,7 +114,11 @@ def main():
 //! Regenerate with:
 //!
 //!     curl -sSL -o rfc9001.txt https://www.rfc-editor.org/rfc/rfc9001.txt
-//!     python3 corpus/extract.py rfc9001.txt > corpus/rfc9001_vectors.zig
+//!     python3 corpus/extract.py rfc9001.txt > src/quic/crypto/rfc9001_vectors.zig
+//!
+//! Under `src/` rather than `corpus/` because `crypto.conformance.check` runs
+//! these through a consumer's own crypto backend, and `corpus/` does not ship.
+//! Nothing here is compiled into a binary that does not call it.
 
 /// Parse a compile-time hex string into the octets it denotes.
 fn hexed(comptime text: []const u8) [text.len / 2]u8 {
@@ -181,6 +189,10 @@ comptime {
 ''')
     out.append(field('client_initial_header', hex_block_at(appendix, 'includes the connection ID and a packet number of 2'), 22))
     out.append(field('client_initial_sample', hex_block_at(appendix, 'sample = d1b1c98d'), 16))
+    # The five mask octets the appendix prints for A.2's header protection, so
+    # the AES block can be checked on its own rather than only through the
+    # whole sealed packet.
+    out.append(field('client_initial_mask', hex_block_at(appendix, 'mask = AES-ECB(hp, sample)[0..4]'), 5))
     out.append(field('client_initial_protected', hex_block_at(appendix, 'The resulting protected packet is'), 1200))
 
     # A.3 — server Initial.
@@ -201,9 +213,14 @@ comptime {
     out.append(field('chacha_nonce', hex_block_at(appendix, 'nonce              ='), 12))
     out.append(field('chacha_header', hex_block_at(appendix, 'unprotected header ='), 4))
     out.append(field('chacha_plaintext', hex_block_at(appendix, 'payload plaintext  ='), 1))
+    out.append(field('chacha_sample', hex_block_at(appendix, 'sample = 5e5cd55c'), 16))
+    # And A.5's, for the ChaCha20 keystream on its own.
+    out.append(field('chacha_mask', hex_block_at(appendix, 'mask   = aefefe7d03'), 5))
     out.append(field('chacha_packet', hex_block_at(appendix, 'packet = 4cfe4189'), 21))
 
-    print('\n'.join(out))
+    # One newline at the end and no blank line after it, which is what `zig
+    # fmt` leaves: each field already ends in a newline of its own.
+    sys.stdout.write('\n'.join(out).rstrip('\n') + '\n')
 
 
 main()

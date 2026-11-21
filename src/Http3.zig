@@ -81,6 +81,23 @@ pub const Config = struct {
     max_field_section_size: u64 = 64 * 1024,
 };
 
+/// The longest payload of a known control-stream frame — SETTINGS, GOAWAY,
+/// MAX_PUSH_ID, CANCEL_PUSH — this endpoint will wait for.
+///
+/// Those four are read whole before they are acted on, so a declared length
+/// is a claim on the stream: the octets before the frame's end are held until
+/// it arrives. A length past this one is refused on the header alone rather
+/// than waited for. Three of the four carry one variable-length integer, eight
+/// octets at most; SETTINGS is the one this bounds, at room for 64 settings at
+/// their longest encoding. An unknown frame is not bounded by it, because it
+/// is read past as it arrives and never held.
+pub const control_payload_octets_max: u32 = 64 * 2 * 8;
+
+comptime {
+    assert(control_payload_octets_max >= 8);
+    assert(control_payload_octets_max <= std.math.maxInt(u16));
+}
+
 /// Every failure this layer can produce, named for the HTTP/3 error code it
 /// becomes. `code` is the mapping, and it is exhaustive so that a new error
 /// cannot be added without deciding what a peer is told about it.
@@ -96,13 +113,16 @@ pub const Error = error{
     /// A critical stream ended. Section 6.2.1: the control stream and QPACK's
     /// two are open for the life of the connection.
     ClosedCriticalStream,
-    /// A push stream, or a GOAWAY that went backwards.
+    /// A push stream, a GOAWAY that went backwards, a MAX_PUSH_ID that went
+    /// down, or a CANCEL_PUSH — which names a push ID this endpoint neither
+    /// promised nor allowed, whichever side it is.
     IdError,
     /// A setting sent twice, or one of HTTP/2's.
     SettingsError,
     /// A field section that does not decode.
     GeneralProtocolError,
-    /// More streams than this endpoint tracks.
+    /// More streams than this endpoint tracks, or a control frame longer than
+    /// `control_payload_octets_max`.
     ExcessiveLoad,
     /// RFC 9204 section 4.3: an encoder instruction this endpoint's advertised
     /// capacity does not permit.
@@ -243,6 +263,12 @@ pub fn Http3(comptime config: Config) type {
         /// And the last one this endpoint sent, for the sending half of the
         /// same rule.
         sent_goaway: ?u64 = null,
+        /// Section 7.2.7: the client's MAX_PUSH_ID may rise and not fall. A
+        /// server keeps it for that rule alone, since it never pushes.
+        peer_max_push_id: ?u64 = null,
+        /// Octets of an unknown frame on the peer's control stream still to be
+        /// read past. Such a frame is never held, however long it says it is.
+        peer_control_skip: u64 = 0,
 
         unidirectional: [config.unidirectional_max]Unidirectional = undefined,
         unidirectional_count: u32 = 0,
@@ -384,8 +410,24 @@ pub fn Http3(comptime config: Config) type {
             fin: bool,
             events: []Event,
         ) Error!Received {
+            return self.receiveBounded(id, data, fin, events, std.math.maxInt(u64));
+        }
+
+        /// `receive`, delivering at most `data_room` octets of DATA payload on
+        /// a request stream. What follows them stays unconsumed — a partial
+        /// DATA frame is already something this layer resumes — so a caller
+        /// with somewhere to put only so much body takes only so much, and the
+        /// stream's flow control window holds the peer back for it.
+        pub fn receiveBounded(
+            self: *Self,
+            id: u64,
+            data: []const u8,
+            fin: bool,
+            events: []Event,
+            data_room: u64,
+        ) Error!Received {
             const kind = stream_id.kindOf(id);
-            if (kind.bidirectional()) return self.receiveRequest(id, data, fin, events);
+            if (kind.bidirectional()) return self.receiveRequest(id, data, fin, events, data_room);
             // A unidirectional stream this endpoint opened is one it cannot
             // receive on; QUIC refuses the frame before this layer sees it.
             assert(kind.initiator() != self.side);
@@ -587,83 +629,179 @@ pub fn Http3(comptime config: Config) type {
 
             var consumed: usize = 0;
             var produced: usize = 0;
-            // Bounded by `data`: every iteration consumes at least the two
-            // octets of a frame header, and the loop stops when a whole frame
-            // does not fit in what is left.
+            // Bounded by `data`: every iteration consumes at least one octet —
+            // of an unknown frame being read past, or the two of a frame
+            // header — or stops because a whole frame is not there yet.
             while (consumed < data.len) {
                 if (produced == events.len) break;
+                if (self.peer_control_skip > 0) {
+                    const take = @min(self.peer_control_skip, data.len - consumed);
+                    assert(take > 0);
+                    self.peer_control_skip -= take;
+                    consumed += @intCast(take);
+                    continue;
+                }
                 const header = frame.parseHeader(data[consumed..]) catch |err| switch (err) {
                     error.Incomplete => break,
                     error.NotMinimal, error.Http2Reserved => return error.FrameError,
                 };
-                const length = std.math.cast(usize, header.length) orelse return error.FrameError;
+                try self.permitControl(header);
+
+                switch (header.frame_type) {
+                    .settings, .goaway, .max_push_id, .cancel_push => {},
+                    // Section 9: an unknown frame type is ignored, which is
+                    // what makes the extension point an extension point — and
+                    // ignored as it arrives, so that its length is no claim on
+                    // the stream at all.
+                    else => {
+                        consumed += header.octets;
+                        self.peer_control_skip = header.length;
+                        continue;
+                    },
+                }
+                const length: usize = @intCast(header.length);
                 const total = header.octets + length;
                 if (data.len - consumed < total) break;
                 const payload = data[consumed + header.octets ..][0..length];
-
-                //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.1
-                //# If the first frame of the control stream is any other frame
-                //# type, this MUST be treated as a connection error of type
-                //# H3_MISSING_SETTINGS.
-                //= type=test
-                if (self.peer_settings == null and header.frame_type != .settings) {
-                    return error.MissingSettings;
-                }
-                //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.1
-                //# DATA frames MUST be associated with an HTTP request or response.  If
-                //# a DATA frame is received on a control stream, the recipient MUST
-                //# respond with a connection error of type H3_FRAME_UNEXPECTED.
-                //= type=test
-                //
-                //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.2
-                //# HEADERS frames can only be sent on request streams or push streams.
-                //# If a HEADERS frame is received on a control stream, the recipient
-                //# MUST respond with a connection error of type H3_FRAME_UNEXPECTED.
-                //= type=test
-                if (!header.frame_type.allowedOnControlStream()) return error.FrameUnexpected;
-
-                switch (header.frame_type) {
-                    .settings => {
-                        //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4
-                        //# If an endpoint receives a second SETTINGS frame on the
-                        //# control stream, the endpoint MUST respond with a connection
-                        //# error of type H3_FRAME_UNEXPECTED.
-                        //= type=test
-                        if (self.peer_settings != null) return error.FrameUnexpected;
-                        const parsed = try parseSettings(payload);
-                        self.peer_settings = parsed;
-                        events[produced] = .{ .settings = parsed };
-                        produced += 1;
-                    },
-                    .goaway => {
-                        const identifier = frame.parseSingleVarint(payload) catch
-                            return error.FrameError;
-                        // Section 5.2 rather than 7.2.6: the frame's layout is in
-                        // section 7, and what an endpoint may do with a second
-                        // one is in the shutdown section that motivates it.
-                        //= https://www.rfc-editor.org/rfc/rfc9114#section-5.2
-                        //# Receiving a GOAWAY containing a larger identifier than previously
-                        //# received MUST be treated as a connection error of type H3_ID_ERROR.
-                        //= type=test
-                        if (self.peer_goaway) |previous| {
-                            if (identifier > previous) return error.IdError;
-                        }
-                        self.peer_goaway = identifier;
-                        events[produced] = .{ .goaway = identifier };
-                        produced += 1;
-                    },
-                    // CANCEL_PUSH and MAX_PUSH_ID are permitted here and mean
-                    // nothing to an endpoint that neither pushes nor accepts a
-                    // push. Read past rather than refused, which is what
-                    // section 7.2.3 asks of a receiver with no push state.
-                    .cancel_push, .max_push_id => {},
-                    // Section 9: an unknown frame type is ignored, which is
-                    // what makes the extension point an extension point.
-                    else => {},
+                if (try self.receiveControlFrame(header.frame_type, payload)) |event| {
+                    events[produced] = event;
+                    produced += 1;
                 }
                 consumed += total;
             }
+            assert(consumed <= data.len);
             return .{ .consumed = consumed, .events = produced };
+        }
+
+        /// What a control-stream frame's header alone is enough to refuse.
+        /// Checked before its payload has arrived, so that a frame which will
+        /// be refused is never waited for.
+        fn permitControl(self: *const Self, header: frame.Header) Error!void {
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.1
+            //# If the first frame of the control stream is any other frame
+            //# type, this MUST be treated as a connection error of type
+            //# H3_MISSING_SETTINGS.
+            //= type=test
+            if (self.peer_settings == null and header.frame_type != .settings) {
+                return error.MissingSettings;
+            }
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.1
+            //# DATA frames MUST be associated with an HTTP request or response.  If
+            //# a DATA frame is received on a control stream, the recipient MUST
+            //# respond with a connection error of type H3_FRAME_UNEXPECTED.
+            //= type=test
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.2
+            //# HEADERS frames can only be sent on request streams or push streams.
+            //# If a HEADERS frame is received on a control stream, the recipient
+            //# MUST respond with a connection error of type H3_FRAME_UNEXPECTED.
+            //= type=test
+            if (!header.frame_type.allowedOnControlStream()) return error.FrameUnexpected;
+            // A known frame is held whole before it is read, so its length is
+            // what the stream is asked to hold: past the bound, the claim is
+            // refused instead of waited on. h3spec 0.1.15 sends a GOAWAY of
+            // 2^30 octets and none of them.
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-10.5
+            //# Implementations SHOULD track the
+            //# use of these features and set limits on their use.  An endpoint MAY
+            //# treat activity that is suspicious as a connection error of type
+            //# H3_EXCESSIVE_LOAD, but false positives will result in disrupting
+            //# valid connections and requests.
+            //= type=test
+            switch (header.frame_type) {
+                .settings, .goaway, .max_push_id, .cancel_push => {
+                    if (header.length > control_payload_octets_max) return error.ExcessiveLoad;
+                },
+                else => {},
+            }
+            assert(header.octets >= 2);
+        }
+
+        /// One whole known frame from the peer's control stream, and the event
+        /// it makes, if any.
+        fn receiveControlFrame(self: *Self, frame_type: frame.Type, payload: []const u8) Error!?Event {
+            assert(payload.len <= control_payload_octets_max);
+            switch (frame_type) {
+                .settings => {
+                    //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4
+                    //# If an endpoint receives a second SETTINGS frame on the
+                    //# control stream, the endpoint MUST respond with a connection
+                    //# error of type H3_FRAME_UNEXPECTED.
+                    //= type=test
+                    if (self.peer_settings != null) return error.FrameUnexpected;
+                    const parsed = try parseSettings(payload);
+                    self.peer_settings = parsed;
+                    return .{ .settings = parsed };
+                },
+                .goaway => {
+                    const identifier = frame.parseSingleVarint(payload) catch
+                        return error.FrameError;
+                    // Section 5.2 rather than 7.2.6: the frame's layout is in
+                    // section 7, and what an endpoint may do with a second
+                    // one is in the shutdown section that motivates it.
+                    //= https://www.rfc-editor.org/rfc/rfc9114#section-5.2
+                    //# Receiving a GOAWAY containing a larger identifier than previously
+                    //# received MUST be treated as a connection error of type H3_ID_ERROR.
+                    //= type=test
+                    if (self.peer_goaway) |previous| {
+                        if (identifier > previous) return error.IdError;
+                    }
+                    self.peer_goaway = identifier;
+                    return .{ .goaway = identifier };
+                },
+                .max_push_id => return self.receiveMaxPushId(payload),
+                .cancel_push => {
+                    _ = frame.parseSingleVarint(payload) catch return error.FrameError;
+                    // Neither side ever has a push ID to cancel. A server
+                    // sends no PUSH_PROMISE, so none has been mentioned; a
+                    // client sends no MAX_PUSH_ID, so none is allowed.
+                    //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.3
+                    //# If a server receives a CANCEL_PUSH frame for a push
+                    //# ID that has not yet been mentioned by a PUSH_PROMISE frame, this MUST
+                    //# be treated as a connection error of type H3_ID_ERROR.
+                    //= type=test
+                    //
+                    //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.3
+                    //# If a CANCEL_PUSH frame is received that
+                    //# references a push ID greater than currently allowed on the
+                    //# connection, this MUST be treated as a connection error of type
+                    //# H3_ID_ERROR.
+                    //= type=test
+                    return error.IdError;
+                },
+                else => unreachable,
+            }
+        }
+
+        /// Section 7.2.7, which a server keeps only to refuse what breaks it.
+        fn receiveMaxPushId(self: *Self, payload: []const u8) Error!?Event {
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.7
+            //# A server MUST NOT send a MAX_PUSH_ID frame.  A client MUST treat the
+            //# receipt of a MAX_PUSH_ID frame as a connection error of type
+            //# H3_FRAME_UNEXPECTED.
+            //= type=test
+            if (self.side == .client) return error.FrameUnexpected;
+            // A trailing octet makes the payload longer than its one field,
+            // which `parseSingleVarint` refuses.
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-7.1
+            //# A frame payload that contains additional bytes
+            //# after the identified fields or a frame payload that terminates before
+            //# the end of the identified fields MUST be treated as a connection
+            //# error of type H3_FRAME_ERROR.
+            //= type=test
+            const maximum = frame.parseSingleVarint(payload) catch return error.FrameError;
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.7
+            //# A MAX_PUSH_ID frame cannot reduce the maximum push
+            //# ID; receipt of a MAX_PUSH_ID frame that contains a smaller value than
+            //# previously received MUST be treated as a connection error of type
+            //# H3_ID_ERROR.
+            //= type=test
+            if (self.peer_max_push_id) |previous| {
+                if (maximum < previous) return error.IdError;
+            }
+            self.peer_max_push_id = maximum;
+            assert(self.side == .server);
+            return null;
         }
 
         fn receiveRequest(
@@ -672,18 +810,22 @@ pub fn Http3(comptime config: Config) type {
             data: []const u8,
             fin: bool,
             events: []Event,
+            data_room: u64,
         ) Error!Received {
             const request = try self.requestFor(id);
             var consumed: usize = 0;
             var produced: usize = 0;
+            var room = data_room;
             // Bounded by `data`, as in `receiveControl`.
             while (consumed < data.len) {
                 if (produced == events.len) break;
 
                 // The tail of a DATA frame whose header arrived earlier.
                 if (request.data_remaining > 0) {
+                    if (room == 0) break;
                     const available = data.len - consumed;
-                    const take = @min(request.data_remaining, available);
+                    const take = @min(@min(request.data_remaining, available), room);
+                    room -= take;
                     events[produced] = .{ .data = .{
                         .stream = id,
                         .payload = data[consumed..][0..@intCast(take)],
@@ -701,6 +843,16 @@ pub fn Http3(comptime config: Config) type {
                     error.NotMinimal, error.Http2Reserved => return error.FrameError,
                 };
                 if (!header.frame_type.allowedOnRequestStream()) return error.FrameUnexpected;
+                // Refused on its header: a server need not read the promise to
+                // know a client may not make one.
+                //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.5
+                //# A client MUST NOT send a PUSH_PROMISE frame.  A server MUST treat the
+                //# receipt of a PUSH_PROMISE frame as a connection error of type
+                //# H3_FRAME_UNEXPECTED.
+                //= type=test
+                if (header.frame_type == .push_promise and self.side == .server) {
+                    return error.FrameUnexpected;
+                }
 
                 // DATA is the one frame whose payload does not have to be here
                 // before any of it is delivered; see `Request.data_remaining`.
@@ -800,6 +952,18 @@ pub fn Http3(comptime config: Config) type {
             }
         }
 
+        /// Whether a request stream has sequencing state here: it has been read
+        /// and not yet released. `Http3Server` uses it to tell a stream it has
+        /// already finished from one it has never seen.
+        pub fn tracks(self: *const Self, id: u64) bool {
+            assert(stream_id.kindOf(id).bidirectional());
+            // Bounded by `requests_count`.
+            for (self.requests[0..self.requests_count]) |*one| {
+                if (one.id == id) return true;
+            }
+            return false;
+        }
+
         /// Whether the peer's SETTINGS have arrived.
         pub fn settings(self: *const Self) ?Settings {
             return self.peer_settings;
@@ -813,18 +977,24 @@ pub fn Http3(comptime config: Config) type {
 }
 
 /// Section 7.2.4's payload: identifier and value, repeated, with no count.
+///
+/// A repeat is refused whatever the identifier, known or not: the check
+/// compares each pair against the ones before it in the payload, which costs
+/// a square of the pair count and no memory. At two octets a pair at least,
+/// `control_payload_octets_max` bounds the count at 512, and the square is
+/// paid once per connection. It used to be four flags for the four known
+/// settings, and h3spec 0.1.15 repeats an unknown one.
 //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4
 //# The same setting identifier MUST NOT occur more than once in the
-//# SETTINGS frame.
+//# SETTINGS frame.  A receiver MAY treat the presence of duplicate
+//# setting identifiers as a connection error of type H3_SETTINGS_ERROR.
 //= type=test
 fn parseSettings(payload: []const u8) Error!Settings {
+    assert(payload.len <= control_payload_octets_max);
     var out: Settings = .{};
-    var seen_capacity = false;
-    var seen_field_section = false;
-    var seen_blocked = false;
-    var seen_connect = false;
 
     var iterator: frame.SettingsIterator = .init(payload);
+    var start: usize = 0;
     // Bounded by the payload: every `next` consumes at least two octets.
     while (iterator.next() catch |err| switch (err) {
         //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4.1
@@ -839,26 +1009,14 @@ fn parseSettings(payload: []const u8) Error!Settings {
         // Length disagrees with its contents, which is section 7.1's
         // H3_FRAME_ERROR rather than a settings error.
         error.Truncated => return error.FrameError,
-    }) |pair| {
+    }) |pair| : (start = iterator.offset) {
+        assert(start < iterator.offset);
+        if (settingIn(payload[0..start], pair.identifier)) return error.SettingsError;
         switch (pair.identifier) {
-            .qpack_max_table_capacity => {
-                if (seen_capacity) return error.SettingsError;
-                seen_capacity = true;
-                out.qpack_max_table_capacity = pair.value;
-            },
-            .max_field_section_size => {
-                if (seen_field_section) return error.SettingsError;
-                seen_field_section = true;
-                out.max_field_section_size = pair.value;
-            },
-            .qpack_blocked_streams => {
-                if (seen_blocked) return error.SettingsError;
-                seen_blocked = true;
-                out.qpack_blocked_streams = pair.value;
-            },
+            .qpack_max_table_capacity => out.qpack_max_table_capacity = pair.value,
+            .max_field_section_size => out.max_field_section_size = pair.value,
+            .qpack_blocked_streams => out.qpack_blocked_streams = pair.value,
             .enable_connect_protocol => {
-                if (seen_connect) return error.SettingsError;
-                seen_connect = true;
                 // RFC 9220 section 3 defines this one as a flag, and it is not
                 // among the specs vendored under `specs/` — so the rule is
                 // stated here rather than cited, and `fields.zig` is where
@@ -877,6 +1035,19 @@ fn parseSettings(payload: []const u8) Error!Settings {
         }
     }
     return out;
+}
+
+/// Whether `identifier` is among the settings `earlier` holds: a prefix of a
+/// payload `parseSettings` has already read without error, which is why
+/// reading it again cannot fail.
+fn settingIn(earlier: []const u8, identifier: frame.Setting) bool {
+    var iterator: frame.SettingsIterator = .init(earlier);
+    // Bounded by `earlier`: every `next` consumes at least two octets.
+    while (iterator.next() catch unreachable) |pair| {
+        if (pair.identifier == identifier) return true;
+    }
+    assert(iterator.offset == earlier.len);
+    return false;
 }
 
 const testing = std.testing;
@@ -1396,4 +1567,185 @@ test "an Insert Count Increment acknowledges insertions that never happened" {
         const result = try client.receive(peerUni(.client, 0), buffer[0..offset], false, &events);
         try testing.expectEqual(offset, result.consumed);
     }
+}
+
+/// A server that has read a client's control stream as far as its SETTINGS,
+/// for the tests below that send it something after them.
+fn testServerAfterSettings() !TestHttp3 {
+    var client: TestHttp3 = .init(.client);
+    var server: TestHttp3 = .init(.server);
+    var events: [4]Event = undefined;
+    var control: [128]u8 = undefined;
+    const written = try client.writeControl(&control);
+    const read = try server.receive(peerUni(.server, 0), control[0..written], false, &events);
+    assert(read.consumed == written);
+    assert(server.peer_settings != null);
+    return server;
+}
+
+/// One frame of `frame_type` carrying `octets` as its payload.
+fn testFrame(target: []u8, frame_type: frame.Type, octets: []const u8) !usize {
+    const offset = try frame.writeHeader(target, frame_type, octets.len);
+    @memcpy(target[offset..][0..octets.len], octets);
+    return offset + octets.len;
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9114#section-10.5
+//# Implementations SHOULD track the
+//# use of these features and set limits on their use.  An endpoint MAY
+//# treat activity that is suspicious as a connection error of type
+//# H3_EXCESSIVE_LOAD, but false positives will result in disrupting
+//# valid connections and requests.
+//= type=test
+test "a known control frame longer than this endpoint holds is refused on its header" {
+    var server = try testServerAfterSettings();
+    var events: [4]Event = undefined;
+    var buffer: [16]u8 = undefined;
+    // h3spec 0.1.15's: a GOAWAY claiming 2^30 octets, and none of them sent.
+    const goaway = try frame.writeHeader(&buffer, .goaway, 1 << 30);
+    try testing.expectError(
+        error.ExcessiveLoad,
+        server.receive(peerUni(.server, 0), buffer[0..goaway], false, &events),
+    );
+
+    // And a SETTINGS one octet past the bound, as the first frame: refused
+    // before its payload is waited for, whatever that payload would have been.
+    var client: TestHttp3 = .init(.client);
+    var offset = try h3stream.write(&buffer, .control);
+    offset += try frame.writeHeader(buffer[offset..], .settings, control_payload_octets_max + 1);
+    try testing.expectError(
+        error.ExcessiveLoad,
+        client.receive(peerUni(.client, 0), buffer[0..offset], false, &events),
+    );
+}
+
+test "an unknown frame on the control stream is read past as it arrives, however long" {
+    var server = try testServerAfterSettings();
+    var events: [4]Event = undefined;
+    var buffer: [64]u8 = @splat(0);
+    // h3spec 0.1.15 sends 40000 octets of type 0x21; this one claims more than
+    // any stream would hold, and every octet that arrives is taken at once.
+    const header = try frame.writeHeader(&buffer, @fromBackingInt(0x21), 100_000);
+    const first = try server.receive(peerUni(.server, 0), buffer[0 .. header + 10], false, &events);
+    try testing.expectEqual(header + 10, first.consumed);
+    try testing.expectEqual(@as(u64, 100_000 - 10), server.peer_control_skip);
+
+    // The rest of it in pieces, none of which waits for the next.
+    const piece: [4096]u8 = @splat(0);
+    var pieces: u32 = 0;
+    while (server.peer_control_skip > piece.len) : (pieces += 1) {
+        assert(pieces < 100_000 / piece.len);
+        const read = try server.receive(peerUni(.server, 0), &piece, false, &events);
+        try testing.expectEqual(piece.len, read.consumed);
+    }
+    // And its last octets, with the frame after it in the same read.
+    const last: usize = @intCast(server.peer_control_skip);
+    var tail: [piece.len + 16]u8 = @splat(0);
+    var offset = last;
+    offset += try frame.writeHeader(tail[offset..], .goaway, 1);
+    offset += try varint.encode(tail[offset..], 0);
+    const second = try server.receive(peerUni(.server, 0), tail[0..offset], false, &events);
+    try testing.expectEqual(offset, second.consumed);
+    try testing.expectEqual(@as(usize, 1), second.events);
+    try testing.expectEqual(@as(u64, 0), events[0].goaway);
+}
+
+test "a setting identifier repeated is a settings error, known or not" {
+    // h3spec 0.1.15's: 0x40 twice, in its two-octet form.
+    try testing.expectError(error.SettingsError, parseSettings("\x40\x40\x00\x40\x40\x00"));
+    // Different identifiers are not a repeat, however many.
+    _ = try parseSettings("\x40\x40\x00\x40\x41\x00\x21\x00");
+}
+
+test "a server refuses PUSH_PROMISE, on its header alone" {
+    var server: TestHttp3 = .init(.server);
+    var events: [4]Event = undefined;
+    var buffer: [16]u8 = undefined;
+    // Push ID 0 and no field section, before any HEADERS: h3spec 0.1.15's.
+    const written = try testFrame(&buffer, .push_promise, "\x00");
+    try testing.expectError(error.FrameUnexpected, server.receive(0, buffer[0..written], false, &events));
+    // Even with no payload yet: the header is enough.
+    try testing.expectError(error.FrameUnexpected, server.receive(4, buffer[0..2], false, &events));
+}
+
+test "CANCEL_PUSH names a push ID that is not allowed, on either side" {
+    var server = try testServerAfterSettings();
+    var events: [4]Event = undefined;
+    var buffer: [16]u8 = undefined;
+    var written = try testFrame(&buffer, .cancel_push, "\x00");
+    try testing.expectError(error.IdError, server.receive(peerUni(.server, 0), buffer[0..written], false, &events));
+
+    var client: TestHttp3 = .init(.client);
+    var control: [128]u8 = undefined;
+    const settings = try server.writeControl(&control);
+    _ = try client.receive(peerUni(.client, 0), control[0..settings], false, &events);
+    try testing.expectError(error.IdError, client.receive(peerUni(.client, 0), buffer[0..written], false, &events));
+
+    // A malformed one is a frame error first.
+    var fresh = try testServerAfterSettings();
+    written = try testFrame(&buffer, .cancel_push, "\x00\x00");
+    try testing.expectError(error.FrameError, fresh.receive(peerUni(.server, 0), buffer[0..written], false, &events));
+}
+
+test "MAX_PUSH_ID may rise and not fall, carries one field, and is a server's alone to receive" {
+    var server = try testServerAfterSettings();
+    var events: [4]Event = undefined;
+    var buffer: [32]u8 = undefined;
+    var offset = try testFrame(&buffer, .max_push_id, "\x05");
+    offset += try testFrame(buffer[offset..], .max_push_id, "\x05");
+    offset += try testFrame(buffer[offset..], .max_push_id, "\x07");
+    const read = try server.receive(peerUni(.server, 0), buffer[0..offset], false, &events);
+    try testing.expectEqual(offset, read.consumed);
+    try testing.expectEqual(@as(?u64, 7), server.peer_max_push_id);
+    // h3spec 0.1.15's: 5, then 3 — here 7, then 3.
+    offset = try testFrame(&buffer, .max_push_id, "\x03");
+    try testing.expectError(error.IdError, server.receive(peerUni(.server, 0), buffer[0..offset], false, &events));
+
+    // And 5 with an octet more.
+    var trailing = try testServerAfterSettings();
+    offset = try testFrame(&buffer, .max_push_id, "\x05\x00");
+    try testing.expectError(error.FrameError, trailing.receive(peerUni(.server, 0), buffer[0..offset], false, &events));
+
+    // A client is sent none.
+    var client: TestHttp3 = .init(.client);
+    var control: [128]u8 = undefined;
+    const settings = try trailing.writeControl(&control);
+    _ = try client.receive(peerUni(.client, 0), control[0..settings], false, &events);
+    offset = try testFrame(&buffer, .max_push_id, "\x05");
+    try testing.expectError(error.FrameUnexpected, client.receive(peerUni(.client, 0), buffer[0..offset], false, &events));
+}
+
+test "the control stream's header checks need no payload, and an unknown frame is no SETTINGS" {
+    var events: [4]Event = undefined;
+    var buffer: [32]u8 = undefined;
+    // An unknown frame first is missing SETTINGS, on its header alone.
+    var client: TestHttp3 = .init(.client);
+    var offset = try h3stream.write(&buffer, .control);
+    offset += try frame.writeHeader(buffer[offset..], @fromBackingInt(0x21), 1000);
+    try testing.expectError(
+        error.MissingSettings,
+        client.receive(peerUni(.client, 0), buffer[0..offset], false, &events),
+    );
+
+    // Every known control frame is held to the bound, not only GOAWAY.
+    const known = [_]frame.Type{ .goaway, .max_push_id, .cancel_push, .settings };
+    for (known) |frame_type| {
+        var server = try testServerAfterSettings();
+        offset = try frame.writeHeader(&buffer, frame_type, control_payload_octets_max + 1);
+        try testing.expectError(
+            error.ExcessiveLoad,
+            server.receive(peerUni(.server, 0), buffer[0..offset], false, &events),
+        );
+    }
+
+    // An unknown frame of no octets leaves nothing to skip, and the frame after
+    // it is read in the same pass.
+    var server = try testServerAfterSettings();
+    offset = try frame.writeHeader(&buffer, @fromBackingInt(0x21), 0);
+    offset += try frame.writeHeader(buffer[offset..], .goaway, 1);
+    offset += try varint.encode(buffer[offset..], 4);
+    const read = try server.receive(peerUni(.server, 0), buffer[0..offset], false, &events);
+    try testing.expectEqual(offset, read.consumed);
+    try testing.expectEqual(@as(u64, 0), server.peer_control_skip);
+    try testing.expectEqual(@as(u64, 4), events[0].goaway);
 }

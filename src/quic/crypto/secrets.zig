@@ -18,8 +18,13 @@
 //! because the alternative is a dependency on a TLS library — and the whole
 //! shape of this package is that the consumer brings its own. zoxy's is ztls
 //! and zrk's is zssl; a `Hkdf` in the seam would force one of them to link the
-//! other's. Twenty lines of `std.crypto` is the cheaper trade, and the labels
-//! it is called with are QUIC's, not TLS's.
+//! other's. Twenty lines over an HKDF is the cheaper trade, and the labels it
+//! is called with are QUIC's, not TLS's.
+//!
+//! The HKDF itself is the crypto backend's (`backend.zig`): `Schedule` takes
+//! one, and the module-level functions below are `Schedule(backend.Std)`. The
+//! labels, the salt and the `HkdfLabel` encoding are this file's whichever
+//! backend computes the hash, because those are where a derivation goes wrong.
 //!
 //! ## Salt and label are version-scoped
 //!
@@ -32,6 +37,7 @@
 const std = @import("std");
 
 const assert = @import("../../assert.zig").assert;
+const backend = @import("backend.zig");
 const crypto = @import("../crypto.zig");
 
 const Side = crypto.Side;
@@ -133,144 +139,158 @@ pub const Secret = struct {
     }
 };
 
-//= https://www.rfc-editor.org/rfc/rfc9001#section-5.1
-//# The keys used for packet protection are computed from the TLS secrets
-//# using the KDF provided by TLS. In TLS 1.3, the HKDF-Expand-Label
-//# function described in Section 7.1 of [TLS13] is used with the hash
-//# function from the negotiated cipher suite. All uses of HKDF-Expand-
-//# Label in QUIC use a zero-length Context.
-//
-//= https://www.rfc-editor.org/rfc/rfc9001#section-5.1
-//# Note that labels, which are described using strings, are encoded as
-//# bytes using ASCII [ASCII] without quotes or any trailing NUL byte.
-//
-//= https://www.rfc-editor.org/rfc/rfc9001#section-5.1
-//# Other versions of TLS MUST provide a similar function in order to be
-//# used with QUIC.
-//= type=exception
-//= reason=the seam takes traffic secrets, not a TLS engine, and `Suite` names only TLS 1.3 cipher suites -- so there is no version of TLS other than 1.3 that can reach these labels. A requirement on the specification of a future TLS, not on this package. See docs/DESIGN.md section 4.
-//
-//= https://www.rfc-editor.org/rfc/rfc9001#section-9.6
-//# To preserve this separation, a new version of QUIC SHOULD define new
-//# labels for key derivation for packet protection key and IV, plus the
-//# header protection keys.
-//= type=exception
-//= reason=addressed to the specification of a future QUIC version rather than to an implementation of version 1. The three labels this package expands with -- "quic key", "quic iv" and "quic hp" -- are version 1's and carry its "quic" string; a version that changed them would pass different labels to the function below, which takes the label as an argument for exactly that reason.
-/// RFC 8446 section 7.1's HKDF-Expand-Label, with the empty context every QUIC
-/// use of it has.
-///
-/// `suite` picks the hash, which is the only thing that varies. Fills `out`
-/// completely.
-pub fn expandLabel(suite: Suite, out: []u8, secret: []const u8, label: []const u8) void {
-    assert(out.len >= 1);
-    assert(out.len <= 255);
-    assert(label.len >= 1);
-    assert(label.len <= label_octets_max);
-    assert(secret.len == suite.hashOctets());
+/// The key schedule over a chosen backend: HKDF is the backend's, and the
+/// labels, the salt and the `HkdfLabel` encoding are this file's whatever the
+/// backend. See `backend.zig` for where the line is drawn.
+pub fn Schedule(comptime Backend: type) type {
+    comptime backend.check(Backend);
+    return struct {
+        const Self = @This();
 
-    var info: [info_octets_max]u8 = undefined;
-    std.mem.writeInt(u16, info[0..2], @intCast(out.len), .big);
-    info[2] = @intCast(tls13_prefix.len + label.len);
-    @memcpy(info[3..][0..tls13_prefix.len], tls13_prefix);
-    @memcpy(info[3 + tls13_prefix.len ..][0..label.len], label);
-    const context_at = 3 + tls13_prefix.len + label.len;
-    info[context_at] = 0;
-    const used = context_at + 1;
-    assert(used <= info_octets_max);
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-5.1
+        //# The keys used for packet protection are computed from the TLS secrets
+        //# using the KDF provided by TLS. In TLS 1.3, the HKDF-Expand-Label
+        //# function described in Section 7.1 of [TLS13] is used with the hash
+        //# function from the negotiated cipher suite. All uses of HKDF-Expand-
+        //# Label in QUIC use a zero-length Context.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-5.1
+        //# Note that labels, which are described using strings, are encoded as
+        //# bytes using ASCII [ASCII] without quotes or any trailing NUL byte.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-5.1
+        //# Other versions of TLS MUST provide a similar function in order to be
+        //# used with QUIC.
+        //= type=exception
+        //= reason=the seam takes traffic secrets, not a TLS engine, and `Suite` names only TLS 1.3 cipher suites -- so there is no version of TLS other than 1.3 that can reach these labels. A requirement on the specification of a future TLS, not on this package. See docs/DESIGN.md section 4.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-9.6
+        //# To preserve this separation, a new version of QUIC SHOULD define new
+        //# labels for key derivation for packet protection key and IV, plus the
+        //# header protection keys.
+        //= type=exception
+        //= reason=addressed to the specification of a future QUIC version rather than to an implementation of version 1. The three labels this package expands with -- "quic key", "quic iv" and "quic hp" -- are version 1's and carry its "quic" string; a version that changed them would pass different labels to the function below, which takes the label as an argument for exactly that reason.
+        /// RFC 8446 section 7.1's HKDF-Expand-Label, with the empty context every QUIC
+        /// use of it has.
+        ///
+        /// `suite` picks the hash, which is the only thing that varies. Fills `out`
+        /// completely.
+        pub fn expandLabel(suite: Suite, out: []u8, secret: []const u8, label: []const u8) void {
+            assert(out.len >= 1);
+            // The widest secret is the widest thing ever expanded, and the
+            // backend contract promises a backend no more.
+            assert(out.len <= crypto.secret_octets_max);
+            assert(label.len >= 1);
+            assert(label.len <= label_octets_max);
+            assert(secret.len == suite.hashOctets());
 
-    switch (suite) {
-        .aes_128_gcm_sha256, .chacha20_poly1305_sha256 => {
-            const Hkdf = std.crypto.kdf.hkdf.HkdfSha256;
-            Hkdf.expand(out, info[0..used], secret[0..Hkdf.prk_length].*);
-        },
-        .aes_256_gcm_sha384 => {
-            const Hkdf = std.crypto.kdf.hkdf.Hkdf(std.crypto.auth.hmac.sha2.HmacSha384);
-            Hkdf.expand(out, info[0..used], secret[0..Hkdf.prk_length].*);
-        },
-    }
-}
+            var info: [info_octets_max]u8 = undefined;
+            std.mem.writeInt(u16, info[0..2], @intCast(out.len), .big);
+            info[2] = @intCast(tls13_prefix.len + label.len);
+            @memcpy(info[3..][0..tls13_prefix.len], tls13_prefix);
+            @memcpy(info[3 + tls13_prefix.len ..][0..label.len], label);
+            const context_at = 3 + tls13_prefix.len + label.len;
+            info[context_at] = 0;
+            const used = context_at + 1;
+            assert(used <= info_octets_max);
 
-//= https://www.rfc-editor.org/rfc/rfc9001#section-5.2
-//# The secret used by clients to construct Initial packets uses the PRK and
-//# the label "client in" as input to the HKDF-Expand-Label function from
-//# TLS [TLS13] to produce a 32-byte secret. Packets constructed by the
-//# server use the same process with the label "server in".
-//
-//= https://www.rfc-editor.org/rfc/rfc9001#section-5.2
-//# The HKDF-Expand-Label function defined in TLS 1.3 MUST be used for
-//# Initial packets even where the TLS versions offered do not include TLS
-//# 1.3.
-//
-//= https://www.rfc-editor.org/rfc/rfc9001#section-5.2
-//# The connection ID used with HKDF-Expand-Label is the Destination
-//# Connection ID in the Initial packet sent by the client. This will be a
-//# randomly selected value unless the client creates the Initial packet
-//# after receiving a Retry packet, where the Destination Connection ID is
-//# selected by the server.
-//
-//= https://www.rfc-editor.org/rfc/rfc9001#section-5.2
-//# The secrets used for constructing subsequent Initial packets change when
-//# a server sends a Retry packet to use the connection ID value selected by
-//# the server. The secrets do not change when a client changes the
-//# Destination Connection ID it uses in response to an Initial packet from
-//# the server.
-/// RFC 9001 section 5.2: the client's and server's Initial secrets, derived
-/// from the Destination Connection ID of the client's *first* Initial packet.
-///
-/// "First" is load-bearing and is the caller's to remember. A server that sends
-/// a Retry causes the client to send a second Initial with a different
-/// Destination Connection ID, and the Initial keys change with it; a client
-/// that keeps deriving from the original will not decrypt anything the server
-/// sends afterwards. Section 7.2 spells the rule out because implementations
-/// get it wrong.
-pub fn initial(destination_connection_id: []const u8, side: Side) Secret {
-    assert(destination_connection_id.len <= 20);
+            switch (suite) {
+                .aes_128_gcm_sha256, .chacha20_poly1305_sha256 => Backend.hkdfSha256Expand(out, secret[0..backend.sha256_octets], info[0..used]),
+                .aes_256_gcm_sha384 => Backend.hkdfSha384Expand(out, secret[0..backend.sha384_octets], info[0..used]),
+            }
+        }
 
-    const Hkdf = std.crypto.kdf.hkdf.HkdfSha256;
-    const initial_secret = Hkdf.extract(&initial_salt_v1, destination_connection_id);
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-5.2
+        //# The secret used by clients to construct Initial packets uses the PRK and
+        //# the label "client in" as input to the HKDF-Expand-Label function from
+        //# TLS [TLS13] to produce a 32-byte secret. Packets constructed by the
+        //# server use the same process with the label "server in".
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-5.2
+        //# The HKDF-Expand-Label function defined in TLS 1.3 MUST be used for
+        //# Initial packets even where the TLS versions offered do not include TLS
+        //# 1.3.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-5.2
+        //# The connection ID used with HKDF-Expand-Label is the Destination
+        //# Connection ID in the Initial packet sent by the client. This will be a
+        //# randomly selected value unless the client creates the Initial packet
+        //# after receiving a Retry packet, where the Destination Connection ID is
+        //# selected by the server.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-5.2
+        //# The secrets used for constructing subsequent Initial packets change when
+        //# a server sends a Retry packet to use the connection ID value selected by
+        //# the server. The secrets do not change when a client changes the
+        //# Destination Connection ID it uses in response to an Initial packet from
+        //# the server.
+        /// RFC 9001 section 5.2: the client's and server's Initial secrets, derived
+        /// from the Destination Connection ID of the client's *first* Initial packet.
+        ///
+        /// "First" is load-bearing and is the caller's to remember. A server that sends
+        /// a Retry causes the client to send a second Initial with a different
+        /// Destination Connection ID, and the Initial keys change with it; a client
+        /// that keeps deriving from the original will not decrypt anything the server
+        /// sends afterwards. Section 7.2 spells the rule out because implementations
+        /// get it wrong.
+        pub fn initial(destination_connection_id: []const u8, side: Side) Secret {
+            assert(destination_connection_id.len <= 20);
 
-    const label = switch (side) {
-        .client => "client in",
-        .server => "server in",
+            var initial_secret: [backend.sha256_octets]u8 = undefined;
+            Backend.hkdfSha256Extract(&initial_secret, &initial_salt_v1, destination_connection_id);
+
+            const label = switch (side) {
+                .client => "client in",
+                .server => "server in",
+            };
+            assert(label.len == 9);
+
+            var secret: Secret = .{ .length = initial_suite.hashOctets() };
+            Self.expandLabel(initial_suite, secret.storage[0..secret.length], &initial_secret, label);
+            assert(secret.length == 32);
+            return secret;
+        }
+
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-6.1
+        //# An endpoint initiates a key update by updating its packet protection
+        //# write secret and using that to protect new packets.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-6.1
+        //# secret_<n+1> = HKDF-Expand-Label(secret_<n>, "quic ku", "", Hash.length)
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-6
+        //# Endpoints MUST NOT send a TLS KeyUpdate message.
+        //= type=exception
+        //= reason=a TLS KeyUpdate is a TLS handshake message, and this package neither builds nor parses one: CRYPTO stream octets cross the seam as data and the consumer's TLS engine is what would see an unexpected message. QUIC's own key update, which is `update` below and the Key Phase bit, is implemented. See docs/DESIGN.md section 4.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9001#section-6
+        //# Endpoints MUST treat the receipt of a TLS KeyUpdate message as a
+        //# connection error of type 0x010a, equivalent to a fatal TLS alert of
+        //# unexpected_message; see Section 4.8.
+        //= type=exception
+        //= reason=the other half of the same seam: this package never parses a TLS handshake message, so the engine that decodes the CRYPTO stream is the only thing that can recognise a KeyUpdate and report it. What crosses back is a connection error, which `Connection.close` already carries.
+        /// RFC 9001 section 6.1: the next generation of a traffic secret.
+        ///
+        /// Only ever applied to 1-RTT secrets — a key update at any other level is a
+        /// protocol error, because no other level lives long enough to need one. The
+        /// caller enforces that; this function is arithmetic.
+        pub fn update(suite: Suite, current: *const Secret) Secret {
+            assert(current.length == suite.hashOctets());
+            var next: Secret = .{ .length = suite.hashOctets() };
+            Self.expandLabel(suite, next.storage[0..next.length], current.bytes(), "quic ku");
+            assert(next.length == current.length);
+            return next;
+        }
     };
-    assert(label.len == 9);
-
-    var secret: Secret = .{ .length = initial_suite.hashOctets() };
-    expandLabel(initial_suite, secret.storage[0..secret.length], &initial_secret, label);
-    assert(secret.length == 32);
-    return secret;
 }
 
-//= https://www.rfc-editor.org/rfc/rfc9001#section-6.1
-//# An endpoint initiates a key update by updating its packet protection
-//# write secret and using that to protect new packets.
-//
-//= https://www.rfc-editor.org/rfc/rfc9001#section-6.1
-//# secret_<n+1> = HKDF-Expand-Label(secret_<n>, "quic ku", "", Hash.length)
-//
-//= https://www.rfc-editor.org/rfc/rfc9001#section-6
-//# Endpoints MUST NOT send a TLS KeyUpdate message.
-//= type=exception
-//= reason=a TLS KeyUpdate is a TLS handshake message, and this package neither builds nor parses one: CRYPTO stream octets cross the seam as data and the consumer's TLS engine is what would see an unexpected message. QUIC's own key update, which is `update` below and the Key Phase bit, is implemented. See docs/DESIGN.md section 4.
-//
-//= https://www.rfc-editor.org/rfc/rfc9001#section-6
-//# Endpoints MUST treat the receipt of a TLS KeyUpdate message as a
-//# connection error of type 0x010a, equivalent to a fatal TLS alert of
-//# unexpected_message; see Section 4.8.
-//= type=exception
-//= reason=the other half of the same seam: this package never parses a TLS handshake message, so the engine that decodes the CRYPTO stream is the only thing that can recognise a KeyUpdate and report it. What crosses back is a connection error, which `Connection.close` already carries.
-/// RFC 9001 section 6.1: the next generation of a traffic secret.
-///
-/// Only ever applied to 1-RTT secrets — a key update at any other level is a
-/// protocol error, because no other level lives long enough to need one. The
-/// caller enforces that; this function is arithmetic.
-pub fn update(suite: Suite, current: *const Secret) Secret {
-    assert(current.length == suite.hashOctets());
-    var next: Secret = .{ .length = suite.hashOctets() };
-    expandLabel(suite, next.storage[0..next.length], current.bytes(), "quic ku");
-    assert(next.length == current.length);
-    return next;
-}
+/// The schedule over `backend.Std`, which is what a consumer that names no
+/// backend gets. The three names below are the ones this file exported before
+/// the backend became a parameter, kept so that nothing that called them moves.
+const std_schedule = Schedule(backend.Std);
+pub const expandLabel = std_schedule.expandLabel;
+pub const initial = std_schedule.initial;
+pub const update = std_schedule.update;
 
 //= https://www.rfc-editor.org/rfc/rfc9001#section-5.2
 //# initial_salt = 0x38762cf7f55934b34d179ae6a4c80cadccbb7f0a initial_secret

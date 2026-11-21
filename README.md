@@ -20,11 +20,12 @@ validates on the far side.
 
 Not implemented yet:
 
-- QPACK dynamic table, encoder and decoder streams
-- HTTP/3 control stream, SETTINGS exchange, GOAWAY
-- Connection migration, stateless reset, 0-RTT
+- QPACK dynamic table (a capacity of zero is advertised, and the encoder and
+  decoder streams are checked against it)
+- Connection migration and path validation, NEW_CONNECTION_ID issuance, 0-RTT
+- Stateless reset *detection* (a server writes them; a client does not
+  recognise one)
 - ECN (parsed, not acted on) and pacing
-- Interoperability testing against other implementations
 
 The full ledger is in [docs/DESIGN.md §6](docs/DESIGN.md#6-what-is-built-and-what-is-next).
 
@@ -33,7 +34,7 @@ The full ledger is in [docs/DESIGN.md §6](docs/DESIGN.md#6-what-is-built-and-wh
 | RFC | Coverage |
 |---|---|
 | [9000](https://www.rfc-editor.org/rfc/rfc9000) QUIC transport | Variable-length integers, long and short headers, version negotiation, packet numbers, all twenty frame types, transport parameters, stream identifiers, error codes, the connection state machine, streams, stream- and connection-level flow control, address validation and the amplification limit |
-| [9001](https://www.rfc-editor.org/rfc/rfc9001) QUIC TLS | Initial secrets, AEAD packet protection, header protection, Retry integrity tag, key update, AEAD confidentiality and integrity limits. AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305 via `std.crypto` |
+| [9001](https://www.rfc-editor.org/rfc/rfc9001) QUIC TLS | Initial secrets, AEAD packet protection, header protection, Retry integrity tag, key update, AEAD confidentiality and integrity limits. AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305 through a comptime crypto backend: `std.crypto` by default, or the consumer's own |
 | [9002](https://www.rfc-editor.org/rfc/rfc9002) Loss detection | RTT estimation, packet- and time-threshold loss detection, probe timeout with backoff, NewReno with persistent congestion |
 | [9204](https://www.rfc-editor.org/rfc/rfc9204) QPACK | Static table, field line representations in both directions. Prefixed integers and Huffman coding come from [hpack](https://github.com/zoxy-io/hpack) |
 | [9114](https://www.rfc-editor.org/rfc/rfc9114) HTTP/3 | Frame layer, unidirectional stream types, the connection layer — control stream, SETTINGS exchange, GOAWAY and §4.1's frame sequence — and request and response validation per §4.2 and §4.3, including RFC 9220 extended CONNECT and RFC 9110 `content-length` syntax. No server push and no QPACK dynamic table |
@@ -46,9 +47,10 @@ Evidence that does not come from this package: `corpus/qifs.zig` decodes 144
 QPACK field sections produced by four other implementations, and `interop/` is
 a [QUIC Interop Runner](https://github.com/quic-interop/quic-interop-runner)
 client that completes a real handshake, Retry, and HTTP/3 transfer against
-quic-go, ngtcp2 and aioquic — and a server that passes all 49 of
-[h3spec](https://github.com/kazu-yamamoto/h3spec)'s conformance cases. Between
-them they found eleven defects; they are in the table in
+quic-go, ngtcp2 and aioquic — and a server that passes 85 of
+[h3spec](https://github.com/kazu-yamamoto/h3spec) 0.1.15's 86 conformance
+cases, the 86th pending because it needs 0-RTT. What they found is in the
+table in
 [docs/VERIFICATION.md](docs/VERIFICATION.md) §1, the shims are §5.5, and
 [interop/README.md](interop/README.md) is how to run them.
 
@@ -142,6 +144,44 @@ const response = connection.readable(0);
 try connection.consume(0, response.len);
 ```
 
+A server starts a connection from the first Initial that may start one, and
+everything RFC 9000 asks of it before then is `quic.endpoint`'s:
+
+```zig
+const datagram = h3.quic.endpoint.classify(bytes, server_id_octets);
+switch (datagram.action) {
+    .route => {},                     // to the connection that answers to datagram.destination
+    .version_negotiation => {},       // endpoint.writeVersionNegotiation(&out, &datagram)
+    .drop => {},
+    .initial => if (table.find(datagram.destination) == null and datagram.mayStart()) {
+        // Optionally a Retry first: endpoint.writeRetry(Backend, &out, &scratch,
+        // &datagram, new_id, token). The Initial that brings the token back
+        // starts the connection with `.retry = .{ .original_destination = ... }`.
+        var connection = try Connection.initServer(.{
+            .initial_destination = datagram.destination,
+            .source = server_id, // the consumer's, at `server_id_octets`
+            // Requests, the peer's control and QPACK streams, and this
+            // endpoint's three: they share the table, so they fit `streams_max`.
+            .advertised = .{
+                .max_idle_timeout_ms = 30_000,
+                .max_streams_bidirectional = 16,
+                .max_streams_unidirectional = 3,
+                .streams_opened_max = 3,
+            },
+        });
+        // The extension the TLS engine carries in EncryptedExtensions.
+        const parameters = try connection.localTransportParameters(&buffer);
+    },
+}
+```
+
+`h3.Http3Server(Connection, config)` is the server side of HTTP/3 on top:
+`flush` opens the control and QPACK streams, `receive` and `consume` read a
+request under the embedder's buffer space, `writeHeaders`, `writeData` and
+`writeTrailers` answer it, and `goaway` drains. A consumer that takes its
+cryptographic primitives from elsewhere names a backend in
+`Connection(.{ .crypto = Backend })`.
+
 [`example/initial.zig`](example/initial.zig) is a complete program at the
 packet level: it builds a client Initial, seals it under the Initial keys,
 then parses and opens it again. It is compiled and run as part of
@@ -158,7 +198,12 @@ then parses and opens it again. It is compiled and run as part of
   connection identifiers and other random values are arguments. A connection
   can be replayed deterministically.
 - **No TLS engine.** Handshake messages and secrets cross the API as data.
-  Packet protection is inside the library, using `std.crypto` only.
+  Packet protection is inside the library. Its primitives come from a
+  comptime backend (`Config.crypto`): `std.crypto` by default, or one the
+  consumer supplies, checked against the contract in
+  [`src/quic/crypto/backend.zig`](src/quic/crypto/backend.zig). A consumer's
+  backend runs RFC 9001 appendix A in its own tests with
+  `h3.quic.crypto.conformance.check(Backend)`.
 - **Assertions are a build option.** They are on by default in every
   optimize mode and removed with `-Dassertions=false`. See
   [`src/assert.zig`](src/assert.zig).
@@ -188,7 +233,7 @@ the row beside it says what a green one means:
 | --- | --- | --- |
 | [![test](https://github.com/zoxy-io/h3/actions/workflows/test.yml/badge.svg)](https://github.com/zoxy-io/h3/actions/workflows/test.yml) [`test`](.github/workflows/test.yml) | The unit tests, and everything `zig build test` depends on: the lint's own tests, the ledger's, the simulator's, the RFC corpus, the fuzz targets, the README example, the negative fixture and the interop shims | all three |
 | [![sim](https://github.com/zoxy-io/h3/actions/workflows/sim.yml/badge.svg)](https://github.com/zoxy-io/h3/actions/workflows/sim.yml) [`sim`](.github/workflows/sim.yml) | 256 seeds of the seeded network simulation, its oracles, and a coverage census that fails the run when a behaviour no seed reached would otherwise pass quietly | all three |
-| [![fuzz](https://github.com/zoxy-io/h3/actions/workflows/fuzz.yml/badge.svg)](https://github.com/zoxy-io/h3/actions/workflows/fuzz.yml) [`fuzz`](.github/workflows/fuzz.yml) | The 16 fuzz targets, each run once as a regression with a deterministic draw — their oracles hold and their accept paths still compile. Under the builds that ship, not only under Debug | all three |
+| [![fuzz](https://github.com/zoxy-io/h3/actions/workflows/fuzz.yml/badge.svg)](https://github.com/zoxy-io/h3/actions/workflows/fuzz.yml) [`fuzz`](.github/workflows/fuzz.yml) | The 17 fuzz targets, each run once as a regression with a deterministic draw — their oracles hold and their accept paths still compile. Under the builds that ship, not only under Debug | all three |
 | [![corpus](https://github.com/zoxy-io/h3/actions/workflows/corpus.yml/badge.svg)](https://github.com/zoxy-io/h3/actions/workflows/corpus.yml) [`corpus`](.github/workflows/corpus.yml) | RFC 9001 appendix A's worked packets octet for octet, and qifs's QPACK field sections from four other implementations | all three |
 | [![requirements](https://github.com/zoxy-io/h3/actions/workflows/requirements.yml/badge.svg)](https://github.com/zoxy-io/h3/actions/workflows/requirements.yml) [`requirements`](.github/workflows/requirements.yml) | Every `//=` citation quotes the RFC section it names, verbatim, and every exception states a reason | source scan |
 | [![lint](https://github.com/zoxy-io/h3/actions/workflows/lint.yml/badge.svg)](https://github.com/zoxy-io/h3/actions/workflows/lint.yml) [`lint`](.github/workflows/lint.yml) | No I/O types, no allocator, no unbounded loops and no `std.debug.assert` under `src/` | source scan |

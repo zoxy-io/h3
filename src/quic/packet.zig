@@ -157,20 +157,15 @@ pub const Header = union(Kind) {
     /// rule, the new Destination Connection ID, the new Initial keys and the
     /// token that goes into every subsequent Initial.
     ///
-    /// What stays out of scope is the *sending* half. A server here issues no
-    /// Retry, because issuing one needs a token, which needs randomness and a
-    /// clock that docs/DESIGN.md section 3 keeps outside the seam.
-    //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.5.1
-    //# This value MUST NOT be equal to the Destination Connection ID field
-    //# of the packet sent by the client.
-    //= type=exception
-    //= reason=a rule on the server that writes a Retry packet, and this package writes none: issuing one needs a token, which needs the randomness and the clock docs/DESIGN.md section 3 keeps outside the seam. The client's half of the same rule — discarding such a Retry — is implemented and tested in `Connection.receiveRetry`.
-    //
+    /// The *sending* half is `writeRetry` below and `endpoint.writeRetry`,
+    /// which builds one for a classified datagram. Deciding to send one is the
+    /// consumer's, because the token needs randomness and a clock that
+    /// docs/DESIGN.md section 3 keeps outside the seam.
     //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.5.1
     //# A server MUST NOT send more than one Retry packet in response to a
     //# single UDP datagram.
     //= type=exception
-    //= reason=`writeRetry` builds the packet and `Connection` never calls it: deciding to retry is address validation policy, and how many Retries answer one datagram is a question about that policy rather than about the encoding. The token needs the randomness and the clock docs/DESIGN.md section 3 keeps outside the seam, so the decision is the consumer's — `interop/server.zig` is the consumer that makes it.
+    //= reason=`writeRetry` builds the packet and `Connection` never calls it: deciding to retry is address validation policy, and how many Retries answer one datagram is a question about that policy rather than about the encoding. `endpoint.classify` gives a datagram one action; the token needs the randomness and the clock docs/DESIGN.md section 3 keeps outside the seam, so the decision is the consumer's.
     //
     /// Section 17.2.5. No packet number and no length: the rest of the datagram
     /// is the token followed by the 16-octet integrity tag.
@@ -189,35 +184,14 @@ pub const Header = union(Kind) {
     //= reason=superseded: `writeVersionNegotiation` writes one and sets this bit. The rule is cited as a test there; this line is the parser's side, which reads the field and ignores it as section 17.2.1 tells a client to.
     /// A Version Negotiation packet is parsed, so that a client can see one and
     /// a consumer can act on it. Sending one is a server's answer to a version
-    /// it does not implement, and building that answer is out of scope here —
-    /// which is what the four rules below say.
-    //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.1
-    //# The Version field of a Version Negotiation packet MUST be set to
-    //# 0x00000000. The server MUST include the value from the Source
-    //# Connection ID field of the packet it receives in the Destination
-    //# Connection ID field.
-    //= type=exception
-    //= reason=version negotiation is out of scope; nothing here writes a Version Negotiation packet, because a connection in this package speaks one version. See docs/DESIGN.md section 2, which leaves the packet types that begin a *different* connection to the consumer, and section 6.
-    //
-    //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.1
-    //# The value for Source Connection ID MUST be copied from the
-    //# Destination Connection ID of the received packet, which is initially
-    //# randomly selected by a client.
-    //= type=exception
-    //= reason=no Version Negotiation packet is ever written, so there is no Source Connection ID of ours to copy into one; see docs/DESIGN.md section 2 and section 6.
-    //
-    //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.1
-    //# Version- specific rules for the connection ID therefore MUST NOT
-    //# influence a decision about whether to send a Version Negotiation
-    //# packet.
-    //= type=exception
-    //= reason=this package makes no decision about whether to send a Version Negotiation packet, because it never sends one; see docs/DESIGN.md section 2 and section 6.
-    //
+    /// it does not implement: `endpoint.classify` decides that from RFC 8999's
+    /// version-independent header rather than from this parser, which is
+    /// version 1's, and `writeVersionNegotiation` below builds it.
     //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.1
     //# A server MUST NOT send more than one Version Negotiation packet in
     //# response to a single UDP datagram.
     //= type=exception
-    //= reason=none is sent at all, so none can be sent twice; version negotiation is out of scope per docs/DESIGN.md section 2 and section 6.
+    //= reason=the consumer's loop, not this encoding: `endpoint.classify` gives one datagram one action and `endpoint.writeVersionNegotiation` builds one packet for it, and whether that packet is sent once is decided where the socket is.
     /// Section 17.2.1. The versions are left as raw octets rather than decoded
     /// into a slice of `u32`, because decoding them would need somewhere to put
     /// them and this package has no allocator. `versionAt` reads one.
@@ -556,7 +530,7 @@ fn readConnectionId(datagram: []const u8, cursor: *usize) ParseError!ConnectionI
     //# SHOULD be able to read longer connection IDs from other QUIC
     //# versions.
     //= type=exception
-    //= reason=writing a Version Negotiation packet is out of scope, so the only reader that would need the longer identifier does not exist here; a version 1 endpoint is otherwise required to refuse it. See docs/DESIGN.md section 2 and section 6.
+    //= reason=this parser is version 1's and the cap above is version 1's rule. The reader a Version Negotiation packet needs is `endpoint.classify`, which reads RFC 8999's version-independent header for any other version and keeps identifiers of up to 255 octets; the SHOULD is cited and tested there.
     if (length > ConnectionId.octets_max) return error.ConnectionIdTooLong;
     const end = cursor.* + length;
     if (end > datagram.len) return error.Truncated;
@@ -631,6 +605,21 @@ pub fn writeVersionNegotiation(
     source: ConnectionId,
     versions: []const u32,
 ) WriteError!usize {
+    return writeVersionNegotiationOctets(target, destination.bytes(), source.bytes(), versions);
+}
+
+/// `writeVersionNegotiation` over identifiers as octets, which is what RFC
+/// 8999 gives a packet in a version this package does not speak: up to 255
+/// octets each, where version 1 caps them at 20. `endpoint.classify` reads them
+/// that way, so the answer can echo an identifier no `ConnectionId` can hold.
+pub fn writeVersionNegotiationOctets(
+    target: []u8,
+    destination: []const u8,
+    source: []const u8,
+    versions: []const u32,
+) WriteError!usize {
+    assert(destination.len <= std.math.maxInt(u8));
+    assert(source.len <= std.math.maxInt(u8));
     var cursor: usize = 0;
     try put(target, &cursor, 1);
     // Section 17.2.1: the Unused bits are the server's to choose, and the one
@@ -640,8 +629,8 @@ pub fn writeVersionNegotiation(
     try put(target, &cursor, 4);
     std.mem.writeInt(u32, target[1..5], version_negotiation, .big);
 
-    try writeConnectionId(target, &cursor, destination);
-    try writeConnectionId(target, &cursor, source);
+    try writeLengthPrefixed(target, &cursor, destination);
+    try writeLengthPrefixed(target, &cursor, source);
 
     for (versions) |one| {
         try put(target, &cursor, 4);
@@ -688,6 +677,13 @@ pub const RetryError = WriteError || error{
 //# A Retry packet does not contain any protected fields.
 //= type=test
 pub fn writeRetry(target: []u8, scratch: []u8, options: RetryOptions) RetryError!usize {
+    return writeRetryWith(crypto.backend.Std, target, scratch, options);
+}
+
+/// `writeRetry`, with the integrity tag computed by a chosen crypto backend —
+/// the one a consumer's `Connection` is configured with, so that a server that
+/// takes every primitive from one library takes this one from it too.
+pub fn writeRetryWith(comptime Backend: type, target: []u8, scratch: []u8, options: RetryOptions) RetryError!usize {
     var cursor: usize = 0;
     try put(target, &cursor, 1);
     // Section 17.2.5: the four Unused bits are the server's to choose, and a
@@ -710,7 +706,7 @@ pub fn writeRetry(target: []u8, scratch: []u8, options: RetryOptions) RetryError
         total,
     );
     if (scratch.len < needed) return error.ScratchTooSmall;
-    const tag = crypto.retry.tag(
+    const tag = crypto.retry.Integrity(Backend).tag(
         scratch[0..needed],
         options.original_destination.bytes(),
         target[0..total],
@@ -881,6 +877,15 @@ fn writeConnectionId(target: []u8, cursor: *usize, id: ConnectionId) WriteError!
     try put(target, cursor, 1);
     target[at] = id.length;
     try writeConnectionIdBare(target, cursor, id);
+}
+
+/// An RFC 8999 identifier: a one-octet length and that many octets.
+fn writeLengthPrefixed(target: []u8, cursor: *usize, octets: []const u8) WriteError!void {
+    assert(octets.len <= std.math.maxInt(u8));
+    const at = cursor.*;
+    try put(target, cursor, 1 + octets.len);
+    target[at] = @intCast(octets.len);
+    @memcpy(target[at + 1 .. cursor.*], octets);
 }
 
 fn writeConnectionIdBare(target: []u8, cursor: *usize, id: ConnectionId) WriteError!void {

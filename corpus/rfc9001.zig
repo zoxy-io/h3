@@ -13,11 +13,13 @@
 //! everyone's dependency tree.
 //!
 //! The vectors themselves are machine-lifted; see `extract.py` and README.md.
+//! They live in `src/quic/crypto/rfc9001_vectors.zig`, because
+//! `crypto.conformance.check` ships them to consumers with their own backend.
 
 const std = @import("std");
 
 const h3 = @import("h3");
-const vectors = @import("rfc9001_vectors.zig");
+const vectors = h3.quic.crypto.conformance.vectors;
 
 const quic = h3.quic;
 

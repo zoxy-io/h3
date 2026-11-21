@@ -71,15 +71,13 @@ const Connection = quic.Connection(.{
     .connection_receive_octets = connection_receive_octets,
 });
 
-const Http3 = h3.Http3(.{
+/// The server side of HTTP/3, which this file used to write by hand: the three
+/// unidirectional streams pushed as credit opens, the FIN read off the stream's
+/// internals, the response framed into one write. All of it is the library's.
+const Session = h3.Http3Server(Connection, .{
     .requests_max = requests_max,
     .unidirectional_max = unidirectional_max,
 });
-
-/// RFC 9000 section 2.1: server-initiated unidirectional streams are 3, 7, 11.
-const control_stream: u64 = 3;
-const qpack_encoder_stream: u64 = 7;
-const qpack_decoder_stream: u64 = 11;
 
 const receive_octets: usize = 2048;
 const connection_id_octets: usize = 8;
@@ -156,7 +154,7 @@ const Peer = struct {
     /// and none is: the table is fixed and slots are reused in place.
     trace: qlog_file.Trace,
     server: tls.Server,
-    http3: Http3,
+    session: Session,
     /// The identifier this endpoint chose, which is what a client addresses
     /// once it has seen a packet from here.
     local: quic.ConnectionId,
@@ -171,16 +169,6 @@ const Peer = struct {
     address: Io.net.IpAddress,
     started_ns: u64,
     last_ns: u64,
-    /// Whether this endpoint's unidirectional streams have been *produced*.
-    /// Not whether they have been sent: `writeControl` may be called once, and
-    /// a peer that has not yet granted stream credit takes fewer octets than
-    /// it is offered — so the octets are held here and pushed until they are
-    /// gone. Calling `writeControl` again instead is an assertion failure, and
-    /// was.
-    http3_started: bool,
-    uni_out: [3][256]u8,
-    uni_len: [3]usize,
-    uni_sent: [3]usize,
     /// Streams the connection has reported data on.
     readable: [streams_max]u64,
     readable_len: usize,
@@ -197,6 +185,9 @@ const Answer = struct {
     stream: u64,
     /// The file the path resolved to, or null for the built-in body.
     file: ?Io.File,
+    /// Whether the body goes out as HTTP/3 DATA frames, or bare as
+    /// `hq-interop` sends it.
+    framed: bool,
     /// Octets handed to `write` so far, and how many there are.
     offset: u64,
     total: u64,
@@ -306,14 +297,12 @@ fn alertFor(err: tls.Error) u8 {
 
 /// Match a datagram to a connection by the Destination Connection ID it names.
 fn find(peers: []Peer, data: []const u8, from: Io.net.IpAddress) ?*Peer {
-    const parsed = quic.packet.parse(data, connection_id_octets) catch return null;
-    const destination = switch (parsed.header) {
-        .initial => |value| value.destination,
-        .handshake, .zero_rtt => |value| value.destination,
-        .retry => |value| value.destination,
-        .short => |value| value.destination,
-        else => return null,
-    };
+    const classified = quic.endpoint.classify(data, connection_id_octets);
+    switch (classified.action) {
+        .route, .initial => {},
+        .version_negotiation, .drop => return null,
+    }
+    const destination = classified.destination;
     // Bounded by the table.
     for (peers) |*peer| {
         if (!peer.live) continue;
@@ -339,35 +328,24 @@ fn accept(
     parameters_buffer: []u8,
     shared: *const Shared,
 ) !?*Peer {
-    const parsed = quic.packet.parse(message.data, connection_id_octets) catch |err| {
-        if (shared.verbose) try note(log, "parse of {d} octets: {s}", .{ message.data.len, @errorName(err) });
-        return null;
-    };
-
-    // RFC 9000 section 6.1: a long header in a version this endpoint does not
-    // implement is answered with the list of versions it does. Not optional for
-    // a server, and not only for politeness — the interop runner's network
-    // simulator will not start a test until the server answers exactly this
-    // probe, so a server that ignores it fails every case before the first
-    // packet of the first handshake.
-    //
-    // The datagram floor is section 14.1's, applied here for the reason section
-    // 6.1 gives: a Version Negotiation packet is larger than the packet that
-    // provokes it, so answering a small one is an amplification vector.
-    if (parsed.header == .unsupported_version) {
-        const unsupported = parsed.header.unsupported_version;
-        if (message.data.len >= 1200) {
-            try sendVersionNegotiation(io, log, socket, message, unsupported, shared);
-        }
-        return null;
+    // RFC 9000's rules for a datagram no connection holds are the library's
+    // now: an Initial counts only in a datagram of 1200 octets, an unknown
+    // version is answered only at that size too (section 6.1's amplification
+    // argument), and a Version Negotiation packet or a Retry is never one to
+    // answer. Only an Initial may start a connection.
+    const datagram = quic.endpoint.classify(message.data, connection_id_octets);
+    switch (datagram.action) {
+        .version_negotiation => {
+            try sendVersionNegotiation(io, log, socket, message, &datagram, shared);
+            return null;
+        },
+        .initial => {},
+        .route, .drop => {
+            if (shared.verbose) try note(log, "nothing to start from {d} octets ({t})", .{ message.data.len, datagram.action });
+            return null;
+        },
     }
-
-    // Only an Initial starts a connection. Everything else addressed to an
-    // identifier this endpoint does not hold is a packet for a connection that
-    // is over, and section 10.3's stateless reset is the answer this package
-    // does not have.
-    if (parsed.header != .initial) return null;
-    const initial = parsed.header.initial;
+    if (!datagram.mayStart()) return null;
 
     var seed: [96]u8 = undefined;
     try io.randomSecure(&seed);
@@ -377,16 +355,17 @@ fn accept(
     // for it. The identifier the transport parameters must repeat is the one
     // from *before* the Retry, and after a Retry the packet no longer carries
     // it — so it travels inside the token and comes back here.
-    var original = initial.destination;
+    var retried: ?Connection.Retried = null;
     if (shared.retry) {
-        if (initial.token.len == 0) {
-            try sendRetry(io, log, socket, message, initial, source, shared);
+        if (datagram.token.len == 0) {
+            try sendRetry(io, log, socket, message, &datagram, source, shared);
             return null;
         }
-        original = validateToken(initial.token, message.from, shared) orelse {
+        const original = validateToken(datagram.token, message.from, shared) orelse {
             if (shared.verbose) try note(log, "a token that does not authenticate", .{});
             return null;
         };
+        retried = .{ .original_destination = original };
     }
 
     const slot = free: {
@@ -420,58 +399,65 @@ fn accept(
         break :free oldest;
     };
 
-    slot.* = .{
-        .connection = .init(.{
-            .side = .server,
-            // RFC 9001 section 5.2: the Initial keys come from the Destination
-            // Connection ID of the packet that just arrived — the client's own
-            // choice on a first flight, and *this server's* Retry Source
-            // Connection ID on a retried one. `original` above is the other
-            // value, the one section 7.3 has the transport parameters repeat.
-            .original_destination = initial.destination,
-            .source = source,
-        }),
-        .server = .init(.{
-            .certificates = shared.certificates,
-            .private_key = shared.private_key,
-            // `h3` for h3spec, and `hq-interop` so the same binary answers the
-            // interop runner's HTTP/0.9 cases.
-            .protocols = &.{ "h3", "hq-interop" },
-            .transport_parameters = try transportParameters(
-                parameters_buffer,
-                source,
-                original,
-                if (shared.retry) initial.destination else null,
-            ),
-            .random = seed[0..32].*,
-            .key_seed = seed[32..64].*,
-        }),
-        .http3 = .init(.server),
-        .local = source,
-        .original = initial.destination,
-        .address = message.from,
-        .started_ns = now_ns,
-        .last_ns = now_ns,
-        .http3_started = false,
-        .uni_out = undefined,
-        .uni_len = @splat(0),
-        .uni_sent = @splat(0),
-        .readable = undefined,
-        .readable_len = 0,
-        .answers = undefined,
-        .answers_len = 0,
-        .trace = .{},
-        .live = true,
-    };
+    // The connection first, in place: it is megabytes at this file's
+    // configuration, and building it anywhere but its slot put two copies of
+    // it on the stack and overflowed it on the first connection. A free slot
+    // and an evicted one are both not live, and this one becomes live only
+    // once everything below has succeeded.
+    assert(!slot.live);
+    // RFC 9001 section 5.2: the Initial keys come from the Destination
+    // Connection ID of the packet that just arrived — the client's own choice
+    // on a first flight, and *this server's* Retry Source Connection ID on a
+    // retried one. `retried` carries the other value, the one section 7.3 has
+    // the transport parameters repeat.
+    try slot.connection.initServer(.{
+        .initial_destination = datagram.destination,
+        .source = source,
+        .retry = retried,
+        .advertised = .{
+            // The same number `idle_ns` retires on, so what this server
+            // does is what it said it would do. It advertised nothing
+            // while dropping connections after five seconds, which is a
+            // server telling its peer the connection never times out and
+            // then behaving as though it does.
+            .max_idle_timeout_ms = @divExact(idle_ns, std.time.ns_per_ms),
+            // What the stream layer enforces: the table is shared between
+            // four kinds of stream, so `streams_max` is never the per-kind
+            // limit.
+            .max_streams_bidirectional = requests_max,
+            .max_streams_unidirectional = unidirectional_max,
+            // Control and QPACK's two.
+            .streams_opened_max = 3,
+        },
+    });
+    // Every other field by name, so nothing here builds a `Peer` value — whose
+    // first field is the connection — anywhere but in the slot.
+    slot.session = .init();
+    slot.local = source;
+    slot.original = datagram.destination;
+    slot.address = message.from;
+    slot.started_ns = now_ns;
+    slot.last_ns = now_ns;
+    slot.readable_len = 0;
+    slot.answers_len = 0;
+    slot.trace = .{};
+    // The extension is the connection's own, built from what it enforces, so
+    // it is encoded once the connection exists and handed to the TLS engine.
+    slot.server = .init(.{
+        .certificates = shared.certificates,
+        .private_key = shared.private_key,
+        // `h3` for h3spec, and `hq-interop` so the same binary answers the
+        // interop runner's HTTP/0.9 cases.
+        .protocols = &.{ "h3", "hq-interop" },
+        .transport_parameters = try slot.connection.localTransportParameters(parameters_buffer),
+        .random = seed[0..32].*,
+        .key_seed = seed[32..64].*,
+    });
     // Named for the client's original Destination Connection ID, which is the
     // value both endpoints agree on before either has chosen anything — so a
     // client's trace and this one can be put side by side.
-    slot.trace.start(io, shared.qlog, initial.destination.bytes(), .server);
-    // The same numbers the transport parameters above carry. The stream layer
-    // enforces what was advertised and grants more as streams retire, and it
-    // cannot know what a consumer chose to offer: the table is shared between
-    // four kinds of stream, so `streams_max` is never the per-kind limit.
-    slot.connection.streams.setAdvertisedStreamLimits(requests_max, unidirectional_max);
+    slot.trace.start(io, shared.qlog, datagram.destination.bytes(), .server);
+    slot.live = true;
     try note(log, "accepted a connection as {x}", .{source.bytes()});
     return slot;
 }
@@ -487,27 +473,19 @@ fn rank(peer: *const Peer) u8 {
     };
 }
 
-/// The versions this endpoint speaks, which is one.
-const versions = [_]u32{quic.packet.version_1};
-
 /// Answer an unknown version with the list of known ones.
 fn sendVersionNegotiation(
     io: Io,
     log: *Io.Writer,
     socket: *Io.net.Socket,
     message: Io.net.IncomingMessage,
-    unsupported: @FieldType(quic.packet.Header, "unsupported_version"),
+    datagram: *const quic.endpoint.Datagram,
     shared: *const Shared,
 ) !void {
-    var datagram: [256]u8 = @splat(0);
-    const written = try quic.packet.writeVersionNegotiation(
-        &datagram,
-        unsupported.source,
-        unsupported.destination,
-        &versions,
-    );
-    try socket.send(io, &message.from, datagram[0..written]);
-    if (shared.verbose) try note(log, "version 0x{x} is not one of ours", .{unsupported.version});
+    var answer: [1 + 4 + 2 * 256 + 4 * quic.endpoint.supported_versions.len]u8 = undefined;
+    const written = try quic.endpoint.writeVersionNegotiation(&answer, datagram);
+    try socket.send(io, &message.from, answer[0..written]);
+    if (shared.verbose) try note(log, "version 0x{x} is not one of ours", .{datagram.version.?});
 }
 
 /// Answer a first flight with a Retry, and forget about it.
@@ -521,30 +499,24 @@ fn sendRetry(
     log: *Io.Writer,
     socket: *Io.net.Socket,
     message: Io.net.IncomingMessage,
-    initial: @FieldType(quic.packet.Header, "initial"),
+    datagram: *const quic.endpoint.Datagram,
     source: quic.ConnectionId,
     shared: *const Shared,
 ) !void {
-    // Section 17.2.5.1: the Source Connection ID a Retry carries must differ
-    // from the one the client addressed, and a client discards a Retry that
-    // breaks the rule. `source` is drawn fresh per datagram, so the only way
-    // they collide is chance at 2^-64 — and answering nothing is better than
-    // answering a packet the client will throw away.
-    if (source.eql(&initial.destination)) return;
-
     var token: [1 + quic.ConnectionId.octets_max + token_mac_octets]u8 = undefined;
-    const octets = makeToken(&token, initial.destination, message.from, shared);
+    const octets = makeToken(&token, datagram.destination, message.from, shared);
 
-    var datagram: [512]u8 = @splat(0);
+    var retry: [512]u8 = @splat(0);
     var scratch: [1024]u8 = undefined;
-    const written = try quic.packet.writeRetry(&datagram, &scratch, .{
-        .destination = initial.source,
-        .source = source,
-        .token = octets,
-        .original_destination = initial.destination,
-    });
-    try socket.send(io, &message.from, datagram[0..written]);
-    if (shared.verbose) try note(log, "retried {x} as {x}", .{ initial.destination.bytes(), source.bytes() });
+    // Section 17.2.5.1 forbids reusing the client's identifier, and `source`
+    // is drawn fresh per datagram, so a collision is chance at 2^-64 — and
+    // answering nothing is better than a packet the client will throw away.
+    const written = quic.endpoint.writeRetry(quic.crypto.backend.Std, &retry, &scratch, datagram, source, octets) catch |err| switch (err) {
+        error.SourceUnchanged => return,
+        else => return err,
+    };
+    try socket.send(io, &message.from, retry[0..written]);
+    if (shared.verbose) try note(log, "retried {x} as {x}", .{ datagram.destination.bytes(), source.bytes() });
 }
 
 /// `odcid_len || odcid || HMAC(key, odcid || address)`.
@@ -613,39 +585,6 @@ fn tokenMac(
     mac.final(out);
 }
 
-/// This endpoint's transport parameters. RFC 9000 section 7.3 has the client
-/// check both identifiers against the packets it saw.
-fn transportParameters(
-    target: []u8,
-    source: quic.ConnectionId,
-    original: quic.ConnectionId,
-    retry_source: ?quic.ConnectionId,
-) ![]const u8 {
-    const written = try quic.transport_parameters.encode(target, &.{
-        // Section 7.3: present exactly when a Retry was sent, and equal to the
-        // Retry's Source Connection ID. A client refuses the connection if
-        // either half is wrong, which is what makes the identifier an attacker
-        // injected during the handshake detectable.
-        .retry_source_connection_id = retry_source,
-        .initial_max_data = connection_receive_octets,
-        .initial_max_stream_data_bidi_local = stream_receive_octets,
-        .initial_max_stream_data_bidi_remote = stream_receive_octets,
-        .initial_max_stream_data_uni = stream_receive_octets,
-        .initial_max_streams_bidi = requests_max,
-        .initial_max_streams_uni = unidirectional_max,
-        // The same number `idle_ns` retires on, so what this server does is
-        // what it said it would do. It advertised nothing here while dropping
-        // connections after five seconds, which is a server telling its peer
-        // the connection never times out and then behaving as though it does.
-        .max_idle_timeout_ms = @divExact(idle_ns, std.time.ns_per_ms),
-        .max_udp_payload_size = Connection.datagram_octets,
-        .active_connection_id_limit = 2,
-        .initial_source_connection_id = source,
-        .original_destination_connection_id = original,
-    });
-    return target[0..written];
-}
-
 /// Everything that happens between datagrams: the handshake, the HTTP/3
 /// streams, and the responses.
 fn drive(io: Io, log: *Io.Writer, peer: *Peer, now_ns: u64, shared: *const Shared, scratch: []u8) !void {
@@ -694,7 +633,7 @@ fn drive(io: Io, log: *Io.Writer, peer: *Peer, now_ns: u64, shared: *const Share
     // both sent its Finished and verified the peer's, and `tls.Server` reaching
     // `.established` is exactly that. Only the TLS engine knows it, which is
     // why `Connection` takes it as a report rather than inferring it.
-    if (peer.server.state == .established and !peer.connection.recovery.handshake_confirmed) {
+    if (peer.server.state == .established and !peer.connection.handshakeConfirmed()) {
         peer.connection.confirmHandshake();
     }
 
@@ -723,34 +662,24 @@ fn drive(io: Io, log: *Io.Writer, peer: *Peer, now_ns: u64, shared: *const Share
         return;
     }
 
-    if (!peer.http3_started) try startHttp3(peer);
-    try pushUnidirectional(peer);
+    peer.session.flush(&peer.connection);
 
     var index: usize = 0;
     // Bounded by `readable_len`, which is bounded by the stream table.
     while (index < peer.readable_len) : (index += 1) {
         const id = peer.readable[index];
-        const stream = peer.connection.findStream(id) orelse continue;
-        if (stream.receive_state == .reset) continue;
-        const data = peer.connection.readable(id);
-        const fin = if (stream.received.final_size) |size|
-            size == stream.consumed + data.len
-        else
-            false;
-        if (data.len == 0 and !fin) continue;
-
         var events: [16]h3.http3.Event = undefined;
-        const result = peer.http3.receive(id, data, fin, &events) catch |err| {
-            const application = h3.http3.code(err);
+        // A connection error has already been closed on, with the code RFC
+        // 9114 names; what is left here is to say so.
+        const read = peer.session.receive(&peer.connection, id, &events, std.math.maxInt(u64)) catch |err| {
             try note(log, "http3 on stream {d}: {s} (0x{x})", .{
                 id,
                 @errorName(err),
-                @backingInt(application),
+                @backingInt(h3.http3.code(err)),
             });
-            peer.connection.closeApplication(@backingInt(application));
             return;
         };
-        for (events[0..result.events]) |event| {
+        for (events[0..read.events]) |event| {
             respond(io, peer, shared, event) catch |err| {
                 const application = respondCode(err);
                 try note(log, "response on stream {d}: {s} (0x{x})", .{
@@ -762,31 +691,10 @@ fn drive(io: Io, log: *Io.Writer, peer: *Peer, now_ns: u64, shared: *const Share
                 return;
             };
         }
-        if (result.consumed > 0) try peer.connection.consume(id, result.consumed);
+        peer.session.consume(&peer.connection, id, read);
     }
     compactReadable(peer);
     try pushAnswers(io, peer, scratch);
-}
-
-const unidirectional_streams = [3]u64{ control_stream, qpack_encoder_stream, qpack_decoder_stream };
-
-/// Produce this endpoint's three unidirectional streams, once.
-fn startHttp3(peer: *Peer) !void {
-    peer.uni_len[0] = try peer.http3.writeControl(&peer.uni_out[0]);
-    peer.uni_len[1] = try h3.stream.write(&peer.uni_out[1], .qpack_encoder);
-    peer.uni_len[2] = try h3.stream.write(&peer.uni_out[2], .qpack_decoder);
-    peer.http3_started = true;
-}
-
-/// Push what is left of them. A stream this endpoint has no credit for takes
-/// nothing and is tried again on the next pass, which is what a MAX_STREAM_DATA
-/// from the peer is for.
-fn pushUnidirectional(peer: *Peer) !void {
-    for (unidirectional_streams, 0..) |id, index| {
-        if (peer.uni_sent[index] == peer.uni_len[index]) continue;
-        const rest = peer.uni_out[index][peer.uni_sent[index]..peer.uni_len[index]];
-        peer.uni_sent[index] += peer.connection.write(id, rest, false) catch 0;
-    }
 }
 
 /// One event, and the response a HEADERS on a request stream earns.
@@ -812,53 +720,47 @@ fn respond(io: Io, peer: *Peer, shared: *const Shared, event: h3.http3.Event) Re
             // decides whether a field section is a message at all, and a server
             // that skipped it would be the request-smuggling surface
             // `fields.zig` exists to close.
-            var buffer: [16 * 1024]u8 = undefined;
-            var iterator = h3.qpack.field_line.iterate(value.section, &buffer, 1 << 20) catch
-                return error.GeneralProtocolError;
-            var validator: h3.fields.MessageValidator = .init(.{
+            var decoder: [16 * 1024]u8 = undefined;
+            var storage: [16 * 1024]u8 = undefined;
+            var list: [64]h3.qpack.Field = undefined;
+            const decoded = h3.http3_server.decodeSection(value.section, .{
                 .kind = if (value.trailers) .trailer else .request,
-            });
-            var path: [256]u8 = undefined;
-            var path_len: usize = 0;
-            while (iterator.next() catch return error.GeneralProtocolError) |field| {
-                validator.field(&field) catch return error.MessageError;
-                if (std.mem.eql(u8, field.name, ":path") and field.value.len <= path.len) {
-                    @memcpy(path[0..field.value.len], field.value);
-                    path_len = field.value.len;
-                }
+            }, 1 << 20, &decoder, &storage, &list) catch |err| return switch (err) {
+                error.DecompressionFailed => error.GeneralProtocolError,
+                error.MessageError => error.MessageError,
+                error.TooLarge => error.ExcessiveLoad,
+            };
+            var path: []const u8 = "";
+            for (decoded.fields) |field| {
+                if (std.mem.eql(u8, field.name, ":path")) path = field.value;
             }
-            validator.finish() catch return error.MessageError;
             if (value.trailers) return;
 
             // Answered once. A second HEADERS on the same stream is trailers,
             // which is legal and is not a second request.
             if (findAnswer(peer, value.stream) != null) return;
-            const answer = openAnswer(io, peer, shared, value.stream, path[0..path_len]) orelse
+            const answer = openAnswer(io, peer, shared, value.stream, path, true) orelse
                 return error.ExcessiveLoad;
 
             var out: [512]u8 = undefined;
             var length: [24]u8 = undefined;
-            var offset = try peer.http3.writeHeaders(&out, &.{
+            // The headers whole; the body follows through `pushAnswers` as the
+            // peer's window opens, in DATA frames `writeData` sizes to fit — a
+            // megabyte does not fit in one write, and a server that assumed it
+            // did would truncate every large response and call it a success.
+            peer.session.writeHeaders(&peer.connection, value.stream, &.{
                 .{ .name = ":status", .value = "200" },
                 .{
                     .name = "content-length",
                     .value = std.fmt.bufPrint(&length, "{d}", .{answer.total}) catch
                         return error.GeneralProtocolError,
                 },
-            });
-            offset += try Http3.writeData(out[offset..], answer.total);
-            // The frame header only. The body follows through `pushAnswers` as
-            // the peer's window opens — a megabyte does not fit in one write,
-            // and a server that assumed it did would truncate every large
-            // response and call it a success.
-            const written = peer.connection.write(value.stream, out[0..offset], false) catch
-                return error.GeneralProtocolError;
-            if (written != offset) return error.GeneralProtocolError;
+            }, &out, false) catch return error.GeneralProtocolError;
         },
         .settings => {},
         .goaway => {},
         .data => {},
-        .finished => |id| peer.http3.release(id),
+        .finished => |id| peer.session.release(id),
     }
 }
 
@@ -882,10 +784,11 @@ fn openAnswer(
     shared: *const Shared,
     stream: u64,
     path: []const u8,
+    framed: bool,
 ) ?*Answer {
     if (peer.answers_len == peer.answers.len) return null;
     const answer = &peer.answers[peer.answers_len];
-    answer.* = .{ .stream = stream, .file = null, .offset = 0, .total = body.len };
+    answer.* = .{ .stream = stream, .file = null, .framed = framed, .offset = 0, .total = body.len };
 
     open: {
         const www = shared.www orelse break :open;
@@ -929,7 +832,10 @@ fn pushAnswers(io: Io, peer: *Peer, scratch: []u8) !void {
                 body[@intCast(answer.offset)..@intCast(answer.total)];
             if (chunk.len > 0) {
                 const fin = answer.offset + chunk.len == answer.total;
-                const taken = peer.connection.write(answer.stream, chunk, fin) catch 0;
+                const taken = if (answer.framed)
+                    peer.session.writeData(&peer.connection, answer.stream, chunk, fin) catch 0
+                else
+                    peer.connection.write(answer.stream, chunk, fin) catch 0;
                 answer.offset += taken;
                 // A short write is ordinary: it means the window closed, and
                 // the FIN went with the last octet only if all of them fit.
@@ -942,6 +848,14 @@ fn pushAnswers(io: Io, peer: *Peer, scratch: []u8) !void {
         if (answer.offset < answer.total) {
             index += 1;
             continue;
+        }
+        // An empty HTTP/3 body never reached a write that could carry the
+        // FIN, so it goes on its own; and until it does the slot stays.
+        if (answer.framed and answer.total == 0) {
+            peer.session.finish(&peer.connection, answer.stream) catch {
+                index += 1;
+                continue;
+            };
         }
         // Finished. The slot goes back, which for a `multiconnect` run is what
         // keeps the table from filling.
@@ -961,7 +875,7 @@ fn respondHq(io: Io, peer: *Peer, shared: *const Shared, stream: u64) !void {
     try peer.connection.consume(stream, end + 2);
 
     const space = std.mem.indexOfScalar(u8, line, ' ') orelse return;
-    _ = openAnswer(io, peer, shared, stream, line[space + 1 ..]) orelse return;
+    _ = openAnswer(io, peer, shared, stream, line[space + 1 ..], false) orelse return;
 }
 
 /// Drop the identifiers whose streams are gone.

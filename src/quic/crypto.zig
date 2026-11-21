@@ -11,8 +11,11 @@
 //!
 //! Here: section 5's packet protection and header protection, section 5.2's
 //! Initial secrets, section 5.8's Retry integrity tag, and section 6's key
-//! update. All of it computation over caller-supplied keys, all of it through
-//! `std.crypto`, none of it needing an allocator or a dependency.
+//! update. All of it computation over caller-supplied keys, none of it needing
+//! an allocator or a dependency. The primitives underneath — the AEADs, the
+//! header protection ciphers and HKDF — come from a comptime backend
+//! (`crypto/backend.zig`), which is `std.crypto` unless the consumer supplies
+//! its own; everything built on them stays here.
 //!
 //! Not here: **the TLS handshake**. h3 never builds a ClientHello, never
 //! verifies a certificate, and never holds a private key. What it does is hand
@@ -35,11 +38,17 @@ const std = @import("std");
 
 const assert = @import("../assert.zig").assert;
 
+pub const backend = @import("crypto/backend.zig");
 pub const secrets = @import("crypto/secrets.zig");
 pub const protect = @import("crypto/protect.zig");
 pub const retry = @import("crypto/retry.zig");
+/// RFC 9001 appendix A as a check a consumer runs its own backend through.
+pub const conformance = @import("crypto/conformance.zig");
 
+/// Packet protection keys over `backend.Std`. `KeysOf` takes another backend;
+/// `Connection` picks one with `Config.crypto`.
 pub const Keys = protect.Keys;
+pub const KeysOf = protect.KeysOf;
 pub const Secret = secrets.Secret;
 
 // What RFC 9001 asks of the TLS engine rather than of this package.
@@ -553,9 +562,11 @@ comptime {
 }
 
 test {
+    _ = backend;
     _ = secrets;
     _ = protect;
     _ = retry;
+    _ = conformance;
 }
 
 test "a level's space is the one section 12.3 assigns it" {

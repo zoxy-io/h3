@@ -162,6 +162,27 @@ comptime {
     assert(ack_delay_ns_max < std.math.maxInt(u64));
 }
 
+/// An ACK frame's Delay field in nanoseconds, under the exponent its sender
+/// advertised, saturated at or just below `ack_delay_ns_max`.
+///
+/// The clamp is in the wire's units, before the shift, for the reason
+/// `ack_delay_units_max` gives at the default exponent — and per exponent,
+/// because the ceiling in units is the ceiling in time divided by the
+/// exponent's multiplier, rounded down. At an exponent of 20 one unit is about
+/// a second and the clamp is fifteen of them; at 0 it is sixteen million.
+fn ackDelayNs(delay_units: u64, exponent: u6) u64 {
+    assert(exponent <= transport_parameters.ack_delay_exponent_max);
+    const units_max: u64 = (ack_delay_ns_max / std.time.ns_per_us) >> exponent;
+    // The `u64` annotation is load-bearing. `@min` narrows its result type to
+    // fit a comptime-known bound, so a clamp written without it is a narrow
+    // integer that the shift below overflows — the clamp creating the overflow
+    // it was added to prevent, which is what the first version of it did.
+    const units: u64 = @min(delay_units, units_max);
+    const delay_ns = (units << exponent) * std.time.ns_per_us;
+    assert(delay_ns <= ack_delay_ns_max);
+    return delay_ns;
+}
+
 //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1
 //# Prior to validating the client address, servers MUST NOT send more
 //# than three times as many bytes as the number of bytes they have
@@ -171,6 +192,16 @@ comptime {
 /// send no more than this multiple of what it has received. Without it a server
 /// is a reflector for anyone who can spoof a source address.
 pub const amplification_factor: u32 = 3;
+
+/// The one connection identifier this endpoint issues is the handshake's, at
+/// sequence 0 (RFC 9000 section 5.1.1); it sends no NEW_CONNECTION_ID.
+const issued_sequence_max: u64 = 0;
+
+/// RFC 9000 section 10.1's floor on the idle timeout and section 10.2's
+/// length of the closing and draining period, each in PTOs. Both sections say
+/// three; named twice because they are two rules that happen to agree.
+const idle_pto_multiple: u64 = 3;
+const close_pto_multiple: u64 = 3;
 
 pub const Config = struct {
     //= https://www.rfc-editor.org/rfc/rfc9000#section-7.5
@@ -219,6 +250,14 @@ pub const Config = struct {
     stream_receive_octets: u32 = 64 * 1024,
     stream_send_octets: u32 = 16 * 1024,
     connection_receive_octets: u64 = 1 << 20,
+    /// The packet-protection backend: every AEAD, header protection cipher
+    /// and HKDF this connection computes with. `std.crypto` unless a consumer
+    /// supplies its own; `crypto/backend.zig` is the contract one has to meet,
+    /// and `crypto.conformance.check` is how to test that it does.
+    ///
+    /// A type, so `Config` exists only at compile time — which it always did,
+    /// since every field here sizes something.
+    crypto: type = crypto.backend.Std,
 };
 
 /// Where the connection is, in the terms section 10 uses.
@@ -245,6 +284,13 @@ pub fn Connection(comptime config: Config) type {
         assert(config.datagram_octets >= initial_datagram_min);
         assert(config.datagram_octets <= udp_payload_octets_max);
     }
+
+    comptime crypto.backend.check(config.crypto);
+    // The three places the backend reaches: packet protection, the key
+    // schedule a key update runs, and the Retry integrity tag a client checks.
+    const Keys = crypto.KeysOf(config.crypto);
+    const Schedule = crypto.secrets.Schedule(config.crypto);
+    const Integrity = crypto.retry.Integrity(config.crypto);
 
     const CryptoLevel = struct {
         /// Handshake bytes from the peer, reassembled in order.
@@ -374,12 +420,12 @@ pub fn Connection(comptime config: Config) type {
         phase: bool = false,
         /// The generation before the current one, kept so packets reordered
         /// across an update still decrypt (section 6.3).
-        previous_receive: ?crypto.Keys = null,
+        previous_receive: ?Keys = null,
         /// The generation after, derived in advance rather than on demand.
         /// Section 6.3: deriving keys inside the receive path is a timing
         /// signal that leaks when an update happened, and therefore the
         /// value of a bit that is otherwise protected.
-        next_receive: ?crypto.Keys = null,
+        next_receive: ?Keys = null,
         /// Packets sealed under the current send key, for section 6.6's
         /// confidentiality limit. Reset by an update, because the limit is
         /// per key rather than per connection.
@@ -388,6 +434,18 @@ pub fn Connection(comptime config: Config) type {
         /// phase has been acknowledged, so that both peers are known to
         /// hold the keys before another one begins.
         phase_acknowledged: bool = true,
+    };
+
+    // The values `localTransportParameters` encodes that neither `config` nor
+    // the connection identifiers already fix.
+    const Local = struct {
+        max_idle_timeout_ms: u64 = 0,
+        stateless_reset_token: ?[transport_parameters.stateless_reset_token_octets]u8 = null,
+        disable_active_migration: bool = false,
+        max_udp_payload_size: u64 = config.datagram_octets,
+        /// A server's section 7.3 identifiers; null at a client.
+        original_destination: ?ConnectionId = null,
+        retry_source: ?ConnectionId = null,
     };
 
     const ConnectionStreams = StreamsOf(.{
@@ -399,6 +457,11 @@ pub fn Connection(comptime config: Config) type {
 
     const Recovery = RecoveryOf(.{
         .sent_max = config.sent_max,
+        // The comptime bound, not the peer's `max_udp_payload_size`: RFC 9002
+        // appendix B.2 sizes the initial and minimum windows from the datagram
+        // size in use, and a peer that caps it at 1200 gets windows sized for
+        // `datagram_octets`. Generous by the ratio of the two, never more, and
+        // recorded rather than fixed because `Recovery`'s size is comptime.
         .max_datagram_size = config.datagram_octets,
         .Context = PacketContext,
     });
@@ -442,6 +505,9 @@ pub fn Connection(comptime config: Config) type {
         const Self = @This();
 
         pub const datagram_octets: u32 = config.datagram_octets;
+        /// One stream's receive window, which is also the most of it a reader
+        /// can be handed at once.
+        pub const stream_receive_octets: u32 = config.stream_receive_octets;
         /// The smallest send room `send` builds a datagram in; see `room_min`.
         /// Public so a consumer can tell "nothing owed" from "an
         /// amplification-limited server waiting for its peer" if it needs to.
@@ -523,8 +589,9 @@ pub fn Connection(comptime config: Config) type {
         //= reason=path MTU discovery is the consumer's: it needs the socket, its options and the ICMP messages the kernel delivers beside it, and none of the three crosses the seam of docs/DESIGN.md section 3. This package takes `datagram_octets` as a comptime constant that a comptime assert holds at or above section 14's 1200-octet floor. See docs/DESIGN.md section 2 and section 6.
         //
         // This half is honoured rather than excused: `send` builds into
-        // `min(sendRoom(), datagram_octets)` and there is no PMTU probe path at all, so
-        // every packet this package emits is sized to fit the maximum datagram size.
+        // `min(sendRoom(), datagramLimit())` — `datagram_octets`, and the peer's
+        // `max_udp_payload_size` once known — and there is no PMTU probe path at all,
+        // so every packet this package emits is sized to fit the maximum datagram size.
         //= https://www.rfc-editor.org/rfc/rfc9000#section-14.2
         //# All QUIC packets that are not sent in a PMTU probe SHOULD be
         //# sized to fit within the maximum datagram size to avoid the
@@ -690,8 +757,8 @@ pub fn Connection(comptime config: Config) type {
         /// connection, across all keys" — so one counter, not one per key.
         forgeries: u64 = 0,
 
-        send_keys: [Level.count]?crypto.Keys = @splat(null),
-        receive_keys: [Level.count]?crypto.Keys = @splat(null),
+        send_keys: [Level.count]?Keys = @splat(null),
+        receive_keys: [Level.count]?Keys = @splat(null),
         levels: [Level.count]CryptoLevel = @splat(.{}),
         spaces: [Space.count]PacketSpace = @splat(.{}),
 
@@ -841,11 +908,26 @@ pub fn Connection(comptime config: Config) type {
         //# secured UDP endpoints.
         //= type=exception
         //= reason=a rule addressed to whoever runs the server rather than to the code it runs: ingress filtering is the network's, and the count of clients, the connections one address may open and how long any of them may stay are all decided above a single `Connection` — this type holds one connection, owns no socket and reads no clock. See docs/DESIGN.md section 2 and section 3.
+        /// What `localTransportParameters` says about this endpoint, beyond
+        /// what `config` and the identifiers fix. See `Advertised`.
+        local: Local = .{},
+
         /// Section 8.1's accounting. A client validates its peer by construction
         /// — it chose the address — so this only ever restrains a server.
         address_validated: bool,
         received_octets: u64 = 0,
         sent_octets: u64 = 0,
+
+        /// Section 18.2's `ack_delay_exponent` the peer sent, which is what
+        /// decodes the ACK Delay field of every ACK it sends. The default until
+        /// its transport parameters arrive, because absent means 3.
+        peer_ack_delay_exponent: u6 = ack_delay_exponent_default,
+        /// Section 18.2's `max_udp_payload_size` the peer sent: the largest
+        /// datagram it will process. The default, the largest UDP payload,
+        /// until its transport parameters arrive — so until then `send` is
+        /// bounded by `datagram_octets` alone, which section 14.1's 1200-octet
+        /// floor already keeps safe for an Initial.
+        peer_max_udp_payload_size: u64 = transport_parameters.max_udp_payload_size_default,
 
         /// The peer's transport parameters, as the extension's octets. Held
         /// rather than decoded so that a consumer's TLS engine can hand them
@@ -928,6 +1010,24 @@ pub fn Connection(comptime config: Config) type {
         events_count: u32 = 0,
         events_dropped: u32 = 0,
 
+        /// RFC 9000 section 10.1's idle timer. `peer_idle_timeout_ms` is what
+        /// the peer advertised; `idle_since_ns` is when the timer last
+        /// restarted, or null before anything has been sent or received; and
+        /// `idle_restarted_by_send` is section 10.1's "if no other ack-eliciting
+        /// packets have been sent since last receiving", so a sender that
+        /// keeps sending into silence does not keep itself alive.
+        peer_idle_timeout_ms: u64 = 0,
+        idle_since_ns: ?u64 = null,
+        idle_restarted_by_send: bool = false,
+        /// Section 10.2's closing or draining period: when it ends, measured
+        /// from the first call that saw the state with a clock in hand — the
+        /// state can be entered from `close`, which takes no clock.
+        close_deadline_ns: ?u64 = null,
+        /// Nothing is left to do and the connection's state may be discarded:
+        /// the idle timer expired, or the closing or draining period ended.
+        /// See `isClosed`.
+        closed: bool = false,
+
         /// Set by a CONNECTION_CLOSE in either direction.
         close_code: u64 = 0,
         close_is_application: bool = false,
@@ -947,12 +1047,14 @@ pub fn Connection(comptime config: Config) type {
         close_pending: [Level.count]bool = @splat(false),
 
         // The client's first Destination Connection ID arrives here already chosen,
-        // and its length is never checked against section 7.2's floor: an eight-octet
-        // minimum is what makes the identifier hard to guess for an off-path attacker
-        // who wants to forge an Initial, and `ConnectionId.octets_min` is zero.
+        // and a `Connection` does not check it against section 7.2's floor: an
+        // eight-octet minimum is what makes the identifier hard to guess for an
+        // off-path attacker who wants to forge an Initial, and the place a server
+        // first sees it is before any connection exists.
         //= https://www.rfc-editor.org/rfc/rfc9000#section-7.2
         //# This Destination Connection ID MUST be at least 8 bytes in length.
-        //= type=todo
+        //= type=exception
+        //= reason=held where a server decides to create a connection: `endpoint.Datagram.mayStart` refuses a first Initial whose Destination Connection ID is shorter than eight octets, which is the only Initial the rule binds. A `Connection` is built from an identifier its consumer already accepted. See quic/endpoint.zig.
         //= https://www.rfc-editor.org/rfc/rfc9000#section-3.1
         //# Once all stream data has been successfully acknowledged, the sending
         //# part of the stream enters the "Data Recvd" state, which is a terminal
@@ -988,8 +1090,10 @@ pub fn Connection(comptime config: Config) type {
             /// rather than per packet because that is what a census wants and
             /// what `Recovery` can say without keeping a list.
             packets_lost: u32,
-            /// A CONNECTION_CLOSE arrived, or this endpoint sent one.
-            closed: struct { code: u64, application: bool },
+            /// A CONNECTION_CLOSE arrived, or this endpoint sent one — or, with
+            /// `idle` set, the idle timer expired and the connection closed
+            /// silently (RFC 9000 section 10.1), with no frame either way.
+            closed: struct { code: u64, application: bool, idle: bool = false },
             /// Events were produced faster than they were polled, and this many
             /// were dropped.
             ///
@@ -1008,10 +1112,197 @@ pub fn Connection(comptime config: Config) type {
             original_destination: ConnectionId,
             /// What this endpoint asks the peer to address it as.
             source: ConnectionId,
+            /// What this endpoint says about itself in its transport
+            /// parameters, beyond what `config` already fixes. Optional so that
+            /// a consumer building its own extension can leave it out; one that
+            /// builds it with `localTransportParameters` says it here, so the
+            /// limits enforced are the limits advertised.
+            advertised: ?Advertised = null,
         };
 
+        /// RFC 9000 section 18.2's parameters that are the consumer's to
+        /// choose. Everything else this endpoint advertises is fixed by
+        /// `config` — the receive windows are the buffers behind them — or by
+        /// the connection identifiers, so `localTransportParameters` reads it
+        /// from there and cannot disagree with what is enforced.
+        pub const Advertised = struct {
+            /// Section 18.2's `max_idle_timeout`, in milliseconds; zero
+            /// advertises none. Section 10.1 makes the effective timeout the
+            /// smaller of the two endpoints' non-zero values.
+            max_idle_timeout_ms: u64 = 0,
+            /// Section 18.2's `stateless_reset_token` for `source`: a server's
+            /// alone, and derived by the consumer from a key this package never
+            /// sees. `endpoint.writeStatelessReset` ends a reset in it.
+            stateless_reset_token: ?[transport_parameters.stateless_reset_token_octets]u8 = null,
+            /// Section 18.2's `disable_active_migration`. True unless a
+            /// consumer says otherwise, because this package does not validate
+            /// a new path: a peer that moved would be talking to a connection
+            /// that cannot follow it.
+            disable_active_migration: bool = true,
+            /// Streams of each kind the peer may have open at once (section
+            /// 4.6). Their sum, plus `streams_opened_max`, has to fit
+            /// `streams_max`, because every kind shares one table and a peer
+            /// inside its limit may hold every identifier the limit names.
+            max_streams_bidirectional: u64,
+            max_streams_unidirectional: u64,
+            /// The most streams this endpoint opens itself at once — an HTTP/3
+            /// server's three unidirectional ones, a client's requests — which
+            /// the table must hold beside the peer's.
+            streams_opened_max: u64 = 0,
+            /// Section 18.2's `max_udp_payload_size`: the largest datagram the
+            /// consumer's receive buffer takes. At least 1200, and by default
+            /// the largest this endpoint sends.
+            max_udp_payload_size: u64 = config.datagram_octets,
+        };
+
+        /// What a server knows when it starts a connection after a Retry.
+        pub const Retried = struct {
+            /// The Destination Connection ID of the client's Initial *before*
+            /// the Retry, which section 7.3 has the server repeat. After the
+            /// Retry no packet carries it, so it is what the consumer's token
+            /// had to bring back.
+            original_destination: ConnectionId,
+        };
+
+        pub const AdvertiseError = error{
+            /// The peer's two stream limits and `streams_opened_max` together
+            /// exceed `streams_max`: a conforming peer could then be refused a
+            /// stream it was promised, with STREAM_LIMIT_ERROR blamed on it.
+            StreamsExceedTable,
+            /// Section 18.2: a `max_udp_payload_size` under 1200 is invalid.
+            UdpPayloadTooSmall,
+            /// A value no variable-length integer can carry.
+            ValueTooLarge,
+            /// Section 18.2: `stateless_reset_token` is a server's alone.
+            ClientResetToken,
+        };
+
+        /// Check what a consumer chose to advertise against what this
+        /// connection can honour. `initServer` returns this error; `init`
+        /// asserts it, so a client building from runtime configuration calls
+        /// this first.
+        pub fn validateAdvertised(side: Side, advertised: Advertised) AdvertiseError!void {
+            if (side == .client and advertised.stateless_reset_token != null) return error.ClientResetToken;
+            if (advertised.max_udp_payload_size < transport_parameters.max_udp_payload_size_min) {
+                return error.UdpPayloadTooSmall;
+            }
+            if (advertised.max_udp_payload_size > varint.max) return error.ValueTooLarge;
+            if (advertised.max_idle_timeout_ms > varint.max) return error.ValueTooLarge;
+            const streams_max: u64 = config.streams_max;
+            if (advertised.max_streams_bidirectional > streams_max) return error.StreamsExceedTable;
+            if (advertised.max_streams_unidirectional > streams_max) return error.StreamsExceedTable;
+            if (advertised.streams_opened_max > streams_max) return error.StreamsExceedTable;
+            const total = advertised.max_streams_bidirectional + advertised.max_streams_unidirectional +
+                advertised.streams_opened_max;
+            if (total > streams_max) return error.StreamsExceedTable;
+            assert(total <= streams_max);
+        }
+
+        pub const InitError = AdvertiseError || error{
+            /// Section 17.2.5.1: a Retry's Source Connection ID differs from
+            /// the identifier the client used first, and the client's next
+            /// Initial is addressed to it. `Retried.original_destination` equal
+            /// to `initial_destination` means the consumer's token named the
+            /// wrong one of the two — a token is wire data, so it is refused
+            /// rather than asserted.
+            RetryIdentifierReused,
+        };
+
+        pub const ServerOptions = struct {
+            /// The Destination Connection ID of the client Initial this
+            /// connection is built from, which is what the Initial keys derive
+            /// from (RFC 9001 section 5.2): the client's own choice, or after a
+            /// Retry the Source Connection ID that Retry carried.
+            initial_destination: ConnectionId,
+            /// This server's connection identifier, chosen by the consumer. A
+            /// server that routes short headers by identifier gives every
+            /// connection the same length (see `endpoint.classify`).
+            source: ConnectionId,
+            /// Present exactly when this connection follows a Retry whose
+            /// token the consumer validated.
+            retry: ?Retried = null,
+            advertised: Advertised,
+        };
+
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-7.3
+        //# A server includes the Destination Connection ID field from the first
+        //# Initial packet it received from the client in the
+        //# original_destination_connection_id transport parameter; if the server
+        //# sent a Retry packet, this refers to the first Initial packet received
+        //# before sending the Retry packet.
+        //= type=test
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-7.3
+        //# If it sends a Retry packet, a
+        //# server also includes the Source Connection ID field from the Retry
+        //# packet in the retry_source_connection_id transport parameter.
+        //= type=test
+        //
+        // A Retry whose token came back is an address this server has had a
+        // packet delivered to, which is section 8.1's whole definition of a
+        // validated one: the amplification limit stops binding at once rather
+        // than at the first Handshake packet.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.2
+        //# As long as it is not possible for an attacker to generate a valid
+        //# token for its own address (see Section 8.1.4) and the client is able
+        //# to return that token, it proves to the server that it received the
+        //# token.
+        //= type=test
+        /// A server's connection, from the client Initial that starts it.
+        ///
+        /// The one constructor a server needs: the transport parameters
+        /// section 7.3 requires of a server follow from these options, and
+        /// `localTransportParameters` encodes them for the consumer's TLS
+        /// engine to carry.
+        ///
+        /// In place, into the connection's own storage, because a connection
+        /// is not a stack value: `footprint_octets` is hundreds of kilobytes at
+        /// a modest configuration and megabytes at the defaults, and a
+        /// constructor that returned `Self` — inside an error union, at that —
+        /// held a copy of it in the caller's frame and another in its own. The
+        /// interop server overflowed an 8 MiB stack on its first connection
+        /// that way. Everything is checked before `self` is touched, so a
+        /// refusal leaves the storage as it was.
+        pub fn initServer(self: *Self, options: ServerOptions) InitError!void {
+            try validateAdvertised(.server, options.advertised);
+            if (options.retry) |retried| {
+                if (retried.original_destination.eql(&options.initial_destination)) {
+                    return error.RetryIdentifierReused;
+                }
+            }
+            self.initInPlace(.{
+                .side = .server,
+                .original_destination = options.initial_destination,
+                .source = options.source,
+                .advertised = options.advertised,
+            });
+            if (options.retry) |retried| {
+                assert(!retried.original_destination.eql(&options.initial_destination));
+                self.local.original_destination = retried.original_destination;
+                self.local.retry_source = options.initial_destination;
+                self.address_validated = true;
+            }
+            assert(self.side == .server);
+            assert(self.local.original_destination != null);
+        }
+
+        /// A connection by value, for a configuration small enough to hold on
+        /// a stack — tests and the simulator. Anything sized like a real
+        /// connection is built where it lives, with `initInPlace` or
+        /// `initServer`, which make no copy: a by-value return may.
         pub fn init(options: Options) Self {
-            var self: Self = .{
+            var self: Self = undefined;
+            self.initInPlace(options);
+            return self;
+        }
+
+        /// Initialize the connection where it lives, with no copy of `Self`
+        /// on the stack: the assignment below is a struct literal written
+        /// straight into `self`, which is the result location Zig gives it.
+        /// `test "a connection initializes in place, on a stack smaller than
+        /// it"` is what holds that true.
+        pub fn initInPlace(self: *Self, options: Options) void {
+            self.* = .{
                 .side = options.side,
                 .destination = options.original_destination,
                 .source = options.source,
@@ -1029,7 +1320,122 @@ pub fn Connection(comptime config: Config) type {
             const bytes = options.original_destination.bytes();
             self.send_keys[@backingInt(Level.initial)] = .initial(bytes, options.side);
             self.receive_keys[@backingInt(Level.initial)] = .initial(bytes, options.side.peer());
-            return self;
+            // A server without a Retry repeats the identifier its first Initial
+            // carried, which is the one the keys came from; `initServer` moves
+            // it when there was a Retry.
+            if (options.side == .server) self.local.original_destination = options.original_destination;
+            if (options.advertised) |advertised| self.advertise(advertised);
+            assert(self.side == options.side);
+            assert(self.state == .handshaking);
+        }
+
+        fn advertise(self: *Self, advertised: Advertised) void {
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-18.2
+            //# This transport parameter MUST NOT be sent by a client but MAY be
+            //# sent by a server.
+            //
+            // Refused by `validateAdvertised`, which `initServer` returns.
+            // `init` cannot return it, so there it is a precondition — and a
+            // precondition guarded only by the caller is not `unreachable`
+            // (docs/TIGER_STYLE.md): with assertions off that would be
+            // undefined behaviour. A panic is defined in every build.
+            validateAdvertised(self.side, advertised) catch |err| {
+                @panic(switch (err) {
+                    error.StreamsExceedTable => "h3: advertised stream limits exceed streams_max; see validateAdvertised",
+                    error.UdpPayloadTooSmall => "h3: advertised max_udp_payload_size is below 1200",
+                    error.ValueTooLarge => "h3: an advertised value exceeds a variable-length integer",
+                    error.ClientResetToken => "h3: a client may not advertise a stateless reset token",
+                });
+            };
+            assert(advertised.max_udp_payload_size >= transport_parameters.max_udp_payload_size_min);
+            self.local.max_idle_timeout_ms = advertised.max_idle_timeout_ms;
+            self.local.stateless_reset_token = advertised.stateless_reset_token;
+            self.local.disable_active_migration = advertised.disable_active_migration;
+            self.local.max_udp_payload_size = advertised.max_udp_payload_size;
+            self.streams.setAdvertisedStreamLimits(
+                advertised.max_streams_bidirectional,
+                advertised.max_streams_unidirectional,
+            );
+        }
+
+        // Section 18.2's three connection-identifier parameters, and its eleven
+        // integer ones — every integer it defines, not only the eight
+        // `localTransportParameters` sets today, so the bound does not go stale
+        // when `Local` grows one.
+        const identifier_parameters: usize = 3;
+        const integer_parameters: usize = 11;
+        // A parameter's identifier and length, at their widest here: every
+        // identifier section 18.2 defines is under 64, and every value under
+        // 64 octets, so one octet each — two allowed for the identifier.
+        const parameter_prefix_octets: usize = 2 + 1;
+
+        /// The largest extension `localTransportParameters` can write: the
+        /// identifiers, the reset token, the integers at their widest and the
+        /// one flag. A caller's buffer of this size never fails; a test encodes
+        /// the worst case and checks it against this.
+        pub const local_transport_parameters_octets_max: usize =
+            identifier_parameters * (parameter_prefix_octets + ConnectionId.octets_max) +
+            (parameter_prefix_octets + transport_parameters.stateless_reset_token_octets) +
+            integer_parameters * (parameter_prefix_octets + varint.octets_max) +
+            parameter_prefix_octets;
+
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-7.3
+        //# Each endpoint includes the value of the Source Connection ID field
+        //# from the first Initial packet it sent in the
+        //# initial_source_connection_id transport parameter; see Section 18.2.
+        //= type=test
+        /// This endpoint's transport parameters, as the extension's octets,
+        /// for the consumer's TLS engine to carry in its ClientHello or
+        /// EncryptedExtensions.
+        ///
+        /// Built from what the connection enforces rather than from what a
+        /// consumer would restate: the receive windows are `config`'s buffers,
+        /// the stream limits are the ones `Streams` counts against, and the
+        /// identifiers are the ones on the wire — so the promise and the
+        /// accounting cannot drift apart, which is the defect `sim/` once had
+        /// (windows of a megabyte advertised over buffers of sixty-four
+        /// kilobytes).
+        pub fn localTransportParameters(self: *const Self, target: []u8) transport_parameters.EncodeError![]const u8 {
+            const parameters: transport_parameters.Parameters = .{
+                .original_destination_connection_id = self.local.original_destination,
+                .initial_source_connection_id = self.source,
+                .retry_source_connection_id = self.local.retry_source,
+                .stateless_reset_token = self.local.stateless_reset_token,
+                .max_idle_timeout_ms = self.local.max_idle_timeout_ms,
+                .max_udp_payload_size = self.local.max_udp_payload_size,
+                .initial_max_data = config.connection_receive_octets,
+                .initial_max_stream_data_bidi_local = config.stream_receive_octets,
+                .initial_max_stream_data_bidi_remote = config.stream_receive_octets,
+                .initial_max_stream_data_uni = config.stream_receive_octets,
+                .initial_max_streams_bidi = self.streams.advertised_bidi,
+                .initial_max_streams_uni = self.streams.advertised_uni,
+                .disable_active_migration = self.local.disable_active_migration,
+            };
+            // Section 18.2's server-only parameters, held by construction: a
+            // client's `local` never has the first three set and `advertise`
+            // refused the fourth.
+            if (self.side == .client) {
+                assert(parameters.original_destination_connection_id == null);
+                assert(parameters.retry_source_connection_id == null);
+                assert(parameters.stateless_reset_token == null);
+            }
+            const written = try transport_parameters.encode(target, &parameters);
+            assert(written <= local_transport_parameters_octets_max);
+            return target[0..written];
+        }
+
+        /// Whether the handshake is confirmed (RFC 9001 section 4.1.2): for a
+        /// client, HANDSHAKE_DONE arrived; for a server, `confirmHandshake`
+        /// was called.
+        pub fn handshakeConfirmed(self: *const Self) bool {
+            return self.recovery.handshake_confirmed;
+        }
+
+        /// Whether section 8.1's amplification limit still binds this
+        /// endpoint: false for a client, and for a server once a Handshake
+        /// packet opened or a Retry's token came back.
+        pub fn addressValidated(self: *const Self) bool {
+            return self.address_validated;
         }
 
         // ---------------------------------------------------------------- TLS
@@ -1116,7 +1522,7 @@ pub fn Connection(comptime config: Config) type {
             suite: crypto.Suite,
         ) SecretError!void {
             if (secret.length != suite.hashOctets()) return error.Rejected;
-            const keys: crypto.Keys = .fromSecret(suite, secret);
+            const keys: Keys = .fromSecret(suite, secret);
 
             // Nothing checks the level below before installing this one. A peer that
             // sends a CRYPTO frame at Initial, then hands over Handshake keys before the
@@ -1212,7 +1618,7 @@ pub fn Connection(comptime config: Config) type {
                         //# Endpoints responding to an apparent key update MUST NOT generate a
                         //# timing side-channel signal that might indicate that the Key Phase bit
                         //# was invalid (see Section 9.5).
-                        const next = crypto.secrets.update(suite, secret);
+                        const next = Schedule.update(suite, secret);
                         self.one_rtt.next_receive = keys.nextGeneration(suite, &next);
                     },
                 }
@@ -1276,7 +1682,7 @@ pub fn Connection(comptime config: Config) type {
         //# than the server to correlate connections; see Appendix C.4 of
         //# [TLS13].
         //= type=exception
-        //= reason=session tickets and address validation tokens are out of scope: this package sends no Retry, issues no NEW_TOKEN and resumes no session, so it neither writes nor reads either kind of token. See docs/DESIGN.md section 2 and section 6.
+        //= reason=a session ticket is a TLS 1.3 NewSessionTicket the consumer's TLS engine issues and stores; this package resumes no session, issues no NEW_TOKEN and keeps nothing between connections. See docs/DESIGN.md section 4.
         //
         //= https://www.rfc-editor.org/rfc/rfc9001#section-8.4
         //# A server SHOULD treat the receipt of a TLS ClientHello with a
@@ -1290,7 +1696,7 @@ pub fn Connection(comptime config: Config) type {
         //# address verification, QUIC implementations SHOULD instead use
         //# the Retry feature; see Section 8.1 of [QUIC-TRANSPORT].
         //= type=exception
-        //= reason=neither mechanism this sentence weighs is available here: HelloRetryRequest is a TLS handshake message the consumer's engine owns, and Retry needs a token with a server key and a clock behind it, which is why section 8.1.4 is excused elsewhere in this file. A server here validates an address the third way section 8.1 allows, by opening a Handshake packet, and holds the amplification limit until it can. See docs/DESIGN.md section 2 and section 4.
+        //= reason=HelloRetryRequest is a TLS handshake message the consumer's engine owns, so it is never this package's to use for address validation. Retry is what this package provides instead — `endpoint.writeRetry` builds one for a classified Initial — and when to send one, and what its token proves, is the consumer's policy.
         //
         // The 0-RTT pair, on the same footing as every other 0-RTT rule here: no
         // early-data key is installed, so there is no 0-RTT packet to have sent, to stop
@@ -1314,20 +1720,20 @@ pub fn Connection(comptime config: Config) type {
         //# Future versions of QUIC SHOULD generate a new salt value, thus
         //# ensuring that the keys are different for each version of QUIC.
         //= type=exception
-        //= reason=version negotiation is out of scope; a connection here speaks QUIC version 1 and the packet types that would begin a different one are the consumer's, per docs/DESIGN.md section 2. The rule is in any case addressed to a future version of QUIC rather than to an implementation of this one.
+        //= reason=addressed to whoever specifies a future version of QUIC rather than to an implementation of this one. This package speaks version 1, and `endpoint.classify` answers a long header in any other version with Version Negotiation.
         //
         //= https://www.rfc-editor.org/rfc/rfc9001#section-9.6
         //# To preserve this separation, a new version of QUIC SHOULD define
         //# new labels for key derivation for packet protection key and IV,
         //# plus the header protection keys.
         //= type=exception
-        //= reason=version negotiation is out of scope; a connection here speaks QUIC version 1 and the packet types that would begin a different one are the consumer's, per docs/DESIGN.md section 2. The rule is in any case addressed to a future version of QUIC rather than to an implementation of this one.
+        //= reason=addressed to whoever specifies a future version of QUIC rather than to an implementation of this one. This package speaks version 1, and `endpoint.classify` answers a long header in any other version with Version Negotiation.
         //
         //= https://www.rfc-editor.org/rfc/rfc9001#section-9.6
         //# New QUIC versions SHOULD define a new salt value used in
         //# calculating initial secrets.
         //= type=exception
-        //= reason=version negotiation is out of scope; a connection here speaks QUIC version 1 and the packet types that would begin a different one are the consumer's, per docs/DESIGN.md section 2. The rule is in any case addressed to a future version of QUIC rather than to an implementation of this one.
+        //= reason=addressed to whoever specifies a future version of QUIC rather than to an implementation of this one. This package speaks version 1, and `endpoint.classify` answers a long header in any other version with Version Negotiation.
         /// Queue handshake bytes for sending at `level`.
         pub fn cryptoIn(self: *Self, level: Level, data: []const u8) error{CryptoBufferExceeded}!void {
             assert(@backingInt(level) < self.levels.len);
@@ -1395,20 +1801,15 @@ pub fn Connection(comptime config: Config) type {
             return self.peer_parameters[0..self.peer_parameters_len];
         }
 
-        // The one advisory rule this package would want to obey and structurally cannot:
-        // a deployment on this code does not implement migration, so it *should* say so
-        // in disable_active_migration — and the extension that would carry the parameter
-        // is assembled on the other side of the TLS seam.
-        //= https://www.rfc-editor.org/rfc/rfc9000#section-5.2.3
-        //# A server in a deployment that does not implement a solution to
-        //# maintain connection continuity when the client address changes
-        //# SHOULD indicate that migration is not supported by using the
-        //# disable_active_migration transport parameter.
-        //= type=exception
-        //= reason=the transport parameters this endpoint advertises are built by the consumer's TLS engine and never by this package: `transportParametersIn` and `transportParametersOut` carry the *peer's* extension in and back out, and nothing here encodes one of its own. A deployment on this package should indeed advertise disable_active_migration, because migration is out of scope here — but only the consumer can, per docs/DESIGN.md section 4. See docs/DESIGN.md section 2 and section 6.
-        // The receive half of the rule, which is the half this package can enforce:
-        // the extension this endpoint *sends* is built by the consumer's TLS engine,
-        // and `transport_parameters.parse` refuses a repeated identifier with
+        // Section 5.2.3's advisory rule, which this package now obeys by default:
+        // `Advertised.disable_active_migration` is true unless a consumer says
+        // otherwise, and `localTransportParameters` carries it. Cited, with its
+        // test, where the extension is built.
+        //
+        // The receive half of the duplicate rule below is the half this package
+        // enforces, and the sending half holds by construction:
+        // `localTransportParameters` encodes each parameter once.
+        // `transport_parameters.parse` refuses a repeated identifier with
         // `error.Malformed` before any of it is kept.
         //= https://www.rfc-editor.org/rfc/rfc9000#section-7.4
         //# An endpoint MUST NOT send a parameter more than once in a given
@@ -1710,6 +2111,7 @@ pub fn Connection(comptime config: Config) type {
             //= reason=connection migration and a server's preferred address are out of scope: a connection here has one path, never learns an address, and never sends preferred_address. See docs/DESIGN.md section 2 and section 6.
             self.streams.setPeerStreamLimit(true, parsed.initial_max_streams_bidi);
             self.streams.setPeerStreamLimit(false, parsed.initial_max_streams_uni);
+            self.applyPeerTiming(&parsed);
 
             // Section 4.1: the flow control limits a connection starts with are
             // these, and until `interop/` ran, this function parsed all four of
@@ -1734,6 +2136,57 @@ pub fn Connection(comptime config: Config) type {
             @memcpy(self.peer_parameters[0..octets.len], octets);
             self.peer_parameters_len = @intCast(octets.len);
             assert(self.peer_parameters_len == octets.len);
+        }
+
+        /// The three of the peer's parameters that govern this endpoint's
+        /// sending and timing rather than its streams: how to read the delay in
+        /// its ACKs, how long it may hold one back, and how large a datagram it
+        /// will take. All three were parsed and then read by nobody, so an ACK
+        /// from a peer with a non-default exponent was mis-scaled into the RTT
+        /// estimate, the PTO assumed 25 milliseconds whatever the peer said,
+        /// and a peer that dedicated 1200 octets to each incoming packet was
+        /// sent datagrams of `datagram_octets` it would not process.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-19.3
+        //# It is decoded by
+        //# multiplying the value in the field by 2 to the power of the
+        //# ack_delay_exponent transport parameter sent by the sender of the
+        //# ACK frame; see Section 18.2.
+        //= type=test
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-14
+        //# Enforcement of the max_udp_payload_size transport parameter
+        //# (Section 18.2) might act as an additional limit on the maximum
+        //# datagram size.
+        //= type=test
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-18.2
+        //# This limit does act as an additional constraint on datagram size
+        //# in the same way as the path MTU, but it is a property of the
+        //# endpoint and not the path; see Section 14.
+        //= type=test
+        fn applyPeerTiming(self: *Self, parsed: *const transport_parameters.Parameters) void {
+            // `parse` refused anything outside section 18.2's ranges, so these
+            // bounds are guaranteed rather than hoped for.
+            assert(parsed.ack_delay_exponent <= transport_parameters.ack_delay_exponent_max);
+            assert(parsed.max_ack_delay_ms <= transport_parameters.max_ack_delay_max);
+            assert(parsed.max_udp_payload_size >= transport_parameters.max_udp_payload_size_min);
+            self.peer_ack_delay_exponent = @intCast(parsed.ack_delay_exponent);
+            // RFC 9002 section 5.3: the peer's max_ack_delay is what the PTO and
+            // the RTT sample allow for, not this endpoint's own.
+            self.recovery.max_ack_delay_ns = parsed.max_ack_delay_ms * std.time.ns_per_ms;
+            self.peer_max_udp_payload_size = parsed.max_udp_payload_size;
+            self.peer_idle_timeout_ms = parsed.max_idle_timeout_ms;
+        }
+
+        /// The largest datagram `send` builds: this endpoint's comptime bound,
+        /// and the peer's `max_udp_payload_size` once it is known. Never below
+        /// section 14's 1200, because section 18.2 makes a smaller value
+        /// invalid and `parse` refuses it.
+        fn datagramLimit(self: *const Self) u64 {
+            const limit = @min(@as(u64, config.datagram_octets), self.peer_max_udp_payload_size);
+            assert(limit >= initial_datagram_min);
+            assert(limit <= config.datagram_octets);
+            return limit;
         }
 
         // ------------------------------------------------------------ receive
@@ -1767,6 +2220,10 @@ pub fn Connection(comptime config: Config) type {
         //# confirmed (Section 4.1.2).
         //= type=test
         pub fn confirmHandshake(self: *Self) void {
+            // A handshake the consumer's engine finished after the connection
+            // closed is a handshake for nothing: moving back to `established`
+            // would undo the close and leave the closing period unending.
+            if (self.closed or self.state == .closing or self.state == .draining) return;
             if (self.state != .established) self.emit(.handshake_confirmed);
             self.state = .established;
             self.recovery.handshake_confirmed = true;
@@ -1802,8 +2259,8 @@ pub fn Connection(comptime config: Config) type {
             const send_secret = one.send_secret orelse return;
             const receive_secret = one.receive_secret orelse return;
 
-            const next_send = crypto.secrets.update(one.suite, &send_secret);
-            const next_receive = crypto.secrets.update(one.suite, &receive_secret);
+            const next_send = Schedule.update(one.suite, &send_secret);
+            const next_receive = Schedule.update(one.suite, &receive_secret);
 
             // The outgoing generation is kept for reading, not for writing:
             // section 6.3 expects reordered packets from the old phase for up
@@ -1860,7 +2317,7 @@ pub fn Connection(comptime config: Config) type {
 
             one.send_secret = next_send;
             one.receive_secret = next_receive;
-            const after = crypto.secrets.update(one.suite, &next_receive);
+            const after = Schedule.update(one.suite, &next_receive);
             one.next_receive = current_receive.nextGeneration(one.suite, &after);
 
             one.phase = !one.phase;
@@ -1893,8 +2350,9 @@ pub fn Connection(comptime config: Config) type {
 
         pub const ReceiveError = error{
             /// A frame that section 12.4 does not permit at this encryption
-            /// level, a reserved bit set, or a malformed frame.
-            /// `PROTOCOL_VIOLATION` or `FRAME_ENCODING_ERROR`.
+            /// level, a reserved bit set, or a frame the peer may not send.
+            /// `PROTOCOL_VIOLATION`. A frame that does not parse is
+            /// `FrameEncoding`.
             Protocol,
             /// More handshake data than `crypto_octets`. RFC 9001 section 4.4's
             /// `CRYPTO_BUFFER_EXCEEDED`.
@@ -1920,6 +2378,9 @@ pub fn Connection(comptime config: Config) type {
             /// honest close is `INTERNAL_ERROR` rather than a code that accuses
             /// the peer of something.
             TooFragmented,
+            /// A frame that does not parse: cut short, of an unknown type, or
+            /// carrying a field its type does not allow. `FRAME_ENCODING_ERROR`.
+            FrameEncoding,
         };
 
         /// The code a peer is told, for every error `receive` can return.
@@ -1929,13 +2390,14 @@ pub fn Connection(comptime config: Config) type {
         /// read them and choose. A server needs it on every datagram, which is
         /// why it arrived with `interop/`'s server role and not before.
         ///
-        /// `Protocol` collapses `PROTOCOL_VIOLATION` and
-        /// `FRAME_ENCODING_ERROR` into one, and this returns the first: the two
-        /// are raised from the same places here, and telling them apart would
-        /// mean splitting the error rather than guessing at the call site.
+        /// `Protocol` and `FrameEncoding` are separate. They were one, on the
+        /// strength of RFC 9000 section 11's permission to use a generic code
+        /// — and section 12.4 names FRAME_ENCODING_ERROR for a badly formatted
+        /// frame specifically, and h3spec 0.1.15 asks for exactly it.
         pub fn errorCode(err: ReceiveError) error_code.Transport {
             return switch (err) {
                 error.Protocol => .protocol_violation,
+                error.FrameEncoding => .frame_encoding_error,
                 error.CryptoBufferExceeded => .crypto_buffer_exceeded,
                 error.FlowControl => .flow_control_error,
                 error.FinalSize => .final_size_error,
@@ -1964,54 +2426,47 @@ pub fn Connection(comptime config: Config) type {
             //# in an incoming datagram either cannot be associated with a
             //# connection or cannot be decrypted.
             //= type=exception
-            //= reason=stateless reset is out of scope: it needs a static key and a token this package neither holds nor advertises, and detecting one means recognising a datagram that belongs to no connection — a decision made by whatever routes datagrams to a Connection, which is the consumer's, per docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //= reason=detecting a Stateless Reset needs the peer's reset token, and a server never holds one: RFC 9000 section 18.2 forbids a client's stateless_reset_token, and this endpoint takes no token from a NEW_CONNECTION_ID frame. The client side of detection is not implemented. Generating a reset is `endpoint.writeStatelessReset`. See docs/DESIGN.md section 6.
             //
             //= https://www.rfc-editor.org/rfc/rfc9000#section-10.3.1
             //# An endpoint MUST NOT check for any stateless reset tokens
             //# associated with connection IDs it has not used or for connection
             //# IDs that have been retired.
             //= type=exception
-            //= reason=stateless reset is out of scope: it needs a static key and a token this package neither holds nor advertises, and detecting one means recognising a datagram that belongs to no connection — a decision made by whatever routes datagrams to a Connection, which is the consumer's, per docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //= reason=detecting a Stateless Reset needs the peer's reset token, and a server never holds one: RFC 9000 section 18.2 forbids a client's stateless_reset_token, and this endpoint takes no token from a NEW_CONNECTION_ID frame. The client side of detection is not implemented. Generating a reset is `endpoint.writeStatelessReset`. See docs/DESIGN.md section 6.
             //
             //= https://www.rfc-editor.org/rfc/rfc9000#section-10.3.1
             //# When comparing a datagram to stateless reset token values,
             //# endpoints MUST perform the comparison without leaking
             //# information about the value of the token.
             //= type=exception
-            //= reason=stateless reset is out of scope: it needs a static key and a token this package neither holds nor advertises, and detecting one means recognising a datagram that belongs to no connection — a decision made by whatever routes datagrams to a Connection, which is the consumer's, per docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //= reason=detecting a Stateless Reset needs the peer's reset token, and a server never holds one: RFC 9000 section 18.2 forbids a client's stateless_reset_token, and this endpoint takes no token from a NEW_CONNECTION_ID frame. The client side of detection is not implemented. Generating a reset is `endpoint.writeStatelessReset`. See docs/DESIGN.md section 6.
             //
             //= https://www.rfc-editor.org/rfc/rfc9000#section-10.3.1
             //# If the last 16 bytes of the datagram are identical in value to a
             //# stateless reset token, the endpoint MUST enter the draining
             //# period and not send any further packets on this connection.
             //= type=exception
-            //= reason=stateless reset is out of scope: it needs a static key and a token this package neither holds nor advertises, and detecting one means recognising a datagram that belongs to no connection — a decision made by whatever routes datagrams to a Connection, which is the consumer's, per docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
-            //
-            //= https://www.rfc-editor.org/rfc/rfc9000#section-10.3
-            //# An endpoint MUST NOT send a Stateless Reset that is three times
-            //# or more larger than the packet it receives to avoid being used
-            //# for amplification.
-            //= type=exception
-            //= reason=stateless reset is out of scope: it needs a static key and a token this package neither holds nor advertises, and detecting one means recognising a datagram that belongs to no connection — a decision made by whatever routes datagrams to a Connection, which is the consumer's, per docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //= reason=detecting a Stateless Reset needs the peer's reset token, and a server never holds one: RFC 9000 section 18.2 forbids a client's stateless_reset_token, and this endpoint takes no token from a NEW_CONNECTION_ID frame. The client side of detection is not implemented. Generating a reset is `endpoint.writeStatelessReset`. See docs/DESIGN.md section 6.
             //
             //= https://www.rfc-editor.org/rfc/rfc9000#section-10.3.2
             //# The stateless reset token MUST be difficult to guess.
             //= type=exception
-            //= reason=stateless reset is out of scope: it needs a static key and a token this package neither holds nor advertises, and detecting one means recognising a datagram that belongs to no connection — a decision made by whatever routes datagrams to a Connection, which is the consumer's, per docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //= reason=the reset token is derived by the consumer from a static key it holds, and reaches this package as data: `endpoint.writeStatelessReset` writes it, and the consumer advertises it in the transport parameters it builds. How hard it is to guess, which identifiers share a key and whether a pair is ever reused are decided where the key is, outside the seam of docs/DESIGN.md section 3.
             //
             //= https://www.rfc-editor.org/rfc/rfc9000#section-10.3.2
             //# An endpoint that uses this design MUST either use the same
             //# connection ID length for all connections or encode the length of
             //# the connection ID such that it can be recovered without state.
             //= type=exception
-            //= reason=stateless reset is out of scope: it needs a static key and a token this package neither holds nor advertises, and detecting one means recognising a datagram that belongs to no connection — a decision made by whatever routes datagrams to a Connection, which is the consumer's, per docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //= reason=the consumer's: it chooses the identifiers this server issues, and `endpoint.classify` routes a short header by the single length it is told — so a server issuing more than one length could neither route by them nor reset them. See quic/endpoint.zig.
             //
             //= https://www.rfc-editor.org/rfc/rfc9000#section-10.3.2
             //# This method for choosing the stateless reset token means that
             //# the combination of connection ID and static key MUST NOT be used
             //# for another connection.
             //= type=exception
-            //= reason=stateless reset is out of scope: it needs a static key and a token this package neither holds nor advertises, and detecting one means recognising a datagram that belongs to no connection — a decision made by whatever routes datagrams to a Connection, which is the consumer's, per docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //= reason=the reset token is derived by the consumer from a static key it holds, and reaches this package as data: `endpoint.writeStatelessReset` writes it, and the consumer advertises it in the transport parameters it builds. How hard it is to guess, which identifiers share a key and whether a pair is ever reused are decided where the key is, outside the seam of docs/DESIGN.md section 3.
             //
             //= https://www.rfc-editor.org/rfc/rfc9000#section-10.3.2
             //# A denial-of-service attack is possible if the same connection ID
@@ -2022,20 +2477,14 @@ pub fn Connection(comptime config: Config) type {
             //# token MUST NOT be reused for new connections at nodes that share
             //# a static key.
             //= type=exception
-            //= reason=stateless reset is out of scope: it needs a static key and a token this package neither holds nor advertises, and detecting one means recognising a datagram that belongs to no connection — a decision made by whatever routes datagrams to a Connection, which is the consumer's, per docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //= reason=a deployment's question rather than this code's: which instances share a static key, and whether a connection identifier could be active on another of them, are facts above a single `Connection`. `endpoint.writeStatelessReset` is only ever called on a datagram the consumer's own table could not route. See quic/endpoint.zig.
             //
             //= https://www.rfc-editor.org/rfc/rfc9000#section-10.3.2
             //# The same stateless reset token MUST NOT be used for multiple
             //# connection IDs.
             //= type=exception
-            //= reason=stateless reset is out of scope: it needs a static key and a token this package neither holds nor advertises, and detecting one means recognising a datagram that belongs to no connection — a decision made by whatever routes datagrams to a Connection, which is the consumer's, per docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //= reason=the reset token is derived by the consumer from a static key it holds, and reaches this package as data: `endpoint.writeStatelessReset` writes it, and the consumer advertises it in the transport parameters it builds. How hard it is to guess, which identifiers share a key and whether a pair is ever reused are decided where the key is, outside the seam of docs/DESIGN.md section 3.
             //
-            //= https://www.rfc-editor.org/rfc/rfc9000#section-10.3.3
-            //# An endpoint MUST ensure that every Stateless Reset that it sends
-            //# is smaller than the packet that triggered it, unless it
-            //# maintains state sufficient to prevent looping.
-            //= type=exception
-            //= reason=stateless reset is out of scope: it needs a static key and a token this package neither holds nor advertises, and detecting one means recognising a datagram that belongs to no connection — a decision made by whatever routes datagrams to a Connection, which is the consumer's, per docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
             //= https://www.rfc-editor.org/rfc/rfc9000#section-21.11
             //# To defend against this style of denial of service, endpoints
             //# that share a static key for stateless resets (see Section
@@ -2043,38 +2492,26 @@ pub fn Connection(comptime config: Config) type {
             //# ID always arrive at an instance that has connection state,
             //# unless that connection is no longer active.
             //= type=exception
-            //= reason=stateless reset is out of scope: this endpoint holds no static key and no reset token, advertises none, and generates no reset — so it cannot be the oracle this section describes. How instances share connection state behind a load balancer is a deployment's question and outside the seam of docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //= reason=a deployment's question rather than this code's: which instances share a static key, and whether a connection identifier could be active on another of them, are facts above a single `Connection`. `endpoint.writeStatelessReset` is only ever called on a datagram the consumer's own table could not route. See quic/endpoint.zig.
             //
             //= https://www.rfc-editor.org/rfc/rfc9000#section-21.11
             //# More generally, servers MUST NOT generate a stateless reset if a
             //# connection with the corresponding connection ID could be active
             //# on any endpoint using the same static key.
             //= type=exception
-            //= reason=stateless reset is out of scope: this endpoint holds no static key and no reset token, advertises none, and generates no reset — so it cannot be the oracle this section describes. How instances share connection state behind a load balancer is a deployment's question and outside the seam of docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //= reason=a deployment's question rather than this code's: which instances share a static key, and whether a connection identifier could be active on another of them, are facts above a single `Connection`. `endpoint.writeStatelessReset` is only ever called on a datagram the consumer's own table could not route. See quic/endpoint.zig.
             // The three advisory rules about the shape of a Stateless Reset, which follow
             // the mandatory ones above and are out for the same reason: none is ever built.
-            //= https://www.rfc-editor.org/rfc/rfc9000#section-10.3
-            //# The remainder of the first byte and an arbitrary number of
-            //# bytes following it are set to values that SHOULD be
-            //# indistinguishable from random.
-            //= type=exception
-            //= reason=stateless reset is out of scope: it needs a static key and a token this package neither holds nor advertises, and detecting one means recognising a datagram that belongs to no connection — a decision made by whatever routes datagrams to a Connection, which is the consumer's, per docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
-            //
             //= https://www.rfc-editor.org/rfc/rfc9000#section-10.3
             //# To achieve that end, the endpoint SHOULD ensure that all
             //# packets it sends are at least 22 bytes longer than the
             //# minimum connection ID length that it requests the peer to
             //# include in its packets, adding PADDING frames as necessary.
             //= type=exception
-            //= reason=stateless reset is out of scope: it needs a static key and a token this package neither holds nor advertises, and detecting one means recognising a datagram that belongs to no connection — a decision made by whatever routes datagrams to a Connection, which is the consumer's, per docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //= reason=not done, and recorded as a gap rather than hidden: a packet here is padded to section 5.4.2's sample floor and, when it carries an Initial, to section 14.1's datagram floor, and no further. A short 1-RTT packet can therefore be smaller than a peer's Stateless Reset, which lets an observer tell the two apart — it never makes a reset unprocessable. See docs/DESIGN.md section 6.
             //
-            //= https://www.rfc-editor.org/rfc/rfc9000#section-10.3
-            //# An endpoint that sends a Stateless Reset in response to a
-            //# packet that is 43 bytes or shorter SHOULD send a Stateless
-            //# Reset that is one byte shorter than the packet it responds
-            //# to.
-            //= type=exception
-            //= reason=stateless reset is out of scope: it needs a static key and a token this package neither holds nor advertises, and detecting one means recognising a datagram that belongs to no connection — a decision made by whatever routes datagrams to a Connection, which is the consumer's, per docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            if (self.closed) return;
+            defer self.armClosePeriod(now_ns);
             if (self.state == .draining) return;
 
             // Section 14.1: "A server MUST discard an Initial packet that is
@@ -2157,26 +2594,20 @@ pub fn Connection(comptime config: Config) type {
             //# current connection attempt if it receives a Version Negotiation
             //# packet, with the following two exceptions.
             //= type=exception
-            //= reason=version negotiation is out of scope for this slice; a connection here speaks one version. See docs/DESIGN.md section 2, which puts the QUIC connection state machine in this package and leaves the packet types that begin a *different* connection to the consumer.
-            //
-            //= https://www.rfc-editor.org/rfc/rfc9000#section-6.1
-            //# An endpoint MUST NOT send a Version Negotiation packet in
-            //# response to receiving a Version Negotiation packet.
-            //= type=exception
-            //= reason=version negotiation is out of scope; a connection here speaks QUIC version 1, and a Version Negotiation packet has no encryption level, so it leaves `receivePacket` discarded. Deciding to try another version means beginning a different connection, which is the consumer's, per docs/DESIGN.md section 2 and section 6.
+            //= reason=a rule on a client receiving Version Negotiation. A client here speaks one version and holds no keys for such a packet, which has no encryption level and so leaves `receivePacket` discarded; abandoning the attempt and trying another version is beginning a different connection, which is the consumer's. The server half is `endpoint.classify`.
             //
             //= https://www.rfc-editor.org/rfc/rfc9000#section-6.2
             //# A client MUST discard any Version Negotiation packet if it has
             //# received and successfully processed any other packet, including
             //# an earlier Version Negotiation packet.
             //= type=exception
-            //= reason=version negotiation is out of scope; a connection here speaks QUIC version 1, and a Version Negotiation packet has no encryption level, so it leaves `receivePacket` discarded. Deciding to try another version means beginning a different connection, which is the consumer's, per docs/DESIGN.md section 2 and section 6.
+            //= reason=a rule on a client receiving Version Negotiation. A client here speaks one version and holds no keys for such a packet, which has no encryption level and so leaves `receivePacket` discarded; abandoning the attempt and trying another version is beginning a different connection, which is the consumer's. The server half is `endpoint.classify`.
             //
             //= https://www.rfc-editor.org/rfc/rfc9000#section-6.2
             //# A client MUST discard a Version Negotiation packet that lists
             //# the QUIC version selected by the client.
             //= type=exception
-            //= reason=version negotiation is out of scope; a connection here speaks QUIC version 1, and a Version Negotiation packet has no encryption level, so it leaves `receivePacket` discarded. Deciding to try another version means beginning a different connection, which is the consumer's, per docs/DESIGN.md section 2 and section 6.
+            //= reason=a rule on a client receiving Version Negotiation. A client here speaks one version and holds no keys for such a packet, which has no encryption level and so leaves `receivePacket` discarded; abandoning the attempt and trying another version is beginning a different connection, which is the consumer's. The server half is `endpoint.classify`.
             //
             // Retry is no longer refused here — `receiveRetry` above is the whole
             // of section 17.2.5's client half, and this comment claimed the
@@ -2206,32 +2637,16 @@ pub fn Connection(comptime config: Config) type {
             //# MUST avoid the creation of a stateless reset oracle; see Section
             //# 21.11.
             //= type=exception
-            //= reason=stateless reset is out of scope; nothing here holds a reset token or recognises one, and a load balancer's addressing is outside the seam of docs/DESIGN.md section 3. See docs/DESIGN.md section 2 and section 6.
+            //= reason=a deployment's question rather than this code's: which instances share a static key, and whether a connection identifier could be active on another of them, are facts above a single `Connection`. `endpoint.writeStatelessReset` is only ever called on a datagram the consumer's own table could not route. See quic/endpoint.zig.
             //= https://www.rfc-editor.org/rfc/rfc9000#section-21.12
             //# Future versions of QUIC that use Version Negotiation packets
             //# MUST define a mechanism that is robust against version downgrade
             //# attacks.
             //= type=exception
-            //= reason=version negotiation is out of scope; a connection here speaks QUIC version 1 and the packet types that would begin a different one are the consumer's, per docs/DESIGN.md section 2. The rule is in any case addressed to a future version of QUIC rather than to an implementation of this one.
+            //= reason=addressed to whoever specifies a future version of QUIC rather than to an implementation of this one. This package speaks version 1, and `endpoint.classify` answers a long header in any other version with Version Negotiation.
             // Section 5.2.2's advisory half. The mandatory drops are cited above and are what
             // this package does; the two sentences that ask a server to *answer* with a
             // Version Negotiation packet are the ones it declines.
-            //= https://www.rfc-editor.org/rfc/rfc9000#section-5.2.2
-            //# If a server receives a packet that indicates an unsupported
-            //# version and if the packet is large enough to initiate a new
-            //# connection for any supported version, the server SHOULD send
-            //# a Version Negotiation packet as described in Section 6.1. A
-            //# server MAY limit the number of packets to which it responds
-            //# with a Version Negotiation packet.
-            //= type=exception
-            //= reason=version negotiation is out of scope; a connection here speaks QUIC version 1, and a Version Negotiation packet has no encryption level, so it leaves `receivePacket` discarded. Deciding to try another version means beginning a different connection, which is the consumer's, per docs/DESIGN.md section 2 and section 6.
-            //
-            //= https://www.rfc-editor.org/rfc/rfc9000#section-5.2.2
-            //# Servers SHOULD respond with a Version Negotiation packet,
-            //# provided that the datagram is sufficiently long.
-            //= type=exception
-            //= reason=version negotiation is out of scope; a connection here speaks QUIC version 1, and a Version Negotiation packet has no encryption level, so it leaves `receivePacket` discarded. Deciding to try another version means beginning a different connection, which is the consumer's, per docs/DESIGN.md section 2 and section 6.
-            //
             // Vacuous here and excused rather than claimed: this client supports one version,
             // so "the largest of the minimum datagram sizes" is section 14.1's 1200 octets,
             // which `send` pads every client Initial datagram to.
@@ -2241,7 +2656,7 @@ pub fn Connection(comptime config: Config) type {
             //# largest of the minimum datagram sizes from all versions they
             //# support, using PADDING frames (Section 19.1) as necessary.
             //= type=exception
-            //= reason=version negotiation is out of scope; a connection here speaks QUIC version 1, and a Version Negotiation packet has no encryption level, so it leaves `receivePacket` discarded. Deciding to try another version means beginning a different connection, which is the consumer's, per docs/DESIGN.md section 2 and section 6.
+            //= reason=vacuous here and excused rather than claimed: a client of this package speaks one version, so the largest of the minimum datagram sizes is section 14.1's 1200 octets, which `send` pads every client Initial datagram to.
             //
             //= https://www.rfc-editor.org/rfc/rfc9000#section-5.2.2
             //# If a server refuses to accept a new connection, it SHOULD
@@ -2265,7 +2680,7 @@ pub fn Connection(comptime config: Config) type {
             // Which is why this is handled before the packet number space is
             // reached rather than inside it: a Retry has no number to record,
             // nothing to acknowledge it with, and no payload to open.
-            if (header == .retry) return self.receiveRetry(bytes, header.retry);
+            if (header == .retry) return self.receiveRetry(bytes, header.retry, now_ns);
             const level = header.level() orelse return; // Version Negotiation: not this slice.
             const offset = header.packetNumberOffset() orelse return;
             const index = @backingInt(level);
@@ -2434,6 +2849,7 @@ pub fn Connection(comptime config: Config) type {
             //# fully revert any changes made during that processing.
             const eliciting = try self.receiveFrames(level, opened.payload, now_ns);
             space.received.record(opened.number, now_ns, eliciting);
+            self.restartIdleOnReceive(now_ns);
 
             // Section 7.2: a client's Source Connection ID is chosen once and
             // fixed for the connection, so a server adopts it from the first
@@ -2598,7 +3014,7 @@ pub fn Connection(comptime config: Config) type {
         //# A client MUST use the same cryptographic handshake message it
         //# included in this packet.
         //= type=test
-        fn receiveRetry(self: *Self, bytes: []const u8, header: @FieldType(packet.Header, "retry")) void {
+        fn receiveRetry(self: *Self, bytes: []const u8, header: @FieldType(packet.Header, "retry"), now_ns: u64) void {
             // A server acts on no Retry: it is the endpoint that would send
             // one, and this package sends none.
             if (self.side != .client) return;
@@ -2622,7 +3038,7 @@ pub fn Connection(comptime config: Config) type {
                 bytes.len,
             );
             if (needed > scratch.len) return;
-            crypto.retry.verify(
+            Integrity.verify(
                 scratch[0..needed],
                 self.original_destination.bytes(),
                 bytes,
@@ -2630,6 +3046,9 @@ pub fn Connection(comptime config: Config) type {
 
             // Accepted. From here the connection attempt restarts under the
             // server's identifier and token, and nothing else about it moves.
+            // A Retry that authenticated is a packet from the peer processed
+            // successfully, which is section 10.1's restart.
+            self.restartIdleOnReceive(now_ns);
             self.retry_seen = true;
             self.retry_source = header.source;
             self.destination = header.source;
@@ -2689,11 +3108,11 @@ pub fn Connection(comptime config: Config) type {
         fn openPacket(
             self: *Self,
             level: Level,
-            keys: crypto.Keys,
+            keys: Keys,
             bytes: []u8,
             offset: usize,
             largest: ?u64,
-        ) error{ Discard, AeadLimitReached, ReservedBits }!crypto.Keys.Opened {
+        ) error{ Discard, AeadLimitReached, ReservedBits }!crypto.protect.Opened {
             // Header protection first and on its own: RFC 9001 section 6.1
             // keeps the header protection key across an update, so this works
             // whichever generation protected the payload.
@@ -2864,7 +3283,17 @@ pub fn Connection(comptime config: Config) type {
                 //= https://www.rfc-editor.org/rfc/rfc9000#section-12.4
                 //# An endpoint MUST treat the receipt of a frame of unknown type as a
                 //# connection error of type FRAME_ENCODING_ERROR.
-                const one = iterator.next() catch return error.Protocol;
+                //= type=test
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-20.1
+                //# FRAME_ENCODING_ERROR (0x07):  An endpoint received a frame that was
+                //# badly formatted -- for instance, a frame of an unknown type or an
+                //# ACK frame that has more acknowledgment ranges than the remainder
+                //# of the packet could carry.
+                //= type=test
+                const one = iterator.next() catch |err| switch (err) {
+                    error.Truncated, error.UnknownType, error.Malformed => return error.FrameEncoding,
+                };
                 const value = one orelse break;
                 // Section 12.4, Table 3. A STREAM frame in an Initial packet is
                 // application data accepted before anyone is authenticated.
@@ -3057,7 +3486,8 @@ pub fn Connection(comptime config: Config) type {
                 //# client.
                 //= type=exception
                 //= reason=connection migration is out of scope: a connection here has exactly one path and never learns an address, because the seam of docs/DESIGN.md section 3 hands over a datagram rather than a peer. There is no second path to probe, revert to or reset a controller for. See docs/DESIGN.md section 2 and section 6.
-                .new_connection_id, .retire_connection_id, .path_challenge, .path_response => {
+                .retire_connection_id => |value| return receiveRetireConnectionId(value.sequence),
+                .new_connection_id, .path_challenge, .path_response => {
                     // Migration is not this slice; the frames parse and are
                     // ignored rather than refused, because they are legal and a
                     // conforming peer may send them.
@@ -3096,33 +3526,31 @@ pub fn Connection(comptime config: Config) type {
                 //# constructed in a way that allows the server to identify how
                 //# it was provided to a client.
                 //= type=exception
-                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //= reason=the token is the consumer's: a server mints it, checks it and decides what it binds — `endpoint.writeRetry` carries it as opaque octets and nothing here reads it — because a sound token needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 keeps outside. This package issues no NEW_TOKEN, and a client here keeps no token across connections.
                 //
                 //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.2
                 //# This token MUST be repeated by the client in all Initial
                 //# packets it sends for that connection after it receives the
                 //# Retry packet.
-                //= type=exception
-                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
                 //
                 //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.3
                 //# The client MUST include the token in all Initial packets it
                 //# sends, unless a Retry replaces the token with a newer one.
                 //= type=exception
-                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //= reason=the token is the consumer's: a server mints it, checks it and decides what it binds — `endpoint.writeRetry` carries it as opaque octets and nothing here reads it — because a sound token needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 keeps outside. This package issues no NEW_TOKEN, and a client here keeps no token across connections.
                 //
                 //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.3
                 //# The client MUST NOT use the token provided in a Retry for
                 //# future connections.
                 //= type=exception
-                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //= reason=the token is the consumer's: a server mints it, checks it and decides what it binds — `endpoint.writeRetry` carries it as opaque octets and nothing here reads it — because a sound token needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 keeps outside. This package issues no NEW_TOKEN, and a client here keeps no token across connections.
                 //
                 //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.3
                 //# A token issued with NEW_TOKEN MUST NOT include information
                 //# that would allow values to be linked by an observer to the
                 //# connection on which it was issued.
                 //= type=exception
-                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //= reason=the token is the consumer's: a server mints it, checks it and decides what it binds — `endpoint.writeRetry` carries it as opaque octets and nothing here reads it — because a sound token needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 keeps outside. This package issues no NEW_TOKEN, and a client here keeps no token across connections.
                 //
                 //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.3
                 //# A client MUST NOT include a token that is not applicable to
@@ -3131,40 +3559,40 @@ pub fn Connection(comptime config: Config) type {
                 //# server the client is connecting to are jointly managing the
                 //# tokens.
                 //= type=exception
-                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //= reason=the token is the consumer's: a server mints it, checks it and decides what it binds — `endpoint.writeRetry` carries it as opaque octets and nothing here reads it — because a sound token needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 keeps outside. This package issues no NEW_TOKEN, and a client here keeps no token across connections.
                 //
                 //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.3
                 //# In comparison, a token obtained in a Retry packet MUST be
                 //# used immediately during the connection attempt and cannot be
                 //# used in subsequent connection attempts.
                 //= type=exception
-                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //= reason=the token is the consumer's: a server mints it, checks it and decides what it binds — `endpoint.writeRetry` carries it as opaque octets and nothing here reads it — because a sound token needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 keeps outside. This package issues no NEW_TOKEN, and a client here keeps no token across connections.
                 //
                 //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.3
                 //# When a server receives an Initial packet with an address
                 //# validation token, it MUST attempt to validate the token,
                 //# unless it has already completed address validation.
                 //= type=exception
-                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //= reason=the token is the consumer's: a server mints it, checks it and decides what it binds — `endpoint.writeRetry` carries it as opaque octets and nothing here reads it — because a sound token needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 keeps outside. This package issues no NEW_TOKEN, and a client here keeps no token across connections.
                 //
                 //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.4
                 //# An address validation token MUST be difficult to guess.
                 //= type=exception
-                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //= reason=the token is the consumer's: a server mints it, checks it and decides what it binds — `endpoint.writeRetry` carries it as opaque octets and nothing here reads it — because a sound token needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 keeps outside. This package issues no NEW_TOKEN, and a client here keeps no token across connections.
                 //
                 //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.4
                 //# For this design to work, the token MUST be covered by
                 //# integrity protection against modification or falsification
                 //# by clients.
                 //= type=exception
-                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //= reason=the token is the consumer's: a server mints it, checks it and decides what it binds — `endpoint.writeRetry` carries it as opaque octets and nothing here reads it — because a sound token needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 keeps outside. This package issues no NEW_TOKEN, and a client here keeps no token across connections.
                 //
                 //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.4
                 //# Tokens sent in NEW_TOKEN frames MUST include information
                 //# that allows the server to verify that the client IP address
                 //# has not changed from when the token was issued.
                 //= type=exception
-                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //= reason=the token is the consumer's: a server mints it, checks it and decides what it binds — `endpoint.writeRetry` carries it as opaque octets and nothing here reads it — because a sound token needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 keeps outside. This package issues no NEW_TOKEN, and a client here keeps no token across connections.
                 //
                 //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.4
                 //# If the client IP address has changed, the server MUST adhere
@@ -3173,13 +3601,13 @@ pub fn Connection(comptime config: Config) type {
                 //# to protect other hosts that share the NAT from amplification
                 //# attacks.
                 //= type=exception
-                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //= reason=the token is the consumer's: a server mints it, checks it and decides what it binds — `endpoint.writeRetry` carries it as opaque octets and nothing here reads it — because a sound token needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 keeps outside. This package issues no NEW_TOKEN, and a client here keeps no token across connections.
                 //
                 //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.4
                 //# To protect against such attacks, servers MUST ensure that
                 //# replay of tokens is prevented or limited.
                 //= type=exception
-                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //= reason=the token is the consumer's: a server mints it, checks it and decides what it binds — `endpoint.writeRetry` carries it as opaque octets and nothing here reads it — because a sound token needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 keeps outside. This package issues no NEW_TOKEN, and a client here keeps no token across connections.
                 // The advisory half of the same lifecycle. Every one of these describes a token
                 // this package neither builds, carries, nor checks, so each fails for the reason
                 // the mandatory ones above do rather than for a new one.
@@ -3187,7 +3615,7 @@ pub fn Connection(comptime config: Config) type {
                 //# Instead, the server SHOULD immediately close (Section
                 //# 10.2) the connection with an INVALID_TOKEN error.
                 //= type=exception
-                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //= reason=the consumer's call, and the mechanism is here: a server that finds a Retry token invalid can construct the connection and `close(.invalid_token)`, which frames the CONNECTION_CLOSE into an Initial packet. Whether a token is invalid is the consumer's verdict, for the reason the other token rules give.
                 //
                 //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.3
                 //# Thus, a token SHOULD have an expiration time, which
@@ -3195,27 +3623,27 @@ pub fn Connection(comptime config: Config) type {
                 //# timestamp that can be used to dynamically calculate the
                 //# expiration time.
                 //= type=exception
-                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //= reason=the token is the consumer's: a server mints it, checks it and decides what it binds — `endpoint.writeRetry` carries it as opaque octets and nothing here reads it — because a sound token needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 keeps outside. This package issues no NEW_TOKEN, and a client here keeps no token across connections.
                 //
                 //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.3
                 //# When connecting to a server for which the client retains
                 //# an applicable and unused token, it SHOULD include that
                 //# token in the Token field of its Initial packet.
                 //= type=exception
-                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //= reason=the token is the consumer's: a server mints it, checks it and decides what it binds — `endpoint.writeRetry` carries it as opaque octets and nothing here reads it — because a sound token needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 keeps outside. This package issues no NEW_TOKEN, and a client here keeps no token across connections.
                 //
                 //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.3
                 //# A client SHOULD NOT reuse a token from a NEW_TOKEN frame
                 //# for different connection attempts.
                 //= type=exception
-                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //= reason=the token is the consumer's: a server mints it, checks it and decides what it binds — `endpoint.writeRetry` carries it as opaque octets and nothing here reads it — because a sound token needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 keeps outside. This package issues no NEW_TOKEN, and a client here keeps no token across connections.
                 //
                 //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.3
                 //# If the token is invalid, then the server SHOULD proceed
                 //# as if the client did not have a validated address,
                 //# including potentially sending a Retry packet.
                 //= type=exception
-                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //= reason=the token is the consumer's: a server mints it, checks it and decides what it binds — `endpoint.writeRetry` carries it as opaque octets and nothing here reads it — because a sound token needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 keeps outside. This package issues no NEW_TOKEN, and a client here keeps no token across connections.
                 //
                 //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.3
                 //# If the validation succeeds, the server SHOULD then allow
@@ -3227,35 +3655,35 @@ pub fn Connection(comptime config: Config) type {
                 //# might be unable to | validate the token at all, leading
                 //# to connection failure if the | packet is discarded.
                 //= type=exception
-                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //= reason=the token is the consumer's: a server mints it, checks it and decides what it binds — `endpoint.writeRetry` carries it as opaque octets and nothing here reads it — because a sound token needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 keeps outside. This package issues no NEW_TOKEN, and a client here keeps no token across connections.
                 //
                 //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.4
                 //# Tokens sent in Retry packets SHOULD include information
                 //# that allows the server to verify that the source IP
                 //# address and port in client packets remain constant.
                 //= type=exception
-                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //= reason=the token is the consumer's: a server mints it, checks it and decides what it binds — `endpoint.writeRetry` carries it as opaque octets and nothing here reads it — because a sound token needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 keeps outside. This package issues no NEW_TOKEN, and a client here keeps no token across connections.
                 //
                 //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.4
                 //# Servers SHOULD ensure that tokens sent in Retry packets
                 //# are only accepted for a short time, as they are returned
                 //# immediately by clients.
                 //= type=exception
-                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //= reason=the token is the consumer's: a server mints it, checks it and decides what it binds — `endpoint.writeRetry` carries it as opaque octets and nothing here reads it — because a sound token needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 keeps outside. This package issues no NEW_TOKEN, and a client here keeps no token across connections.
                 //
                 //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.4
                 //# Tokens that are provided in NEW_TOKEN frames (Section
                 //# 19.7) need to be valid for longer but SHOULD NOT be
                 //# accepted multiple times.
                 //= type=exception
-                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //= reason=the token is the consumer's: a server mints it, checks it and decides what it binds — `endpoint.writeRetry` carries it as opaque octets and nothing here reads it — because a sound token needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 keeps outside. This package issues no NEW_TOKEN, and a client here keeps no token across connections.
                 //
                 //= https://www.rfc-editor.org/rfc/rfc9000#section-21.3
                 //# Servers SHOULD provide mitigations for this attack by
                 //# limiting the usage and lifetime of address validation
                 //# tokens; see Section 8.1.3.
                 //= type=exception
-                //= reason=address validation tokens are out of scope: this package sends no Retry and issues no NEW_TOKEN, and constructing or checking one needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 deliberately keeps outside. A server here validates an address the way section 8.1 allows without a token, by opening a Handshake packet. See docs/DESIGN.md section 2 and section 6.
+                //= reason=the token is the consumer's: a server mints it, checks it and decides what it binds — `endpoint.writeRetry` carries it as opaque octets and nothing here reads it — because a sound token needs a server key, a clock and randomness that the seam of docs/DESIGN.md section 3 keeps outside. This package issues no NEW_TOKEN, and a client here keeps no token across connections.
                 //
                 //= https://www.rfc-editor.org/rfc/rfc9000#section-19.7
                 //# The token MUST NOT be empty.  A client MUST treat receipt
@@ -3267,7 +3695,9 @@ pub fn Connection(comptime config: Config) type {
                 // malformed rather than merely useless.
                 .new_token => |value| {
                     if (self.side == .server) return error.Protocol;
-                    if (value.token.len == 0) return error.Protocol;
+                    // Section 19.7 names the code for this one, and it is not
+                    // the generic one it used to be.
+                    if (value.token.len == 0) return error.FrameEncoding;
                 },
                 // Both take `@max`, so a limit that moved backwards under loss
                 // or reordering leaves the send window where it was.
@@ -3463,7 +3893,7 @@ pub fn Connection(comptime config: Config) type {
                     //# semantics between endpoints; clients MUST treat them as
                     //# opaque values.
                     //= type=exception
-                    //= reason=session tickets and address validation tokens are out of scope: this package sends no Retry, issues no NEW_TOKEN and resumes no session, so it neither writes nor reads either kind of token. See docs/DESIGN.md section 2 and section 6.
+                    //= reason=this package issues no session ticket and no NEW_TOKEN frame, so it defines the contents of neither; the Retry token it does carry is the consumer's octets, copied into every Initial after the Retry without being read.
                     if (level != .one_rtt and level != .zero_rtt) return error.Protocol;
                     // Section 19.8's two state rules, which nothing checked: a
                     // STREAM frame for a stream this endpoint cannot receive on
@@ -3579,6 +4009,30 @@ pub fn Connection(comptime config: Config) type {
         }
 
         /// Section 13.2 and RFC 9002 section 5: what an acknowledgement moves.
+        /// Section 19.16, for an endpoint that issues one identifier.
+        ///
+        /// This endpoint's only connection identifier is the handshake's, at
+        /// sequence 0, and every packet the peer sends it is addressed to that
+        /// one. So a RETIRE naming a larger number names one never sent, and
+        /// one naming 0 names the packet's own Destination Connection ID —
+        /// which leaves no RETIRE a conforming peer has a reason to send.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-19.16
+        //# Receipt of a RETIRE_CONNECTION_ID frame containing a sequence number
+        //# greater than any previously sent to the peer MUST be treated as a
+        //# connection error of type PROTOCOL_VIOLATION.
+        //= type=test
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-19.16
+        //# The peer MAY treat this as a
+        //# connection error of type PROTOCOL_VIOLATION.
+        //= type=test
+        fn receiveRetireConnectionId(sequence: u64) ReceiveError!void {
+            assert(sequence <= varint.max);
+            if (sequence > issued_sequence_max) return error.Protocol;
+            assert(sequence == issued_sequence_max);
+            return error.Protocol;
+        }
+
         fn receiveAck(self: *Self, level: Level, value: frame.Ack, now_ns: u64) ReceiveError!void {
             // Section 13.4's ECN, in full. `frame.Ack.ecn` holds the counts an ACK_ECN
             // frame carried and nothing below reads it.
@@ -3638,17 +4092,9 @@ pub fn Connection(comptime config: Config) type {
             if (level == .one_rtt) self.one_rtt.phase_acknowledged = true;
 
             // Section 13.2.5: the delay is in microseconds, scaled by the
-            // exponent the peer advertised. Until the transport parameters are
-            // decoded this uses section 18.2's default, which is what an absent
-            // one means. Clamped before the shift — see `ack_delay_units_max`.
-            // The `u64` annotation is load-bearing. `@min` narrows its result
-            // type to fit the comptime-known bound, so `@min(x, 2_048_000)` is
-            // a `u21` — and `u21 << 3` needs twenty-four bits and overflows.
-            // The clamp written without it *created* the overflow it was added
-            // to prevent.
-            const delay_units: u64 = @min(value.delay, ack_delay_units_max);
-            assert(delay_units <= ack_delay_units_max);
-            const delay_ns: u64 = (delay_units << ack_delay_exponent_default) * std.time.ns_per_us;
+            // exponent the peer advertised — the default, 3, until its
+            // transport parameters arrive. Clamped; see `ackDelayNs`.
+            const delay_ns = ackDelayNs(value.delay, self.peer_ack_delay_exponent);
             assert(delay_ns <= ack_delay_ns_max);
 
             const result = self.recovery.onAckReceived(
@@ -3811,6 +4257,31 @@ pub fn Connection(comptime config: Config) type {
             // is the comptime limit rather than anything the peer sent.
             assert(out.len <= config.stream_receive_octets);
             return out;
+        }
+
+        /// How many octets `write(id, ...)` would accept now on a stream that
+        /// exists, without writing: the send buffer's room and both levels of
+        /// flow control, so zero means "wait for credit or an acknowledgement".
+        /// Null means the stream cannot be written on at all — not this
+        /// endpoint's to send on, not open yet, or its send half finished or
+        /// reset. What a framing layer checks before writing a frame it may not
+        /// split: `Http3Server` writes a HEADERS frame whole or not at all.
+        pub fn writable(self: *const Self, id: u64) ?u64 {
+            const room = self.streams.writableOctets(id) orelse return null;
+            assert(room <= config.stream_send_octets);
+            return room;
+        }
+
+        /// Whether the peer's FIN sits at the end of what `readable(id)`
+        /// returns, so that consuming all of it reads the stream to its end.
+        /// False for a stream that was reset, whose octets are not readable.
+        pub fn readableFin(self: *Self, id: u64) bool {
+            const stream = self.streams.find(id) orelse return false;
+            if (stream.receive_state == .reset) return false;
+            const final_size = stream.received.final_size orelse return false;
+            const end = stream.consumed + stream.readable().len;
+            assert(end <= final_size);
+            return end == final_size;
         }
 
         /// Release bytes the application has read, which is what moves the flow
@@ -4059,50 +4530,161 @@ pub fn Connection(comptime config: Config) type {
         /// two consumers arm one very differently and neither wants this
         /// package's idea of a timer wheel.
         pub fn timeout(self: *const Self) ?u64 {
-            // Only `Recovery`'s timer is reported. There is no close timer, so
-            // nothing here tells the caller when the closing or draining state
-            // is over — the connection stops answering and the consumer decides
-            // when to let go of it.
-            //= https://www.rfc-editor.org/rfc/rfc9000#section-10.2
-            //# These states SHOULD persist for at least three
-            //# times the current PTO interval as defined in [QUIC-RECOVERY].
-            //= type=todo
-            //
-            // There is no idle timer at all, so section 10.1's floor on one has nothing
-            // to raise. `max_idle_timeout` is parsed out of the peer's transport
-            // parameters and read by nobody, and a connection that stops hearing from
-            // its peer stays in `handshaking` or `established` until the consumer
-            // decides otherwise.
-            //= https://www.rfc-editor.org/rfc/rfc9000#section-10.1
-            //# To avoid excessively small idle timeout periods, endpoints MUST
-            //# increase the idle timeout period to be at least three times the
-            //# current Probe Timeout (PTO).
-            //= type=todo
-            // The same missing timer, from the other two directions: with no close timer
-            // there is nothing that ends the closing or draining state at all, so nothing
-            // can end it early and nothing discards the state when it is over.
-            //= https://www.rfc-editor.org/rfc/rfc9000#section-10.2
-            //# Servers that retain an open socket for accepting new
-            //# connections SHOULD NOT end the closing or draining state
-            //# early.
-            //= type=todo
-            //
-            //= https://www.rfc-editor.org/rfc/rfc9000#section-10.2
-            //# Once its closing or draining state ends, an endpoint SHOULD
-            //# discard all connection state.
-            //= type=todo
-            //
+            // Three timers in one deadline: `Recovery`'s, section 10.1's idle
+            // timer, and section 10.2's closing or draining period — each cited
+            // where it is kept, below.
             //= https://www.rfc-editor.org/rfc/rfc9000#section-10.1.2
             //# Application protocols that use QUIC SHOULD provide guidance
             //# on when deferring an idle timeout is appropriate.
             //= type=exception
             //= reason=a requirement on the specification of an application protocol that uses QUIC rather than on an implementation of the transport. This package carries no application protocol: what a consumer does with a stream, and how long it is willing to hold an idle connection, are decided above the seam of docs/DESIGN.md section 3. See docs/DESIGN.md section 2.
-            if (self.state == .draining) return null;
-            return self.recovery.timeoutAt();
+            if (self.closed) return null;
+            // In the closing and draining states the only thing left to wake
+            // for is the end of the period; loss recovery has nothing more to
+            // send that the state permits. Null until a clock has seen the
+            // state, which is the next `send`, `receive` or `onTimeout`.
+            if (self.state == .closing or self.state == .draining) return self.close_deadline_ns;
+            const recovery_at = self.recovery.timeoutAt();
+            const idle_at = self.idleDeadline() orelse return recovery_at;
+            const at = recovery_at orelse return idle_at;
+            return @min(at, idle_at);
         }
 
-        /// Section A.9 of RFC 9002: the timer fired.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-10.1
+        //# Each endpoint advertises a max_idle_timeout, but the effective value
+        //# at an endpoint is computed as the minimum of the two advertised
+        //# values (or the sole advertised value, if only one endpoint advertises
+        //# a non-zero value).
+        //= type=test
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-10.1
+        //# To avoid excessively small idle timeout periods, endpoints MUST
+        //# increase the idle timeout period to be at least three times the
+        //# current Probe Timeout (PTO).
+        //= type=test
+        /// The effective idle timeout, in nanoseconds, or null when neither
+        /// endpoint advertised one.
+        fn idleTimeoutNs(self: *const Self) ?u64 {
+            const local = self.local.max_idle_timeout_ms;
+            const peer = self.peer_idle_timeout_ms;
+            const effective_ms = if (local == 0) peer else if (peer == 0) local else @min(local, peer);
+            if (effective_ms == 0) return null;
+            // Both are varints, at most 2^62 - 1 milliseconds; saturate rather
+            // than overflow on the way to nanoseconds.
+            const advertised_ns = std.math.mul(u64, effective_ms, std.time.ns_per_ms) catch std.math.maxInt(u64);
+            const floor_ns = std.math.mul(u64, idle_pto_multiple, self.recovery.ptoDuration()) catch std.math.maxInt(u64);
+            assert(floor_ns > 0);
+            return @max(advertised_ns, floor_ns);
+        }
+
+        /// When the idle timer expires, or null when there is none. Until the
+        /// peer's transport parameters arrive its timeout is unknown and the
+        /// local value stands alone, which section 10.1's "sole advertised
+        /// value" already covers.
+        fn idleDeadline(self: *const Self) ?u64 {
+            const since = self.idle_since_ns orelse return null;
+            const timeout_ns = self.idleTimeoutNs() orelse return null;
+            assert(timeout_ns > 0);
+            const deadline = std.math.add(u64, since, timeout_ns) catch std.math.maxInt(u64);
+            assert(deadline > since);
+            return deadline;
+        }
+
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-10.1
+        //# An endpoint restarts its idle timer when a packet from its peer is
+        //# received and processed successfully.
+        //= type=test
+        fn restartIdleOnReceive(self: *Self, now_ns: u64) void {
+            self.idle_since_ns = now_ns;
+            self.idle_restarted_by_send = false;
+            assert(self.idle_since_ns.? == now_ns);
+            assert(!self.idle_restarted_by_send);
+        }
+
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-10.1
+        //# An endpoint also restarts its
+        //# idle timer when sending an ack-eliciting packet if no other ack-
+        //# eliciting packets have been sent since last receiving and processing
+        //# a packet.
+        //= type=test
+        fn restartIdleOnSend(self: *Self, now_ns: u64) void {
+            if (self.idle_restarted_by_send) return;
+            self.idle_since_ns = now_ns;
+            self.idle_restarted_by_send = true;
+            assert(self.idle_since_ns.? == now_ns);
+        }
+
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-10.2
+        //# These states SHOULD persist for at least three
+        //# times the current PTO interval as defined in [QUIC-RECOVERY].
+        //= type=test
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-10.2
+        //# Servers that retain an open socket for accepting new
+        //# connections SHOULD NOT end the closing or draining state
+        //# early.
+        //= type=test
+        /// Start section 10.2's period, once, the first time a clock sees the
+        /// closing or draining state. `close` takes no clock, so for an
+        /// endpoint that closes the period runs from the `send` that frames
+        /// its CONNECTION_CLOSE — which a consumer makes anyway, since
+        /// `wantsSend` answers true until the close is out. A close an
+        /// unvalidated server cannot afford to send under section 8.1 is never
+        /// sent, and the period ends without it; the peer's idle timer is what
+        /// ends the connection there.
+        fn armClosePeriod(self: *Self, now_ns: u64) void {
+            if (self.state != .closing and self.state != .draining) return;
+            if (self.close_deadline_ns != null) return;
+            const period = std.math.mul(u64, close_pto_multiple, self.recovery.ptoDuration()) catch std.math.maxInt(u64);
+            self.close_deadline_ns = std.math.add(u64, now_ns, period) catch std.math.maxInt(u64);
+            assert(self.close_deadline_ns.? > now_ns);
+        }
+
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-10.2
+        //# Once its closing or draining state ends, an endpoint SHOULD
+        //# discard all connection state.
+        //= type=test
+        /// Whether this connection is over and its state may be discarded:
+        /// its idle timer expired (RFC 9000 section 10.1), or its closing or
+        /// draining period of three PTOs ended (section 10.2). Once true it
+        /// sends nothing, takes nothing, and `timeout` answers null, so a
+        /// consumer reuses the slot.
+        pub fn isClosed(self: *const Self) bool {
+            if (self.closed) assert(self.state == .closing or self.state == .draining);
+            return self.closed;
+        }
+
+        /// Section A.9 of RFC 9002: the timer fired. And RFC 9000's two
+        /// others, which `timeout` folds into the same deadline: the idle
+        /// timer and the end of the closing or draining period.
         pub fn onTimeout(self: *Self, now_ns: u64) void {
+            if (self.closed) return;
+            if (self.state == .closing or self.state == .draining) {
+                self.armClosePeriod(now_ns);
+                if (now_ns >= self.close_deadline_ns.?) self.closed = true;
+                return;
+            }
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-10.1
+            //# If a max_idle_timeout is specified by either endpoint in its
+            //# transport parameters (Section 18.2), the connection is silently
+            //# closed and its state is discarded when it remains idle for longer
+            //# than the minimum of the max_idle_timeout value advertised by both
+            //# endpoints.
+            //= type=test
+            if (self.idleDeadline()) |at| {
+                if (now_ns >= at) {
+                    // Silently: no CONNECTION_CLOSE, so straight to the state
+                    // that sends nothing, and over at once.
+                    self.state = .draining;
+                    self.closed = true;
+                    self.emit(.{ .closed = .{ .code = 0, .application = false, .idle = true } });
+                    return;
+                }
+            }
+            self.onRecoveryTimeout(now_ns);
+        }
+
+        fn onRecoveryTimeout(self: *Self, now_ns: u64) void {
             switch (self.recovery.onLossDetectionTimeout(now_ns, &self.report_lost)) {
                 // No clamp here either, and for the reason `receiveAck` gives:
                 // a timeout cannot declare more packets lost than are tracked.
@@ -4196,6 +4778,8 @@ pub fn Connection(comptime config: Config) type {
         /// package deciding how fast to send.
         pub fn send(self: *Self, buffer: []u8, now_ns: u64) SendError!usize {
             if (buffer.len < config.datagram_octets) return error.BufferTooSmall;
+            if (self.closed) return 0;
+            self.armClosePeriod(now_ns);
             //= https://www.rfc-editor.org/rfc/rfc9000#section-10.2.2
             //# While otherwise identical to the closing state, an
             //# endpoint in the draining state MUST NOT send any packets.
@@ -4203,7 +4787,7 @@ pub fn Connection(comptime config: Config) type {
 
             const room = self.sendRoom();
             if (room < send_room_min) return 0;
-            const limit = @min(room, config.datagram_octets);
+            const limit = @min(room, self.datagramLimit());
 
             var offset: usize = 0;
             // Section 12.2: levels are coalesced oldest first, so a peer that
@@ -4299,6 +4883,7 @@ pub fn Connection(comptime config: Config) type {
                 offset += written;
                 if (level == .initial and written > 0) initial_written = true;
                 if (level == .initial and eliciting) initial_ack_eliciting = true;
+                if (eliciting) self.restartIdleOnSend(now_ns);
                 if (level == .handshake and written > 0) handshake_sent = true;
             }
             if (offset == 0) return 0;
@@ -4591,7 +5176,7 @@ pub fn Connection(comptime config: Config) type {
 
             // The payload goes after the header, leaving room for the tag.
             // Checked, not assumed. `send` hands this a slice whose length is
-            // `min(sendRoom(), datagram_octets)`, and for an unvalidated server
+            // `min(sendRoom(), datagramLimit())`, and for an unvalidated server
             // `sendRoom()` is `3 * received - sent` — a number the peer tunes by
             // choosing how much it sends. Land it in the sixteen-octet window
             // where a header fits but the header plus the tag does not, and the
@@ -5048,7 +5633,7 @@ pub fn Connection(comptime config: Config) type {
             //# containing a CONNECTION_CLOSE frame if it receives more
             //# packets on a terminated connection.
             //= type=exception
-            //= reason=one close and then silence is deliberate. `close_pending` is cleared when the CONNECTION_CLOSE is framed and is never set again, so a closing endpoint answers further packets with nothing rather than with a repeat — stricter than section 10.2.1's rate limit and needing no timer to be, which is what lets this package own no clock. A peer that loses the one close falls back to its own idle timeout.
+            //= reason=one close and then silence is deliberate. `close_pending` is cleared when the CONNECTION_CLOSE is framed and is never set again, so a closing endpoint answers further packets with nothing rather than with a repeat — stricter than section 10.2.1's rate limit and needing no timer to be: the one timer a closing endpoint keeps is section 10.2's period, which ends the state rather than paces repeats. A peer that loses the one close falls back to its own idle timeout.
             const written = frame.encode(payload, self.closeFrameFor(level)) catch return result.*;
             self.close_pending[@backingInt(level)] = false;
             result.octets = written;
@@ -5131,8 +5716,9 @@ pub fn Connection(comptime config: Config) type {
             // Acknowledged as soon as there is a datagram to carry it, at every level:
             // `wantsSend` answers true while this flag is set, so a consumer that polls
             // it sends the ACK on the next turn of its loop. That is stricter than
-            // `max_ack_delay` asks for and needs no timer to be, which is what lets
-            // this package own no clock.
+            // `max_ack_delay` asks for and needs no delayed-acknowledgement timer to
+            // be; the timers this package does keep are loss recovery's, the idle
+            // timer and the closing period.
             //= https://www.rfc-editor.org/rfc/rfc9000#section-13.2.1
             //# An endpoint MUST acknowledge all ack-eliciting Initial and
             //# Handshake packets immediately and all ack-eliciting 0-RTT and
@@ -5645,7 +6231,7 @@ pub fn Connection(comptime config: Config) type {
         //# valid stateless reset token as a Stateless Reset, as other QUIC
         //# versions might allow the use of a long header.
         //= type=exception
-        //= reason=stateless reset is out of scope; it is the answer of an endpoint that has *lost* the connection state, which is the consumer's lookup table rather than this type, and its token needs randomness that docs/DESIGN.md section 3 keeps outside the package. See docs/DESIGN.md section 2 and section 6.
+        //= reason=the sending half is `endpoint.writeStatelessReset`, which writes a short header and is cited there; the receiving half — treating any packet that ends in a valid token as a reset — needs the peer's token, which a server never holds (RFC 9000 section 18.2 forbids a client's stateless_reset_token), and the client side of detection is not implemented. See docs/DESIGN.md section 6.
         //
         // The single entry point for section 11.1's connection error, and the only
         // thing that sets `closing`. Every `ReceiveError` the caller sees is meant to
@@ -5839,6 +6425,7 @@ pub fn Connection(comptime config: Config) type {
         }
 
         pub fn wantsSend(self: *const Self) bool {
+            if (self.closed) return false;
             if (self.state == .draining) return false;
             //= https://www.rfc-editor.org/rfc/rfc9000#section-10.2
             //# After sending a CONNECTION_CLOSE frame, an endpoint immediately
@@ -5906,6 +6493,7 @@ pub fn Connection(comptime config: Config) type {
 }
 
 const testing = std.testing;
+const endpoint_module = @import("endpoint.zig");
 
 /// Deliberately small. These tests exercise behaviour, not capacity, and a
 /// connection at the default configuration is megabytes — see the note on
@@ -8475,7 +9063,7 @@ test "section 19.7: a client refuses a NEW_TOKEN with an empty token" {
     var payload: [16]u8 = @splat(0);
     payload[0] = 0x07; // NEW_TOKEN
     payload[1] = 0x00; // token length zero
-    try testing.expectError(error.Protocol, client.receiveFrames(.one_rtt, payload[0..2], 1000));
+    try testing.expectError(error.FrameEncoding, client.receiveFrames(.one_rtt, payload[0..2], 1000));
 
     // A non-empty one is still merely ignored: this package requests no token
     // and stores none, but the frame is legal.
@@ -9981,4 +10569,818 @@ test "three streams at once each get through a lossy path" {
         }
         try testing.expectEqual(@as(usize, body.len), one);
     }
+}
+
+/// A backend that forwards to `std.crypto` and counts what it was asked for, so
+/// a test can tell a connection that went through `Config.crypto` from one that
+/// reached past it. Counters rather than a flag, because "every primitive was
+/// reached" is twelve separate claims.
+const CountingBackend = struct {
+    const Std = crypto.backend.Std;
+    const Primitive = enum {
+        aes128_gcm_seal,
+        aes128_gcm_open,
+        aes256_gcm_seal,
+        aes256_gcm_open,
+        chacha20_poly1305_seal,
+        chacha20_poly1305_open,
+        aes128_block,
+        aes256_block,
+        chacha20_keystream,
+        hkdf_sha256_extract,
+        hkdf_sha256_expand,
+        hkdf_sha384_expand,
+    };
+    var calls: std.EnumArray(Primitive, u32) = .initFill(0);
+
+    fn count(primitive: Primitive) void {
+        calls.getPtr(primitive).* += 1;
+    }
+
+    pub fn aes128GcmSeal(data: []u8, tag: *[16]u8, ad: []const u8, nonce: *const [12]u8, key: *const [16]u8) void {
+        count(.aes128_gcm_seal);
+        Std.aes128GcmSeal(data, tag, ad, nonce, key);
+    }
+    pub fn aes128GcmOpen(data: []u8, tag: *const [16]u8, ad: []const u8, nonce: *const [12]u8, key: *const [16]u8) crypto.backend.AuthenticationError!void {
+        count(.aes128_gcm_open);
+        return Std.aes128GcmOpen(data, tag, ad, nonce, key);
+    }
+    pub fn aes256GcmSeal(data: []u8, tag: *[16]u8, ad: []const u8, nonce: *const [12]u8, key: *const [32]u8) void {
+        count(.aes256_gcm_seal);
+        Std.aes256GcmSeal(data, tag, ad, nonce, key);
+    }
+    pub fn aes256GcmOpen(data: []u8, tag: *const [16]u8, ad: []const u8, nonce: *const [12]u8, key: *const [32]u8) crypto.backend.AuthenticationError!void {
+        count(.aes256_gcm_open);
+        return Std.aes256GcmOpen(data, tag, ad, nonce, key);
+    }
+    pub fn chacha20Poly1305Seal(data: []u8, tag: *[16]u8, ad: []const u8, nonce: *const [12]u8, key: *const [32]u8) void {
+        count(.chacha20_poly1305_seal);
+        Std.chacha20Poly1305Seal(data, tag, ad, nonce, key);
+    }
+    pub fn chacha20Poly1305Open(data: []u8, tag: *const [16]u8, ad: []const u8, nonce: *const [12]u8, key: *const [32]u8) crypto.backend.AuthenticationError!void {
+        count(.chacha20_poly1305_open);
+        return Std.chacha20Poly1305Open(data, tag, ad, nonce, key);
+    }
+    pub fn aes128EncryptBlock(out: *[16]u8, in: *const [16]u8, key: *const [16]u8) void {
+        count(.aes128_block);
+        Std.aes128EncryptBlock(out, in, key);
+    }
+    pub fn aes256EncryptBlock(out: *[16]u8, in: *const [16]u8, key: *const [32]u8) void {
+        count(.aes256_block);
+        Std.aes256EncryptBlock(out, in, key);
+    }
+    pub fn chacha20Keystream(out: []u8, key: *const [32]u8, counter: u32, nonce: *const [12]u8) void {
+        count(.chacha20_keystream);
+        Std.chacha20Keystream(out, key, counter, nonce);
+    }
+    pub fn hkdfSha256Extract(prk: *[32]u8, salt: []const u8, ikm: []const u8) void {
+        count(.hkdf_sha256_extract);
+        Std.hkdfSha256Extract(prk, salt, ikm);
+    }
+    pub fn hkdfSha256Expand(out: []u8, prk: *const [32]u8, info: []const u8) void {
+        count(.hkdf_sha256_expand);
+        Std.hkdfSha256Expand(out, prk, info);
+    }
+    pub fn hkdfSha384Expand(out: []u8, prk: *const [48]u8, info: []const u8) void {
+        count(.hkdf_sha384_expand);
+        Std.hkdfSha384Expand(out, prk, info);
+    }
+};
+
+const CountedConnection = Connection(.{
+    .crypto_octets = 4096,
+    .ack_ranges_max = 8,
+    .sent_max = 32,
+    .streams_max = 4,
+    .stream_receive_octets = 8 * 1024,
+    .stream_send_octets = 8 * 1024,
+    .connection_receive_octets = 32 * 1024,
+    .crypto = CountingBackend,
+});
+
+fn countedDeliver(from: *CountedConnection, to: *CountedConnection, now_ns: u64) !usize {
+    var datagram: [CountedConnection.datagram_octets]u8 = @splat(0);
+    const octets = try from.send(&datagram, now_ns);
+    if (octets == 0) return 0;
+    try to.receive(datagram[0..octets], now_ns);
+    return octets;
+}
+
+fn countedInstall(a: *CountedConnection, b: *CountedConnection, level: Level, suite: crypto.Suite, seed: u8) !void {
+    const raw: [crypto.secret_octets_max]u8 = @splat(seed);
+    const secret = try crypto.secrets.Secret.init(raw[0..suite.hashOctets()]);
+    try a.installSecret(level, .send, &secret, suite);
+    try b.installSecret(level, .receive, &secret, suite);
+}
+
+test "every primitive a connection computes with comes from its configured backend" {
+    // The claim `Config.crypto` makes to a consumer is that nothing reaches
+    // past it, and `zig build lint` holds the source half of that — no
+    // `std.crypto` outside the default backend. This is the behavioural half:
+    // a handshake through all three suites and both header protection ciphers,
+    // then a key update, and every one of the twelve primitives was asked for
+    // through the backend the connection was configured with.
+    CountingBackend.calls = .initFill(0);
+    var client: CountedConnection = .init(.{
+        .side = .client,
+        .original_destination = ConnectionId.init(&client_cid) catch unreachable, // Eight octets.
+        .source = ConnectionId.init(&client_source) catch unreachable, // Four octets.
+    });
+    var server: CountedConnection = .init(.{
+        .side = .server,
+        .original_destination = ConnectionId.init(&client_cid) catch unreachable, // As above.
+        .source = ConnectionId.init(&server_source) catch unreachable, // Eight octets.
+    });
+    // RFC 9001 section 5.2: Initial keys are AES-128-GCM under HKDF-SHA256,
+    // derived in `init` from the client's Destination Connection ID.
+    try testing.expect(CountingBackend.calls.get(.hkdf_sha256_extract) >= 2);
+
+    try client.cryptoIn(.initial, "ClientHello");
+    _ = try countedDeliver(&client, &server, 0);
+    // The Handshake level under AES-256-GCM and SHA-384, which is the only way
+    // a test reaches the wide hash and the wide AES block.
+    try countedInstall(&server, &client, .handshake, .aes_256_gcm_sha384, 0x11);
+    try countedInstall(&client, &server, .handshake, .aes_256_gcm_sha384, 0x22);
+    try server.cryptoIn(.initial, "ServerHello");
+    try server.cryptoIn(.handshake, "EncryptedExtensions");
+    _ = try countedDeliver(&server, &client, 1000);
+    try client.cryptoIn(.handshake, "ClientFinished");
+    _ = try countedDeliver(&client, &server, 2000);
+
+    // And 1-RTT under ChaCha20-Poly1305, with its own header protection.
+    try countedInstall(&server, &client, .one_rtt, .chacha20_poly1305_sha256, 0x33);
+    try countedInstall(&client, &server, .one_rtt, .chacha20_poly1305_sha256, 0x44);
+    server.confirmHandshake();
+    _ = try countedDeliver(&server, &client, 3000);
+    try testing.expectEqual(State.established, client.state);
+    _ = try countedDeliver(&client, &server, 4000);
+
+    // Section 6.1's next generation is an HKDF-Expand too, through the same
+    // backend: both 1-RTT installs above derived one in advance.
+    try testing.expect(server.canUpdateKeys());
+    server.updateKeys();
+    server.closeApplication(0);
+    _ = try countedDeliver(&server, &client, 5000);
+
+    for (std.enums.values(CountingBackend.Primitive)) |primitive| {
+        if (CountingBackend.calls.get(primitive) == 0) {
+            std.debug.print("\nthe backend was never asked for {s}\n", .{@tagName(primitive)});
+        }
+        try testing.expect(CountingBackend.calls.get(primitive) > 0);
+    }
+}
+
+test "a client checks a Retry's integrity tag with its configured backend" {
+    CountingBackend.calls = .initFill(0);
+    var client: CountedConnection = .init(.{
+        .side = .client,
+        .original_destination = ConnectionId.init(&client_cid) catch unreachable, // Eight octets.
+        .source = ConnectionId.init(&client_source) catch unreachable, // Four octets.
+    });
+    try client.cryptoIn(.initial, "ClientHello");
+    var first: [CountedConnection.datagram_octets]u8 = undefined;
+    _ = try client.send(&first, 0);
+
+    var retry: [256]u8 = undefined;
+    var scratch: [512]u8 = undefined;
+    const sealed_before_retry = CountingBackend.calls.get(.aes128_gcm_seal);
+    const written = try packet.writeRetryWith(CountingBackend, &retry, &scratch, .{
+        .destination = ConnectionId.init(&client_source) catch unreachable, // As above.
+        .source = ConnectionId.init(&server_source) catch unreachable, // Eight octets.
+        .token = "a token",
+        .original_destination = ConnectionId.init(&client_cid) catch unreachable, // As above.
+    });
+    // One seal to write the tag, through the backend `writeRetryWith` named.
+    try testing.expectEqual(sealed_before_retry + 1, CountingBackend.calls.get(.aes128_gcm_seal));
+    const before = CountingBackend.calls.get(.aes128_gcm_seal);
+    try client.receive(retry[0..written], 1000);
+    // And one more to check it: section 5.8's tag is an AES-128-GCM seal over
+    // an empty plaintext, and verifying one is computing it again.
+    try testing.expectEqual(before + 1, CountingBackend.calls.get(.aes128_gcm_seal));
+    try testing.expect(client.retry_seen);
+}
+
+const test_advertised: TestConnection.Advertised = .{
+    .max_idle_timeout_ms = 30_000,
+    .stateless_reset_token = @splat(0x7e),
+    .max_streams_bidirectional = 2,
+    .max_streams_unidirectional = 2,
+};
+
+/// A server built the way a consumer builds one: from the first Initial it
+/// classified, with what it advertises.
+fn testServerFrom(server: *TestConnection, datagram: *const endpoint_module.Datagram, retry: ?TestConnection.Retried) void {
+    server.initServer(.{
+        .initial_destination = datagram.destination,
+        .source = ConnectionId.init(&server_source) catch unreachable, // Eight octets.
+        .retry = retry,
+        .advertised = test_advertised,
+    }) catch unreachable; // `test_advertised` fits `TestConnection`, and no test passes a reused identifier.
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9000#section-7.3
+//# A server includes the Destination Connection ID field from the first
+//# Initial packet it received from the client in the
+//# original_destination_connection_id transport parameter; if the server
+//# sent a Retry packet, this refers to the first Initial packet received
+//# before sending the Retry packet.
+//= type=test
+//
+//= https://www.rfc-editor.org/rfc/rfc9000#section-7.3
+//# Each endpoint includes the value of the Source Connection ID field
+//# from the first Initial packet it sent in the
+//# initial_source_connection_id transport parameter; see Section 18.2.
+//= type=test
+//
+//= https://www.rfc-editor.org/rfc/rfc9000#section-5.2.3
+//# A server in a deployment that does not implement a solution to
+//# maintain connection continuity when the client address changes
+//# SHOULD indicate that migration is not supported by using the
+//# disable_active_migration transport parameter.
+//= type=test
+test "a server's own transport parameters are what it enforces, and a client accepts them" {
+    var client = testClient();
+    try client.cryptoIn(.initial, "ClientHello");
+    var first: [TestConnection.datagram_octets]u8 = undefined;
+    const sent = try client.send(&first, 0);
+    const datagram = endpoint_module.classify(first[0..sent], server_source.len);
+    try testing.expect(datagram.mayStart());
+
+    var server: TestConnection = undefined;
+    testServerFrom(&server, &datagram, null);
+    try server.receive(first[0..sent], 0);
+    try testing.expect(!server.addressValidated());
+
+    var buffer: [TestConnection.local_transport_parameters_octets_max]u8 = undefined;
+    const octets = try server.localTransportParameters(&buffer);
+    const parsed = try transport_parameters.parse(octets);
+    try testing.expectEqualSlices(u8, &client_cid, parsed.original_destination_connection_id.?.bytes());
+    try testing.expectEqualSlices(u8, &server_source, parsed.initial_source_connection_id.?.bytes());
+    try testing.expectEqual(@as(?ConnectionId, null), parsed.retry_source_connection_id);
+    try testing.expectEqual(@as(u64, 30_000), parsed.max_idle_timeout_ms);
+    try testing.expect(parsed.disable_active_migration);
+    try testing.expectEqualSlices(u8, &test_advertised.stateless_reset_token.?, &parsed.stateless_reset_token.?);
+    // The windows and limits are the ones the connection counts against.
+    try testing.expectEqual(@as(u64, 32 * 1024), parsed.initial_max_data);
+    try testing.expectEqual(@as(u64, 8 * 1024), parsed.initial_max_stream_data_bidi_remote);
+    try testing.expectEqual(@as(u64, 2), parsed.initial_max_streams_bidi);
+    try testing.expectEqual(@as(u64, TestConnection.datagram_octets), parsed.max_udp_payload_size);
+
+    // And the client, once it has seen the server's Initial, takes them.
+    server.cryptoConsumed(.initial, server.cryptoOut(.initial).len);
+    try server.cryptoIn(.initial, "ServerHello");
+    _ = try deliver(&server, &client, 1000);
+    try client.transportParametersIn(octets);
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9000#section-7.3
+//# If it sends a Retry packet, a
+//# server also includes the Source Connection ID field from the Retry
+//# packet in the retry_source_connection_id transport parameter.
+//= type=test
+//
+//= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.2
+//# As long as it is not possible for an attacker to generate a valid
+//# token for its own address (see Section 8.1.4) and the client is able
+//# to return that token, it proves to the server that it received the
+//# token.
+//= type=test
+test "after a Retry the server repeats both identifiers, and its address is validated" {
+    var client = testClient();
+    try client.cryptoIn(.initial, "ClientHello");
+    var first: [TestConnection.datagram_octets]u8 = undefined;
+    const first_octets = try client.send(&first, 0);
+    const probe = endpoint_module.classify(first[0..first_octets], server_source.len);
+    try testing.expect(probe.mayStart());
+    try testing.expectEqual(@as(usize, 0), probe.token.len);
+
+    // The consumer's Retry. Its token here is the original identifier in the
+    // clear, which a real server would authenticate; this package never reads
+    // it, which is the point.
+    const retry_source = ConnectionId.init(&.{ 0xee, 0xdd, 0xcc, 0xbb, 0xaa, 0x99, 0x88, 0x77 }) catch unreachable; // Eight octets.
+    var retry: [256]u8 = undefined;
+    var scratch: [512]u8 = undefined;
+    const retry_octets = try endpoint_module.writeRetry(crypto.backend.Std, &retry, &scratch, &probe, retry_source, &client_cid);
+    try client.receive(retry[0..retry_octets], 100);
+    try testing.expect(client.retry_seen);
+
+    var second: [TestConnection.datagram_octets]u8 = undefined;
+    const second_octets = try client.send(&second, 200);
+    const retried = endpoint_module.classify(second[0..second_octets], server_source.len);
+    try testing.expectEqual(endpoint_module.Action.initial, retried.action);
+    try testing.expectEqualSlices(u8, &client_cid, retried.token);
+    try testing.expectEqualSlices(u8, retry_source.bytes(), retried.destination.bytes());
+
+    var server: TestConnection = undefined;
+    testServerFrom(&server, &retried, .{ .original_destination = try ConnectionId.init(retried.token) });
+    try testing.expect(server.addressValidated());
+    try server.receive(second[0..second_octets], 200);
+    try testing.expectEqualStrings("ClientHello", server.cryptoOut(.initial));
+
+    var buffer: [TestConnection.local_transport_parameters_octets_max]u8 = undefined;
+    const octets = try server.localTransportParameters(&buffer);
+    const parsed = try transport_parameters.parse(octets);
+    try testing.expectEqualSlices(u8, &client_cid, parsed.original_destination_connection_id.?.bytes());
+    try testing.expectEqualSlices(u8, retry_source.bytes(), parsed.retry_source_connection_id.?.bytes());
+
+    server.cryptoConsumed(.initial, server.cryptoOut(.initial).len);
+    try server.cryptoIn(.initial, "ServerHello");
+    _ = try deliver(&server, &client, 300);
+    try client.transportParametersIn(octets);
+
+    // A server that forgot the Retry repeats the wrong original identifier
+    // and none for the Retry, and the client refuses on the first of the two.
+    var forgetful: TestConnection = undefined;
+    testServerFrom(&forgetful, &retried, null);
+    const wrong = try forgetful.localTransportParameters(&buffer);
+    var other = testClient();
+    other.retry_seen = true;
+    other.retry_source = retry_source;
+    try testing.expectError(error.Malformed, other.transportParametersIn(wrong));
+}
+
+/// Room for a server flight past three times a client's first datagram, which
+/// a 4 KiB crypto buffer is not: the amplification tests need the limit to be
+/// what stops the sender, not the buffer.
+const FlightConnection = Connection(.{
+    .crypto_octets = 16 * 1024,
+    .ack_ranges_max = 8,
+    .sent_max = 32,
+    .streams_max = 4,
+    .stream_receive_octets = 8 * 1024,
+    .stream_send_octets = 8 * 1024,
+    .connection_receive_octets = 32 * 1024,
+});
+
+fn flightClient() FlightConnection {
+    return .init(.{
+        .side = .client,
+        .original_destination = ConnectionId.init(&client_cid) catch unreachable, // Eight octets.
+        .source = ConnectionId.init(&client_source) catch unreachable, // Four octets.
+    });
+}
+
+fn flightServer(server: *FlightConnection, datagram: *const endpoint_module.Datagram, retry: ?FlightConnection.Retried) void {
+    server.initServer(.{
+        .initial_destination = datagram.destination,
+        .source = ConnectionId.init(&server_source) catch unreachable, // Eight octets.
+        .retry = retry,
+        .advertised = .{ .max_streams_bidirectional = 2, .max_streams_unidirectional = 2 },
+    }) catch unreachable; // Four streams in a four-slot table, and no reused identifier.
+}
+
+fn flightHandshakeKeys(server: *FlightConnection, client: *FlightConnection) !void {
+    const raw: [32]u8 = @splat(0x11);
+    const secret = try crypto.secrets.Secret.init(&raw);
+    try server.installSecret(.handshake, .send, &secret, .aes_128_gcm_sha256);
+    try client.installSecret(.handshake, .receive, &secret, .aes_128_gcm_sha256);
+}
+
+/// Everything the server will send at one instant, in octets.
+fn flightDrain(server: *FlightConnection) !u64 {
+    var out: [FlightConnection.datagram_octets]u8 = undefined;
+    var total: u64 = 0;
+    for (0..64) |_| {
+        const written = try server.send(&out, 1000);
+        if (written == 0) break;
+        total += written;
+    }
+    return total;
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9000#section-8.1
+//# Prior to validating the client address, servers MUST NOT send more
+//# than three times as many bytes as the number of bytes they have
+//# received.
+//= type=test
+test "section 8.1: a validated Retry lifts the amplification limit, and without one it binds" {
+    const flight: [8000]u8 = @splat(0x5f);
+    for ([_]bool{ false, true }) |retried| {
+        var client = flightClient();
+        try client.cryptoIn(.initial, "ClientHello");
+        var first: [FlightConnection.datagram_octets]u8 = undefined;
+        const octets = try client.send(&first, 0);
+        const datagram = endpoint_module.classify(first[0..octets], server_source.len);
+        // The validation itself is the consumer's: here, a token it accepted.
+        var server: FlightConnection = undefined;
+        flightServer(&server, &datagram, if (retried)
+            .{ .original_destination = ConnectionId.init(&.{ 1, 2, 3, 4, 5, 6, 7, 8 }) catch unreachable } // Eight octets.
+        else
+            null);
+        try server.receive(first[0..octets], 0);
+        try flightHandshakeKeys(&server, &client);
+        try server.cryptoIn(.initial, "ServerHello");
+        try server.cryptoIn(.handshake, &flight);
+
+        const total = try flightDrain(&server);
+        const handshake = &server.levels[@backingInt(Level.handshake)];
+        if (retried) {
+            // Everything went out, well past three times what arrived.
+            try testing.expectEqual(@as(u32, flight.len), handshake.framed);
+            try testing.expect(total > amplification_factor * octets);
+        } else {
+            // Stopped by the limit rather than by the flight running out.
+            try testing.expect(total <= amplification_factor * octets);
+            try testing.expect(handshake.framed < flight.len);
+            try testing.expect(!server.wantsSend());
+        }
+    }
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9000#section-8.1
+//# For the purposes of
+//# avoiding amplification prior to address validation, servers MUST
+//# count all of the payload bytes received in datagrams that are
+//# uniquely attributed to a single connection.
+//= type=test
+test "section 8.1: a first flight of two datagrams buys allowance for both" {
+    // A ClientHello past one datagram — a post-quantum key share is enough —
+    // arrives as two Initials, both addressed to the identifier the client
+    // drew, and both are this connection's to count.
+    var client = flightClient();
+    const hello: [1800]u8 = @splat(0x48);
+    try client.cryptoIn(.initial, &hello);
+    var datagrams: [2][FlightConnection.datagram_octets]u8 = undefined;
+    var lengths: [2]usize = undefined;
+    for (&datagrams, &lengths) |*datagram, *length| length.* = try client.send(datagram, 0);
+    try testing.expect(lengths[1] >= initial_datagram_min);
+
+    const first = endpoint_module.classify(datagrams[0][0..lengths[0]], server_source.len);
+    const second = endpoint_module.classify(datagrams[1][0..lengths[1]], server_source.len);
+    // Both route to the same connection, by the same identifier.
+    try testing.expect(first.destination.eql(&second.destination));
+    try testing.expectEqual(endpoint_module.Action.initial, second.action);
+
+    var server: FlightConnection = undefined;
+    flightServer(&server, &first, null);
+    try server.receive(datagrams[0][0..lengths[0]], 0);
+    try server.receive(datagrams[1][0..lengths[1]], 0);
+    try testing.expectEqual(@as(u64, lengths[0] + lengths[1]), server.received_octets);
+    try testing.expectEqual(hello.len, server.cryptoOut(.initial).len);
+
+    // So the server may send past what the first datagram alone allowed, and
+    // no further than both together do.
+    try flightHandshakeKeys(&server, &client);
+    server.cryptoConsumed(.initial, hello.len);
+    try server.cryptoIn(.initial, "ServerHello");
+    const flight: [12000]u8 = @splat(0x5f);
+    try server.cryptoIn(.handshake, &flight);
+    const total = try flightDrain(&server);
+    try testing.expect(total > amplification_factor * lengths[0]);
+    try testing.expect(total <= amplification_factor * (lengths[0] + lengths[1]));
+}
+
+test "what a consumer advertises is checked against what the connection holds" {
+    const valid: TestConnection.Advertised = .{ .max_streams_bidirectional = 2, .max_streams_unidirectional = 1, .streams_opened_max = 1 };
+    try TestConnection.validateAdvertised(.server, valid);
+    // Four slots: two and one for the peer and one of its own fit, and one
+    // more of either kind does not.
+    var crowded = valid;
+    crowded.streams_opened_max = 2;
+    try testing.expectError(error.StreamsExceedTable, TestConnection.validateAdvertised(.server, crowded));
+    var small = valid;
+    small.max_udp_payload_size = 1199;
+    try testing.expectError(error.UdpPayloadTooSmall, TestConnection.validateAdvertised(.server, small));
+    var token = valid;
+    token.stateless_reset_token = @splat(1);
+    try testing.expectError(error.ClientResetToken, TestConnection.validateAdvertised(.client, token));
+    try TestConnection.validateAdvertised(.server, token);
+    var idle = valid;
+    idle.max_idle_timeout_ms = varint.max + 1;
+    try testing.expectError(error.ValueTooLarge, TestConnection.validateAdvertised(.server, idle));
+
+    // And a Retry naming the identifier it was supposed to replace.
+    const same = ConnectionId.init(&client_cid) catch unreachable; // Eight octets.
+    var refused: TestConnection = undefined;
+    try testing.expectError(error.RetryIdentifierReused, refused.initServer(.{
+        .initial_destination = same,
+        .source = ConnectionId.init(&server_source) catch unreachable, // As above.
+        .retry = .{ .original_destination = same },
+        .advertised = valid,
+    }));
+}
+
+test "the transport parameters bound holds at every field's widest" {
+    var server: TestConnection = undefined;
+    try server.initServer(.{
+        .initial_destination = ConnectionId.init(&@as([20]u8, @splat(1))) catch unreachable, // Twenty octets.
+        .source = ConnectionId.init(&@as([20]u8, @splat(2))) catch unreachable, // As above.
+        .retry = .{ .original_destination = ConnectionId.init(&@as([20]u8, @splat(3))) catch unreachable }, // As above.
+        .advertised = .{
+            .max_idle_timeout_ms = varint.max,
+            .stateless_reset_token = @splat(4),
+            .max_streams_bidirectional = 2,
+            .max_streams_unidirectional = 2,
+            .max_udp_payload_size = varint.max,
+        },
+    });
+    var buffer: [TestConnection.local_transport_parameters_octets_max]u8 = undefined;
+    const octets = try server.localTransportParameters(&buffer);
+    try testing.expect(octets.len <= TestConnection.local_transport_parameters_octets_max);
+    _ = try transport_parameters.parse(octets);
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9000#section-19.3
+//# It is decoded by
+//# multiplying the value in the field by 2 to the power of the
+//# ack_delay_exponent transport parameter sent by the sender of the
+//# ACK frame; see Section 18.2.
+//= type=test
+test "an ACK's delay is read under the exponent its sender advertised, and saturates" {
+    try testing.expectEqual(@as(u64, 10 * 8 * std.time.ns_per_us), ackDelayNs(10, 3));
+    try testing.expectEqual(@as(u64, 10 * std.time.ns_per_us), ackDelayNs(10, 0));
+    try testing.expectEqual(@as(u64, 10 * (1 << 20) * std.time.ns_per_us), ackDelayNs(10, 20));
+    // A peer's 62-bit delay never overflows, under any exponent it may send.
+    for (0..transport_parameters.ack_delay_exponent_max + 1) |exponent| {
+        const shift: u6 = @intCast(exponent);
+        // Saturated exactly at the ceiling rounded down to the exponent's
+        // unit: lower would be a clamp that discards delay a peer may claim.
+        const ceiling_us: u64 = ((ack_delay_ns_max / std.time.ns_per_us) >> shift) << shift;
+        try testing.expectEqual(ceiling_us * std.time.ns_per_us, ackDelayNs(varint.max, shift));
+    }
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9000#section-14
+//# Enforcement of the max_udp_payload_size transport parameter
+//# (Section 18.2) might act as an additional limit on the maximum
+//# datagram size.
+//= type=test
+test "a peer's parameters govern this endpoint's datagrams and its acknowledgement delay" {
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+    var parameters: [512]u8 = undefined;
+    const written = try transport_parameters.encode(&parameters, &.{
+        .initial_source_connection_id = ConnectionId.init(&client_source) catch unreachable, // Four octets.
+        .max_udp_payload_size = 1200,
+        .ack_delay_exponent = 10,
+        .max_ack_delay_ms = 7,
+        .initial_max_data = 1 << 20,
+        .initial_max_stream_data_bidi_local = 1 << 16,
+        .initial_max_streams_bidi = 4,
+    });
+    try server.transportParametersIn(parameters[0..written]);
+    try testing.expectEqual(@as(u6, 10), server.peer_ack_delay_exponent);
+    try testing.expectEqual(@as(u64, 7 * std.time.ns_per_ms), server.recovery.max_ack_delay_ns);
+
+    // A response larger than one datagram goes out in datagrams the peer said
+    // it would process, not in the 1452 this endpoint could build.
+    const body: [6000]u8 = @splat('r');
+    _ = try server.write(0, &body, true);
+    var datagram: [TestConnection.datagram_octets]u8 = undefined;
+    var sent: u32 = 0;
+    for (0..32) |_| {
+        const octets = try server.send(&datagram, 1000);
+        if (octets == 0) break;
+        try testing.expect(octets <= 1200);
+        sent += 1;
+    }
+    try testing.expect(sent >= 5);
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9000#section-10.1
+//# If a max_idle_timeout is specified by either endpoint in its
+//# transport parameters (Section 18.2), the connection is silently
+//# closed and its state is discarded when it remains idle for longer
+//# than the minimum of the max_idle_timeout value advertised by both
+//# endpoints.
+//= type=test
+//
+//= https://www.rfc-editor.org/rfc/rfc9000#section-10.1
+//# Each endpoint advertises a max_idle_timeout, but the effective value
+//# at an endpoint is computed as the minimum of the two advertised
+//# values (or the sole advertised value, if only one endpoint advertises
+//# a non-zero value).
+//= type=test
+test "section 10.1: a quiet connection closes silently at the smaller of the two timeouts" {
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+    server.local.max_idle_timeout_ms = 30_000;
+    server.peer_idle_timeout_ms = 10_000;
+
+    _ = try client.write(0, "ping", false);
+    const start: u64 = std.time.ns_per_s;
+    _ = try deliver(&client, &server, start);
+    const deadline = server.idleDeadline().?;
+    try testing.expectEqual(start + 10 * std.time.ns_per_s, deadline);
+    // Answering the client's packet is ack-only, so it does not restart the
+    // timer; and the deadline is what `timeout` reports once recovery is idle.
+    _ = try deliver(&server, &client, start);
+    try testing.expect(server.timeout().? <= deadline);
+
+    server.onTimeout(deadline - 1);
+    try testing.expect(!server.isClosed());
+    server.onTimeout(deadline);
+    try testing.expect(server.isClosed());
+    try testing.expectEqual(State.draining, server.state);
+    // Silently: nothing on the wire, nothing wanted, nothing to wake for.
+    var datagram: [TestConnection.datagram_octets]u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), try server.send(&datagram, deadline));
+    try testing.expect(!server.wantsSend());
+    try testing.expectEqual(@as(?u64, null), server.timeout());
+    var saw_idle = false;
+    while (server.poll()) |event| switch (event) {
+        .closed => |value| saw_idle = value.idle,
+        else => {},
+    };
+    try testing.expect(saw_idle);
+    // And a packet that arrives afterwards is the peer's to retransmit.
+    _ = try client.write(0, "late", false);
+    _ = try deliver(&client, &server, deadline + 1);
+    try testing.expect(server.isClosed());
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9000#section-10.1
+//# An endpoint also restarts its
+//# idle timer when sending an ack-eliciting packet if no other ack-
+//# eliciting packets have been sent since last receiving and processing
+//# a packet.
+//= type=test
+//
+//= https://www.rfc-editor.org/rfc/rfc9000#section-10.1
+//# An endpoint restarts its idle timer when a packet from its peer is
+//# received and processed successfully.
+//= type=test
+test "section 10.1: sending into silence restarts the timer once, receiving every time" {
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+    client.local.max_idle_timeout_ms = 60_000;
+    var datagram: [TestConnection.datagram_octets]u8 = undefined;
+
+    // A delivery restarts the client's timer, and then its first ack-eliciting
+    // send does too — but its second does not: a sender talking into a
+    // silence it cannot hear back from must not keep itself alive.
+    _ = try client.write(0, "one", false);
+    _ = try deliver(&client, &server, 1000);
+    _ = try deliver(&server, &client, 2000);
+    try testing.expectEqual(@as(?u64, 2000), client.idle_since_ns);
+    _ = try client.write(0, "two", false);
+    _ = try client.send(&datagram, 3000);
+    try testing.expectEqual(@as(?u64, 3000), client.idle_since_ns);
+    _ = try client.write(0, "three", false);
+    _ = try client.send(&datagram, 4000);
+    try testing.expectEqual(@as(?u64, 3000), client.idle_since_ns);
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9000#section-10.1
+//# To avoid excessively small idle timeout periods, endpoints MUST
+//# increase the idle timeout period to be at least three times the
+//# current Probe Timeout (PTO).
+//= type=test
+test "section 10.1: an idle timeout shorter than three PTOs is raised to three" {
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+    server.local.max_idle_timeout_ms = 1;
+    try testing.expectEqual(3 * server.recovery.ptoDuration(), server.idleTimeoutNs().?);
+    try testing.expect(server.idleTimeoutNs().? > std.time.ns_per_ms);
+    // And neither endpoint advertising one is no timer at all.
+    server.local.max_idle_timeout_ms = 0;
+    try testing.expectEqual(@as(?u64, null), server.idleTimeoutNs());
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9000#section-10.2
+//# These states SHOULD persist for at least three
+//# times the current PTO interval as defined in [QUIC-RECOVERY].
+//= type=test
+//
+//= https://www.rfc-editor.org/rfc/rfc9000#section-10.2
+//# Once its closing or draining state ends, an endpoint SHOULD
+//# discard all connection state.
+//= type=test
+test "section 10.2: the closing and draining periods last three PTOs and then end" {
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+    const pto = server.recovery.ptoDuration();
+
+    // The closer: its period starts when the close goes out.
+    server.closeApplication(0x100);
+    try testing.expectEqual(@as(?u64, null), server.timeout());
+    const sent_at: u64 = 5 * std.time.ns_per_s;
+    _ = try deliver(&server, &client, sent_at);
+    try testing.expectEqual(@as(?u64, sent_at + 3 * pto), server.timeout());
+    server.onTimeout(sent_at + 3 * pto - 1);
+    try testing.expect(!server.isClosed());
+    server.onTimeout(sent_at + 3 * pto);
+    try testing.expect(server.isClosed());
+    try testing.expectEqual(@as(?u64, null), server.timeout());
+
+    // The peer: draining from the moment the close arrived.
+    try testing.expectEqual(State.draining, client.state);
+    const client_pto = client.recovery.ptoDuration();
+    try testing.expectEqual(@as(?u64, sent_at + 3 * client_pto), client.timeout());
+    try testing.expect(!client.isClosed());
+    client.onTimeout(sent_at + 3 * client_pto);
+    try testing.expect(client.isClosed());
+}
+
+/// More than twice the stack of the thread below, so a copy of `Self` anywhere on
+/// the construction path is a crash rather than a pass. Static, because it is
+/// the point of the test that it lives nowhere a stack frame could.
+const OversizeConnection = Connection(.{
+    .streams_max = 16,
+    .stream_receive_octets = 128 * 1024,
+    .stream_send_octets = 64 * 1024,
+});
+var oversize_server: OversizeConnection = undefined;
+/// The stack the constructor runs on, under half the connection it builds.
+/// A thread is test-only here: it is the one way to give a test a stack of a
+/// known size, and it touches nothing the seam keeps out.
+const oversize_stack_octets: usize = 1 << 20;
+
+comptime {
+    assert(OversizeConnection.footprint_octets > 2 * oversize_stack_octets);
+}
+
+const OversizeOutcome = struct {
+    init_error: ?OversizeConnection.InitError = null,
+    receive_error: ?OversizeConnection.ReceiveError = null,
+    received_octets: u64 = 0,
+    done: bool = false,
+};
+
+fn initOversize(outcome: *OversizeOutcome) void {
+    defer outcome.done = true;
+    const destination = ConnectionId.init(&client_cid) catch unreachable; // Eight octets.
+    oversize_server.initServer(.{
+        .initial_destination = destination,
+        .source = ConnectionId.init(&server_source) catch unreachable, // Eight octets.
+        .advertised = .{ .max_streams_bidirectional = 8, .max_streams_unidirectional = 4, .streams_opened_max = 3 },
+    }) catch |err| {
+        outcome.init_error = err;
+        return;
+    };
+    // And a datagram through it, the other path a consumer takes straight
+    // after: nothing in `receive` may hold a connection either. A real
+    // client Initial of 1200 octets, so the whole receive path runs.
+    var client: TestConnection = testClient();
+    client.cryptoIn(.initial, "ClientHello") catch unreachable; // Eleven octets into a 4096-octet buffer.
+    var first: [TestConnection.datagram_octets]u8 = undefined;
+    const octets = client.send(&first, 0) catch unreachable; // The buffer is `datagram_octets`.
+    oversize_server.receive(first[0..octets], 0) catch |err| {
+        outcome.receive_error = err;
+    };
+    outcome.received_octets = oversize_server.received_octets;
+}
+
+test "a connection initializes in place, on a stack smaller than it" {
+    // The interop server segfaulted on its first connection: `initServer`
+    // returned `InitError!Self`, so the caller held an error union of a
+    // multi-megabyte connection and `init` held another, both on an 8 MiB
+    // stack. A thread with a stack under half the connection's size makes any
+    // such copy fatal on every machine, whatever its `ulimit -s`.
+    var outcome: OversizeOutcome = .{};
+    const thread = try std.Thread.spawn(.{ .stack_size = oversize_stack_octets }, initOversize, .{&outcome});
+    thread.join();
+    try testing.expect(outcome.done);
+    try testing.expectEqual(@as(?OversizeConnection.InitError, null), outcome.init_error);
+    try testing.expectEqual(@as(?OversizeConnection.ReceiveError, null), outcome.receive_error);
+    try testing.expectEqual(@as(u64, initial_datagram_min), outcome.received_octets);
+    try testing.expectEqualStrings("ClientHello", oversize_server.cryptoOut(.initial));
+    try testing.expectEqual(Side.server, oversize_server.side);
+    try testing.expect(!oversize_server.addressValidated());
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9000#section-20.1
+//# FRAME_ENCODING_ERROR (0x07):  An endpoint received a frame that was
+//# badly formatted -- for instance, a frame of an unknown type or an
+//# ACK frame that has more acknowledgment ranges than the remainder
+//# of the packet could carry.
+//= type=test
+test "a frame cut short, or of no known type, is a FRAME_ENCODING_ERROR" {
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+    // h3spec 0.1.15's own: a CRYPTO frame whose length varint is cut off. And
+    // a type no version of QUIC defines. Both were PROTOCOL_VIOLATION, which
+    // section 11 allows and section 12.4 does not ask for.
+    try testing.expectError(error.FrameEncoding, server.receiveFrames(.one_rtt, &.{ 0x01, 0x06, 0x00, 0xff }, 0));
+    try testing.expectError(error.FrameEncoding, server.receiveFrames(.one_rtt, &.{ 0x01, 0x21 }, 0));
+    try testing.expectEqual(error_code.Transport.frame_encoding_error, TestConnection.errorCode(error.FrameEncoding));
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9000#section-19.16
+//# Receipt of a RETIRE_CONNECTION_ID frame containing a sequence number
+//# greater than any previously sent to the peer MUST be treated as a
+//# connection error of type PROTOCOL_VIOLATION.
+//= type=test
+//
+//= https://www.rfc-editor.org/rfc/rfc9000#section-19.16
+//# The peer MAY treat this as a
+//# connection error of type PROTOCOL_VIOLATION.
+//= type=test
+test "RETIRE_CONNECTION_ID for a number never issued, or for the one in use, is refused" {
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+    var payload: [16]u8 = undefined;
+    // h3spec's: no endpoint has given out a hundred thousand identifiers.
+    const unissued = try frame.encode(&payload, .{ .retire_connection_id = .{ .sequence = 100_000 } });
+    try testing.expectError(error.Protocol, server.receiveFrames(.one_rtt, payload[0..unissued], 0));
+    // And the only one issued, which every packet the peer sends names.
+    const current = try frame.encode(&payload, .{ .retire_connection_id = .{ .sequence = 0 } });
+    try testing.expectError(error.Protocol, server.receiveFrames(.one_rtt, payload[0..current], 0));
 }

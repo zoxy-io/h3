@@ -64,8 +64,10 @@ not represented by any test that runs on a laptop.
   adopts the Huffman code and the prefixed integer unchanged; it has no
   dependencies of its own. The policy is **no dependency outside the
   organisation, and none that pulls in a runtime or a libcrypto**. `@cImport`
-  stays lint-forbidden, and packet protection reaches no further than
-  `std.crypto`.
+  stays lint-forbidden, and packet protection reaches no further than the
+  comptime crypto backend `Config.crypto` names — `std.crypto` by default, a
+  consumer's own (zoxy's: libcrypto through zssl) otherwise. `std.crypto` is
+  lint-confined to `src/quic/crypto/backend.zig`, so nothing reaches past it.
 - **`-Dassertions` is forwarded to hpack, not defaulted.** hpack sits two levels
   below a binary, so a consumer that turned assertions off would otherwise still
   be running hpack's. The line is in build.zig and a review should check it.

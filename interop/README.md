@@ -296,82 +296,29 @@ for things a consumer must act on, and a packet-per-event stream is not that.
 
 [h3spec](https://github.com/kazu-yamamoto/h3spec) is a conformance tester for
 HTTP/3 **servers**: it connects as a client and checks what the server does
-with input a client should never send. `h3-server` passes **49 of 49**.
+with input a client should never send. Against **h3spec 0.1.15**, `h3-server`
+passes **85 of 86, with 1 pending and 0 failing**; 0.1.13's 49 were all passing
+before it.
 
-```sh
-# The binary, and the same certificates as above.
-zig build interop            # zig-out/bin/h3-server
-CERT=/tmp/qi/certs/cert.pem KEY=/tmp/qi/certs/priv.key PORT=4443 \
-  ./zig-out/bin/h3-server &
-
-# h3spec ships a dynamically linked release binary, which NixOS will not run
-# directly; a two-line Debian image is the shortest way round it.
-curl -sLO https://github.com/kazu-yamamoto/h3spec/releases/download/v0.1.13/h3spec-linux-x86_64
-printf 'FROM debian:bookworm-slim\nRUN apt-get update && apt-get install -y --no-install-recommends libgmp10 libnuma1\nCOPY h3spec-linux-x86_64 /usr/local/bin/h3spec\nRUN chmod +x /usr/local/bin/h3spec\nENTRYPOINT ["/usr/local/bin/h3spec"]\n' > Dockerfile
-docker build -q -t h3spec:local .
-docker run --rm --network host h3spec:local -n 127.0.0.1 4443
-```
-
-`-n` skips chain validation, which the throwaway CA needs; it does **not** skip
-the CertificateVerify signature, so a server whose transcript is wrong fails
-every case with "cannot verify CertificateVerify" and no further explanation.
-
-`-m "<substring>"` runs one case and `-d` adds a trace, which is the only way
-to tell "the server did not detect this" from "the server answered nothing
-because something earlier went wrong". Both mistakes look identical in the
-summary, and the second one accounted for eleven of the failures in the first
-full run.
-
-## The server, by hand
-
-The runner drives the server through its own compose file; pointing a
-third-party *client* at it needs two workarounds and is worth the trouble,
-because it is the only way to find out what a real client thinks of the
-handshake this package produces.
-
-```sh
-ROLE=server TESTCASE=transfer CERT=/tmp/qi/certs/cert.pem \
-  KEY=/tmp/qi/certs/priv.key WWW=/tmp/qi/www PORT=4453 \
-  ./zig-out/bin/h3-interop &
-
-# The client images wait for the network simulator before they start, so
-# something has to be listening on 57832; and they resolve `server4`.
-python3 -c "import socket;s=socket.socket();s.bind(('0.0.0.0',57832));s.listen(64)
-while True: s.accept()[0].close()" &
-
-docker run --rm --network host --add-host sim:127.0.0.1 --add-host server4:127.0.0.1 \
-  -v /tmp/qi/certs:/certs:ro -v /tmp/qi/cdown:/downloads -v /tmp/qi/logs:/logs \
-  -e ROLE=client -e TESTCASE=transfer \
-  -e REQUESTS="https://server4:4453/file.bin" \
-  martenseemann/quic-go-interop:latest
-```
-
-Set `TESTCASE=retry` on the *server* for the Retry path. ngtcp2's client image
-does not run this way — its endpoint script derives an address from routes it
-cannot set outside the simulator — so the third-party client evidence here is
-quic-go's and aioquic's.
-
-A client that fails with `expected initial_source_connection_id to equal X, is
-Y` is telling you the server answered two datagrams of one flight as two
-connections. It is worth knowing that message on sight: it is what a
-multi-datagram ClientHello does to a server that keys its table only on the
-identifier it chose.
-
-## h3spec
-
-[h3spec](https://github.com/kazu-yamamoto/h3spec) is a conformance tester for
-HTTP/3 **servers**: it connects as a client and checks what the server does
-with input a client should never send. `h3-server` passes **49 of 49**.
+The pending case is the one deliberate deviation, and h3spec names it:
+"MUST send PROTOCOL_VIOLATION if CRYPTO in 0-RTT is received [TLS 8.3]" needs
+a 0-RTT packet, and this server resumes no session, so there is no 0-RTT key
+to protect one with. 0-RTT is not built (docs/DESIGN.md §6), and h3spec
+reports the case pending — "0-RTT is not possible" — rather than failed.
+`docs/VERIFICATION.md` §5.5 has the two codes chosen among the ones the RFC
+allows.
 
 ```sh
 zig build interop            # zig-out/bin/h3-server, beside h3-interop
 CERT=/tmp/qi/certs/cert.pem KEY=/tmp/qi/certs/priv.key PORT=4443 \
   ./zig-out/bin/h3-server &
 
-# h3spec ships a dynamically linked release binary, which NixOS will not run
-# directly; a four-line Debian image is the shortest way round it.
+# Where the release binary's libgmp and libnuma resolve, it runs as it is:
+#   ./h3spec-linux-x86_64 -n 127.0.0.1 4443
+# NixOS will not run a dynamically linked binary directly; a four-line Debian
+# image is the shortest way round it.
 cd /tmp/qi
-curl -sLO https://github.com/kazu-yamamoto/h3spec/releases/download/v0.1.13/h3spec-linux-x86_64
+curl -sLO https://github.com/kazu-yamamoto/h3spec/releases/download/v0.1.15/h3spec-linux-x86_64
 printf 'FROM debian:bookworm-slim\nRUN apt-get update && apt-get install -y --no-install-recommends libgmp10 libnuma1\nCOPY h3spec-linux-x86_64 /usr/local/bin/h3spec\nRUN chmod +x /usr/local/bin/h3spec\nENTRYPOINT ["/usr/local/bin/h3spec"]\n' > Dockerfile
 docker build -q -t h3spec:local .
 docker run --rm --network host h3spec:local -n 127.0.0.1 4443

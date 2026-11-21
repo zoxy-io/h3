@@ -157,6 +157,27 @@ const adversary_budget_max: u32 = 24;
 /// Not all of them: a behaviour every seed reaches is one no seed can be
 /// compared against.
 const adversary_seed_period: u8 = 3;
+/// One seed in this many answers the client's first Initial with a Retry, as
+/// a server under pressure would. A quarter rather than all: a behaviour every
+/// seed takes is one no seed can be compared against.
+const retry_seed_period: u8 = 4;
+/// Salts the seed for the feature draws, so they come from a stream of their
+/// own; any constant that is not zero will do.
+const feature_stream: u64 = 0x9e37_79b9_7f4a_7c15;
+/// One seed in this many has its server advertise an idle timeout, and after
+/// the transfer goes quiet the pair is left alone until both idle timers have
+/// closed it (RFC 9000 section 10.1).
+const idle_seed_period: u8 = 4;
+/// The idle timeout those seeds advertise: long against anything the transfer
+/// itself waits for, so that a timer firing *during* it is a defect rather
+/// than a bad path.
+const idle_timeout_ms: u64 = 60_000;
+/// Steps the idle phase may take. A quiet pair needs one per timer, and there
+/// are two timers.
+const idle_steps_max: u32 = 64;
+/// The longest a late reader leaves octets it has been handed: past this the
+/// clock creeps rather than jumps, so a reader is never a minute late.
+const reader_wait_max_ns: u64 = std.time.ns_per_s;
 const reader_seed_period: u8 = 3;
 
 /// The most steps a late reader waits between drains, and how far the clock
@@ -188,6 +209,10 @@ const server_flight: [2600]u8 = @splat(0xa5);
 /// datagram oracle needs the *peer's* length to walk a short header.
 const client_source = [_]u8{ 0x01, 0x02, 0x03, 0x04 };
 const server_source = [_]u8{ 0xf0, 0x67, 0xa5, 0x50, 0x2a, 0x42, 0x62, 0xb5 };
+/// The identifier a Retry asks the client to address next. Not `server_source`:
+/// the server may choose a different one for the connection itself, and doing
+/// so here is what makes section 7.3's three identifiers three.
+const retry_source = [_]u8{ 0x5e, 0x77, 0x1e, 0x55, 0x00, 0xc0, 0xff, 0xee };
 
 const Census = struct {
     runs: u64 = 0,
@@ -277,6 +302,18 @@ const Census = struct {
     /// window update with nothing sent after it is repaired by the PTO" is
     /// what pins the window update itself.
     flow_control_alone_in_flight: u64 = 0,
+    /// Retries the harness sent as the server's consumer, and handshakes that
+    /// completed on a connection started from the Initial that brought the
+    /// token back. The second is the row docs/VERIFICATION.md section 5 listed
+    /// as planned and not built: "a Retry must be honoured".
+    retries_sent: u64 = 0,
+    handshakes_after_retry: u64 = 0,
+    /// Connections the idle timer closed, after their transfer went quiet.
+    idle_closes: u64 = 0,
+    /// First Initials a server was started from and then discarded because
+    /// the datagram did not authenticate — the adversary's work, mostly, and
+    /// what a consumer that creates state only for an Initial that opens does.
+    starts_abandoned: u64 = 0,
 
     /// The counters that must move somewhere in a sweep. A zero here means the
     /// sweep did not reach the behaviour, so any confidence drawn from it about
@@ -372,6 +409,16 @@ const Census = struct {
                 return c.clock_jumps;
             }
         }.get },
+        .{ .name = "handshakes after a Retry", .get = struct {
+            fn get(c: *const Census) u64 {
+                return c.handshakes_after_retry;
+            }
+        }.get },
+        .{ .name = "connections closed by the idle timer", .get = struct {
+            fn get(c: *const Census) u64 {
+                return c.idle_closes;
+            }
+        }.get },
     };
 };
 
@@ -427,7 +474,32 @@ const World = struct {
     step: u32 = 0,
 
     client: Connection,
+    /// Not a connection until the first Initial that may start one arrives and
+    /// opens: the harness is the server's consumer, and a consumer builds a
+    /// connection from what `endpoint.classify` read off the wire rather than
+    /// from what it expects. Until then this holds a placeholder that has
+    /// nothing to send.
     server: Connection,
+    server_started: bool = false,
+    /// Whether this seed's server answers the first Initial with a Retry.
+    retry: bool = false,
+    /// Whether this seed's server advertises an idle timeout.
+    idle: bool = false,
+    /// When the server processed the first packet that took its stream's high
+    /// mark to the payload's end. Its idle timer restarted then, so it cannot
+    /// have started earlier — which is what bounds an idle close from below. A
+    /// high mark rather than completion, so with reordering this can be a
+    /// little early, which only loosens the bound. Not when the reader took
+    /// the octets: a late reader takes them long after they arrived.
+    arrived_at_ns: ?u64 = null,
+    /// The last time the server received a datagram or sent one. Its idle
+    /// timer restarted no later than that, which bounds an idle close from
+    /// above.
+    server_active_at_ns: u64 = 0,
+    /// When each endpoint's idle timer closed it, client then server, read off
+    /// the `closed` event rather than inferred, so the oracle below measures
+    /// the close and not when the harness happened to look.
+    idle_closed_at_ns: [2]?u64 = @splat(null),
     /// Client to server, then server to client.
     to_server: Link,
     to_client: Link,
@@ -534,6 +606,7 @@ fn buildWorld(seed: u64) World {
             .side = .client,
             .original_destination = ConnectionId.init(&client_cid) catch unreachable, // Eight octets.
             .source = ConnectionId.init(&client_source) catch unreachable, // Four octets.
+            .advertised = client_advertised,
         }),
         .server = .init(.{
             .side = .server,
@@ -575,6 +648,12 @@ fn buildWorld(seed: u64) World {
     if (random.uintLessThan(u8, reader_seed_period) == 0) {
         world.read_every = 1 + random.uintLessThan(u32, read_every_max);
     }
+    // The two features added after the seeds above had names: drawn from a
+    // stream of their own, so that adding one does not move every draw after
+    // it and turn a pinned seed — 155905, below — into a different run.
+    var features: std.Random.DefaultPrng = .init(seed ^ feature_stream);
+    world.retry = features.random().uintLessThan(u8, retry_seed_period) == 0;
+    world.idle = features.random().uintLessThan(u8, idle_seed_period) == 0;
     // Content that a partial or reordered delivery cannot accidentally satisfy.
     for (&world.payload, 0..) |*octet, index| octet.* = @truncate(index *% 31 +% 7);
     world.prng = prng;
@@ -620,49 +699,59 @@ fn driveHandshake(world: *World) void {
         world.server.confirmHandshake();
         world.client_installed = 2;
         world.census.handshakes_completed += 1;
+        if (world.retry) {
+            // The client took exactly the one Retry, and the server it is
+            // talking to was built from the Initial that brought its token back.
+            if (!world.client.retry_seen) fail(world, "a Retry seed completed a handshake without a Retry", 0);
+            world.census.handshakes_after_retry += 1;
+        }
     }
 }
 
-/// Section 7.4: the limits each endpoint grants the other, carried in the TLS
-/// extension. Encoded and fed through `transportParametersIn` rather than
-/// poked into the streams directly, because that is the path a consumer takes
-/// and it is where section 4.6's stream limits are applied — a simulation that
-/// set the limits by hand would never exercise it.
-fn exchangeTransportParameters(world: *World) void {
-    // Section 7.3's identifiers are required of both roles, and a server must
-    // also echo the client's original Destination Connection ID. The exchange
-    // is symmetric here because the fake handshake is, so the encoding carries
-    // both and each side validates the other's.
-    const parameters: quic.transport_parameters.Parameters = .{
-        .initial_source_connection_id = ConnectionId.init(&.{ 0xf0, 0x67, 0xa5, 0x50, 0x2a, 0x42, 0x62, 0xb5 }) catch unreachable, // Eight octets.
-        .original_destination_connection_id = ConnectionId.init(&.{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 }) catch unreachable, // As above.
-        // The windows this connection actually has, not larger ones. These
-        // were 1 MiB and 256 KiB against buffers of 64 KiB and 16 KiB, which is
-        // a promise the receiver cannot keep: the sender is permitted past the
-        // window and takes a FLOW_CONTROL_ERROR for doing what it was told it
-        // could. A harness misconfiguration scored against the library — and,
-        // because a connection error exempts a run from the transfer oracle,
-        // one that hid itself.
-        .initial_max_data = connection_receive_octets,
-        .initial_max_stream_data_bidi_local = stream_receive_octets,
-        .initial_max_stream_data_bidi_remote = stream_receive_octets,
-        .initial_max_stream_data_uni = stream_receive_octets,
-        .initial_max_streams_bidi = 8,
-        .initial_max_streams_uni = 8,
-    };
-    var encoded: [512]u8 = undefined;
-    const written = quic.transport_parameters.encode(&encoded, &parameters) catch return;
-    world.client.transportParametersIn(encoded[0..written]) catch return;
-    world.server.transportParametersIn(encoded[0..written]) catch return;
+/// What each endpoint advertises beyond `config`. The eight-slot table holds
+/// the peer's streams and the endpoint's own: the client opens one request
+/// stream, so it offers the server seven; the server opens none and offers
+/// the client all eight.
+const client_advertised: Connection.Advertised = .{
+    .max_streams_bidirectional = 3,
+    .max_streams_unidirectional = 4,
+    .streams_opened_max = 1,
+};
+const server_advertised: Connection.Advertised = .{
+    .max_streams_bidirectional = 4,
+    .max_streams_unidirectional = 4,
+};
+const server_advertised_idle: Connection.Advertised = .{
+    .max_streams_bidirectional = 4,
+    .max_streams_unidirectional = 4,
+    .max_idle_timeout_ms = idle_timeout_ms,
+};
 
-    // The data windows are the consumer's seam — `Connection` deliberately
-    // applies only the stream limits from the extension, leaving MAX_DATA and
-    // MAX_STREAM_DATA to drive the rest. See `transportParametersIn`.
-    world.client.streams.setConnectionSendLimit(parameters.initial_max_data);
-    world.server.streams.setConnectionSendLimit(parameters.initial_max_data);
-    const stream = quic.stream_id.make(.client_bidirectional, 0);
-    world.client.streams.setSendLimit(stream, parameters.initial_max_stream_data_bidi_remote) catch {};
-    world.server.streams.setSendLimit(stream, parameters.initial_max_stream_data_bidi_remote) catch {};
+/// Section 7.4: the limits each endpoint grants the other, carried in the TLS
+/// extension. Each side's own, from `localTransportParameters`, and fed through
+/// `transportParametersIn` on the other, which is the path a consumer takes and
+/// the one where section 4.6's stream limits and section 4.1's initial windows
+/// are applied.
+///
+/// It used to be one hand-built extension handed to both sides, carrying
+/// `original_destination_connection_id` — a server-only parameter — so the
+/// server refused the client's copy with `ServerOnlyParameter`, and the
+/// `catch return` that followed skipped the rest. The server never applied a
+/// single limit the client granted, in any seed, and nothing noticed because
+/// the server writes no data.
+fn exchangeTransportParameters(world: *World) void {
+    var client_parameters: [Connection.local_transport_parameters_octets_max]u8 = undefined;
+    var server_parameters: [Connection.local_transport_parameters_octets_max]u8 = undefined;
+    const from_client = world.client.localTransportParameters(&client_parameters) catch unreachable; // Sized by `local_transport_parameters_octets_max`.
+    const from_server = world.server.localTransportParameters(&server_parameters) catch unreachable; // As above.
+    world.server.transportParametersIn(from_client) catch |err| {
+        fail(world, "the server refused the client's own transport parameters", @intFromError(err));
+        return;
+    };
+    world.client.transportParametersIn(from_server) catch |err| {
+        fail(world, "the client refused the server's own transport parameters", @intFromError(err));
+        return;
+    };
 }
 
 fn installBoth(world: *World, level: Level, seed: u8) void {
@@ -913,6 +1002,132 @@ fn checkInvariants(world: *World) void {
     }
 }
 
+/// The server's consumer: the first Initial that may start a connection does,
+/// once it has opened — after a Retry, on seeds that ask for one — and every
+/// datagram after that goes to the connection.
+///
+/// Classified first, as a server routes, even though there is only ever the
+/// one connection here: what `endpoint.classify` decides is what a consumer
+/// acts on, and a datagram it drops is one the connection never sees.
+fn deliverToServer(world: *World, datagram: []u8, random: std.Random) void {
+    if (!world.server_started) {
+        // The first datagram is delivered inside `startServer`, which is what
+        // decides whether there is a connection to deliver it to.
+        _ = startServer(world, datagram, random);
+        return;
+    }
+    world.server.receive(datagram, world.now_ns) catch |err| recordClose(world, err);
+    world.server_active_at_ns = world.now_ns;
+    if (world.arrived_at_ns == null) {
+        const stream = world.server.findStream(quic.stream_id.make(.client_bidirectional, 0)) orelse return;
+        if (stream.received_highest >= world.payload_len) world.arrived_at_ns = world.now_ns;
+    }
+}
+
+/// Start the server from a first Initial, or answer it with a Retry on a seed
+/// that asks for one. The token the harness puts in a Retry is the identifier
+/// the client used first, in the clear: a real server authenticates it, and
+/// this package never reads it, so the harness need not.
+fn startServer(world: *World, datagram: []u8, random: std.Random) bool {
+    const classified = quic.endpoint.classify(datagram, server_source.len);
+    if (!classified.mayStart()) return false;
+    var retried: ?Connection.Retried = null;
+    if (world.retry) {
+        if (classified.token.len == 0) {
+            sendRetry(world, &classified, random);
+            return false;
+        }
+        const original = ConnectionId.init(classified.token) catch return false;
+        retried = .{ .original_destination = original };
+    }
+    world.server.initServer(.{
+        .initial_destination = classified.destination,
+        .source = ConnectionId.init(&server_source) catch unreachable, // Eight octets.
+        .retry = retried,
+        .advertised = if (world.idle) server_advertised_idle else server_advertised,
+    }) catch |err| {
+        fail(world, "the harness could not start a server", @intFromError(err));
+        return false;
+    };
+    const result = world.server.receive(datagram, world.now_ns);
+    // State only for an Initial that opened: an adversary's corrupted copy of
+    // the first flight classifies as an Initial and authenticates nothing, and
+    // its error belongs to no connection, so it is not a close to record.
+    if (!world.server.peer_initial_processed) {
+        world.census.starts_abandoned += 1;
+        return false;
+    }
+    world.server_started = true;
+    result catch |err| recordClose(world, err);
+    if (world.retry) assert(world.server.addressValidated());
+    assert(world.server.peer_source != null);
+    return true;
+}
+
+/// Section 8.1.2's Retry, built from the classified Initial with the same
+/// backend the connections use.
+fn sendRetry(world: *World, classified: *const quic.endpoint.Datagram, random: std.Random) void {
+    var retry: [Link.datagram_octets_max]u8 = undefined;
+    var scratch: [1024]u8 = undefined;
+    const written = quic.endpoint.writeRetry(
+        quic.crypto.backend.Std,
+        &retry,
+        &scratch,
+        classified,
+        ConnectionId.init(&retry_source) catch unreachable, // Eight octets.
+        classified.destination.bytes(),
+    ) catch |err| {
+        fail(world, "the harness could not write a Retry", @intFromError(err));
+        return;
+    };
+    world.census.retries_sent += 1;
+    world.to_client.send(retry[0..written], world.now_ns, random);
+}
+
+/// After a quiet transfer on an idle seed: leave the pair alone, and both idle
+/// timers have to close it — silently, no earlier than the advertised timeout
+/// after the server last heard of the payload, and no later than the timeout
+/// plus a clock jump after the server last did anything. A connection that
+/// stays open with nothing to do is a slot a server never gets back, and one
+/// that closes late is the same slot held for longer.
+fn runIdle(world: *World) void {
+    assert(world.idle);
+    const arrived_at = world.arrived_at_ns orelse {
+        // The transfer completed, so a packet took the server's high mark to
+        // the end; a harness that did not see it measured nothing.
+        fail(world, "an idle seed finished without the harness seeing the payload arrive", 0);
+        return;
+    };
+    var steps: u32 = 0;
+    while (steps < idle_steps_max) : (steps += 1) {
+        if (world.client.isClosed() and world.server.isClosed()) break;
+        if (!stepOnce(world)) break;
+    }
+    // The timer that closed the second endpoint fired in `advanceClock`, after
+    // that step had drained its events, so its `closed` is still queued.
+    drainEvents(world);
+    if (world.failure != null) return;
+    if (!world.client.isClosed() or !world.server.isClosed()) {
+        fail(world, "the idle timer never closed a quiet connection", steps);
+        return;
+    }
+    // Not before the timeout either: closing early is abandoning a connection
+    // the peer was promised. The server processed a packet when the payload
+    // finished arriving, so its timer started no earlier than that.
+    const closed_at = world.idle_closed_at_ns[1] orelse {
+        fail(world, "the server closed for idleness and said nothing", 0);
+        return;
+    };
+    if (closed_at < arrived_at + idle_timeout_ms * std.time.ns_per_ms) {
+        fail(world, "the idle timer closed a connection before its timeout", closed_at - arrived_at);
+    }
+    // And not late: a timer that restarted from the wrong packet, or never on
+    // a send, still closes inside the step budget and passes everything else.
+    if (closed_at > world.server_active_at_ns + idle_timeout_ms * std.time.ns_per_ms + clock_jump_ns_max) {
+        fail(world, "the idle timer closed a connection long after its timeout", closed_at - world.server_active_at_ns);
+    }
+}
+
 /// One step: deliver what is due, let both sides send, advance the clock.
 fn stepOnce(world: *World) bool {
     const random = world.prng.random();
@@ -923,9 +1138,7 @@ fn stepOnce(world: *World) bool {
 
     // Deliver everything due now, both directions.
     while (world.to_server.receive(world.now_ns, &datagram)) |received| {
-        world.server.receive(received, world.now_ns) catch |err| {
-            recordClose(world, err);
-        };
+        deliverToServer(world, received, random);
     }
     while (world.to_client.receive(world.now_ns, &datagram)) |received| {
         world.client.receive(received, world.now_ns) catch |err| {
@@ -956,6 +1169,7 @@ fn stepOnce(world: *World) bool {
                 break;
             }
             inspectDatagram(world, datagram[0..octets], peer_id_octets);
+            if (direction == 1) world.server_active_at_ns = world.now_ns;
             world.adversary.capture(direction, datagram[0..octets]);
             link.send(datagram[0..octets], world.now_ns, random);
         }
@@ -997,9 +1211,20 @@ fn advanceClock(world: *World, random: std.Random) bool {
     // has octets buffered — nothing is owed in either direction, no timer is
     // armed, and the loop would end with the transfer short and both endpoints
     // blameless. The clock moves on so the reader can catch up.
-    if (next == null and world.received < world.payload_len and
-        world.server.readable(quic.stream_id.make(.client_bidirectional, 0)).len > 0)
-    {
+    //
+    // And not only when no timer is armed: an idle timer sixty seconds out is
+    // armed, and jumping to it leapt the clock past a reader with octets in
+    // hand, which then found its connection closed for idleness. A late reader
+    // is late by steps, not by a minute; past `reader_wait_max_ns` the clock
+    // moves on in catch-up increments instead of to the timer.
+    const unread = world.received < world.payload_len and
+        world.server.readable(quic.stream_id.make(.client_bidirectional, 0)).len > 0;
+    // Idle seeds only: they are the ones with a timer far enough out to leap
+    // a reader past, and every other seed keeps the clock it always had — the
+    // pinned seed below is a late reader, and a cap applied everywhere turned
+    // it into a run that never fills its recovery table.
+    const far = if (next) |at| world.idle and at > world.now_ns + reader_wait_max_ns else true;
+    if (unread and far) {
         world.now_ns += reader_catch_up_ns;
         return true;
     }
@@ -1082,7 +1307,7 @@ fn advanceClock(world: *World, random: std.Random) bool {
 /// reports losses per acknowledgement and keeps no total, so nothing outside
 /// the library could count them.
 fn drainEvents(world: *World) void {
-    inline for (.{ &world.client, &world.server }) |connection| {
+    inline for (.{ &world.client, &world.server }, 0..) |connection, which| {
         var guard: u32 = 0;
         while (guard < events_per_step_max) : (guard += 1) {
             const event = connection.poll() orelse break;
@@ -1092,7 +1317,19 @@ fn drainEvents(world: *World) void {
                 .handshake_confirmed => {},
                 .stream_delivered => world.census.streams_delivered += 1,
                 .stream_readable, .stream_reset, .stream_stopped => {},
-                .closed => world.census.closes_observed += 1,
+                // An idle close is not a connection error: nothing went wrong
+                // and nothing crossed the wire. It is only legitimate once the
+                // transfer is over — the advertised timeout is long against
+                // anything the transfer waits for.
+                .closed => |value| if (value.idle) {
+                    world.census.idle_closes += 1;
+                    world.idle_closed_at_ns[which] = world.now_ns;
+                    if (!(world.write_done and world.received == world.payload_len)) {
+                        fail(world, "the idle timer ended a transfer still under way", world.received);
+                    }
+                } else {
+                    world.census.closes_observed += 1;
+                },
                 // A dropped event is the harness failing to poll, not the
                 // library failing to report — and it must never be silent.
                 .overflowed => |dropped| fail(world, "the simulator dropped connection events", dropped),
@@ -1183,6 +1420,7 @@ fn runSeed(seed: u64, census: *Census) ?Failure {
     if (world.failure == null and world.step >= steps_max) {
         fail(&world, "step budget exhausted without finishing", world.step);
     }
+    if (world.failure == null and world.idle and world.received == world.payload_len) runIdle(&world);
     // And the other way a run can end without finishing: the virtual clock
     // reaching the deadline. That exit was silent, and the silence cost
     // something — a key update stalled fifty-nine transfers in a sweep and the
@@ -1358,6 +1596,10 @@ fn printCensus(census: *const Census) void {
         .{ .name = "clock jumps", .value = census.clock_jumps },
         .{ .name = "steps with a full recovery table", .value = census.recovery_table_full },
         .{ .name = "flow control alone in flight", .value = census.flow_control_alone_in_flight },
+        .{ .name = "retries sent", .value = census.retries_sent },
+        .{ .name = "handshakes after a Retry", .value = census.handshakes_after_retry },
+        .{ .name = "server starts abandoned", .value = census.starts_abandoned },
+        .{ .name = "idle timer closes", .value = census.idle_closes },
     };
     for (rows) |row| std.debug.print("  {s:<32} {d}\n", .{ row.name, row.value });
 }
@@ -1376,19 +1618,28 @@ test "a clean path completes a transfer and goes quiet" {
 }
 
 test "a sender that fills its recovery table with slivers still finishes" {
-    // Seed 155905, from the nightly sweep: a 3 ms path with a quarter of the
-    // acknowledgements lost and a receiver whose window reopened a few octets
-    // at a time. Pinned because the 256-seed sweep never fills a table, so
-    // without this nothing `zig build ci` runs reaches the state at all — and
-    // the census assertion is what says the seed still does.
+    // Seed 155905, from the nightly sweep, found it: a 3 ms path with a quarter
+    // of the acknowledgements lost and a receiver whose window reopened a few
+    // octets at a time. Pinned because the 256-seed sweep never filled a table,
+    // so nothing `zig build ci` ran reached the state at all — and the census
+    // assertion is what says the pinned seed still does.
+    //
+    // Re-pinned to seed 404 when the harness became the server's consumer:
+    // 155905 draws a Retry now, which changes its handshake and with it every
+    // step after, and it no longer fills a table. 404 fills one for seventy
+    // steps without a Retry or an idle timeout. The assertion below is the one
+    // that would say so again if the harness moves this seed too.
     var census: Census = .{};
-    const failure = runSeed(155905, &census);
+    const failure = runSeed(pinned_full_table_seed, &census);
     if (failure) |one| {
-        std.debug.print("seed 155905 failed: {s}\n", .{one.what});
+        std.debug.print("seed {d} failed: {s}\n", .{ pinned_full_table_seed, one.what });
         return error.SimulationFailed;
     }
     try testing.expect(census.recovery_table_full > 0);
 }
+
+/// See the test above for why this number and not the one that found it.
+const pinned_full_table_seed: u64 = 404;
 
 test "the same seed produces the same run" {
     // The property the whole harness rests on: a failure is replayed rather

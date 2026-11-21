@@ -46,6 +46,12 @@ pub const http3 = @import("Http3.zig");
 pub const qlog = @import("qlog.zig");
 pub const Http3 = http3.Http3;
 
+/// The server side of an HTTP/3 connection over one QUIC `Connection`: this
+/// endpoint's control and QPACK streams, request streams read under the
+/// embedder's buffer space, responses written frame by whole frame, GOAWAY.
+pub const http3_server = @import("Http3Server.zig");
+pub const Http3Server = http3_server.Http3Server;
+
 // Every module in this package, and a module that is missing from this list is
 // a module whose tests Zig never compiles. That is not a hypothetical: `qlog`
 // was written, wired into both interop roles and green for an hour before this
@@ -60,5 +66,6 @@ test {
     _ = frame;
     _ = stream;
     _ = http3;
+    _ = http3_server;
     _ = qlog;
 }
