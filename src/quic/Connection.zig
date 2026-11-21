@@ -505,6 +505,9 @@ pub fn Connection(comptime config: Config) type {
         const Self = @This();
 
         pub const datagram_octets: u32 = config.datagram_octets;
+        /// One stream's receive window, which is also the most of it a reader
+        /// can be handed at once.
+        pub const stream_receive_octets: u32 = config.stream_receive_octets;
         /// The smallest send room `send` builds a datagram in; see `room_min`.
         /// Public so a consumer can tell "nothing owed" from "an
         /// amplification-limited server waiting for its peer" if it needs to.

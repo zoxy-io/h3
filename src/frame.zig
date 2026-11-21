@@ -66,13 +66,13 @@ pub const Type = enum(u64) {
     //# connection, this MUST be treated as a connection error of type
     //# H3_ID_ERROR.
     //= type=exception
-    //= reason=server push is not implemented and the push ID a connection currently allows is connection state `Http3.zig` would hold if server push were implemented; it is not, and `Http3.zig` refuses a push stream rather than tracking one
+    //= reason=which push IDs a connection allows is connection state, so the rule is enforced in `Http3.receiveControlFrame` rather than here: a client sends no MAX_PUSH_ID, so no push ID is allowed and every CANCEL_PUSH it receives is refused
     //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.3
     //# If a server receives a CANCEL_PUSH frame for a push
     //# ID that has not yet been mentioned by a PUSH_PROMISE frame, this MUST
     //# be treated as a connection error of type H3_ID_ERROR.
     //= type=exception
-    //= reason=server push is not implemented; which push IDs a PUSH_PROMISE has mentioned is connection state `Http3.zig` would hold if server push were implemented; it is not, and `Http3.zig` refuses a push stream rather than tracking one
+    //= reason=which push IDs a PUSH_PROMISE has mentioned is connection state, so the rule is enforced in `Http3.receiveControlFrame` rather than here: a server sends no PUSH_PROMISE, so every CANCEL_PUSH it receives is refused
     //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.3
     //# The server SHOULD abort sending the resource, but the mechanism to do
     //# so depends on the state of the corresponding push stream.
@@ -128,7 +128,7 @@ pub const Type = enum(u64) {
     //# receipt of a PUSH_PROMISE frame as a connection error of type
     //# H3_FRAME_UNEXPECTED.
     //= type=exception
-    //= reason=which endpoint this is decides both halves of the rule, and this file encodes and decodes frames without knowing; `Http3.zig`, the connection layer, is what knows
+    //= reason=which endpoint this is decides both halves of the rule, and this file encodes and decodes frames without knowing; `Http3.receiveRequest` knows, and a server there refuses a PUSH_PROMISE on its header
     //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
     //# PUSH_PROMISE frames are not permitted on push streams;
     //# a pushed response that includes PUSH_PROMISE frames MUST be treated
@@ -241,13 +241,13 @@ pub const Type = enum(u64) {
     //# previously received MUST be treated as a connection error of type
     //# H3_ID_ERROR.
     //= type=exception
-    //= reason=comparing a MAX_PUSH_ID against the one before it needs the previous value, which is connection state `Http3.zig` would hold if server push were implemented; it is not, and `Http3.zig` refuses a push stream rather than tracking one
+    //= reason=comparing a MAX_PUSH_ID against the one before it needs the previous value, which is connection state: `Http3.receiveMaxPushId` keeps it and refuses one that falls
     //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.7
     //# A server MUST NOT send a MAX_PUSH_ID frame.  A client MUST treat the
     //# receipt of a MAX_PUSH_ID frame as a connection error of type
     //# H3_FRAME_UNEXPECTED.
     //= type=exception
-    //= reason=which endpoint this is decides both halves of the rule, and this file encodes and decodes frames without knowing; server push is not implemented in either direction
+    //= reason=which endpoint this is decides both halves of the rule, and this file encodes and decodes frames without knowing; `Http3.receiveMaxPushId` knows, and a client there refuses the frame. This endpoint sends none in either role
     //= https://www.rfc-editor.org/rfc/rfc9114#section-10.5
     //# A client that accepts server push SHOULD limit the number of push IDs
     //# it issues at a time.
@@ -651,7 +651,7 @@ pub const SettingPair = struct {
 //# SETTINGS frame.  A receiver MAY treat the presence of duplicate
 //# setting identifiers as a connection error of type H3_SETTINGS_ERROR.
 //= type=exception
-//= reason=which duplicates matter is the consumer's policy, as this struct's header says: the iterator hands every pair to the caller so a proxy can forward what it received, and an iterator that refused a repeat would deny it that
+//= reason=the iterator hands every pair to the caller, as this struct's header says, so that a consumer reading SETTINGS for itself can forward what it received; `Http3.parseSettings` is the receiver that takes the MAY, for every identifier
 pub const SettingsIterator = struct {
     payload: []const u8,
     offset: usize = 0,

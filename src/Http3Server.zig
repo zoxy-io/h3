@@ -202,6 +202,15 @@ pub fn Http3Server(comptime Connection: type, comptime config: http3.Config) typ
         const Self = @This();
         pub const Sequencer = http3.Http3(config);
 
+        comptime {
+            // The peer's control stream is read whole frame by whole frame, so
+            // the longest frame `Sequencer` waits for has to fit in the window
+            // the connection reads it through, or a legal SETTINGS would stall
+            // the stream for ever.
+            assert(Connection.stream_receive_octets >=
+                2 * varint.octets_max + http3.control_payload_octets_max);
+        }
+
         /// One of this endpoint's unidirectional streams: what it carries, and
         /// how much of that the connection has taken. A stream is a byte
         /// stream, so a short write is ordinary and the rest goes next time.
