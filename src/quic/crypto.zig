@@ -42,6 +42,8 @@ pub const backend = @import("crypto/backend.zig");
 pub const secrets = @import("crypto/secrets.zig");
 pub const protect = @import("crypto/protect.zig");
 pub const retry = @import("crypto/retry.zig");
+/// RFC 9001 appendix A as a check a consumer runs its own backend through.
+pub const conformance = @import("crypto/conformance.zig");
 
 /// Packet protection keys over `backend.Std`. `KeysOf` takes another backend;
 /// `Connection` picks one with `Config.crypto`.
@@ -564,6 +566,7 @@ test {
     _ = secrets;
     _ = protect;
     _ = retry;
+    _ = conformance;
 }
 
 test "a level's space is the one section 12.3 assigns it" {

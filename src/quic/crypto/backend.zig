@@ -107,6 +107,14 @@
 //!   `info` is the `HkdfLabel` h3 has already built, at most 19 octets. `out`
 //!   never overlaps `prk` or `info`.
 //! - None of the three can fail, for the reason `Seal` cannot.
+//!
+//! ## Testing a backend
+//!
+//! `conformance.check(Backend)` runs RFC 9001 appendix A's worked packets
+//! through a backend, compares the primitives the appendix does not reach with
+//! `Std`'s, and checks that every AEAD refuses a forgery. A consumer that
+//! supplies its own backend runs it in its own test suite; this package runs it
+//! against `Std`, and against mutants of `Std` that it must fail.
 
 const std = @import("std");
 

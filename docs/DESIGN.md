@@ -159,7 +159,11 @@ unaffected and the dependency table is still empty. What stays above the seam
 is everything this section says belongs here: the nonce, the associated data,
 the sample, the mask, the labels, the key update and the AEAD limits. `zig
 build lint` confines `std.crypto` to the default backend's file, so no
-primitive can reach past the seam.
+primitive can reach past the seam, and `crypto.conformance.check(Backend)` runs
+RFC 9001 appendix A's worked packets — plus a differential check of the
+AES-256 and SHA-384 primitives the appendix never reaches, and a forgery
+refused three ways per AEAD — through a foreign backend in the consumer's own
+test suite.
 
 ## 5. No allocator, with a QUIC-sized asterisk
 

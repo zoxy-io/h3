@@ -161,7 +161,9 @@ then parses and opens it again. It is compiled and run as part of
   Packet protection is inside the library. Its primitives come from a
   comptime backend (`Config.crypto`): `std.crypto` by default, or one the
   consumer supplies, checked against the contract in
-  [`src/quic/crypto/backend.zig`](src/quic/crypto/backend.zig).
+  [`src/quic/crypto/backend.zig`](src/quic/crypto/backend.zig). A consumer's
+  backend runs RFC 9001 appendix A in its own tests with
+  `h3.quic.crypto.conformance.check(Backend)`.
 - **Assertions are a build option.** They are on by default in every
   optimize mode and removed with `-Dassertions=false`. See
   [`src/assert.zig`](src/assert.zig).
