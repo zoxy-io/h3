@@ -405,6 +405,18 @@ pub fn Connection(comptime config: Config) type {
         phase_acknowledged: bool = true,
     };
 
+    // The values `localTransportParameters` encodes that neither `config` nor
+    // the connection identifiers already fix.
+    const Local = struct {
+        max_idle_timeout_ms: u64 = 0,
+        stateless_reset_token: ?[transport_parameters.stateless_reset_token_octets]u8 = null,
+        disable_active_migration: bool = false,
+        max_udp_payload_size: u64 = config.datagram_octets,
+        /// A server's section 7.3 identifiers; null at a client.
+        original_destination: ?ConnectionId = null,
+        retry_source: ?ConnectionId = null,
+    };
+
     const ConnectionStreams = StreamsOf(.{
         .streams_max = config.streams_max,
         .receive_octets = config.stream_receive_octets,
@@ -856,6 +868,10 @@ pub fn Connection(comptime config: Config) type {
         //# secured UDP endpoints.
         //= type=exception
         //= reason=a rule addressed to whoever runs the server rather than to the code it runs: ingress filtering is the network's, and the count of clients, the connections one address may open and how long any of them may stay are all decided above a single `Connection` — this type holds one connection, owns no socket and reads no clock. See docs/DESIGN.md section 2 and section 3.
+        /// What `localTransportParameters` says about this endpoint, beyond
+        /// what `config` and the identifiers fix. See `Advertised`.
+        local: Local = .{},
+
         /// Section 8.1's accounting. A client validates its peer by construction
         /// — it chose the address — so this only ever restrains a server.
         address_validated: bool,
@@ -1025,7 +1041,171 @@ pub fn Connection(comptime config: Config) type {
             original_destination: ConnectionId,
             /// What this endpoint asks the peer to address it as.
             source: ConnectionId,
+            /// What this endpoint says about itself in its transport
+            /// parameters, beyond what `config` already fixes. Optional so that
+            /// a consumer building its own extension can leave it out; one that
+            /// builds it with `localTransportParameters` says it here, so the
+            /// limits enforced are the limits advertised.
+            advertised: ?Advertised = null,
         };
+
+        /// RFC 9000 section 18.2's parameters that are the consumer's to
+        /// choose. Everything else this endpoint advertises is fixed by
+        /// `config` — the receive windows are the buffers behind them — or by
+        /// the connection identifiers, so `localTransportParameters` reads it
+        /// from there and cannot disagree with what is enforced.
+        pub const Advertised = struct {
+            /// Section 18.2's `max_idle_timeout`, in milliseconds; zero
+            /// advertises none. Section 10.1 makes the effective timeout the
+            /// smaller of the two endpoints' non-zero values.
+            max_idle_timeout_ms: u64 = 0,
+            /// Section 18.2's `stateless_reset_token` for `source`: a server's
+            /// alone, and derived by the consumer from a key this package never
+            /// sees. `endpoint.writeStatelessReset` ends a reset in it.
+            stateless_reset_token: ?[transport_parameters.stateless_reset_token_octets]u8 = null,
+            /// Section 18.2's `disable_active_migration`. True unless a
+            /// consumer says otherwise, because this package does not validate
+            /// a new path: a peer that moved would be talking to a connection
+            /// that cannot follow it.
+            disable_active_migration: bool = true,
+            /// Streams of each kind the peer may have open at once (section
+            /// 4.6). Their sum, plus `streams_opened_max`, has to fit
+            /// `streams_max`, because every kind shares one table and a peer
+            /// inside its limit may hold every identifier the limit names.
+            max_streams_bidirectional: u64,
+            max_streams_unidirectional: u64,
+            /// The most streams this endpoint opens itself at once — an HTTP/3
+            /// server's three unidirectional ones, a client's requests — which
+            /// the table must hold beside the peer's.
+            streams_opened_max: u64 = 0,
+            /// Section 18.2's `max_udp_payload_size`: the largest datagram the
+            /// consumer's receive buffer takes. At least 1200, and by default
+            /// the largest this endpoint sends.
+            max_udp_payload_size: u64 = config.datagram_octets,
+        };
+
+        /// What a server knows when it starts a connection after a Retry.
+        pub const Retried = struct {
+            /// The Destination Connection ID of the client's Initial *before*
+            /// the Retry, which section 7.3 has the server repeat. After the
+            /// Retry no packet carries it, so it is what the consumer's token
+            /// had to bring back.
+            original_destination: ConnectionId,
+        };
+
+        pub const AdvertiseError = error{
+            /// The peer's two stream limits and `streams_opened_max` together
+            /// exceed `streams_max`: a conforming peer could then be refused a
+            /// stream it was promised, with STREAM_LIMIT_ERROR blamed on it.
+            StreamsExceedTable,
+            /// Section 18.2: a `max_udp_payload_size` under 1200 is invalid.
+            UdpPayloadTooSmall,
+            /// A value no variable-length integer can carry.
+            ValueTooLarge,
+            /// Section 18.2: `stateless_reset_token` is a server's alone.
+            ClientResetToken,
+        };
+
+        /// Check what a consumer chose to advertise against what this
+        /// connection can honour. `initServer` returns this error; `init`
+        /// asserts it, so a client building from runtime configuration calls
+        /// this first.
+        pub fn validateAdvertised(side: Side, advertised: Advertised) AdvertiseError!void {
+            if (side == .client and advertised.stateless_reset_token != null) return error.ClientResetToken;
+            if (advertised.max_udp_payload_size < transport_parameters.max_udp_payload_size_min) {
+                return error.UdpPayloadTooSmall;
+            }
+            if (advertised.max_udp_payload_size > varint.max) return error.ValueTooLarge;
+            if (advertised.max_idle_timeout_ms > varint.max) return error.ValueTooLarge;
+            const streams_max: u64 = config.streams_max;
+            if (advertised.max_streams_bidirectional > streams_max) return error.StreamsExceedTable;
+            if (advertised.max_streams_unidirectional > streams_max) return error.StreamsExceedTable;
+            if (advertised.streams_opened_max > streams_max) return error.StreamsExceedTable;
+            const total = advertised.max_streams_bidirectional + advertised.max_streams_unidirectional +
+                advertised.streams_opened_max;
+            if (total > streams_max) return error.StreamsExceedTable;
+            assert(total <= streams_max);
+        }
+
+        pub const InitError = AdvertiseError || error{
+            /// Section 17.2.5.1: a Retry's Source Connection ID differs from
+            /// the identifier the client used first, and the client's next
+            /// Initial is addressed to it. `Retried.original_destination` equal
+            /// to `initial_destination` means the consumer's token named the
+            /// wrong one of the two — a token is wire data, so it is refused
+            /// rather than asserted.
+            RetryIdentifierReused,
+        };
+
+        pub const ServerOptions = struct {
+            /// The Destination Connection ID of the client Initial this
+            /// connection is built from, which is what the Initial keys derive
+            /// from (RFC 9001 section 5.2): the client's own choice, or after a
+            /// Retry the Source Connection ID that Retry carried.
+            initial_destination: ConnectionId,
+            /// This server's connection identifier, chosen by the consumer. A
+            /// server that routes short headers by identifier gives every
+            /// connection the same length (see `endpoint.classify`).
+            source: ConnectionId,
+            /// Present exactly when this connection follows a Retry whose
+            /// token the consumer validated.
+            retry: ?Retried = null,
+            advertised: Advertised,
+        };
+
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-7.3
+        //# A server includes the Destination Connection ID field from the first
+        //# Initial packet it received from the client in the
+        //# original_destination_connection_id transport parameter; if the server
+        //# sent a Retry packet, this refers to the first Initial packet received
+        //# before sending the Retry packet.
+        //= type=test
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-7.3
+        //# If it sends a Retry packet, a
+        //# server also includes the Source Connection ID field from the Retry
+        //# packet in the retry_source_connection_id transport parameter.
+        //= type=test
+        //
+        // A Retry whose token came back is an address this server has had a
+        // packet delivered to, which is section 8.1's whole definition of a
+        // validated one: the amplification limit stops binding at once rather
+        // than at the first Handshake packet.
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.2
+        //# As long as it is not possible for an attacker to generate a valid
+        //# token for its own address (see Section 8.1.4) and the client is able
+        //# to return that token, it proves to the server that it received the
+        //# token.
+        //= type=test
+        /// A server's connection, from the client Initial that starts it.
+        ///
+        /// The one constructor a server needs: the transport parameters
+        /// section 7.3 requires of a server follow from these options, and
+        /// `localTransportParameters` encodes them for the consumer's TLS
+        /// engine to carry.
+        pub fn initServer(options: ServerOptions) InitError!Self {
+            try validateAdvertised(.server, options.advertised);
+            if (options.retry) |retried| {
+                if (retried.original_destination.eql(&options.initial_destination)) {
+                    return error.RetryIdentifierReused;
+                }
+            }
+            var self: Self = .init(.{
+                .side = .server,
+                .original_destination = options.initial_destination,
+                .source = options.source,
+                .advertised = options.advertised,
+            });
+            if (options.retry) |retried| {
+                assert(!retried.original_destination.eql(&options.initial_destination));
+                self.local.original_destination = retried.original_destination;
+                self.local.retry_source = options.initial_destination;
+                self.address_validated = true;
+            }
+            assert(self.side == .server);
+            assert(self.local.original_destination != null);
+            return self;
+        }
 
         pub fn init(options: Options) Self {
             var self: Self = .{
@@ -1046,7 +1226,121 @@ pub fn Connection(comptime config: Config) type {
             const bytes = options.original_destination.bytes();
             self.send_keys[@backingInt(Level.initial)] = .initial(bytes, options.side);
             self.receive_keys[@backingInt(Level.initial)] = .initial(bytes, options.side.peer());
+            // A server without a Retry repeats the identifier its first Initial
+            // carried, which is the one the keys came from; `initServer` moves
+            // it when there was a Retry.
+            if (options.side == .server) self.local.original_destination = options.original_destination;
+            if (options.advertised) |advertised| self.advertise(advertised);
             return self;
+        }
+
+        fn advertise(self: *Self, advertised: Advertised) void {
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-18.2
+            //# This transport parameter MUST NOT be sent by a client but MAY be
+            //# sent by a server.
+            //
+            // Refused by `validateAdvertised`, which `initServer` returns.
+            // `init` cannot return it, so there it is a precondition — and a
+            // precondition guarded only by the caller is not `unreachable`
+            // (docs/TIGER_STYLE.md): with assertions off that would be
+            // undefined behaviour. A panic is defined in every build.
+            validateAdvertised(self.side, advertised) catch |err| {
+                @panic(switch (err) {
+                    error.StreamsExceedTable => "h3: advertised stream limits exceed streams_max; see validateAdvertised",
+                    error.UdpPayloadTooSmall => "h3: advertised max_udp_payload_size is below 1200",
+                    error.ValueTooLarge => "h3: an advertised value exceeds a variable-length integer",
+                    error.ClientResetToken => "h3: a client may not advertise a stateless reset token",
+                });
+            };
+            assert(advertised.max_udp_payload_size >= transport_parameters.max_udp_payload_size_min);
+            self.local.max_idle_timeout_ms = advertised.max_idle_timeout_ms;
+            self.local.stateless_reset_token = advertised.stateless_reset_token;
+            self.local.disable_active_migration = advertised.disable_active_migration;
+            self.local.max_udp_payload_size = advertised.max_udp_payload_size;
+            self.streams.setAdvertisedStreamLimits(
+                advertised.max_streams_bidirectional,
+                advertised.max_streams_unidirectional,
+            );
+        }
+
+        // Section 18.2's three connection-identifier parameters, and its eleven
+        // integer ones — every integer it defines, not only the eight
+        // `localTransportParameters` sets today, so the bound does not go stale
+        // when `Local` grows one.
+        const identifier_parameters: usize = 3;
+        const integer_parameters: usize = 11;
+        // A parameter's identifier and length, at their widest here: every
+        // identifier section 18.2 defines is under 64, and every value under
+        // 64 octets, so one octet each — two allowed for the identifier.
+        const parameter_prefix_octets: usize = 2 + 1;
+
+        /// The largest extension `localTransportParameters` can write: the
+        /// identifiers, the reset token, the integers at their widest and the
+        /// one flag. A caller's buffer of this size never fails; a test encodes
+        /// the worst case and checks it against this.
+        pub const local_transport_parameters_octets_max: usize =
+            identifier_parameters * (parameter_prefix_octets + ConnectionId.octets_max) +
+            (parameter_prefix_octets + transport_parameters.stateless_reset_token_octets) +
+            integer_parameters * (parameter_prefix_octets + varint.octets_max) +
+            parameter_prefix_octets;
+
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-7.3
+        //# Each endpoint includes the value of the Source Connection ID field
+        //# from the first Initial packet it sent in the
+        //# initial_source_connection_id transport parameter; see Section 18.2.
+        //= type=test
+        /// This endpoint's transport parameters, as the extension's octets,
+        /// for the consumer's TLS engine to carry in its ClientHello or
+        /// EncryptedExtensions.
+        ///
+        /// Built from what the connection enforces rather than from what a
+        /// consumer would restate: the receive windows are `config`'s buffers,
+        /// the stream limits are the ones `Streams` counts against, and the
+        /// identifiers are the ones on the wire — so the promise and the
+        /// accounting cannot drift apart, which is the defect `sim/` once had
+        /// (windows of a megabyte advertised over buffers of sixty-four
+        /// kilobytes).
+        pub fn localTransportParameters(self: *const Self, target: []u8) transport_parameters.EncodeError![]const u8 {
+            const parameters: transport_parameters.Parameters = .{
+                .original_destination_connection_id = self.local.original_destination,
+                .initial_source_connection_id = self.source,
+                .retry_source_connection_id = self.local.retry_source,
+                .stateless_reset_token = self.local.stateless_reset_token,
+                .max_idle_timeout_ms = self.local.max_idle_timeout_ms,
+                .max_udp_payload_size = self.local.max_udp_payload_size,
+                .initial_max_data = config.connection_receive_octets,
+                .initial_max_stream_data_bidi_local = config.stream_receive_octets,
+                .initial_max_stream_data_bidi_remote = config.stream_receive_octets,
+                .initial_max_stream_data_uni = config.stream_receive_octets,
+                .initial_max_streams_bidi = self.streams.advertised_bidi,
+                .initial_max_streams_uni = self.streams.advertised_uni,
+                .disable_active_migration = self.local.disable_active_migration,
+            };
+            // Section 18.2's server-only parameters, held by construction: a
+            // client's `local` never has the first three set and `advertise`
+            // refused the fourth.
+            if (self.side == .client) {
+                assert(parameters.original_destination_connection_id == null);
+                assert(parameters.retry_source_connection_id == null);
+                assert(parameters.stateless_reset_token == null);
+            }
+            const written = try transport_parameters.encode(target, &parameters);
+            assert(written <= local_transport_parameters_octets_max);
+            return target[0..written];
+        }
+
+        /// Whether the handshake is confirmed (RFC 9001 section 4.1.2): for a
+        /// client, HANDSHAKE_DONE arrived; for a server, `confirmHandshake`
+        /// was called.
+        pub fn handshakeConfirmed(self: *const Self) bool {
+            return self.recovery.handshake_confirmed;
+        }
+
+        /// Whether section 8.1's amplification limit still binds this
+        /// endpoint: false for a client, and for a server once a Handshake
+        /// packet opened or a Retry's token came back.
+        pub fn addressValidated(self: *const Self) bool {
+            return self.address_validated;
         }
 
         // ---------------------------------------------------------------- TLS
@@ -1412,20 +1706,15 @@ pub fn Connection(comptime config: Config) type {
             return self.peer_parameters[0..self.peer_parameters_len];
         }
 
-        // The one advisory rule this package would want to obey and structurally cannot:
-        // a deployment on this code does not implement migration, so it *should* say so
-        // in disable_active_migration — and the extension that would carry the parameter
-        // is assembled on the other side of the TLS seam.
-        //= https://www.rfc-editor.org/rfc/rfc9000#section-5.2.3
-        //# A server in a deployment that does not implement a solution to
-        //# maintain connection continuity when the client address changes
-        //# SHOULD indicate that migration is not supported by using the
-        //# disable_active_migration transport parameter.
-        //= type=exception
-        //= reason=the transport parameters this endpoint advertises are built by the consumer's TLS engine and never by this package: `transportParametersIn` and `transportParametersOut` carry the *peer's* extension in and back out, and nothing here encodes one of its own. A deployment on this package should indeed advertise disable_active_migration, because migration is out of scope here — but only the consumer can, per docs/DESIGN.md section 4. See docs/DESIGN.md section 2 and section 6.
-        // The receive half of the rule, which is the half this package can enforce:
-        // the extension this endpoint *sends* is built by the consumer's TLS engine,
-        // and `transport_parameters.parse` refuses a repeated identifier with
+        // Section 5.2.3's advisory rule, which this package now obeys by default:
+        // `Advertised.disable_active_migration` is true unless a consumer says
+        // otherwise, and `localTransportParameters` carries it. Cited, with its
+        // test, where the extension is built.
+        //
+        // The receive half of the duplicate rule below is the half this package
+        // enforces, and the sending half holds by construction:
+        // `localTransportParameters` encodes each parameter once.
+        // `transport_parameters.parse` refuses a repeated identifier with
         // `error.Malformed` before any of it is kept.
         //= https://www.rfc-editor.org/rfc/rfc9000#section-7.4
         //# An endpoint MUST NOT send a parameter more than once in a given
@@ -5872,6 +6161,7 @@ pub fn Connection(comptime config: Config) type {
 }
 
 const testing = std.testing;
+const endpoint_module = @import("endpoint.zig");
 
 /// Deliberately small. These tests exercise behaviour, not capacity, and a
 /// connection at the default configuration is megabytes — see the note on
@@ -10136,4 +10426,317 @@ test "a client checks a Retry's integrity tag with its configured backend" {
     // an empty plaintext, and verifying one is computing it again.
     try testing.expectEqual(before + 1, CountingBackend.calls.get(.aes128_gcm_seal));
     try testing.expect(client.retry_seen);
+}
+
+const test_advertised: TestConnection.Advertised = .{
+    .max_idle_timeout_ms = 30_000,
+    .stateless_reset_token = @splat(0x7e),
+    .max_streams_bidirectional = 2,
+    .max_streams_unidirectional = 2,
+};
+
+/// A server built the way a consumer builds one: from the first Initial it
+/// classified, with what it advertises.
+fn testServerFrom(datagram: *const endpoint_module.Datagram, retry: ?TestConnection.Retried) TestConnection {
+    return TestConnection.initServer(.{
+        .initial_destination = datagram.destination,
+        .source = ConnectionId.init(&server_source) catch unreachable, // Eight octets.
+        .retry = retry,
+        .advertised = test_advertised,
+    }) catch unreachable; // `test_advertised` fits `TestConnection`, and no test passes a reused identifier.
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9000#section-7.3
+//# A server includes the Destination Connection ID field from the first
+//# Initial packet it received from the client in the
+//# original_destination_connection_id transport parameter; if the server
+//# sent a Retry packet, this refers to the first Initial packet received
+//# before sending the Retry packet.
+//= type=test
+//
+//= https://www.rfc-editor.org/rfc/rfc9000#section-7.3
+//# Each endpoint includes the value of the Source Connection ID field
+//# from the first Initial packet it sent in the
+//# initial_source_connection_id transport parameter; see Section 18.2.
+//= type=test
+//
+//= https://www.rfc-editor.org/rfc/rfc9000#section-5.2.3
+//# A server in a deployment that does not implement a solution to
+//# maintain connection continuity when the client address changes
+//# SHOULD indicate that migration is not supported by using the
+//# disable_active_migration transport parameter.
+//= type=test
+test "a server's own transport parameters are what it enforces, and a client accepts them" {
+    var client = testClient();
+    try client.cryptoIn(.initial, "ClientHello");
+    var first: [TestConnection.datagram_octets]u8 = undefined;
+    const sent = try client.send(&first, 0);
+    const datagram = endpoint_module.classify(first[0..sent], server_source.len);
+    try testing.expect(datagram.mayStart());
+
+    var server = testServerFrom(&datagram, null);
+    try server.receive(first[0..sent], 0);
+    try testing.expect(!server.addressValidated());
+
+    var buffer: [TestConnection.local_transport_parameters_octets_max]u8 = undefined;
+    const octets = try server.localTransportParameters(&buffer);
+    const parsed = try transport_parameters.parse(octets);
+    try testing.expectEqualSlices(u8, &client_cid, parsed.original_destination_connection_id.?.bytes());
+    try testing.expectEqualSlices(u8, &server_source, parsed.initial_source_connection_id.?.bytes());
+    try testing.expectEqual(@as(?ConnectionId, null), parsed.retry_source_connection_id);
+    try testing.expectEqual(@as(u64, 30_000), parsed.max_idle_timeout_ms);
+    try testing.expect(parsed.disable_active_migration);
+    try testing.expectEqualSlices(u8, &test_advertised.stateless_reset_token.?, &parsed.stateless_reset_token.?);
+    // The windows and limits are the ones the connection counts against.
+    try testing.expectEqual(@as(u64, 32 * 1024), parsed.initial_max_data);
+    try testing.expectEqual(@as(u64, 8 * 1024), parsed.initial_max_stream_data_bidi_remote);
+    try testing.expectEqual(@as(u64, 2), parsed.initial_max_streams_bidi);
+    try testing.expectEqual(@as(u64, TestConnection.datagram_octets), parsed.max_udp_payload_size);
+
+    // And the client, once it has seen the server's Initial, takes them.
+    server.cryptoConsumed(.initial, server.cryptoOut(.initial).len);
+    try server.cryptoIn(.initial, "ServerHello");
+    _ = try deliver(&server, &client, 1000);
+    try client.transportParametersIn(octets);
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9000#section-7.3
+//# If it sends a Retry packet, a
+//# server also includes the Source Connection ID field from the Retry
+//# packet in the retry_source_connection_id transport parameter.
+//= type=test
+//
+//= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.2
+//# As long as it is not possible for an attacker to generate a valid
+//# token for its own address (see Section 8.1.4) and the client is able
+//# to return that token, it proves to the server that it received the
+//# token.
+//= type=test
+test "after a Retry the server repeats both identifiers, and its address is validated" {
+    var client = testClient();
+    try client.cryptoIn(.initial, "ClientHello");
+    var first: [TestConnection.datagram_octets]u8 = undefined;
+    const first_octets = try client.send(&first, 0);
+    const probe = endpoint_module.classify(first[0..first_octets], server_source.len);
+    try testing.expect(probe.mayStart());
+    try testing.expectEqual(@as(usize, 0), probe.token.len);
+
+    // The consumer's Retry. Its token here is the original identifier in the
+    // clear, which a real server would authenticate; this package never reads
+    // it, which is the point.
+    const retry_source = ConnectionId.init(&.{ 0xee, 0xdd, 0xcc, 0xbb, 0xaa, 0x99, 0x88, 0x77 }) catch unreachable; // Eight octets.
+    var retry: [256]u8 = undefined;
+    var scratch: [512]u8 = undefined;
+    const retry_octets = try endpoint_module.writeRetry(crypto.backend.Std, &retry, &scratch, &probe, retry_source, &client_cid);
+    try client.receive(retry[0..retry_octets], 100);
+    try testing.expect(client.retry_seen);
+
+    var second: [TestConnection.datagram_octets]u8 = undefined;
+    const second_octets = try client.send(&second, 200);
+    const retried = endpoint_module.classify(second[0..second_octets], server_source.len);
+    try testing.expectEqual(endpoint_module.Action.initial, retried.action);
+    try testing.expectEqualSlices(u8, &client_cid, retried.token);
+    try testing.expectEqualSlices(u8, retry_source.bytes(), retried.destination.bytes());
+
+    var server = testServerFrom(&retried, .{ .original_destination = try ConnectionId.init(retried.token) });
+    try testing.expect(server.addressValidated());
+    try server.receive(second[0..second_octets], 200);
+    try testing.expectEqualStrings("ClientHello", server.cryptoOut(.initial));
+
+    var buffer: [TestConnection.local_transport_parameters_octets_max]u8 = undefined;
+    const octets = try server.localTransportParameters(&buffer);
+    const parsed = try transport_parameters.parse(octets);
+    try testing.expectEqualSlices(u8, &client_cid, parsed.original_destination_connection_id.?.bytes());
+    try testing.expectEqualSlices(u8, retry_source.bytes(), parsed.retry_source_connection_id.?.bytes());
+
+    server.cryptoConsumed(.initial, server.cryptoOut(.initial).len);
+    try server.cryptoIn(.initial, "ServerHello");
+    _ = try deliver(&server, &client, 300);
+    try client.transportParametersIn(octets);
+
+    // A server that forgot the Retry repeats the wrong original identifier
+    // and none for the Retry, and the client refuses on the first of the two.
+    var forgetful = testServerFrom(&retried, null);
+    const wrong = try forgetful.localTransportParameters(&buffer);
+    var other = testClient();
+    other.retry_seen = true;
+    other.retry_source = retry_source;
+    try testing.expectError(error.Malformed, other.transportParametersIn(wrong));
+}
+
+/// Room for a server flight past three times a client's first datagram, which
+/// a 4 KiB crypto buffer is not: the amplification tests need the limit to be
+/// what stops the sender, not the buffer.
+const FlightConnection = Connection(.{
+    .crypto_octets = 16 * 1024,
+    .ack_ranges_max = 8,
+    .sent_max = 32,
+    .streams_max = 4,
+    .stream_receive_octets = 8 * 1024,
+    .stream_send_octets = 8 * 1024,
+    .connection_receive_octets = 32 * 1024,
+});
+
+fn flightClient() FlightConnection {
+    return .init(.{
+        .side = .client,
+        .original_destination = ConnectionId.init(&client_cid) catch unreachable, // Eight octets.
+        .source = ConnectionId.init(&client_source) catch unreachable, // Four octets.
+    });
+}
+
+fn flightServer(datagram: *const endpoint_module.Datagram, retry: ?FlightConnection.Retried) FlightConnection {
+    return FlightConnection.initServer(.{
+        .initial_destination = datagram.destination,
+        .source = ConnectionId.init(&server_source) catch unreachable, // Eight octets.
+        .retry = retry,
+        .advertised = .{ .max_streams_bidirectional = 2, .max_streams_unidirectional = 2 },
+    }) catch unreachable; // Four streams in a four-slot table, and no reused identifier.
+}
+
+fn flightHandshakeKeys(server: *FlightConnection, client: *FlightConnection) !void {
+    const raw: [32]u8 = @splat(0x11);
+    const secret = try crypto.secrets.Secret.init(&raw);
+    try server.installSecret(.handshake, .send, &secret, .aes_128_gcm_sha256);
+    try client.installSecret(.handshake, .receive, &secret, .aes_128_gcm_sha256);
+}
+
+/// Everything the server will send at one instant, in octets.
+fn flightDrain(server: *FlightConnection) !u64 {
+    var out: [FlightConnection.datagram_octets]u8 = undefined;
+    var total: u64 = 0;
+    for (0..64) |_| {
+        const written = try server.send(&out, 1000);
+        if (written == 0) break;
+        total += written;
+    }
+    return total;
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9000#section-8.1
+//# Prior to validating the client address, servers MUST NOT send more
+//# than three times as many bytes as the number of bytes they have
+//# received.
+//= type=test
+test "section 8.1: a validated Retry lifts the amplification limit, and without one it binds" {
+    const flight: [8000]u8 = @splat(0x5f);
+    for ([_]bool{ false, true }) |retried| {
+        var client = flightClient();
+        try client.cryptoIn(.initial, "ClientHello");
+        var first: [FlightConnection.datagram_octets]u8 = undefined;
+        const octets = try client.send(&first, 0);
+        const datagram = endpoint_module.classify(first[0..octets], server_source.len);
+        // The validation itself is the consumer's: here, a token it accepted.
+        var server = flightServer(&datagram, if (retried)
+            .{ .original_destination = ConnectionId.init(&.{ 1, 2, 3, 4, 5, 6, 7, 8 }) catch unreachable } // Eight octets.
+        else
+            null);
+        try server.receive(first[0..octets], 0);
+        try flightHandshakeKeys(&server, &client);
+        try server.cryptoIn(.initial, "ServerHello");
+        try server.cryptoIn(.handshake, &flight);
+
+        const total = try flightDrain(&server);
+        const handshake = &server.levels[@backingInt(Level.handshake)];
+        if (retried) {
+            // Everything went out, well past three times what arrived.
+            try testing.expectEqual(@as(u32, flight.len), handshake.framed);
+            try testing.expect(total > amplification_factor * octets);
+        } else {
+            // Stopped by the limit rather than by the flight running out.
+            try testing.expect(total <= amplification_factor * octets);
+            try testing.expect(handshake.framed < flight.len);
+            try testing.expect(!server.wantsSend());
+        }
+    }
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9000#section-8.1
+//# For the purposes of
+//# avoiding amplification prior to address validation, servers MUST
+//# count all of the payload bytes received in datagrams that are
+//# uniquely attributed to a single connection.
+//= type=test
+test "section 8.1: a first flight of two datagrams buys allowance for both" {
+    // A ClientHello past one datagram — a post-quantum key share is enough —
+    // arrives as two Initials, both addressed to the identifier the client
+    // drew, and both are this connection's to count.
+    var client = flightClient();
+    const hello: [1800]u8 = @splat(0x48);
+    try client.cryptoIn(.initial, &hello);
+    var datagrams: [2][FlightConnection.datagram_octets]u8 = undefined;
+    var lengths: [2]usize = undefined;
+    for (&datagrams, &lengths) |*datagram, *length| length.* = try client.send(datagram, 0);
+    try testing.expect(lengths[1] >= initial_datagram_min);
+
+    const first = endpoint_module.classify(datagrams[0][0..lengths[0]], server_source.len);
+    const second = endpoint_module.classify(datagrams[1][0..lengths[1]], server_source.len);
+    // Both route to the same connection, by the same identifier.
+    try testing.expect(first.destination.eql(&second.destination));
+    try testing.expectEqual(endpoint_module.Action.initial, second.action);
+
+    var server = flightServer(&first, null);
+    try server.receive(datagrams[0][0..lengths[0]], 0);
+    try server.receive(datagrams[1][0..lengths[1]], 0);
+    try testing.expectEqual(@as(u64, lengths[0] + lengths[1]), server.received_octets);
+    try testing.expectEqual(hello.len, server.cryptoOut(.initial).len);
+
+    // So the server may send past what the first datagram alone allowed, and
+    // no further than both together do.
+    try flightHandshakeKeys(&server, &client);
+    server.cryptoConsumed(.initial, hello.len);
+    try server.cryptoIn(.initial, "ServerHello");
+    const flight: [12000]u8 = @splat(0x5f);
+    try server.cryptoIn(.handshake, &flight);
+    const total = try flightDrain(&server);
+    try testing.expect(total > amplification_factor * lengths[0]);
+    try testing.expect(total <= amplification_factor * (lengths[0] + lengths[1]));
+}
+
+test "what a consumer advertises is checked against what the connection holds" {
+    const valid: TestConnection.Advertised = .{ .max_streams_bidirectional = 2, .max_streams_unidirectional = 1, .streams_opened_max = 1 };
+    try TestConnection.validateAdvertised(.server, valid);
+    // Four slots: two and one for the peer and one of its own fit, and one
+    // more of either kind does not.
+    var crowded = valid;
+    crowded.streams_opened_max = 2;
+    try testing.expectError(error.StreamsExceedTable, TestConnection.validateAdvertised(.server, crowded));
+    var small = valid;
+    small.max_udp_payload_size = 1199;
+    try testing.expectError(error.UdpPayloadTooSmall, TestConnection.validateAdvertised(.server, small));
+    var token = valid;
+    token.stateless_reset_token = @splat(1);
+    try testing.expectError(error.ClientResetToken, TestConnection.validateAdvertised(.client, token));
+    try TestConnection.validateAdvertised(.server, token);
+    var idle = valid;
+    idle.max_idle_timeout_ms = varint.max + 1;
+    try testing.expectError(error.ValueTooLarge, TestConnection.validateAdvertised(.server, idle));
+
+    // And a Retry naming the identifier it was supposed to replace.
+    const same = ConnectionId.init(&client_cid) catch unreachable; // Eight octets.
+    try testing.expectError(error.RetryIdentifierReused, TestConnection.initServer(.{
+        .initial_destination = same,
+        .source = ConnectionId.init(&server_source) catch unreachable, // As above.
+        .retry = .{ .original_destination = same },
+        .advertised = valid,
+    }));
+}
+
+test "the transport parameters bound holds at every field's widest" {
+    var server = try TestConnection.initServer(.{
+        .initial_destination = ConnectionId.init(&@as([20]u8, @splat(1))) catch unreachable, // Twenty octets.
+        .source = ConnectionId.init(&@as([20]u8, @splat(2))) catch unreachable, // As above.
+        .retry = .{ .original_destination = ConnectionId.init(&@as([20]u8, @splat(3))) catch unreachable }, // As above.
+        .advertised = .{
+            .max_idle_timeout_ms = varint.max,
+            .stateless_reset_token = @splat(4),
+            .max_streams_bidirectional = 2,
+            .max_streams_unidirectional = 2,
+            .max_udp_payload_size = varint.max,
+        },
+    });
+    var buffer: [TestConnection.local_transport_parameters_octets_max]u8 = undefined;
+    const octets = try server.localTransportParameters(&buffer);
+    try testing.expect(octets.len <= TestConnection.local_transport_parameters_octets_max);
+    _ = try transport_parameters.parse(octets);
 }

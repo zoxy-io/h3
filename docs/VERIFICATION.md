@@ -22,7 +22,7 @@ particular list.
 the part worth reading. The ledger, the simulator, the event queue, the interop
 shim and h3spec were built to catch the eleven classes in the first table; they
 did, and they also caught classes nobody had written down. The second table is
-sixty-two rows against the first table's eleven, because a gate's real yield
+sixty-three rows against the first table's eleven, because a gate's real yield
 is only knowable after it runs.
 
 Each finding, with the gate that would have caught it first:
@@ -130,6 +130,7 @@ requirement list extracted from the specification.
 | MAX_DATA and MAX_STREAM_DATA were framed without marking the packet ack-eliciting, so one carrying nothing else was recorded as acknowledgement-only: not in flight, never a probe's target, arming no PTO. Its loss could only be declared once a *later* packet was acknowledged — and a receiver that has just reopened its window and has nothing else to say sends none. Fixing it exposed a second defect: `rollback` re-owed every cursor `writePayload` commits except the flow-control ones, so a packet that failed to seal after framing a window update left the limit recorded as sent | reading `writePayload` while fixing the row above | The peer classifies frames with `frame.Type.ackEliciting` and acknowledged these packets correctly; only the sender's own accounting disagreed, and an acknowledgement-only packet that happens to be acknowledged looks exactly like a correct one |
 | `wantsSend` answered true while `send` built nothing: stream data, HANDSHAKE_DONE and CRYPTO queued behind a full congestion window or recovery table, and an unvalidated server with a few octets of amplification allowance — more than zero, less than any packet — and a probe owed. An event loop polling the pair never sleeps. The first fix tested the room below the closing state's early return, so a server that closed near its limit still spun | a new simulator oracle, written before the fix, which failed five of the first ten seeds; the closing case by review, since the sweep rarely closes an unvalidated server | Every other oracle watches what goes on the wire, and nothing went on the wire. The flow-control half of the same disagreement had been fixed already, and its comment named the spin; the fix gated the frames it was looking at and not the ones beside them |
 | A RESET_STREAM released connection credit up to its final size, octets already buffered included, and left those octets readable — so an application that read them released them a second time. `consumed_total` passed `received_total`: an assertion in the builds with assertions on, reachable by any peer that sends data and then resets, and in the `-Dassertions=false` one a connection window that grew by what the peer sent first | `zig build fuzz --fuzz`, the streams target, in its second two-minute run | The regression mode draws one input per target and the unit tests reset streams they had already drained; it needs data, a reset and then a read, in that order. The first run found a harness defect on the same target instead — it acknowledged octets that were never written, which `acknowledge` asserts against — and fixing that is what let the second run reach this |
+| `sim/` handed both endpoints one hand-built transport parameters extension carrying `original_destination_connection_id`, which a client may not send, so the server refused the client's copy with `ServerOnlyParameter` — and the `catch return` after it skipped the limits the harness set by hand next. In every seed, the server never applied a limit the client granted | replacing the extension with each side's own `localTransportParameters` | The server writes no data in the sweep, so limits it never learned were limits nothing tested; and a harness that swallows the error from the call it exists to exercise reports success either way, which is §1's recurring failure mode in one line |
 
 Two things about that table.
 
@@ -192,7 +193,7 @@ that crossing, and §5.2 is what it became.
 | `zig build lint` | No I/O, no allocator, no unbounded loop | Nothing about behaviour |
 | The `tiger-style-reviewer` agent | Assertion density, function length, named bounds | It is a reader, not a gate: it found the twenty above, and it will not find the same class twice at the same cost |
 | `zig build requirements` | That every RFC quote in the source is in the section it cites, that every exception states a reason, and that no `//=` URL is silently unreadable | Coverage — the sentence extraction is a heuristic, so the count is a trend rather than a threshold. And "cited" is not "correct": a citation says someone looked, not that they were right |
-| `zig build sim` | 256 seeded runs of two connections over a modelled link — loss, reordering, duplication, MTU changes, clock jumps, a late reader, key updates, and on a third of seeds an adversary that replays, truncates and corrupts — with eight oracles and a 27-row census that fails the sweep when a required behaviour goes unreached | Anything no oracle states, and any fault that lives *inside* the library: a `seal` that fails and a send buffer that is too small are not things a harness can inject, because no caller can produce them. It also enters the state the flow-control deadlock lived in and does not reproduce it — removing both fixes leaves 256 of 256 seeds passing |
+| `zig build sim` | 256 seeded runs of two connections over a modelled link — loss, reordering, duplication, MTU changes, clock jumps, a late reader, key updates, a Retry on a quarter of seeds, and on a third of seeds an adversary that replays, truncates and corrupts — with eight oracles and a 30-row census that fails the sweep when a required behaviour goes unreached | Anything no oracle states, and any fault that lives *inside* the library: a `seal` that fails and a send buffer that is too small are not things a harness can inject, because no caller can produce them. It also enters the state the flow-control deadlock lived in and does not reproduce it — removing both fixes leaves 256 of 256 seeds passing |
 | The interop shim, against quic-go: 9 of 9 as a client, 8 of 8 as a server | That two independent implementations of the same RFCs agree over a lossy link, on the cases the runner has | Only what the runner tests — nine named scenarios, not a specification. And it is run by hand: `interop.yml` builds the shims and stops |
 | h3spec, 49 of 49 | That 49 specific violations are answered with the specific error code the RFC names | The positive path — every case is a negative one. Run by hand, like the interop matrix |
 | `zig build corpus` | RFC 9001 appendix A's worked packets octet for octet — key schedule, AEAD, nonce, sampling offset and mask, right at once — and QPACK field sections four other encoders produced | Anything after the first flight; and only the capacity-zero QPACK encodings, because the decoder is static-table-only |
@@ -368,7 +369,7 @@ and cursors before `seal` was known to succeed, still has no gate.
 number, so no two nights sweep the same one. `--seed N` replays a failure;
 `--from N` chooses a range.
 
-The census is the half that keeps the sweep honest: 24 rows counting behaviours
+The census is the half that keeps the sweep honest: 30 rows counting behaviours
 the seeds reached, merged by an `inline for` over the census's own fields so a
 new counter cannot be forgotten, and a required row at zero **fails** the
 sweep. Which rows are required is declared in `sim/`'s census and nowhere else,
@@ -512,8 +513,11 @@ failure, not a measurement anything takes.
   §5.2 records as not expressible from a harness. They need a fault-injecting
   build of `src/`, and until one exists §1's `writePayload` finding has no
   gate.
-- **Two census rows planned and not built**: a FIN must be retransmitted, and a
-  Retry must be honoured. Neither is among the 24.
+- **One census row planned and not built**: a FIN must be retransmitted. The
+  other, a Retry must be honoured, is "handshakes after a Retry" and is
+  required: the harness is the server's consumer, classifies every datagram
+  the way a server routes, and on a quarter of seeds answers the first Initial
+  with a Retry and starts the connection from the Initial that returns it.
 - **An adversary that forges an Initial** and spoofs a source address.
   `sim/main.zig` says outright that it does not model this, and §1's
   connection-identifier finding is the one it was named for.

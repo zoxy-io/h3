@@ -157,6 +157,10 @@ const adversary_budget_max: u32 = 24;
 /// Not all of them: a behaviour every seed reaches is one no seed can be
 /// compared against.
 const adversary_seed_period: u8 = 3;
+/// One seed in this many answers the client's first Initial with a Retry, as
+/// a server under pressure would. A quarter rather than all: a behaviour every
+/// seed takes is one no seed can be compared against.
+const retry_seed_period: u8 = 4;
 const reader_seed_period: u8 = 3;
 
 /// The most steps a late reader waits between drains, and how far the clock
@@ -188,6 +192,10 @@ const server_flight: [2600]u8 = @splat(0xa5);
 /// datagram oracle needs the *peer's* length to walk a short header.
 const client_source = [_]u8{ 0x01, 0x02, 0x03, 0x04 };
 const server_source = [_]u8{ 0xf0, 0x67, 0xa5, 0x50, 0x2a, 0x42, 0x62, 0xb5 };
+/// The identifier a Retry asks the client to address next. Not `server_source`:
+/// the server may choose a different one for the connection itself, and doing
+/// so here is what makes section 7.3's three identifiers three.
+const retry_source = [_]u8{ 0x5e, 0x77, 0x1e, 0x55, 0x00, 0xc0, 0xff, 0xee };
 
 const Census = struct {
     runs: u64 = 0,
@@ -277,6 +285,16 @@ const Census = struct {
     /// window update with nothing sent after it is repaired by the PTO" is
     /// what pins the window update itself.
     flow_control_alone_in_flight: u64 = 0,
+    /// Retries the harness sent as the server's consumer, and handshakes that
+    /// completed on a connection started from the Initial that brought the
+    /// token back. The second is the row docs/VERIFICATION.md section 5 listed
+    /// as planned and not built: "a Retry must be honoured".
+    retries_sent: u64 = 0,
+    handshakes_after_retry: u64 = 0,
+    /// First Initials a server was started from and then discarded because
+    /// the datagram did not authenticate — the adversary's work, mostly, and
+    /// what a consumer that creates state only for an Initial that opens does.
+    starts_abandoned: u64 = 0,
 
     /// The counters that must move somewhere in a sweep. A zero here means the
     /// sweep did not reach the behaviour, so any confidence drawn from it about
@@ -372,6 +390,11 @@ const Census = struct {
                 return c.clock_jumps;
             }
         }.get },
+        .{ .name = "handshakes after a Retry", .get = struct {
+            fn get(c: *const Census) u64 {
+                return c.handshakes_after_retry;
+            }
+        }.get },
     };
 };
 
@@ -427,7 +450,15 @@ const World = struct {
     step: u32 = 0,
 
     client: Connection,
+    /// Not a connection until the first Initial that may start one arrives and
+    /// opens: the harness is the server's consumer, and a consumer builds a
+    /// connection from what `endpoint.classify` read off the wire rather than
+    /// from what it expects. Until then this holds a placeholder that has
+    /// nothing to send.
     server: Connection,
+    server_started: bool = false,
+    /// Whether this seed's server answers the first Initial with a Retry.
+    retry: bool = false,
     /// Client to server, then server to client.
     to_server: Link,
     to_client: Link,
@@ -534,6 +565,7 @@ fn buildWorld(seed: u64) World {
             .side = .client,
             .original_destination = ConnectionId.init(&client_cid) catch unreachable, // Eight octets.
             .source = ConnectionId.init(&client_source) catch unreachable, // Four octets.
+            .advertised = client_advertised,
         }),
         .server = .init(.{
             .side = .server,
@@ -575,6 +607,7 @@ fn buildWorld(seed: u64) World {
     if (random.uintLessThan(u8, reader_seed_period) == 0) {
         world.read_every = 1 + random.uintLessThan(u32, read_every_max);
     }
+    world.retry = random.uintLessThan(u8, retry_seed_period) == 0;
     // Content that a partial or reordered delivery cannot accidentally satisfy.
     for (&world.payload, 0..) |*octet, index| octet.* = @truncate(index *% 31 +% 7);
     world.prng = prng;
@@ -620,49 +653,54 @@ fn driveHandshake(world: *World) void {
         world.server.confirmHandshake();
         world.client_installed = 2;
         world.census.handshakes_completed += 1;
+        if (world.retry) {
+            // The client took exactly the one Retry, and the server it is
+            // talking to was built from the Initial that brought its token back.
+            if (!world.client.retry_seen) fail(world, "a Retry seed completed a handshake without a Retry", 0);
+            world.census.handshakes_after_retry += 1;
+        }
     }
 }
 
-/// Section 7.4: the limits each endpoint grants the other, carried in the TLS
-/// extension. Encoded and fed through `transportParametersIn` rather than
-/// poked into the streams directly, because that is the path a consumer takes
-/// and it is where section 4.6's stream limits are applied — a simulation that
-/// set the limits by hand would never exercise it.
-fn exchangeTransportParameters(world: *World) void {
-    // Section 7.3's identifiers are required of both roles, and a server must
-    // also echo the client's original Destination Connection ID. The exchange
-    // is symmetric here because the fake handshake is, so the encoding carries
-    // both and each side validates the other's.
-    const parameters: quic.transport_parameters.Parameters = .{
-        .initial_source_connection_id = ConnectionId.init(&.{ 0xf0, 0x67, 0xa5, 0x50, 0x2a, 0x42, 0x62, 0xb5 }) catch unreachable, // Eight octets.
-        .original_destination_connection_id = ConnectionId.init(&.{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 }) catch unreachable, // As above.
-        // The windows this connection actually has, not larger ones. These
-        // were 1 MiB and 256 KiB against buffers of 64 KiB and 16 KiB, which is
-        // a promise the receiver cannot keep: the sender is permitted past the
-        // window and takes a FLOW_CONTROL_ERROR for doing what it was told it
-        // could. A harness misconfiguration scored against the library — and,
-        // because a connection error exempts a run from the transfer oracle,
-        // one that hid itself.
-        .initial_max_data = connection_receive_octets,
-        .initial_max_stream_data_bidi_local = stream_receive_octets,
-        .initial_max_stream_data_bidi_remote = stream_receive_octets,
-        .initial_max_stream_data_uni = stream_receive_octets,
-        .initial_max_streams_bidi = 8,
-        .initial_max_streams_uni = 8,
-    };
-    var encoded: [512]u8 = undefined;
-    const written = quic.transport_parameters.encode(&encoded, &parameters) catch return;
-    world.client.transportParametersIn(encoded[0..written]) catch return;
-    world.server.transportParametersIn(encoded[0..written]) catch return;
+/// What each endpoint advertises beyond `config`. The eight-slot table holds
+/// the peer's streams and the endpoint's own: the client opens one request
+/// stream, so it offers the server seven; the server opens none and offers
+/// the client all eight.
+const client_advertised: Connection.Advertised = .{
+    .max_streams_bidirectional = 3,
+    .max_streams_unidirectional = 4,
+    .streams_opened_max = 1,
+};
+const server_advertised: Connection.Advertised = .{
+    .max_streams_bidirectional = 4,
+    .max_streams_unidirectional = 4,
+};
 
-    // The data windows are the consumer's seam — `Connection` deliberately
-    // applies only the stream limits from the extension, leaving MAX_DATA and
-    // MAX_STREAM_DATA to drive the rest. See `transportParametersIn`.
-    world.client.streams.setConnectionSendLimit(parameters.initial_max_data);
-    world.server.streams.setConnectionSendLimit(parameters.initial_max_data);
-    const stream = quic.stream_id.make(.client_bidirectional, 0);
-    world.client.streams.setSendLimit(stream, parameters.initial_max_stream_data_bidi_remote) catch {};
-    world.server.streams.setSendLimit(stream, parameters.initial_max_stream_data_bidi_remote) catch {};
+/// Section 7.4: the limits each endpoint grants the other, carried in the TLS
+/// extension. Each side's own, from `localTransportParameters`, and fed through
+/// `transportParametersIn` on the other, which is the path a consumer takes and
+/// the one where section 4.6's stream limits and section 4.1's initial windows
+/// are applied.
+///
+/// It used to be one hand-built extension handed to both sides, carrying
+/// `original_destination_connection_id` — a server-only parameter — so the
+/// server refused the client's copy with `ServerOnlyParameter`, and the
+/// `catch return` that followed skipped the rest. The server never applied a
+/// single limit the client granted, in any seed, and nothing noticed because
+/// the server writes no data.
+fn exchangeTransportParameters(world: *World) void {
+    var client_parameters: [Connection.local_transport_parameters_octets_max]u8 = undefined;
+    var server_parameters: [Connection.local_transport_parameters_octets_max]u8 = undefined;
+    const from_client = world.client.localTransportParameters(&client_parameters) catch unreachable; // Sized by `local_transport_parameters_octets_max`.
+    const from_server = world.server.localTransportParameters(&server_parameters) catch unreachable; // As above.
+    world.server.transportParametersIn(from_client) catch |err| {
+        fail(world, "the server refused the client's own transport parameters", @intFromError(err));
+        return;
+    };
+    world.client.transportParametersIn(from_server) catch |err| {
+        fail(world, "the client refused the server's own transport parameters", @intFromError(err));
+        return;
+    };
 }
 
 fn installBoth(world: *World, level: Level, seed: u8) void {
@@ -913,6 +951,83 @@ fn checkInvariants(world: *World) void {
     }
 }
 
+/// The server's consumer: the first Initial that may start a connection does,
+/// once it has opened — after a Retry, on seeds that ask for one — and every
+/// datagram after that goes to the connection.
+///
+/// Classified first, as a server routes, even though there is only ever the
+/// one connection here: what `endpoint.classify` decides is what a consumer
+/// acts on, and a datagram it drops is one the connection never sees.
+fn deliverToServer(world: *World, datagram: []u8, random: std.Random) void {
+    if (!world.server_started) {
+        // The first datagram is delivered inside `startServer`, which is what
+        // decides whether there is a connection to deliver it to.
+        _ = startServer(world, datagram, random);
+        return;
+    }
+    world.server.receive(datagram, world.now_ns) catch |err| recordClose(world, err);
+}
+
+/// Start the server from a first Initial, or answer it with a Retry on a seed
+/// that asks for one. The token the harness puts in a Retry is the identifier
+/// the client used first, in the clear: a real server authenticates it, and
+/// this package never reads it, so the harness need not.
+fn startServer(world: *World, datagram: []u8, random: std.Random) bool {
+    const classified = quic.endpoint.classify(datagram, server_source.len);
+    if (!classified.mayStart()) return false;
+    var retried: ?Connection.Retried = null;
+    if (world.retry) {
+        if (classified.token.len == 0) {
+            sendRetry(world, &classified, random);
+            return false;
+        }
+        const original = ConnectionId.init(classified.token) catch return false;
+        retried = .{ .original_destination = original };
+    }
+    world.server = Connection.initServer(.{
+        .initial_destination = classified.destination,
+        .source = ConnectionId.init(&server_source) catch unreachable, // Eight octets.
+        .retry = retried,
+        .advertised = server_advertised,
+    }) catch |err| {
+        fail(world, "the harness could not start a server", @intFromError(err));
+        return false;
+    };
+    const result = world.server.receive(datagram, world.now_ns);
+    // State only for an Initial that opened: an adversary's corrupted copy of
+    // the first flight classifies as an Initial and authenticates nothing, and
+    // its error belongs to no connection, so it is not a close to record.
+    if (!world.server.peer_initial_processed) {
+        world.census.starts_abandoned += 1;
+        return false;
+    }
+    world.server_started = true;
+    result catch |err| recordClose(world, err);
+    if (world.retry) assert(world.server.addressValidated());
+    assert(world.server.peer_source != null);
+    return true;
+}
+
+/// Section 8.1.2's Retry, built from the classified Initial with the same
+/// backend the connections use.
+fn sendRetry(world: *World, classified: *const quic.endpoint.Datagram, random: std.Random) void {
+    var retry: [Link.datagram_octets_max]u8 = undefined;
+    var scratch: [1024]u8 = undefined;
+    const written = quic.endpoint.writeRetry(
+        quic.crypto.backend.Std,
+        &retry,
+        &scratch,
+        classified,
+        ConnectionId.init(&retry_source) catch unreachable, // Eight octets.
+        classified.destination.bytes(),
+    ) catch |err| {
+        fail(world, "the harness could not write a Retry", @intFromError(err));
+        return;
+    };
+    world.census.retries_sent += 1;
+    world.to_client.send(retry[0..written], world.now_ns, random);
+}
+
 /// One step: deliver what is due, let both sides send, advance the clock.
 fn stepOnce(world: *World) bool {
     const random = world.prng.random();
@@ -923,9 +1038,7 @@ fn stepOnce(world: *World) bool {
 
     // Deliver everything due now, both directions.
     while (world.to_server.receive(world.now_ns, &datagram)) |received| {
-        world.server.receive(received, world.now_ns) catch |err| {
-            recordClose(world, err);
-        };
+        deliverToServer(world, received, random);
     }
     while (world.to_client.receive(world.now_ns, &datagram)) |received| {
         world.client.receive(received, world.now_ns) catch |err| {
@@ -1358,6 +1471,9 @@ fn printCensus(census: *const Census) void {
         .{ .name = "clock jumps", .value = census.clock_jumps },
         .{ .name = "steps with a full recovery table", .value = census.recovery_table_full },
         .{ .name = "flow control alone in flight", .value = census.flow_control_alone_in_flight },
+        .{ .name = "retries sent", .value = census.retries_sent },
+        .{ .name = "handshakes after a Retry", .value = census.handshakes_after_retry },
+        .{ .name = "server starts abandoned", .value = census.starts_abandoned },
     };
     for (rows) |row| std.debug.print("  {s:<32} {d}\n", .{ row.name, row.value });
 }

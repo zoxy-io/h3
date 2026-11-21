@@ -306,14 +306,12 @@ fn alertFor(err: tls.Error) u8 {
 
 /// Match a datagram to a connection by the Destination Connection ID it names.
 fn find(peers: []Peer, data: []const u8, from: Io.net.IpAddress) ?*Peer {
-    const parsed = quic.packet.parse(data, connection_id_octets) catch return null;
-    const destination = switch (parsed.header) {
-        .initial => |value| value.destination,
-        .handshake, .zero_rtt => |value| value.destination,
-        .retry => |value| value.destination,
-        .short => |value| value.destination,
-        else => return null,
-    };
+    const classified = quic.endpoint.classify(data, connection_id_octets);
+    switch (classified.action) {
+        .route, .initial => {},
+        .version_negotiation, .drop => return null,
+    }
+    const destination = classified.destination;
     // Bounded by the table.
     for (peers) |*peer| {
         if (!peer.live) continue;
@@ -339,35 +337,24 @@ fn accept(
     parameters_buffer: []u8,
     shared: *const Shared,
 ) !?*Peer {
-    const parsed = quic.packet.parse(message.data, connection_id_octets) catch |err| {
-        if (shared.verbose) try note(log, "parse of {d} octets: {s}", .{ message.data.len, @errorName(err) });
-        return null;
-    };
-
-    // RFC 9000 section 6.1: a long header in a version this endpoint does not
-    // implement is answered with the list of versions it does. Not optional for
-    // a server, and not only for politeness — the interop runner's network
-    // simulator will not start a test until the server answers exactly this
-    // probe, so a server that ignores it fails every case before the first
-    // packet of the first handshake.
-    //
-    // The datagram floor is section 14.1's, applied here for the reason section
-    // 6.1 gives: a Version Negotiation packet is larger than the packet that
-    // provokes it, so answering a small one is an amplification vector.
-    if (parsed.header == .unsupported_version) {
-        const unsupported = parsed.header.unsupported_version;
-        if (message.data.len >= 1200) {
-            try sendVersionNegotiation(io, log, socket, message, unsupported, shared);
-        }
-        return null;
+    // RFC 9000's rules for a datagram no connection holds are the library's
+    // now: an Initial counts only in a datagram of 1200 octets, an unknown
+    // version is answered only at that size too (section 6.1's amplification
+    // argument), and a Version Negotiation packet or a Retry is never one to
+    // answer. Only an Initial may start a connection.
+    const datagram = quic.endpoint.classify(message.data, connection_id_octets);
+    switch (datagram.action) {
+        .version_negotiation => {
+            try sendVersionNegotiation(io, log, socket, message, &datagram, shared);
+            return null;
+        },
+        .initial => {},
+        .route, .drop => {
+            if (shared.verbose) try note(log, "nothing to start from {d} octets ({t})", .{ message.data.len, datagram.action });
+            return null;
+        },
     }
-
-    // Only an Initial starts a connection. Everything else addressed to an
-    // identifier this endpoint does not hold is a packet for a connection that
-    // is over, and section 10.3's stateless reset is the answer this package
-    // does not have.
-    if (parsed.header != .initial) return null;
-    const initial = parsed.header.initial;
+    if (!datagram.mayStart()) return null;
 
     var seed: [96]u8 = undefined;
     try io.randomSecure(&seed);
@@ -377,16 +364,17 @@ fn accept(
     // for it. The identifier the transport parameters must repeat is the one
     // from *before* the Retry, and after a Retry the packet no longer carries
     // it — so it travels inside the token and comes back here.
-    var original = initial.destination;
+    var retried: ?Connection.Retried = null;
     if (shared.retry) {
-        if (initial.token.len == 0) {
-            try sendRetry(io, log, socket, message, initial, source, shared);
+        if (datagram.token.len == 0) {
+            try sendRetry(io, log, socket, message, &datagram, source, shared);
             return null;
         }
-        original = validateToken(initial.token, message.from, shared) orelse {
+        const original = validateToken(datagram.token, message.from, shared) orelse {
             if (shared.verbose) try note(log, "a token that does not authenticate", .{});
             return null;
         };
+        retried = .{ .original_destination = original };
     }
 
     const slot = free: {
@@ -421,34 +409,35 @@ fn accept(
     };
 
     slot.* = .{
-        .connection = .init(.{
-            .side = .server,
-            // RFC 9001 section 5.2: the Initial keys come from the Destination
-            // Connection ID of the packet that just arrived — the client's own
-            // choice on a first flight, and *this server's* Retry Source
-            // Connection ID on a retried one. `original` above is the other
-            // value, the one section 7.3 has the transport parameters repeat.
-            .original_destination = initial.destination,
+        // RFC 9001 section 5.2: the Initial keys come from the Destination
+        // Connection ID of the packet that just arrived — the client's own
+        // choice on a first flight, and *this server's* Retry Source
+        // Connection ID on a retried one. `retried` carries the other value,
+        // the one section 7.3 has the transport parameters repeat.
+        .connection = try Connection.initServer(.{
+            .initial_destination = datagram.destination,
             .source = source,
+            .retry = retried,
+            .advertised = .{
+                // The same number `idle_ns` retires on, so what this server
+                // does is what it said it would do. It advertised nothing
+                // while dropping connections after five seconds, which is a
+                // server telling its peer the connection never times out and
+                // then behaving as though it does.
+                .max_idle_timeout_ms = @divExact(idle_ns, std.time.ns_per_ms),
+                // What the stream layer enforces: the table is shared between
+                // four kinds of stream, so `streams_max` is never the per-kind
+                // limit.
+                .max_streams_bidirectional = requests_max,
+                .max_streams_unidirectional = unidirectional_max,
+                // Control and QPACK's two.
+                .streams_opened_max = 3,
+            },
         }),
-        .server = .init(.{
-            .certificates = shared.certificates,
-            .private_key = shared.private_key,
-            // `h3` for h3spec, and `hq-interop` so the same binary answers the
-            // interop runner's HTTP/0.9 cases.
-            .protocols = &.{ "h3", "hq-interop" },
-            .transport_parameters = try transportParameters(
-                parameters_buffer,
-                source,
-                original,
-                if (shared.retry) initial.destination else null,
-            ),
-            .random = seed[0..32].*,
-            .key_seed = seed[32..64].*,
-        }),
+        .server = undefined,
         .http3 = .init(.server),
         .local = source,
-        .original = initial.destination,
+        .original = datagram.destination,
         .address = message.from,
         .started_ns = now_ns,
         .last_ns = now_ns,
@@ -463,15 +452,22 @@ fn accept(
         .trace = .{},
         .live = true,
     };
+    // The extension is the connection's own, built from what it enforces, so
+    // it is encoded once the connection exists and handed to the TLS engine.
+    slot.server = .init(.{
+        .certificates = shared.certificates,
+        .private_key = shared.private_key,
+        // `h3` for h3spec, and `hq-interop` so the same binary answers the
+        // interop runner's HTTP/0.9 cases.
+        .protocols = &.{ "h3", "hq-interop" },
+        .transport_parameters = try slot.connection.localTransportParameters(parameters_buffer),
+        .random = seed[0..32].*,
+        .key_seed = seed[32..64].*,
+    });
     // Named for the client's original Destination Connection ID, which is the
     // value both endpoints agree on before either has chosen anything — so a
     // client's trace and this one can be put side by side.
-    slot.trace.start(io, shared.qlog, initial.destination.bytes(), .server);
-    // The same numbers the transport parameters above carry. The stream layer
-    // enforces what was advertised and grants more as streams retire, and it
-    // cannot know what a consumer chose to offer: the table is shared between
-    // four kinds of stream, so `streams_max` is never the per-kind limit.
-    slot.connection.streams.setAdvertisedStreamLimits(requests_max, unidirectional_max);
+    slot.trace.start(io, shared.qlog, datagram.destination.bytes(), .server);
     try note(log, "accepted a connection as {x}", .{source.bytes()});
     return slot;
 }
@@ -487,27 +483,19 @@ fn rank(peer: *const Peer) u8 {
     };
 }
 
-/// The versions this endpoint speaks, which is one.
-const versions = [_]u32{quic.packet.version_1};
-
 /// Answer an unknown version with the list of known ones.
 fn sendVersionNegotiation(
     io: Io,
     log: *Io.Writer,
     socket: *Io.net.Socket,
     message: Io.net.IncomingMessage,
-    unsupported: @FieldType(quic.packet.Header, "unsupported_version"),
+    datagram: *const quic.endpoint.Datagram,
     shared: *const Shared,
 ) !void {
-    var datagram: [256]u8 = @splat(0);
-    const written = try quic.packet.writeVersionNegotiation(
-        &datagram,
-        unsupported.source,
-        unsupported.destination,
-        &versions,
-    );
-    try socket.send(io, &message.from, datagram[0..written]);
-    if (shared.verbose) try note(log, "version 0x{x} is not one of ours", .{unsupported.version});
+    var answer: [1 + 4 + 2 * 256 + 4 * quic.endpoint.supported_versions.len]u8 = undefined;
+    const written = try quic.endpoint.writeVersionNegotiation(&answer, datagram);
+    try socket.send(io, &message.from, answer[0..written]);
+    if (shared.verbose) try note(log, "version 0x{x} is not one of ours", .{datagram.version.?});
 }
 
 /// Answer a first flight with a Retry, and forget about it.
@@ -521,30 +509,24 @@ fn sendRetry(
     log: *Io.Writer,
     socket: *Io.net.Socket,
     message: Io.net.IncomingMessage,
-    initial: @FieldType(quic.packet.Header, "initial"),
+    datagram: *const quic.endpoint.Datagram,
     source: quic.ConnectionId,
     shared: *const Shared,
 ) !void {
-    // Section 17.2.5.1: the Source Connection ID a Retry carries must differ
-    // from the one the client addressed, and a client discards a Retry that
-    // breaks the rule. `source` is drawn fresh per datagram, so the only way
-    // they collide is chance at 2^-64 — and answering nothing is better than
-    // answering a packet the client will throw away.
-    if (source.eql(&initial.destination)) return;
-
     var token: [1 + quic.ConnectionId.octets_max + token_mac_octets]u8 = undefined;
-    const octets = makeToken(&token, initial.destination, message.from, shared);
+    const octets = makeToken(&token, datagram.destination, message.from, shared);
 
-    var datagram: [512]u8 = @splat(0);
+    var retry: [512]u8 = @splat(0);
     var scratch: [1024]u8 = undefined;
-    const written = try quic.packet.writeRetry(&datagram, &scratch, .{
-        .destination = initial.source,
-        .source = source,
-        .token = octets,
-        .original_destination = initial.destination,
-    });
-    try socket.send(io, &message.from, datagram[0..written]);
-    if (shared.verbose) try note(log, "retried {x} as {x}", .{ initial.destination.bytes(), source.bytes() });
+    // Section 17.2.5.1 forbids reusing the client's identifier, and `source`
+    // is drawn fresh per datagram, so a collision is chance at 2^-64 — and
+    // answering nothing is better than a packet the client will throw away.
+    const written = quic.endpoint.writeRetry(quic.crypto.backend.Std, &retry, &scratch, datagram, source, octets) catch |err| switch (err) {
+        error.SourceUnchanged => return,
+        else => return err,
+    };
+    try socket.send(io, &message.from, retry[0..written]);
+    if (shared.verbose) try note(log, "retried {x} as {x}", .{ datagram.destination.bytes(), source.bytes() });
 }
 
 /// `odcid_len || odcid || HMAC(key, odcid || address)`.
@@ -613,39 +595,6 @@ fn tokenMac(
     mac.final(out);
 }
 
-/// This endpoint's transport parameters. RFC 9000 section 7.3 has the client
-/// check both identifiers against the packets it saw.
-fn transportParameters(
-    target: []u8,
-    source: quic.ConnectionId,
-    original: quic.ConnectionId,
-    retry_source: ?quic.ConnectionId,
-) ![]const u8 {
-    const written = try quic.transport_parameters.encode(target, &.{
-        // Section 7.3: present exactly when a Retry was sent, and equal to the
-        // Retry's Source Connection ID. A client refuses the connection if
-        // either half is wrong, which is what makes the identifier an attacker
-        // injected during the handshake detectable.
-        .retry_source_connection_id = retry_source,
-        .initial_max_data = connection_receive_octets,
-        .initial_max_stream_data_bidi_local = stream_receive_octets,
-        .initial_max_stream_data_bidi_remote = stream_receive_octets,
-        .initial_max_stream_data_uni = stream_receive_octets,
-        .initial_max_streams_bidi = requests_max,
-        .initial_max_streams_uni = unidirectional_max,
-        // The same number `idle_ns` retires on, so what this server does is
-        // what it said it would do. It advertised nothing here while dropping
-        // connections after five seconds, which is a server telling its peer
-        // the connection never times out and then behaving as though it does.
-        .max_idle_timeout_ms = @divExact(idle_ns, std.time.ns_per_ms),
-        .max_udp_payload_size = Connection.datagram_octets,
-        .active_connection_id_limit = 2,
-        .initial_source_connection_id = source,
-        .original_destination_connection_id = original,
-    });
-    return target[0..written];
-}
-
 /// Everything that happens between datagrams: the handshake, the HTTP/3
 /// streams, and the responses.
 fn drive(io: Io, log: *Io.Writer, peer: *Peer, now_ns: u64, shared: *const Shared, scratch: []u8) !void {
@@ -694,7 +643,7 @@ fn drive(io: Io, log: *Io.Writer, peer: *Peer, now_ns: u64, shared: *const Share
     // both sent its Finished and verified the peer's, and `tls.Server` reaching
     // `.established` is exactly that. Only the TLS engine knows it, which is
     // why `Connection` takes it as a report rather than inferring it.
-    if (peer.server.state == .established and !peer.connection.recovery.handshake_confirmed) {
+    if (peer.server.state == .established and !peer.connection.handshakeConfirmed()) {
         peer.connection.confirmHandshake();
     }
 
