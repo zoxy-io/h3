@@ -22,7 +22,7 @@ particular list.
 the part worth reading. The ledger, the simulator, the event queue, the interop
 shim and h3spec were built to catch the eleven classes in the first table; they
 did, and they also caught classes nobody had written down. The second table is
-sixty-three rows against the first table's eleven, because a gate's real yield
+seventy rows against the first table's eleven, because a gate's real yield
 is only knowable after it runs.
 
 Each finding, with the gate that would have caught it first:
@@ -131,6 +131,13 @@ requirement list extracted from the specification.
 | `wantsSend` answered true while `send` built nothing: stream data, HANDSHAKE_DONE and CRYPTO queued behind a full congestion window or recovery table, and an unvalidated server with a few octets of amplification allowance — more than zero, less than any packet — and a probe owed. An event loop polling the pair never sleeps. The first fix tested the room below the closing state's early return, so a server that closed near its limit still spun | a new simulator oracle, written before the fix, which failed five of the first ten seeds; the closing case by review, since the sweep rarely closes an unvalidated server | Every other oracle watches what goes on the wire, and nothing went on the wire. The flow-control half of the same disagreement had been fixed already, and its comment named the spin; the fix gated the frames it was looking at and not the ones beside them |
 | A RESET_STREAM released connection credit up to its final size, octets already buffered included, and left those octets readable — so an application that read them released them a second time. `consumed_total` passed `received_total`: an assertion in the builds with assertions on, reachable by any peer that sends data and then resets, and in the `-Dassertions=false` one a connection window that grew by what the peer sent first | `zig build fuzz --fuzz`, the streams target, in its second two-minute run | The regression mode draws one input per target and the unit tests reset streams they had already drained; it needs data, a reset and then a read, in that order. The first run found a harness defect on the same target instead — it acknowledged octets that were never written, which `acknowledge` asserts against — and fixing that is what let the second run reach this |
 | `sim/` handed both endpoints one hand-built transport parameters extension carrying `original_destination_connection_id`, which a client may not send, so the server refused the client's copy with `ServerOnlyParameter` — and the `catch return` after it skipped the limits the harness set by hand next. In every seed, the server never applied a limit the client granted | replacing the extension with each side's own `localTransportParameters` | The server writes no data in the sweep, so limits it never learned were limits nothing tested; and a harness that swallows the error from the call it exists to exercise reports success either way, which is §1's recurring failure mode in one line |
+| `Connection.initServer` returned the connection by value, through an error union, so at `interop/`'s configuration — megabytes — the result was built on the stack and copied out, and `h3-server` overflowed its stack on the first datagram of the first connection: 81 of h3spec 0.1.15's 86 cases failed | h3spec 0.1.15, on this branch before it merged | Every unit test's connection is small enough for the copy to fit, and `sim/` holds two small ones. The constructor now writes in place, and its regression test runs it on a 1 MiB thread stack with a connection larger than that |
+| Every frame that did not parse — cut short, of an unknown type, carrying a field its type forbids — closed with PROTOCOL_VIOLATION, while the citation above the line quoted RFC 9000 §12.4's FRAME_ENCODING_ERROR | h3spec 0.1.15, which asks for the specific code | Section 11 permits the generic code, so the substitution is legal and only a tester that refuses the generic answer for this one case can tell. The ledger counted the quote as cited, which is §2's "cited is not correct" in one line |
+| RETIRE_CONNECTION_ID was parsed and ignored, so a sequence number never issued — §19.16's MUST — was accepted | h3spec 0.1.15 | The ledger carried it as an exception whose reason was migration being out of scope, which explains why nothing is *sent* and not why nothing *received* is checked |
+| A repeated SETTINGS identifier was refused only for the four this endpoint knows, through four flags; an unknown one repeated passed | h3spec 0.1.15, which repeats 0x40 | The unit test repeated a known identifier, and the flags were the shape of the test |
+| CANCEL_PUSH, MAX_PUSH_ID and a client's PUSH_PROMISE were all read past because push is unimplemented — and three of the rules on them need no push state: no push ID was ever promised or allowed, a MAX_PUSH_ID may not fall, and a server may not be sent a promise | h3spec 0.1.15, four cases | "Not implemented" was read as "nothing to check". The exceptions said the rules needed push state, which was true of the rules beside these and not of these |
+| A known control frame was waited for whole whatever length it declared, so a GOAWAY announcing 2^30 octets and sending none held the control stream for the life of the connection; and an unknown frame was held whole too, up to the stream window | h3spec 0.1.15 | Control frames are small in every implementation this package has met, and the 40000-octet unknown frame h3spec already sent fits in a window — so "however long" passed at the one length anyone tried |
+| The interop client never initialised its `Session`'s qlog trace — `gpa.create` hands back undefined memory, and `run` resets every other field on purpose — so in a Debug build the first connection aborted in `Trace.finish` | a Debug loopback run, checking the six rows above | The runner's image and every recorded run were ReleaseFast, where the allocation read as zeroes: a Debug client had not made a connection since the trace landed |
 
 Two things about that table.
 
@@ -195,7 +202,7 @@ that crossing, and §5.2 is what it became.
 | `zig build requirements` | That every RFC quote in the source is in the section it cites, that every exception states a reason, and that no `//=` URL is silently unreadable | Coverage — the sentence extraction is a heuristic, so the count is a trend rather than a threshold. And "cited" is not "correct": a citation says someone looked, not that they were right |
 | `zig build sim` | 256 seeded runs of two connections over a modelled link — loss, reordering, duplication, MTU changes, clock jumps, a late reader, key updates, a Retry on a quarter of seeds, an idle timeout on another quarter that must close the pair once it goes quiet, and on a third of seeds an adversary that replays, truncates and corrupts — with eight oracles and a 31-row census that fails the sweep when a required behaviour goes unreached | Anything no oracle states, and any fault that lives *inside* the library: a `seal` that fails and a send buffer that is too small are not things a harness can inject, because no caller can produce them. It also enters the state the flow-control deadlock lived in and does not reproduce it — removing both fixes leaves 256 of 256 seeds passing |
 | The interop shim, against quic-go: 9 of 9 as a client, 8 of 8 as a server | That two independent implementations of the same RFCs agree over a lossy link, on the cases the runner has | Only what the runner tests — nine named scenarios, not a specification. And it is run by hand: `interop.yml` builds the shims and stops |
-| h3spec, 49 of 49 | That 49 specific violations are answered with the specific error code the RFC names | The positive path — every case is a negative one. Run by hand, like the interop matrix |
+| h3spec 0.1.15, 85 of 86 and 1 pending | That 85 specific violations are answered with the specific error code the RFC names; the 86th needs 0-RTT, which is not built | The positive path — every case is a negative one. Run by hand, like the interop matrix |
 | `zig build corpus` | RFC 9001 appendix A's worked packets octet for octet — key schedule, AEAD, nonce, sampling offset and mask, right at once — and QPACK field sections four other encoders produced | Anything after the first flight; and only the capacity-zero QPACK encodings, because the decoder is static-table-only |
 | `src/qlog.zig` | Nothing. It is not a gate — it writes a trace a person can read after a failure | Everything. It is evidence for a human, and §5.7 says exactly which events it does not carry |
 
@@ -282,13 +289,14 @@ should_activate |= !is_largest;
   serves `/www`, exits 127 for a test case it does not support. Verdicts are
   byte-exact file comparison plus pcap analysis with the key log. **Built and
   run**, as `interop/`; see §5.5 for the results.
-- **[h3spec](https://github.com/kazu-yamamoto/h3spec)** — **run, and passing
-  49 of 49** against `interop/server.zig`; see §5.5. Forty-nine negative cases
-  against a listening server: 33 transport and TLS, 16 HTTP/3 and QPACK. Each
-  mutates a frame, a transport parameter or a TLS extension and expects a
-  specific error code. Its case list is the closest thing to a public MUST
-  catalogue for the surfaces `fields.zig` and the connection guard, and it
-  found four defects in `src/` that nothing else here could reach.
+- **[h3spec](https://github.com/kazu-yamamoto/h3spec)** — **run: 0.1.15
+  passes 85 of 86, with 1 pending** against `interop/server.zig`; see §5.5.
+  Eighty-six negative cases against a listening server: 44 transport and TLS,
+  42 HTTP/3 and QPACK. Each mutates a frame, a transport parameter or a TLS
+  extension and expects a specific error code. Its case list is the closest
+  thing to a public MUST catalogue for the surfaces `fields.zig` and the
+  connection guard, and it found four defects in `src/` at 0.1.13 and six more
+  at 0.1.15 that nothing else here could reach.
 - **[qifs](https://github.com/qpackers/qifs)** — QPACK field sections encoded by
   ten implementations, in the
   [offline interop format](https://github.com/quicwg/base-drafts/wiki/QPACK-Offline-Interop):
@@ -456,17 +464,29 @@ small print on: fifty connections through 30% loss, and a `multiconnect` client
 abandons the run on the first one it loses, so it is the case most able to fail
 for nobody's reason. Three runs of three in both roles on the last measurement.
 
-**h3spec passes 49 of 49** against `interop/server.zig`: 33 transport and TLS
-cases, 16 HTTP/3 and QPACK. Its case list is the closest thing to a public MUST
-catalogue for the surfaces `fields.zig` and the connection guard cover, and it
-found four defects in `src/` that nothing else here could reach.
+**h3spec 0.1.15 passes 85 of 86, with 1 pending and 0 failing**, against
+`interop/server.zig` on the library's own server API — `quic.endpoint`,
+`Connection.initServer` and `Http3Server` — in a Debug build: 44 transport and
+TLS cases, 42 HTTP/3 and QPACK. 0.1.13's 49 were all passing before the port.
+Its case list is the closest thing to a public MUST catalogue for the surfaces
+`fields.zig` and the connection guard cover, and it found four defects in
+`src/` at 0.1.13 and six at 0.1.15 that nothing else here could reach; they
+are §1's rows.
 
-That count predates the server's move onto the library's own server API —
-`quic.endpoint`, `Connection.initServer` and `Http3Server` — and h3spec has not
-been re-run since. A loopback run of the interop client against the ported
-server passes `handshake`, `transfer`, `retry`, `http3`, `chacha20`,
-`multiconnect` and `keyupdate`; h3spec is what would say whether the error
-paths still answer with the codes it expects.
+The pending case is the one deliberate deviation, and h3spec states it itself:
+"MUST send PROTOCOL_VIOLATION if CRYPTO in 0-RTT is received [TLS 8.3]" needs a
+0-RTT packet, and this endpoint neither accepts nor resumes sessions, so no
+0-RTT key ever exists to protect one with — 0-RTT is among what
+docs/DESIGN.md §6 lists as not built. Two codes are a choice among the ones the RFC allows rather
+than a deviation: an over-long known control frame is H3_EXCESSIVE_LOAD on its
+header (RFC 9114 §10.5's MAY), not a wait for the H3_FRAME_ERROR its payload
+would earn; and RETIRE_CONNECTION_ID for sequence 0 is refused, as §19.16
+permits, because the only identifier this endpoint issues is the one the
+packet is addressed to.
+
+A loopback run of the interop client against the same server, in Debug, passes
+`handshake`, `transfer`, `retry`, `http3`, `chacha20`, `multiconnect` and
+`keyupdate`.
 
 **qifs** is vendored under `corpus/qifs/` and gated by `zig build corpus`:
 QPACK field sections encoded by four other implementations, decoded against the

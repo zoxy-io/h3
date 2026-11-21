@@ -47,9 +47,10 @@ Evidence that does not come from this package: `corpus/qifs.zig` decodes 144
 QPACK field sections produced by four other implementations, and `interop/` is
 a [QUIC Interop Runner](https://github.com/quic-interop/quic-interop-runner)
 client that completes a real handshake, Retry, and HTTP/3 transfer against
-quic-go, ngtcp2 and aioquic — and a server that passes all 49 of
-[h3spec](https://github.com/kazu-yamamoto/h3spec)'s conformance cases. Between
-them they found eleven defects; they are in the table in
+quic-go, ngtcp2 and aioquic — and a server that passes 85 of
+[h3spec](https://github.com/kazu-yamamoto/h3spec) 0.1.15's 86 conformance
+cases, the 86th pending because it needs 0-RTT. What they found is in the
+table in
 [docs/VERIFICATION.md](docs/VERIFICATION.md) §1, the shims are §5.5, and
 [interop/README.md](interop/README.md) is how to run them.
 

@@ -388,8 +388,10 @@ green on all three build legs):
 
      What it still refuses rather than implements: **server push** (a push
      stream is `H3_ID_ERROR`, which is the correct answer for an endpoint that
-     sends no MAX_PUSH_ID) and **QPACK's dynamic table** (capacity zero is
-     advertised, and the peer's encoder stream is read and discarded).
+     sends no MAX_PUSH_ID; so is a CANCEL_PUSH on either side, and a server
+     refuses a PUSH_PROMISE and a MAX_PUSH_ID that falls) and **QPACK's
+     dynamic table** (capacity zero is advertised, and the peer's encoder
+     stream is read and discarded).
    * **Migration, NEW_CONNECTION_ID issuance, stateless reset *detection*,
      0-RTT, and ECN.** Stateless reset *generation* is built — see the server
      items below — and a server has no reset to detect: RFC 9000 section 18.2
