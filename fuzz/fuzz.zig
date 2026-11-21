@@ -1024,7 +1024,17 @@ fn fuzzStreams(_: void, smith: *std.testing.Smith) !void {
             // The four the retirement work added, none of which had a target.
             .abandon => set.resetSend(id, smith.value(u16)) catch {},
             .stop => set.stopSending(id, smith.value(u16)) catch {},
-            .acknowledge => set.acknowledge(id, smith.value(u16)),
+            // Bounded by what was written, which is the precondition
+            // `acknowledge` asserts and the only thing `Connection` ever hands
+            // it: an acknowledgement names a range some packet carried. Drawn
+            // as a bare `u16` this acknowledged octets never written, and the
+            // coverage-guided run found the assertion in two minutes — a
+            // harness defect the one-pass regression mode could not reach.
+            .acknowledge => {
+                const stream = set.find(id) orelse continue;
+                const written = stream.send_offset + stream.send_len;
+                set.acknowledge(id, smith.valueRangeAtMost(u64, 0, written));
+            },
             .deliver => {
                 set.resetDelivered(id);
                 set.release(id, null);

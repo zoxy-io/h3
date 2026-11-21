@@ -285,7 +285,25 @@ pub fn Streams(comptime config: Config) type {
             //= https://www.rfc-editor.org/rfc/rfc9000#section-2.2
             //# Endpoints MUST be able to deliver stream data to an application as an
             //# ordered byte stream.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-3.2
+            //# Receiving a RESET_STREAM frame in the "Recv" or "Size Known" state
+            //# causes the stream to enter the "Reset Recvd" state. This might
+            //# cause the delivery of stream data to the application to be
+            //# interrupted.
+            //
+            // Interrupted, here, and not optional. `reset` releases the
+            // connection credit for every octet up to the final size — those
+            // the peer will never send and those already buffered alike — so
+            // an octet still readable after it is one the application could
+            // consume and the window would release a second time. Found by
+            // the coverage-guided fuzz run: two octets received, a reset, the
+            // two consumed, and `consumed_total` passed `received_total` — an
+            // assertion in the safe builds, reachable by any peer, and in the
+            // `-Dassertions=false` one a connection window that grew by what
+            // the peer had sent before resetting.
             pub fn readable(self: *const Stream) []const u8 {
+                if (self.receive_state == .reset) return &.{};
                 return self.received.readable();
             }
 
@@ -1628,6 +1646,25 @@ test "a retransmission does not consume the window twice" {
     // And an overlapping frame charges only for what is past the high mark.
     try set.receive(0, 3, "lo there", false);
     try testing.expectEqual(@as(u64, 11), set.received_total);
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9000#section-3.2
+//# Receiving a RESET_STREAM frame in the "Recv" or "Size Known" state
+//# causes the stream to enter the "Reset Recvd" state. This might
+//# cause the delivery of stream data to the application to be
+//# interrupted.
+//= type=test
+test "a RESET_STREAM over unread octets does not release them twice" {
+    var set = testSet();
+    try set.receive(0, 0, "hi", false);
+    try testing.expectEqualStrings("hi", set.find(0).?.readable());
+
+    try set.reset(0, 7, 40);
+    // The two octets were credited by the reset along with the thirty-eight
+    // that will never come, so they are no longer the application's to take.
+    try testing.expectEqual(@as(usize, 0), set.find(0).?.readable().len);
+    try testing.expectError(error.Protocol, set.consume(0, 2));
+    try testing.expectEqual(set.received_total, set.consumed_total);
 }
 
 test "a reset stream keeps its accounting" {
