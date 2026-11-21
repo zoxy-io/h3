@@ -188,7 +188,7 @@ that crossing, and §5.2 is what it became.
 
 | Gate | What it proves | What it cannot prove |
 |---|---|---|
-| 371 `test` blocks | Each function does what its author meant | That the author read the RFC correctly, or that anything calls the function |
+| 411 `test` blocks | Each function does what its author meant | That the author read the RFC correctly, or that anything calls the function |
 | 17 fuzz targets, run in all three build legs | Decoders reject or parse with no third outcome | Anything a `u16` draw cannot reach; and — until `b9c796d` — whether a target reaches its accept path at all, which two of them did not |
 | `zig build lint` | No I/O, no allocator, no unbounded loop | Nothing about behaviour |
 | The `tiger-style-reviewer` agent | Assertion density, function length, named bounds | It is a reader, not a gate: it found the twenty above, and it will not find the same class twice at the same cost |
@@ -335,7 +335,7 @@ fails on an exception with no reason or a URL it cannot read. It exists in that
 shape because the first citation written for this package was paraphrased from
 memory and was wrong.
 
-783 requirements are cited, 184 with a test, 425 with an exception, 34 with a
+783 requirements are cited, 208 with a test, 407 with an exception, 30 with a
 todo; all 566 mandatory sentences in the five documents are cited.
 
 Two limits, unchanged. The sentence extraction is a heuristic, so the counts
@@ -444,8 +444,9 @@ No corpus is checked in. Zig's fuzzer keeps one under `.zig-cache`, so
 
 `interop/client.zig` and `interop/server.zig` build the endpoint image the QUIC
 Interop Runner expects: `ROLE`, `TESTCASE`, `REQUESTS`, `SSLKEYLOGFILE`,
-`QLOGDIR`, `/www`, and exit 127 for a case they do not support. TLS is ztls,
-which is the consumer's side of the seam and therefore not in `src/`.
+`QLOGDIR`, `/www`, and exit 127 for a case they do not support. TLS is
+`interop/tls.zig`, a handshake written for the shims, which is the consumer's
+side of the seam and therefore not in `src/`.
 
 **As a client against quic-go's server: nine of nine. As a server against
 quic-go's client: eight of eight** — `handshake`, `transfer`, `chacha20`,
@@ -459,6 +460,13 @@ for nobody's reason. Three runs of three in both roles on the last measurement.
 cases, 16 HTTP/3 and QPACK. Its case list is the closest thing to a public MUST
 catalogue for the surfaces `fields.zig` and the connection guard cover, and it
 found four defects in `src/` that nothing else here could reach.
+
+That count predates the server's move onto the library's own server API —
+`quic.endpoint`, `Connection.initServer` and `Http3Server` — and h3spec has not
+been re-run since. A loopback run of the interop client against the ported
+server passes `handshake`, `transfer`, `retry`, `http3`, `chacha20`,
+`multiconnect` and `keyupdate`; h3spec is what would say whether the error
+paths still answer with the codes it expects.
 
 **qifs** is vendored under `corpus/qifs/` and gated by `zig build corpus`:
 QPACK field sections encoded by four other implementations, decoded against the
@@ -521,8 +529,8 @@ failure, not a measurement anything takes.
 - **An adversary that forges an Initial** and spoofs a source address.
   `sim/main.zig` says outright that it does not model this, and §1's
   connection-identifier finding is the one it was named for.
-- **34 requirements marked `type=todo`** — 49 citation blocks in `src/`, which
-  resolve to 34 of the sentences the extractor found. Each is quoted and not
+- **30 requirements marked `type=todo`** among the sentences the extractor
+  found. Each is quoted and not
   yet satisfied, and the number is the ledger working: before it existed the
   same requirements were absent *and* unrecorded.
 - **Packet-level qlog**, which needs the sink of §5.7 rather than the queue.

@@ -20,11 +20,12 @@ validates on the far side.
 
 Not implemented yet:
 
-- QPACK dynamic table, encoder and decoder streams
-- HTTP/3 control stream, SETTINGS exchange, GOAWAY
-- Connection migration, stateless reset, 0-RTT
+- QPACK dynamic table (a capacity of zero is advertised, and the encoder and
+  decoder streams are checked against it)
+- Connection migration and path validation, NEW_CONNECTION_ID issuance, 0-RTT
+- Stateless reset *detection* (a server writes them; a client does not
+  recognise one)
 - ECN (parsed, not acted on) and pacing
-- Interoperability testing against other implementations
 
 The full ledger is in [docs/DESIGN.md §6](docs/DESIGN.md#6-what-is-built-and-what-is-next).
 
@@ -141,6 +142,44 @@ _ = try connection.write(0, request_bytes, true); // fin = true
 const response = connection.readable(0);
 try connection.consume(0, response.len);
 ```
+
+A server starts a connection from the first Initial that may start one, and
+everything RFC 9000 asks of it before then is `quic.endpoint`'s:
+
+```zig
+const datagram = h3.quic.endpoint.classify(bytes, server_id_octets);
+switch (datagram.action) {
+    .route => {},                     // to the connection that answers to datagram.destination
+    .version_negotiation => {},       // endpoint.writeVersionNegotiation(&out, &datagram)
+    .drop => {},
+    .initial => if (table.find(datagram.destination) == null and datagram.mayStart()) {
+        // Optionally a Retry first: endpoint.writeRetry(Backend, &out, &scratch,
+        // &datagram, new_id, token). The Initial that brings the token back
+        // starts the connection with `.retry = .{ .original_destination = ... }`.
+        var connection = try Connection.initServer(.{
+            .initial_destination = datagram.destination,
+            .source = server_id, // the consumer's, at `server_id_octets`
+            // Requests, the peer's control and QPACK streams, and this
+            // endpoint's three: they share the table, so they fit `streams_max`.
+            .advertised = .{
+                .max_idle_timeout_ms = 30_000,
+                .max_streams_bidirectional = 16,
+                .max_streams_unidirectional = 3,
+                .streams_opened_max = 3,
+            },
+        });
+        // The extension the TLS engine carries in EncryptedExtensions.
+        const parameters = try connection.localTransportParameters(&buffer);
+    },
+}
+```
+
+`h3.Http3Server(Connection, config)` is the server side of HTTP/3 on top:
+`flush` opens the control and QPACK streams, `receive` and `consume` read a
+request under the embedder's buffer space, `writeHeaders`, `writeData` and
+`writeTrailers` answer it, and `goaway` drains. A consumer that takes its
+cryptographic primitives from elsewhere names a backend in
+`Connection(.{ .crypto = Backend })`.
 
 [`example/initial.zig`](example/initial.zig) is a complete program at the
 packet level: it builds a client Initial, seals it under the Initial keys,

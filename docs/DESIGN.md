@@ -102,11 +102,13 @@ time the caller must wake it at, and the caller arms whatever its runtime uses.
 QUIC needs TLS 1.3. This package does not implement it, will not implement it,
 and does not depend on a package that does.
 
-The reason is concrete rather than aesthetic: **zoxy uses ztls and zrk uses
-zssl.** They are different libraries with different backends, and neither
-consumer wants the other's linked into its binary. A dependency here on either
-one would make this package unusable by the other consumer — which is the same
-argument that keeps `std.Io` out of the seam, applied to a different axis.
+The reason was concrete rather than aesthetic: **zoxy used ztls and zrk used
+zssl.** They were different libraries with different backends, and neither
+consumer wanted the other's linked into its binary. Both now use zssl, and the
+seam stays where it is for the argument that keeps `std.Io` out of it: the
+engine is the consumer's to choose and to configure — zoxy's certificate
+selection, mutual TLS and ALPN policy live with it — and zoxy-io/zoxy#449
+puts the QUIC mode in zssl rather than here.
 
 So the handshake attaches as **data, in both directions**:
 
@@ -199,8 +201,8 @@ in this package.
 
 ## 6. What is built, and what is next
 
-**Built and tested** (115 unit tests, 10 fuzz targets, `zig build ci` green on
-all three build legs):
+**Built and tested** (411 tests under `src/`, 17 fuzz targets, `zig build ci`
+green on all three build legs):
 
 - `varint.zig` — RFC 9000 §16, with appendix A.1's vectors.
 - `quic/packet_number.zig` — §17.1, with appendix A.2 and A.3's pseudocode.
@@ -274,6 +276,31 @@ all three build legs):
   close sequence. The TLS seam of §4 above, implemented.
 - `qpack/static_table.zig` — RFC 9204 appendix A. §4.1.1's integer and §4.1.2's
   Huffman code come from zoxy-io/hpack and are re-exported by `qpack.zig`.
+- `quic/crypto/backend.zig` — the packet-protection backend: twelve primitives
+  behind `Connection.Config.crypto`, `std.crypto` by default, the contract
+  checked at compile time and `std.crypto` lint-confined to the default; and
+  `crypto/conformance.zig`, RFC 9001 appendix A as a check a consumer runs its
+  own backend through. See §4.
+- `quic/endpoint.zig` — what a server does before a connection exists:
+  `classify` reads a datagram's first header and answers route, Initial,
+  Version Negotiation or drop by RFC 9000 sections 5.2.2, 6.1, 7.2, 14.1 and
+  17.2.1 (unknown versions read by RFC 8999's invariants), and writes the three
+  stateless answers — Version Negotiation, Retry and Stateless Reset.
+- `Connection.initServer` and `localTransportParameters` — a server's
+  connection from the Initial that starts it, with or without a Retry, and
+  this endpoint's own transport parameters built from what it enforces:
+  section 7.3's three identifiers, `disable_active_migration`, the idle
+  timeout, a reset token and the windows. A validated Retry validates the
+  address. The peer's `ack_delay_exponent`, `max_ack_delay` and
+  `max_udp_payload_size` are applied.
+- The idle timer (RFC 9000 section 10.1) and the end of the closing and
+  draining states (section 10.2): `timeout` folds both into its deadline and
+  `isClosed` says when a slot may be reused.
+- `Http3Server.zig` — the server side of RFC 9114's connection layer over one
+  connection: this endpoint's control and QPACK streams, request streams read
+  under the embedder's buffer space, responses written frame by whole frame,
+  cancellation, GOAWAY, and field sections decoded and validated into the
+  caller's storage.
 
 **Next, in the order they unblock each other:**
 
@@ -363,7 +390,10 @@ all three build legs):
      stream is `H3_ID_ERROR`, which is the correct answer for an endpoint that
      sends no MAX_PUSH_ID) and **QPACK's dynamic table** (capacity zero is
      advertised, and the peer's encoder stream is read and discarded).
-   * **Migration, stateless reset, 0-RTT, and ECN.**
+   * **Migration, NEW_CONNECTION_ID issuance, stateless reset *detection*,
+     0-RTT, and ECN.** Stateless reset *generation* is built — see the server
+     items below — and a server has no reset to detect: RFC 9000 section 18.2
+     forbids a client's `stateless_reset_token`.
    * **A second corpus**: encodings captured from other implementations, the
      way hpack vendors http2jp/hpack-test-case. RFC 9001 appendix A proves
      agreement with the specification, not with the implementations a real peer
