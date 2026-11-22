@@ -1569,11 +1569,12 @@ pub fn Streams(comptime config: Config) type {
             assert(stream.framed <= stream.send_len);
             assert(octets <= stream.send_len);
             const width: u32 = @intCast(octets);
-            std.mem.copyForwards(
-                u8,
-                stream.send[0 .. stream.send_len - width],
-                stream.send[width..stream.send_len],
-            );
+            // `@memmove`, not `std.mem.copyForwards`: that is a loop of one
+            // octet at a time, and this runs on every acknowledgement over
+            // everything still unacknowledged. Under zoxy's HTTP/3 it was 8.9%
+            // of the process's CPU (10 KiB answers, a client acknowledging
+            // every packet).
+            @memmove(stream.send[0 .. stream.send_len - width], stream.send[width..stream.send_len]);
             stream.send_len -= width;
             // Octets the peer has do not need framing again, whatever a
             // spurious loss did to the watermark: RFC 9002's loss detection is

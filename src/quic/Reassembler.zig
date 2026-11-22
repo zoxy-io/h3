@@ -279,7 +279,7 @@ pub fn Reassembler(comptime config: Config) type {
             // the common case and the one worth being fast.
             const held = self.spans[self.span_count - 1].end;
             assert(held >= shift);
-            std.mem.copyForwards(u8, self.storage[0 .. held - shift], self.storage[shift..held]);
+            @memmove(self.storage[0 .. held - shift], self.storage[shift..held]);
 
             var kept: u32 = 0;
             for (self.spans[0..self.span_count]) |span| {

@@ -332,11 +332,7 @@ pub fn Http3(comptime config: Config) type {
             // width was not known; it moves down against the header now. Always
             // downward, so the copy is forward and the ranges may overlap.
             assert(header <= reserve);
-            std.mem.copyForwards(
-                u8,
-                target[offset + header ..][0..payload],
-                target[offset + reserve ..][0..payload],
-            );
+            @memmove(target[offset + header ..][0..payload], target[offset + reserve ..][0..payload]);
             offset += header + payload;
 
             self.control_written = true;
@@ -354,7 +350,7 @@ pub fn Http3(comptime config: Config) type {
             const header = frame.writeHeader(target, .headers, section) catch
                 return error.OutputTooSmall;
             assert(header <= reserve);
-            std.mem.copyForwards(u8, target[header..][0..section], target[reserve..][0..section]);
+            @memmove(target[header..][0..section], target[reserve..][0..section]);
             return header + section;
         }
 
@@ -390,7 +386,7 @@ pub fn Http3(comptime config: Config) type {
             const header = frame.writeHeader(target, .goaway, payload) catch
                 return error.OutputTooSmall;
             assert(header <= reserve);
-            std.mem.copyForwards(u8, target[header..][0..payload], target[reserve..][0..payload]);
+            @memmove(target[header..][0..payload], target[reserve..][0..payload]);
             self.sent_goaway = identifier;
             return header + payload;
         }
