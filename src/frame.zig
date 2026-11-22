@@ -431,11 +431,13 @@ pub const ParseError = error{
     /// octets are coming — which is why it is a separate error from the two
     /// below rather than a malformed frame.
     Incomplete,
-    /// A type or length encoded in more octets than it needs. Section 7.1 does
-    /// not require minimal encodings the way RFC 9000 section 12.4 does, so
-    /// this is stricter than the letter of the specification and deliberately
-    /// so: a type with four spellings is four ways past a `switch`, and every
-    /// implementation in the wild writes the short one.
+    /// A type encoded in more octets than it needs. Section 7.1 does not
+    /// require minimal encodings the way RFC 9000 section 12.4 does, so this
+    /// is stricter than the letter of the specification and deliberately so:
+    /// a type with four spellings is four ways past a `switch`. The length is
+    /// read in any encoding RFC 9000 section 16 allows, because nothing
+    /// dispatches on it and real peers pad it: haproxy writes every DATA
+    /// frame's length as eight octets, reserved before it knows the size.
     NotMinimal,
     /// One of section 11.2.1's HTTP/2 carry-overs. `H3_FRAME_UNEXPECTED`.
     Http2Reserved,
@@ -450,9 +452,10 @@ pub fn parseHeader(source: []const u8) ParseError!Header {
     const frame_type: Type = @fromBackingInt(@intCast(type_decoded.value));
     if (frame_type.isHttp2Reserved()) return error.Http2Reserved;
 
-    const length_decoded = varint.decodeMinimal(source[type_decoded.octets..]) catch |err| return switch (err) {
+    // Any encoding: see `ParseError.NotMinimal`.
+    const length_decoded = varint.decode(source[type_decoded.octets..]) catch |err| return switch (err) {
         error.Incomplete => error.Incomplete,
-        error.NotMinimal => error.NotMinimal,
+        error.NotMinimal => unreachable,
     };
 
     const octets = type_decoded.octets + length_decoded.octets;
@@ -777,9 +780,26 @@ test "the reserved family is what section 7.2.8 describes" {
     try testing.expect(!Type.max_push_id.isReserved());
 }
 
-test "a non-minimal type or length is refused" {
+test "a non-minimal type is refused" {
     try testing.expectError(error.NotMinimal, parseHeader(&.{ 0x40, 0x01, 0x00 }));
-    try testing.expectError(error.NotMinimal, parseHeader(&.{ 0x01, 0x40, 0x01 }));
+}
+
+test "a length is read in any encoding, as haproxy pads a DATA frame's" {
+    // The two-octet spelling of 1.
+    const two = try parseHeader(&.{ 0x01, 0x40, 0x01 });
+    try testing.expectEqual(Type.headers, two.frame_type);
+    try testing.expectEqual(@as(u64, 1), two.length);
+    try testing.expectEqual(@as(u8, 3), two.octets);
+
+    // haproxy 3.4's DATA header for a 9422-octet chunk: the length in eight
+    // octets where two would do.
+    const eight = try parseHeader(&.{ 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x24, 0xce });
+    try testing.expectEqual(Type.data, eight.frame_type);
+    try testing.expectEqual(@as(u64, 9422), eight.length);
+    try testing.expectEqual(@as(u8, 9), eight.octets);
+
+    // Cut inside the padded length, it is incomplete rather than malformed.
+    try testing.expectError(error.Incomplete, parseHeader(&.{ 0x00, 0xc0, 0x00, 0x00 }));
 }
 
 //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4
