@@ -221,7 +221,12 @@ pub fn Streams(comptime config: Config) type {
             /// same arrangement the CRYPTO stream uses, for the same reason:
             /// what a retransmission needs is held here, and what decides to
             /// send it is RFC 9002.
-            send: [config.send_octets]u8 = @splat(0),
+            ///
+            /// Undefined until written: only `send[0..send_len]` is ever read.
+            /// Zeroing it cost every new stream a pass over the whole buffer —
+            /// a request, on an HTTP/3 server — and was 3% of zoxy's CPU with
+            /// its receive buffer beside it (`Reassembler.storage`).
+            send: [config.send_octets]u8 = undefined,
             send_len: u32 = 0,
             framed: u32 = 0,
             /// Octets already acknowledged and dropped from the front of
