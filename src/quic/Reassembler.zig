@@ -108,7 +108,9 @@ pub fn Reassembler(comptime config: Config) type {
         pub const capacity: u32 = config.capacity;
         pub const spans_max: u32 = config.spans_max;
 
-        storage: [capacity]u8 = @splat(0),
+        /// Undefined until written: only the octets `spans` covers are ever
+        /// read, and a new stream's buffer was zeroed for nothing.
+        storage: [capacity]u8 = undefined,
         /// The stream offset of `storage[0]`: everything below it has been
         /// consumed and is gone.
         base: u64 = 0,
@@ -279,7 +281,7 @@ pub fn Reassembler(comptime config: Config) type {
             // the common case and the one worth being fast.
             const held = self.spans[self.span_count - 1].end;
             assert(held >= shift);
-            std.mem.copyForwards(u8, self.storage[0 .. held - shift], self.storage[shift..held]);
+            @memmove(self.storage[0 .. held - shift], self.storage[shift..held]);
 
             var kept: u32 = 0;
             for (self.spans[0..self.span_count]) |span| {

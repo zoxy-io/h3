@@ -2182,7 +2182,7 @@ pub fn Connection(comptime config: Config) type {
         /// and the peer's `max_udp_payload_size` once it is known. Never below
         /// section 14's 1200, because section 18.2 makes a smaller value
         /// invalid and `parse` refuses it.
-        fn datagramLimit(self: *const Self) u64 {
+        pub fn datagramLimit(self: *const Self) u64 {
             const limit = @min(@as(u64, config.datagram_octets), self.peer_max_udp_payload_size);
             assert(limit >= initial_datagram_min);
             assert(limit <= config.datagram_octets);
@@ -5866,8 +5866,11 @@ pub fn Connection(comptime config: Config) type {
             }
 
             if (self.close_pending[@backingInt(level)] and offset < payload.len) {
-                offset += frame.encode(payload[offset..], self.closeFrameFor(level)) catch 0;
-                self.close_pending[@backingInt(level)] = false;
+                // Owed until it is written: a packet the stream data filled has
+                // no room for it, and the next packet carries it instead.
+                const written = frame.encode(payload[offset..], self.closeFrameFor(level)) catch 0;
+                offset += written;
+                if (written > 0) self.close_pending[@backingInt(level)] = false;
             }
             result.octets = offset;
             return result;
@@ -5891,7 +5894,9 @@ pub fn Connection(comptime config: Config) type {
             // sent and lost exactly like a window update, and the packet
             // carrying it has to be marked the same way so that losing it puts
             // the credit back on the books.
-            if (self.streams.owesStreamCredit()) return true;
+            // Half a window of it, that is: less goes out on whatever packet
+            // is built next, without one built for it (`needsStreamCredit`).
+            if (self.streams.needsStreamCredit()) return true;
             if (self.streams.receiveLimit() >= self.max_data_sent + config.connection_receive_octets / 2) {
                 return true;
             }
@@ -6166,15 +6171,29 @@ pub fn Connection(comptime config: Config) type {
                 const fin_owed = stream.send_fin and !stream.fin_framed;
                 if (waiting == 0 and !fin_owed) continue;
 
-                // Type, stream id, offset and length, each at its widest.
-                const overhead = 1 + varint.octets_max * 3;
-                if (target.len <= overhead) return 0;
-                // The comparison above is the guard on this subtraction:
-                // `target` is what is left of the datagram after the header,
-                // and a frame that does not fit its own overhead writes nothing.
-                assert(target.len > overhead);
-                const take = @min(waiting, target.len - overhead);
+                // The frame's header as `frame.encode` will write it: a type,
+                // the stream id, the offset when it is not zero, and a length.
+                // Sized exactly rather than at each field's widest, which left
+                // some nineteen octets of every full packet empty, and left
+                // them unevenly: a packet's length followed its offset's
+                // width, so the packets of one answer differed by an octet or
+                // two. A consumer batching a connection's datagrams into one
+                // send (UDP GSO) needs them the same size.
+                const offset = stream.send_offset + stream.framed;
+                const fixed = 1 + varint.encodedLength(stream.id) +
+                    (if (offset != 0) varint.encodedLength(offset) else 0);
+                if (target.len <= fixed) return 0;
+                const room = target.len - fixed;
+                // The length field is as wide as the most this frame could
+                // carry, so the take below it never needs a wider one.
+                const length_octets = varint.encodedLength(@min(waiting, room));
+                if (room < length_octets) return 0;
+                const take = @min(waiting, room - length_octets);
                 assert(take <= waiting);
+                assert(varint.encodedLength(take) <= length_octets);
+                // Data waiting and none of it fitting is no frame: an empty
+                // STREAM frame is only ever the FIN, with nothing before it.
+                if (take == 0 and waiting != 0) return 0;
                 const written = frame.encode(target, .{ .stream = .{
                     .stream = stream.id,
                     .offset = stream.send_offset + stream.framed,
@@ -7127,6 +7146,39 @@ fn exchange(client: *TestConnection, server: *TestConnection, id: u64) !void {
 //# it has sent MUST treat this as a connection error of type
 //# STREAM_LIMIT_ERROR; see Section 11 for details on error handling.
 //= type=test
+test "a packet of stream data fills its datagram to the octet" {
+    // The STREAM frame's header was reserved at each field's widest, leaving
+    // some nineteen octets of every full packet empty and the packets of one
+    // answer differing in length with their offsets' widths. A consumer that
+    // hands the kernel a run of datagrams to cut apart (UDP GSO) needs every
+    // one but the last the same size, and the full size is the limit.
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+
+    const request = "GET /\r\n";
+    try testing.expectEqual(request.len, try client.write(0, request, true));
+    _ = try deliver(&client, &server, 0);
+    const asked = server.readable(0);
+    try server.consume(0, asked.len);
+
+    const body: [6000]u8 = @splat('x');
+    try testing.expectEqual(body.len, try server.write(0, &body, true));
+    var lengths: [8]usize = @splat(0);
+    var count: usize = 0;
+    var datagram: [TestConnection.datagram_octets]u8 = undefined;
+    while (count < lengths.len) : (count += 1) {
+        const octets = try server.send(&datagram, 0);
+        if (octets == 0) break;
+        lengths[count] = octets;
+    }
+    // Four full datagrams and a short last one: 6000 octets at a little
+    // under 1452 each.
+    try testing.expect(count >= 5);
+    for (lengths[0 .. count - 1]) |octets| try testing.expectEqual(server.datagramLimit(), octets);
+    try testing.expect(lengths[count - 1] < server.datagramLimit());
+}
+
 test "section 4.6: a finished stream gives its credit back" {
     // `streams_max` used to be the whole story, and it is a comptime bound: a
     // peer that closed a stream never got it back, so the table's size was a
@@ -7142,7 +7194,8 @@ test "section 4.6: a finished stream gives its credit back" {
     try testing.expectEqual(before + 1, server.streams.advertised_bidi);
 
     // And the peer is told, which is the half that matters: credit nobody hears
-    // about is credit nobody can spend.
+    // about is credit nobody can spend. Here on a packet the server was
+    // building anyway, to acknowledge the end of the exchange.
     try testing.expectEqual(before + 1, client.streams.peer_streams_bidi);
 
     // Drained, so the credit is the only thing that could still be owed.
@@ -7151,6 +7204,22 @@ test "section 4.6: a finished stream gives its credit back" {
         if (try deliver(&server, &client, 0) == 0) break;
     }
     try testing.expect(!server.wantsSend());
+
+    // One finished stream's credit with nothing else to say is no reason for a
+    // packet (`needsStreamCredit`): it rides on the next one built. Half the
+    // window of four is.
+    server.streams.advertised_bidi += 1;
+    try testing.expect(server.streams.owesStreamCredit());
+    try testing.expect(!server.streams.needsStreamCredit());
+    try testing.expect(!server.wantsSend());
+    server.streams.advertised_bidi += 1;
+    try testing.expect(server.streams.needsStreamCredit());
+    try testing.expect(server.wantsSend());
+    for (0..8) |_| {
+        if (!server.wantsSend()) break;
+        if (try deliver(&server, &client, 0) == 0) break;
+    }
+    try testing.expectEqual(before + 3, client.streams.peer_streams_bidi);
 
     // Credit that is owed makes `wantsSend` true on its own, which is what a
     // consumer that sends when it is told to depends on.

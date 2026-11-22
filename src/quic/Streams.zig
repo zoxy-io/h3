@@ -221,7 +221,12 @@ pub fn Streams(comptime config: Config) type {
             /// same arrangement the CRYPTO stream uses, for the same reason:
             /// what a retransmission needs is held here, and what decides to
             /// send it is RFC 9002.
-            send: [config.send_octets]u8 = @splat(0),
+            ///
+            /// Undefined until written: only `send[0..send_len]` is ever read.
+            /// Zeroing it cost every new stream a pass over the whole buffer —
+            /// a request, on an HTTP/3 server — and was 3% of zoxy's CPU with
+            /// its receive buffer beside it (`Reassembler.storage`).
+            send: [config.send_octets]u8 = undefined,
             send_len: u32 = 0,
             framed: u32 = 0,
             /// Octets already acknowledged and dropped from the front of
@@ -415,6 +420,12 @@ pub fn Streams(comptime config: Config) type {
         /// the peer has already been told that much.
         max_streams_bidi_sent: u64 = streams_max,
         max_streams_uni_sent: u64 = streams_max,
+        /// The concurrency each kind was given at the start: how far
+        /// `advertised_*` stays ahead of the identifiers retired. Half of it
+        /// owed is what `needsStreamCredit` sends a MAX_STREAMS for on its
+        /// own.
+        window_bidi: u64 = streams_max,
+        window_uni: u64 = streams_max,
         /// Identifiers of each kind, counting from zero, that have been opened
         /// and given up.
         ///
@@ -847,6 +858,8 @@ pub fn Streams(comptime config: Config) type {
             self.advertised_uni = uni;
             self.max_streams_bidi_sent = bidi;
             self.max_streams_uni_sent = uni;
+            self.window_bidi = bidi;
+            self.window_uni = uni;
         }
 
         /// Whether a MAX_STREAMS is owed on either kind.
@@ -866,6 +879,35 @@ pub fn Streams(comptime config: Config) type {
             if (self.advertised_bidi > self.max_streams_bidi_sent) return true;
             if (self.advertised_uni > self.max_streams_uni_sent) return true;
             return false;
+        }
+
+        /// Whether the credit owed is worth a packet of its own: half of a
+        /// kind's window.
+        ///
+        /// Any credit owed still goes out — `Connection.writeFlowControl`
+        /// puts it in every 1-RTT packet that is built — so this only decides
+        /// whether owing it is a reason to build one. Granting each finished
+        /// stream on its own cost a packet per request, and the peer's
+        /// acknowledgement of it another: an HTTP/3 server answering one
+        /// request at a time on a connection sent its MAX_STREAMS alone, after
+        /// the answer, every time.
+        ///
+        /// It cannot leave a peer waiting, which is the deadlock
+        /// `owesStreamCredit` names. A peer out of identifiers has opened
+        /// everything this endpoint granted, so the credit owed is the window
+        /// less the streams it still has open. Under half owed means over half
+        /// still open, and each of those retires on its own, owing more, until
+        /// half is owed and this says so.
+        pub fn needsStreamCredit(self: *const Self) bool {
+            const bidi_owed = self.advertised_bidi -| self.max_streams_bidi_sent;
+            const uni_owed = self.advertised_uni -| self.max_streams_uni_sent;
+            if (bidi_owed > 0 and bidi_owed >= halfWindow(self.window_bidi)) return true;
+            if (uni_owed > 0 and uni_owed >= halfWindow(self.window_uni)) return true;
+            return false;
+        }
+
+        fn halfWindow(window: u64) u64 {
+            return @max(1, window / 2);
         }
 
         /// Owe both limits again, for the reason `reoweFlowControl` exists: a
@@ -1569,11 +1611,12 @@ pub fn Streams(comptime config: Config) type {
             assert(stream.framed <= stream.send_len);
             assert(octets <= stream.send_len);
             const width: u32 = @intCast(octets);
-            std.mem.copyForwards(
-                u8,
-                stream.send[0 .. stream.send_len - width],
-                stream.send[width..stream.send_len],
-            );
+            // `@memmove`, not `std.mem.copyForwards`: that is a loop of one
+            // octet at a time, and this runs on every acknowledgement over
+            // everything still unacknowledged. Under zoxy's HTTP/3 it was 8.9%
+            // of the process's CPU (10 KiB answers, a client acknowledging
+            // every packet).
+            @memmove(stream.send[0 .. stream.send_len - width], stream.send[width..stream.send_len]);
             stream.send_len -= width;
             // Octets the peer has do not need framing again, whatever a
             // spurious loss did to the watermark: RFC 9002's loss detection is
