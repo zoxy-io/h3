@@ -5882,9 +5882,18 @@ pub fn Connection(comptime config: Config) type {
             // sent and lost exactly like a window update, and the packet
             // carrying it has to be marked the same way so that losing it puts
             // the credit back on the books.
-            // Half a window of it, that is: less goes out on whatever packet
-            // is built next, without one built for it (`needsStreamCredit`).
-            if (self.streams.needsStreamCredit()) return true;
+            //
+            // Any of it, at once, and on a packet of its own if need be: a
+            // server answering one request at a time sends a MAX_STREAMS
+            // after each answer, and the client acknowledges it. Holding it
+            // for half a window to ride on the next answer (bf2c9a3) saved
+            // those two packets, and on the benchmark's c1k-h3 it cost zoxy
+            // a fifth of its HTTP/3 throughput: in five cloud runs with it,
+            // 4.3 to 5.2 packets declared lost per thousand requests and 59
+            // to 69% of nginx's sustained rate; in three without, 2.4 to 3.6
+            // and 79 to 86%. Why the loss rate moves was not found. Measure
+            // there, not on a laptop, before trying it again.
+            if (self.streams.owesStreamCredit()) return true;
             if (self.streams.receiveLimit() >= self.max_data_sent + config.connection_receive_octets / 2) {
                 return true;
             }
@@ -7199,8 +7208,7 @@ test "section 4.6: a finished stream gives its credit back" {
     try testing.expectEqual(before + 1, server.streams.advertised_bidi);
 
     // And the peer is told, which is the half that matters: credit nobody hears
-    // about is credit nobody can spend. Here on a packet the server was
-    // building anyway, to acknowledge the end of the exchange.
+    // about is credit nobody can spend.
     try testing.expectEqual(before + 1, client.streams.peer_streams_bidi);
 
     // Drained, so the credit is the only thing that could still be owed.
@@ -7209,22 +7217,6 @@ test "section 4.6: a finished stream gives its credit back" {
         if (try deliver(&server, &client, 0) == 0) break;
     }
     try testing.expect(!server.wantsSend());
-
-    // One finished stream's credit with nothing else to say is no reason for a
-    // packet (`needsStreamCredit`): it rides on the next one built. Half the
-    // window of four is.
-    server.streams.advertised_bidi += 1;
-    try testing.expect(server.streams.owesStreamCredit());
-    try testing.expect(!server.streams.needsStreamCredit());
-    try testing.expect(!server.wantsSend());
-    server.streams.advertised_bidi += 1;
-    try testing.expect(server.streams.needsStreamCredit());
-    try testing.expect(server.wantsSend());
-    for (0..8) |_| {
-        if (!server.wantsSend()) break;
-        if (try deliver(&server, &client, 0) == 0) break;
-    }
-    try testing.expectEqual(before + 3, client.streams.peer_streams_bidi);
 
     // Credit that is owed makes `wantsSend` true on its own, which is what a
     // consumer that sends when it is told to depends on.
