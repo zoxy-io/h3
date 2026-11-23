@@ -3726,11 +3726,7 @@ pub fn Connection(comptime config: Config) type {
                 // transport parameters legitimately raises a limit on a stream
                 // that does not exist yet.
                 .max_stream_data => |value| {
-                    if (self.streams.find(value.stream) == null and
-                        stream_id.kindOf(value.stream).initiator() == self.side)
-                    {
-                        return error.StreamState;
-                    }
+                    if (self.streams.unopenedLocal(value.stream)) return error.StreamState;
                     self.streams.setSendLimit(value.stream, value.maximum) catch |err| {
                         return streamError(err);
                     };
@@ -3913,11 +3909,7 @@ pub fn Connection(comptime config: Config) type {
                     //# locally initiated stream that has not yet been created,
                     //# or for a send-only stream.
                     //= type=test
-                    if (self.streams.find(value.stream) == null and
-                        stream_id.kindOf(value.stream).initiator() == self.side)
-                    {
-                        return error.StreamState;
-                    }
+                    if (self.streams.unopenedLocal(value.stream)) return error.StreamState;
                     self.streams.receive(value.stream, value.offset, value.data, value.fin) catch |err| {
                         return streamError(err);
                     };
@@ -3972,11 +3964,7 @@ pub fn Connection(comptime config: Config) type {
                     //# has not yet been created MUST be treated as a connection error of
                     //# type STREAM_STATE_ERROR.
                     if (!self.streams.weMaySend(value.stream)) return error.StreamState;
-                    if (self.streams.find(value.stream) == null and
-                        stream_id.kindOf(value.stream).initiator() == self.side)
-                    {
-                        return error.StreamState;
-                    }
+                    if (self.streams.unopenedLocal(value.stream)) return error.StreamState;
                     // The peer asked this endpoint to stop, and section 3.5
                     // says to answer with a RESET_STREAM carrying its code.
                     // The state used to move here and nothing was ever sent, so
@@ -5902,10 +5890,7 @@ pub fn Connection(comptime config: Config) type {
             }
             // Bounded by `count`, which never exceeds `streams_max`.
             for (self.streams.streams[0..self.streams.count]) |*stream| {
-                if (stream.send_state == .reset) continue;
-                if (!self.streams.weMayReceive(stream.id)) continue;
-                const limit = stream.receiveLimit();
-                if (limit >= stream.max_data_sent + config.stream_receive_octets / 2) return true;
+                if (self.streamWindowOwed(stream)) return true;
             }
             return false;
         }
@@ -5948,6 +5933,59 @@ pub fn Connection(comptime config: Config) type {
             return offset;
         }
 
+        /// Whether a MAX_STREAM_DATA is owed on `stream`: its window has moved
+        /// by half since the last one, and nothing rules a frame for it out.
+        ///
+        /// One predicate for `writeFlowControl` and `owesFlowControl` both,
+        /// because the two have to give the same answer: a stream that one
+        /// filtered and the other did not was owed a window that was never
+        /// written, so `wantsSend` said yes to a `send` that built nothing and
+        /// an event loop polling the pair never slept. The simulator found it
+        /// when the section 13.3 filter went into only the writer.
+        fn streamWindowOwed(self: *const Self, stream: *const ConnectionStreams.Stream) bool {
+            assert(self.streams.count <= ConnectionStreams.streams_max);
+            assert(stream.id <= varint.max);
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-3.3
+            //# A sender MUST NOT send a STREAM or
+            //# STREAM_DATA_BLOCKED frame for a stream in the "Reset Sent" state or
+            //# any terminal state -- that is, after sending a RESET_STREAM frame.
+            //
+            // This loop read no send state at all, so `wantsSend` was the
+            // only thing standing between a stopped stream and the wire —
+            // and it tested `.reset` after it tested for unframed data, so
+            // it was not standing there either.
+            if (stream.send_state == .reset) return false;
+            // A stream whose final size is known can take no more data, so a
+            // limit raised on it tells the peer nothing — and it did harm. A
+            // lost packet that carried any credit re-owes every window
+            // (`reoweAllFlowControl`), so the next packet raised one on every
+            // request stream in the table, answered ones included, which a
+            // client may have finished and retired by then. A client that took
+            // a frame for a retired stream as one for a stream it never opened
+            // — this package's own, until `Streams.unopenedLocal` — closed the
+            // connection over it: zrk 3.0.4 against zoxy, on c1k-h3.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-13.3
+            //# An endpoint SHOULD stop sending MAX_STREAM_DATA frames
+            //# when the receiving part of the stream enters a "Size
+            //# Known" or "Reset Recvd" state. * The limit on streams of
+            //# a given type is sent in MAX_STREAMS frames.
+            if (stream.receive_state != .receiving) return false;
+            // A stream this endpoint cannot receive on has no receive window
+            // to raise, and section 19.10 makes offering one a connection
+            // error at the peer. `hq-interop` never opens a unidirectional
+            // stream, so this loop credited every stream in the table for the
+            // life of the package — and the first HTTP/3 connection it made was
+            // closed with STREAM_STATE_ERROR by quic-go, naming the control
+            // stream this endpoint had just opened.
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-19.10
+            //# An endpoint that
+            //# receives a MAX_STREAM_DATA frame for a receive-only stream MUST
+            //# terminate the connection with error STREAM_STATE_ERROR.
+            //= type=test
+            if (!self.streams.weMayReceive(stream.id)) return false;
+            return stream.receiveLimit() >= stream.max_data_sent + config.stream_receive_octets / 2;
+        }
+
         /// Section 4.1: raise the peer's limits as the application reads.
         ///
         /// Sent when the window has moved by half, rather than on every read: a
@@ -5955,6 +5993,7 @@ pub fn Connection(comptime config: Config) type {
         /// flow control than on data, and a peer only needs the limit before it
         /// runs out.
         fn writeFlowControl(self: *Self, target: []u8) usize {
+            assert(self.streams.count <= ConnectionStreams.streams_max);
             var offset: usize = 0;
             const limit = self.streams.receiveLimit();
             if (limit >= self.max_data_sent + config.connection_receive_octets / 2) {
@@ -5962,45 +6001,11 @@ pub fn Connection(comptime config: Config) type {
                 if (offset > 0) self.max_data_sent = limit;
             }
 
+            // Bounded by `count`, which never exceeds `streams_max`.
             for (self.streams.streams[0..self.streams.count]) |*stream| {
-                //= https://www.rfc-editor.org/rfc/rfc9000#section-3.3
-                //# A sender MUST NOT send a STREAM or
-                //# STREAM_DATA_BLOCKED frame for a stream in the "Reset Sent" state or
-                //# any terminal state -- that is, after sending a RESET_STREAM frame.
-                //
-                // This loop read no send state at all, so `wantsSend` was the
-                // only thing standing between a stopped stream and the wire —
-                // and it tested `.reset` after it tested for unframed data, so
-                // it was not standing there either.
-                // The loop reads `send_state` and never `receive_state`, so a stream whose final
-                // size is known still earns a MAX_STREAM_DATA every time the application drains
-                // half a window of what is already buffered. The frames are wasted rather than
-                // wrong — the peer cannot send more — and `Streams.Stream` already carries the
-                // `.size_known` and `.reset` states the check needs.
-                //= https://www.rfc-editor.org/rfc/rfc9000#section-13.3
-                //# An endpoint SHOULD stop sending MAX_STREAM_DATA frames
-                //# when the receiving part of the stream enters a "Size
-                //# Known" or "Reset Recvd" state. * The limit on streams of
-                //# a given type is sent in MAX_STREAMS frames.
-                //= type=todo
-                if (stream.send_state == .reset) continue;
-                // A stream this endpoint cannot receive on has no receive
-                // window to raise, and section 19.10 makes offering one a
-                // connection error at the peer. `hq-interop` never opens a
-                // unidirectional stream, so this loop credited every stream in
-                // the table for the life of the package — and the first HTTP/3
-                // connection it made was closed with STREAM_STATE_ERROR by
-                // quic-go, naming the control stream this endpoint had just
-                // opened.
-                //= https://www.rfc-editor.org/rfc/rfc9000#section-19.10
-                //# An endpoint that
-                //# receives a MAX_STREAM_DATA frame for a receive-only stream MUST
-                //# terminate the connection with error STREAM_STATE_ERROR.
-                //= type=test
-                if (!self.streams.weMayReceive(stream.id)) continue;
+                if (!self.streamWindowOwed(stream)) continue;
                 if (offset >= target.len) break;
                 const stream_limit = stream.receiveLimit();
-                if (stream_limit < stream.max_data_sent + config.stream_receive_octets / 2) continue;
                 const written = frame.encode(target[offset..], .{ .max_stream_data = .{
                     .stream = stream.id,
                     .maximum = stream_limit,
@@ -9216,6 +9221,88 @@ test "section 19.10: MAX_STREAM_DATA may not create a locally-initiated stream" 
         client.receiveFrames(.one_rtt, payload[0..written], 1000),
     );
     try testing.expect(client.findStream(uncreated) == null);
+}
+
+test "section 3.2: a frame for a stream this endpoint has retired is late, not unopened" {
+    // A client that has its answer and its request acknowledged gives the
+    // stream up, and the server can still be talking about it: a probe or a
+    // spurious loss retransmits the answer's tail, a MAX_STREAM_DATA crosses
+    // the last acknowledgement, a STOP_SENDING arrives behind the answer. All
+    // three name a stream of the client's own kind that is not in its table,
+    // which the checks for sections 19.5, 19.8 and 19.10 took to mean one it
+    // never opened: a STREAM_STATE_ERROR, and a connection gone. zrk 3.0.4,
+    // built on this package, lost one or two connections a second that way
+    // at 3,000 HTTP/3 requests a second to a proxy held to a third of a core,
+    // and counted each as a read error.
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+    try exchange(&client, &server, 0);
+    try testing.expect(client.streams.isRetired(0));
+    try testing.expect(client.findStream(0) == null);
+    const opened = client.streams.count;
+
+    const late = [_]frame.Frame{
+        .{ .stream = .{ .stream = 0, .offset = 0, .data = "hello", .fin = true } },
+        .{ .max_stream_data = .{ .stream = 0, .maximum = 1 << 20 } },
+        .{ .stop_sending = .{ .stream = 0, .code = @fromBackingInt(@intCast(0)) } },
+    };
+    for (late) |one| {
+        var payload: [64]u8 = @splat(0);
+        const written = try frame.encode(&payload, one);
+        _ = try client.receiveFrames(.one_rtt, payload[0..written], 1000);
+        // Discarded, and not brought back to life either.
+        try testing.expect(client.findStream(0) == null);
+        try testing.expectEqual(opened, client.streams.count);
+    }
+
+    // The rule itself still holds one identifier further on, which the
+    // client has not opened.
+    const uncreated = stream_id.make(.client_bidirectional, 1);
+    var payload: [64]u8 = @splat(0);
+    const written = try frame.encode(&payload, .{ .max_stream_data = .{
+        .stream = uncreated,
+        .maximum = 1000,
+    } });
+    try testing.expectError(
+        error.StreamState,
+        client.receiveFrames(.one_rtt, payload[0..written], 1000),
+    );
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9000#section-13.3
+//# An endpoint SHOULD stop sending MAX_STREAM_DATA frames
+//# when the receiving part of the stream enters a "Size
+//# Known" or "Reset Recvd" state. * The limit on streams of
+//# a given type is sent in MAX_STREAMS frames.
+//= type=test
+test "section 13.3: no MAX_STREAM_DATA for a stream whose final size is known" {
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+
+    // The whole request, read, and not yet answered: the stream stays in the
+    // server's table with nothing more to receive.
+    const request = "GET /\r\n";
+    try testing.expectEqual(request.len, try client.write(0, request, true));
+    _ = try deliver(&client, &server, 0);
+    try server.consume(0, server.readable(0).len);
+    try testing.expect(server.findStream(0).?.receive_state != .receiving);
+
+    // A lost packet that carried credit re-owes every window, and the packet
+    // after it is where a MAX_STREAM_DATA for this stream used to go — for a
+    // request the client may have finished with by the time it lands. The
+    // client cannot show it: it keeps the larger of two limits, and the one
+    // `established` granted by hand is larger. The server's own record of
+    // what it framed can.
+    server.reoweAllFlowControl();
+    try testing.expectEqual(@as(u64, 0), server.findStream(0).?.max_data_sent);
+    try testing.expect(server.wantsSend());
+    try testing.expect(try deliver(&server, &client, 0) > 0);
+    try testing.expectEqual(@as(u64, 0), server.findStream(0).?.max_data_sent);
+    // And the connection's own window, re-owed with it, did go out: the
+    // packet was built, and the stream was left out of it.
+    try testing.expect(server.max_data_sent > 0);
 }
 
 //= https://www.rfc-editor.org/rfc/rfc9000#section-19.13

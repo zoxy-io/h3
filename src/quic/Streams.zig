@@ -828,6 +828,30 @@ pub fn Streams(comptime config: Config) type {
             return stream_id.index(id) < self.retired[@backingInt(kind)];
         }
 
+        /// Whether `id` is one of this endpoint's own streams that it has not
+        /// opened yet: the "locally initiated stream that has not yet been
+        /// created" of sections 19.5, 19.8 and 19.10, which a frame naming
+        /// one makes a STREAM_STATE_ERROR.
+        ///
+        /// Not the same as missing from the table. A retired stream is missing
+        /// too, and a frame for one is late news about a stream that existed:
+        /// a STREAM frame the peer retransmitted after a spurious loss, or a
+        /// MAX_STREAM_DATA that crossed the last acknowledgement. Section 3.2
+        /// has those discarded, and refusing them closed a connection that
+        /// had done nothing wrong.
+        pub fn unopenedLocal(self: *const Self, id: u64) bool {
+            assert(id <= varint.max);
+            assert(self.count <= streams_max);
+            if (stream_id.kindOf(id).initiator() != self.side) return false;
+            if (self.isRetired(id)) return false;
+            // Bounded by `count`. Not `find`, which hands out a mutable
+            // pointer this question has no use for.
+            for (self.streams[0..self.count]) |*stream| {
+                if (stream.id == id) return false;
+            }
+            return true;
+        }
+
         /// The stream credit this endpoint puts in its transport parameters.
         ///
         /// Held here as well as on the wire because it is the base a
