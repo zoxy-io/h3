@@ -42,6 +42,8 @@ const std = @import("std");
 
 const assert = @import("../assert.zig").assert;
 const crypto = @import("crypto.zig");
+const error_code = @import("error_code.zig");
+const frame = @import("frame.zig");
 const packet = @import("packet.zig");
 
 const ConnectionId = @import("ConnectionId.zig");
@@ -347,6 +349,82 @@ pub fn writeRetry(
     return written;
 }
 
+/// A refusal's whole payload: CONNECTION_CLOSE's type, a one-octet code, a
+/// zero frame type and an empty reason's length, an octet each.
+const refusal_payload_octets: usize = 4;
+
+comptime {
+    assert(@backingInt(error_code.Transport.connection_refused) < 64); // One varint octet.
+    // RFC 9001 section 5.4.2's sample has to lie inside the packet: with a
+    // one-octet packet number, the payload and the tag after it reach past
+    // the sample's end, so `seal` cannot refuse a refusal as too short.
+    assert(1 + refusal_payload_octets + crypto.tag_octets >=
+        crypto.protect.sample_offset + crypto.protect.sample_octets);
+}
+
+/// What `writeRefusal` can return. Only `OutputTooLong` is an outcome a
+/// consumer meets — a `target` too small for the packet. The rest belong to
+/// the calls it is built from, and with a fixed frame in an exact buffer and a
+/// one-octet packet number none of them can occur.
+pub const RefusalError = packet.WriteError || crypto.protect.SealError || frame.EncodeError;
+
+/// The Initial that refuses the connection `datagram`'s Initial would start:
+/// one CONNECTION_CLOSE with CONNECTION_REFUSED, under the server's Initial
+/// keys for the client's Destination Connection ID.
+///
+/// A refused Initial that is answered with nothing leaves the client to wait
+/// out its handshake timeout before it can try again or elsewhere; this tells
+/// it at once. `source` is the identifier the packet names as the server's.
+/// No connection follows, so any will do, and the consumer's own choice keeps
+/// this package drawing no entropy. The packet is a few dozen octets against
+/// the client's 1200 or more, well inside section 8.1's limit without
+/// counting.
+///
+/// Every refusal is packet number zero. Two refusals of one client's
+/// retransmitted Initial therefore share a nonce under one key, which the
+/// rule that a nonce is used once forbids for any key that protects
+/// something. Initial keys protect nothing: RFC 9001 section 5.2 derives
+/// them from the Destination Connection ID the client sent in the clear,
+/// so anyone on the path can open or forge these packets anyway, and a
+/// stateless answer has no packet number to remember.
+//= https://www.rfc-editor.org/rfc/rfc9000#section-5.2.2
+//# If a server refuses to accept a new connection, it SHOULD send an
+//# Initial packet containing a CONNECTION_CLOSE frame with error code
+//# CONNECTION_REFUSED.
+pub fn writeRefusal(
+    comptime Backend: type,
+    target: []u8,
+    datagram: *const Datagram,
+    source: ConnectionId,
+) RefusalError!usize {
+    assert(datagram.action == .initial);
+    assert(datagram.octets >= initial_datagram_min);
+    // A transport close, the only kind an Initial may carry, naming frame type
+    // zero: nothing the client sent was wrong (section 19.19).
+    var payload: [refusal_payload_octets]u8 = undefined;
+    const payload_octets = try frame.encode(&payload, .{ .connection_close = .{
+        .application = false,
+        .code = @backingInt(error_code.Transport.connection_refused),
+        .triggered_by = 0,
+        .reason = "",
+    } });
+    assert(payload_octets == refusal_payload_octets);
+    const written = try packet.writeLong(target, .{
+        .long_type = .initial,
+        .destination = datagram.source,
+        .source = source,
+        .payload_octets = payload_octets,
+        .number = 0,
+        .number_octets = 1,
+    });
+    if (target.len < written.header_octets + payload_octets) return error.OutputTooLong;
+    @memcpy(target[written.header_octets..][0..payload_octets], payload[0..payload_octets]);
+    const keys = crypto.KeysOf(Backend).initial(datagram.destination.bytes(), .server);
+    const octets = try keys.seal(target, written.packet_number_offset, written.header_octets, payload_octets, 0);
+    assert(octets < datagram.octets);
+    return octets;
+}
+
 pub const StatelessResetError = error{
     /// The trigger is too short for a reset smaller than it to be a valid
     /// packet: section 10.3.3's loop guard and section 10.3's 21-octet floor
@@ -648,6 +726,29 @@ test "a Retry this endpoint writes is one a client accepts, under a new identifi
     try testing.expectEqualStrings("a token", parsed.header.retry.token);
     // Section 5.8: the tag binds the identifier the client used first.
     try crypto.retry.verify(&scratch, &client_dcid, retry[0..written]);
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9000#section-5.2.2
+//# If a server refuses to accept a new connection, it SHOULD send an
+//# Initial packet containing a CONNECTION_CLOSE frame with error code
+//# CONNECTION_REFUSED.
+//= type=test
+test "a refusal is an Initial to the client's identifier, far smaller than what it answers" {
+    var buffer: [1500]u8 = undefined;
+    const octets = try testLongDatagram(&buffer, .initial, packet.version_1, &client_dcid, "", 1200);
+    const datagram = classify(buffer[0..octets], 8);
+    try testing.expectEqual(Action.initial, datagram.action);
+
+    const source = try ConnectionId.init(&.{ 9, 8, 7, 6, 5, 4, 3, 2 });
+    var refusal: [128]u8 = undefined;
+    const written = try writeRefusal(crypto.backend.Std, &refusal, &datagram, source);
+    try testing.expect(written < 64);
+    const parsed = try packet.parse(refusal[0..written], 0);
+    try testing.expectEqualSlices(u8, datagram.source.bytes(), parsed.header.initial.destination.bytes());
+    try testing.expectEqualSlices(u8, source.bytes(), parsed.header.initial.source.bytes());
+    try testing.expectEqual(@as(usize, 0), parsed.header.initial.token.len);
+    // No room is an error, never a packet cut short.
+    try testing.expectError(error.OutputTooLong, writeRefusal(crypto.backend.Std, refusal[0..20], &datagram, source));
 }
 
 //= https://www.rfc-editor.org/rfc/rfc9000#section-10.3.3

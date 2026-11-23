@@ -284,8 +284,9 @@ green on all three build legs):
 - `quic/endpoint.zig` — what a server does before a connection exists:
   `classify` reads a datagram's first header and answers route, Initial,
   Version Negotiation or drop by RFC 9000 sections 5.2.2, 6.1, 7.2, 14.1 and
-  17.2.1 (unknown versions read by RFC 8999's invariants), and writes the three
-  stateless answers — Version Negotiation, Retry and Stateless Reset.
+  17.2.1 (unknown versions read by RFC 8999's invariants), and writes the four
+  stateless answers — Version Negotiation, Retry, Stateless Reset, and the
+  Initial that refuses a connection with CONNECTION_REFUSED (section 5.2.2).
 - `Connection.initServer` and `localTransportParameters` — a server's
   connection from the Initial that starts it, with or without a Retry, and
   this endpoint's own transport parameters built from what it enforces:

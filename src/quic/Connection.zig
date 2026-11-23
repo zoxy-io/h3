@@ -9843,6 +9843,31 @@ test "section 17.2.5: a Retry restarts the attempt under the server's identifier
     try testing.expectEqualStrings("ClientHello", client.levels[@backingInt(Level.initial)].pending[0.."ClientHello".len]);
 }
 
+test "a client its server refuses at the first Initial ends the attempt with CONNECTION_REFUSED" {
+    // A server out of room answered nothing, and the client waited out its
+    // handshake timeout. `endpoint.writeRefusal` answers instead, and the
+    // client — this package's — has to read that as the end of the attempt,
+    // not as a packet to ignore or an error of its own.
+    var client = testClient();
+    try client.cryptoIn(.initial, "ClientHello");
+    var datagram: [TestConnection.datagram_octets]u8 = @splat(0);
+    const first = try client.send(&datagram, 0);
+    try testing.expect(first >= endpoint_module.initial_datagram_min);
+    const classified = endpoint_module.classify(datagram[0..first], @intCast(server_source.len));
+    try testing.expectEqual(endpoint_module.Action.initial, classified.action);
+
+    var refusal: [128]u8 = undefined;
+    const source = try ConnectionId.init(&server_source);
+    const octets = try endpoint_module.writeRefusal(crypto.backend.Std, &refusal, &classified, source);
+    try client.receive(refusal[0..octets], 1000);
+
+    const closed = firstEvent(&client, .closed) orelse return error.TestUnexpectedResult;
+    try testing.expect(!closed.application);
+    try testing.expectEqual(@backingInt(error_code.Transport.connection_refused), closed.code);
+    // Draining (RFC 9000 §10.2.2): nothing more goes out on the attempt.
+    try testing.expect(!client.wantsSend());
+}
+
 test "a Retry that does not authenticate is discarded rather than fatal" {
     var client = testClient();
     try client.cryptoIn(.initial, "ClientHello");

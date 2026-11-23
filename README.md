@@ -157,6 +157,9 @@ switch (datagram.action) {
         // Optionally a Retry first: endpoint.writeRetry(Backend, &out, &scratch,
         // &datagram, new_id, token). The Initial that brings the token back
         // starts the connection with `.retry = .{ .original_destination = ... }`.
+        // No room for it: endpoint.writeRefusal(Backend, &out, &datagram, any_id)
+        // tells the client so (CONNECTION_REFUSED) instead of leaving it to
+        // time out.
         var connection = try Connection.initServer(.{
             .initial_destination = datagram.destination,
             .source = server_id, // the consumer's, at `server_id_octets`
