@@ -139,6 +139,7 @@ requirement list extracted from the specification.
 | A known control frame was waited for whole whatever length it declared, so a GOAWAY announcing 2^30 octets and sending none held the control stream for the life of the connection; and an unknown frame was held whole too, up to the stream window | h3spec 0.1.15 | Control frames are small in every implementation this package has met, and the 40000-octet unknown frame h3spec already sent fits in a window — so "however long" passed at the one length anyone tried |
 | The interop client never initialised its `Session`'s qlog trace — `gpa.create` hands back undefined memory, and `run` resets every other field on purpose — so in a Debug build the first connection aborted in `Trace.finish` | a Debug loopback run, checking the six rows above | The runner's image and every recorded run were ReleaseFast, where the allocation read as zeroes: a Debug client had not made a connection since the trace landed |
 | A frame for a stream this endpoint had retired was taken for one naming a stream it never opened: the checks for RFC 9000 §19.5, §19.8 and §19.10 asked only whether the table held it. So a server's retransmission of an answer's tail after a spurious loss or a probe, or a MAX_STREAM_DATA that crossed the last acknowledgement, closed a client's connection with STREAM_STATE_ERROR. The server side fed it: §13.3's SHOULD, carried as a `type=todo`, went unimplemented, so whenever a lost packet re-owed every window the next packet raised MAX_STREAM_DATA on every request stream in the table, answered ones included | zrk 3.0.4 on the benchmark's c1k-h3, as read errors that grew with the request rate and turned into reconnects, and a debug build of zrk that named the error `receive` returned | "Not in the table" was the test for "never opened" from before anything retired; retirement then made the two differ, and every interop case and simulator seed ends before a peer's last word about a stream can arrive late |
+| A FIN that arrived in a STREAM frame of its own, after the reader had taken every octet before it, was lost to the reader twice over. It raised no `stream_readable`, because the event was emitted only when the frame left octets readable, and a reader reads when told to. And it moved the stream to "Data Read" on arrival, so when the same packet's acknowledgement finished the send half, the sweep retired the stream: a reader woken now would find `readableFin` answering false. RFC 9000 §3.2 keeps a stream in "Data Recvd" until its data "has been delivered to the application", and the end had not been; it is delivered now when the reader asks `readableFin`, or reads `readable` empty, as zrk does. A request whose body ends that way is held open until a deadline; an answer ended that way never ends at its client. §19.8 allows the empty frame, and a sender whose application closes a stream after its last write sends one | zoxy's simulator, as an HTTP/3 client of a chunked answer that heard the whole body and no end — zoxy wrote the answer's end after its last DATA had gone. The first fix, to the event, left the replay failing; tracing the client's datagrams found the retirement | `sim/` wrote its FIN in the same step as its last octets, so in practice the two shared a frame; its reader reads on a countdown, not when told, so it would have read to the end regardless; nothing asked whether the end was announced; and its server never writes on the stream, so the stream never had a finished send half to be retired with. Oracle nine asks now, a third of seeds close late, and the retirement has a unit test |
 
 Two things about that table.
 
@@ -201,7 +202,7 @@ that crossing, and §5.2 is what it became.
 | `zig build lint` | No I/O, no allocator, no unbounded loop | Nothing about behaviour |
 | The `tiger-style-reviewer` agent | Assertion density, function length, named bounds | It is a reader, not a gate: it found the twenty above, and it will not find the same class twice at the same cost |
 | `zig build requirements` | That every RFC quote in the source is in the section it cites, that every exception states a reason, and that no `//=` URL is silently unreadable | Coverage — the sentence extraction is a heuristic, so the count is a trend rather than a threshold. And "cited" is not "correct": a citation says someone looked, not that they were right |
-| `zig build sim` | 256 seeded runs of two connections over a modelled link — loss, reordering, duplication, MTU changes, clock jumps, a late reader, key updates, a Retry on a quarter of seeds, an idle timeout on another quarter that must close the pair once it goes quiet, and on a third of seeds an adversary that replays, truncates and corrupts — with eight oracles and a 31-row census that fails the sweep when a required behaviour goes unreached | Anything no oracle states, and any fault that lives *inside* the library: a `seal` that fails and a send buffer that is too small are not things a harness can inject, because no caller can produce them. It also enters the state the flow-control deadlock lived in and does not reproduce it — removing both fixes leaves 256 of 256 seeds passing |
+| `zig build sim` | 256 seeded runs of two connections over a modelled link — loss, reordering, duplication, MTU changes, clock jumps, a late reader, key updates, a Retry on a quarter of seeds, an idle timeout on another quarter that must close the pair once it goes quiet, a client that ends its stream late on a third, and on a third of seeds an adversary that replays, truncates and corrupts — with nine oracles and a 32-row census that fails the sweep when a required behaviour goes unreached | Anything no oracle states, and any fault that lives *inside* the library: a `seal` that fails and a send buffer that is too small are not things a harness can inject, because no caller can produce them. It also enters the state the flow-control deadlock lived in and does not reproduce it — removing both fixes leaves 256 of 256 seeds passing |
 | The interop shim, against quic-go: 9 of 9 as a client, 8 of 8 as a server | That two independent implementations of the same RFCs agree over a lossy link, on the cases the runner has | Only what the runner tests — nine named scenarios, not a specification. And it is run by hand: `interop.yml` builds the shims and stops |
 | h3spec 0.1.15, 85 of 86 and 1 pending | That 85 specific violations are answered with the specific error code the RFC names; the 86th needs 0-RTT, which is not built | The positive path — every case is a negative one. Run by hand, like the interop matrix |
 | `zig build corpus` | RFC 9001 appendix A's worked packets octet for octet — key schedule, AEAD, nonce, sampling offset and mask, right at once — and QPACK field sections four other encoders produced | Anything after the first flight; and only the capacity-zero QPACK encodings, because the decoder is static-table-only |
@@ -378,7 +379,7 @@ and cursors before `seal` was known to succeed, still has no gate.
 number, so no two nights sweep the same one. `--seed N` replays a failure;
 `--from N` chooses a range.
 
-The census is the half that keeps the sweep honest: 31 rows counting behaviours
+The census is the half that keeps the sweep honest: 32 rows counting behaviours
 the seeds reached, merged by an `inline for` over the census's own fields so a
 new counter cannot be forgotten, and a required row at zero **fails** the
 sweep. Which rows are required is declared in `sim/`'s census and nowhere else,
@@ -390,7 +391,7 @@ first run while the sweep was reaching one of them eleven thousand times, and a
 row that is zero because the accumulator is wrong looks exactly like a
 behaviour the seeds never reached.
 
-Eight oracles, numbered here because `sim/main.zig`'s comments cite them by
+Nine oracles, numbered here because `sim/main.zig`'s comments cite them by
 number:
 
 1. Once the application has nothing left to do, the pair goes quiet within
@@ -403,6 +404,9 @@ number:
 6. `timeout()` is never in the past while `wantsSend()` is false.
 7. A datagram is the packets in it and nothing else.
 8. Once `send` returns zero, `wantsSend()` answers false.
+9. A stream's end reaches its reader: a FIN that arrived is one `poll`
+   announced. Checked once, at a run's end, since it is about what was never
+   said — so it is outside `checkInvariants` too.
 
 Two of them are deliberately *not* in `checkInvariants`, and the comments there
 are the record of why.

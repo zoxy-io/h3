@@ -550,6 +550,14 @@ pub fn Streams(comptime config: Config) type {
             return null;
         }
 
+        /// `find` for a caller that only reads.
+        pub fn findConst(self: *const Self, id: u64) ?*const Stream {
+            for (self.streams[0..self.count]) |*stream| {
+                if (stream.id == id) return stream;
+            }
+            return null;
+        }
+
         /// Section 4.6: raise how many streams of one kind this endpoint may
         /// open. Limits only ever rise, so a lower value is ignored rather than
         /// refused — that is what section 4.6 says to do with a stale frame.
@@ -1174,6 +1182,25 @@ pub fn Streams(comptime config: Config) type {
                 stream.received.finish(end) catch return error.FinalSize;
                 stream.receive_state = .size_known;
             }
+            // Not settled here. A FIN that leaves nothing to read is an end the
+            // application has not been told of — section 3.2's "Data Recvd" —
+            // and settling it let the sweep of the same packet's acknowledgement
+            // retire the stream before its reader could ask. `deliverEnd`
+            // settles it once the reader has been told.
+        }
+
+        /// The application has been told the stream's end is in reach
+        /// (`Connection.readableFin`, or an empty `Connection.readable`):
+        /// section 3.2's "Data Recvd" becomes "Data Read" once nothing is left
+        /// to read. Not swept here, because a caller may hold a `readable`
+        /// slice into the table a sweep moves; the next consume or
+        /// acknowledgement retires it. Until then a STOP_SENDING the
+        /// application asked for may still be framed, which the peer, done
+        /// sending, ignores.
+        pub fn deliverEnd(self: *Self, id: u64) void {
+            const stream = self.find(id) orelse return;
+            assert(stream.receive_state != .reset);
+            assert(stream.received.final_size != null);
             self.settle(stream);
         }
 
@@ -1247,7 +1274,8 @@ pub fn Streams(comptime config: Config) type {
 
         /// Move a stream to `data_read` once everything has arrived and been
         /// taken. Separate from `consume` because a zero-length FIN completes a
-        /// stream without anything being read.
+        /// stream without anything being read — once the reader is told of it
+        /// (`deliverEnd`).
         fn settle(self: *Self, stream: *Stream) void {
             _ = self;
             if (stream.receive_state != .size_known) return;
@@ -1769,9 +1797,13 @@ test "a FIN completes a stream once everything has been read" {
     try testing.expect(stream.isComplete());
 }
 
-test "an empty FIN completes a stream with nothing to read" {
+test "an empty FIN completes a stream with nothing to read, once its end is delivered" {
     var set = testSet();
     try set.receive(0, 0, "", true);
+    // Section 3.2's "Data Recvd": everything has arrived, and the application
+    // has not been told — so no sweep may retire it yet.
+    try testing.expectEqual(ReceiveState.size_known, set.find(0).?.receive_state);
+    set.deliverEnd(0);
     try testing.expect(set.find(0).?.isComplete());
 }
 

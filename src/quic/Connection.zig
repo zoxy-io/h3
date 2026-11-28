@@ -1075,7 +1075,9 @@ pub fn Connection(comptime config: Config) type {
         pub const Event = union(enum) {
             /// RFC 9001 section 4.1.2's confirmation, from either side.
             handshake_confirmed,
-            /// New data is readable on this stream.
+            /// New octets are readable on this stream, or its end newly is —
+            /// a FIN that came alone, after every octet before it was read,
+            /// leaves nothing to read but `readableFin`.
             stream_readable: u64,
             /// Every octet this endpoint wrote on the stream, and its FIN, have
             /// been acknowledged: section 3.1's "Data Recvd".
@@ -3910,11 +3912,18 @@ pub fn Connection(comptime config: Config) type {
                     //# or for a send-only stream.
                     //= type=test
                     if (self.streams.unopenedLocal(value.stream)) return error.StreamState;
+                    const fin_was_readable = self.finInReach(value.stream);
                     self.streams.receive(value.stream, value.offset, value.data, value.fin) catch |err| {
                         return streamError(err);
                     };
+                    // New octets, or a stream's end newly in reach of its reader.
+                    // A FIN can come in a frame of its own, after the reader took
+                    // everything before it (section 19.8 allows the empty frame),
+                    // and then nothing is readable but the end — which the reader
+                    // learns here or never: it reads when told to.
                     if (self.streams.find(value.stream)) |stream| {
-                        if (stream.readable().len > 0) self.emit(.{ .stream_readable = value.stream });
+                        const fin_news = !fin_was_readable and self.finInReach(value.stream);
+                        if (stream.readable().len > 0 or fin_news) self.emit(.{ .stream_readable = value.stream });
                     }
                 },
                 //= https://www.rfc-editor.org/rfc/rfc9000#section-4.5
@@ -4237,13 +4246,20 @@ pub fn Connection(comptime config: Config) type {
             try self.streams.stopSending(id, code);
         }
 
-        /// Bytes readable in order on a stream, or an empty slice.
+        /// Bytes readable in order on a stream, or an empty slice. An empty read
+        /// with the stream's end in reach is the read that takes the end
+        /// (RFC 9000 section 3.2): a reader that works the FIN out for itself
+        /// from `findStream`, as zrk does, delivers it this way, and otherwise
+        /// the stream would never reach "Data Read" or be retired.
         pub fn readable(self: *Self, id: u64) []const u8 {
             const stream = self.streams.find(id) orelse return &.{};
             const out = stream.readable();
             // What a stream offers is bounded by the buffer it was given, which
             // is the comptime limit rather than anything the peer sent.
             assert(out.len <= config.stream_receive_octets);
+            // A state change and no sweep, so `out` and every slice a caller
+            // already holds stay where they are.
+            if (out.len == 0 and self.finInReach(id)) self.streams.deliverEnd(id);
             return out;
         }
 
@@ -4263,8 +4279,20 @@ pub fn Connection(comptime config: Config) type {
         /// Whether the peer's FIN sits at the end of what `readable(id)`
         /// returns, so that consuming all of it reads the stream to its end.
         /// False for a stream that was reset, whose octets are not readable.
+        ///
+        /// Answering true is delivering the end (RFC 9000 section 3.2): a stream
+        /// with nothing left to read moves to "Data Read" here, and only then
+        /// can a sweep retire it.
         pub fn readableFin(self: *Self, id: u64) bool {
-            const stream = self.streams.find(id) orelse return false;
+            if (!self.finInReach(id)) return false;
+            self.streams.deliverEnd(id);
+            return true;
+        }
+
+        /// `readableFin`'s answer, without delivering the end: what the receive
+        /// path asks, which is not the application.
+        fn finInReach(self: *const Self, id: u64) bool {
+            const stream = self.streams.findConst(id) orelse return false;
             if (stream.receive_state == .reset) return false;
             const final_size = stream.received.final_size orelse return false;
             const end = stream.consumed + stream.readable().len;
@@ -8380,6 +8408,120 @@ test "a lost FIN is sent again even though it carries no octets" {
     client.onTimeout(at);
     _ = try deliver(&client, &server, at);
     try testing.expect(server.findStream(0).?.receive_state != .receiving);
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9000#section-3.2
+//# The "Data Recvd" state persists until stream data has been delivered
+//# to the application.  Once stream data has been delivered, the stream
+//# enters the "Data Read" state, which is a terminal state.
+//= type=test
+test "a FIN that arrives alone, after every octet was read, is announced" {
+    // A reader reads when `poll` says a stream is readable. A FIN in a frame
+    // of its own, once the reader had taken everything before it, left nothing
+    // readable and so raised nothing: the stream had ended, and its reader was
+    // never told. zoxy's simulator found it as an HTTP/3 answer whose last
+    // DATA went out before its end did, and whose client never saw the end.
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+    _ = try client.write(0, "body", false);
+    _ = try deliver(&client, &server, 1000);
+    try testing.expectEqual(@as(u32, 1), try readableEvents(&server, 0));
+    try testing.expectEqualStrings("body", server.readable(0));
+    try server.consume(0, 4);
+    try testing.expect(!server.readableFin(0));
+
+    _ = try client.write(0, "", true);
+    _ = try deliver(&client, &server, 2000);
+    try testing.expectEqual(@as(usize, 0), server.readable(0).len);
+    try testing.expect(server.readableFin(0));
+    try testing.expectEqual(@as(u32, 1), try readableEvents(&server, 0));
+}
+
+test "a stream whose FIN arrives alone is kept until its reader is told" {
+    // The other half of the defect above. A FIN alone moved the stream to
+    // "Data Read" on arrival; with its send half acknowledged too, the sweep
+    // the same packet's acknowledgement ran retired it, and the reader the
+    // event woke found no stream: `readableFin` answered false, and the end
+    // was lost as surely as if nothing had announced it.
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+    _ = try client.write(0, "GET /", true);
+    _ = try deliver(&client, &server, 1000);
+    try server.consume(0, server.readable(0).len);
+    _ = try server.write(0, "hello", false);
+    _ = try deliver(&server, &client, 2000);
+    try testing.expectEqual(@as(u32, 1), try readableEvents(&client, 0));
+    try testing.expectEqualStrings("hello", client.readable(0));
+    try client.consume(0, 5);
+    try testing.expectEqual(streams.SendState.data_recvd, client.findStream(0).?.send_state);
+
+    _ = try server.write(0, "", true);
+    _ = try deliver(&server, &client, 3000);
+    // What an acknowledgement in the same packet would have run.
+    client.streams.sweep();
+    try testing.expect(client.findStream(0) != null);
+    try testing.expectEqual(@as(u32, 1), try readableEvents(&client, 0));
+    try testing.expect(client.readableFin(0));
+    // Told: now the stream is done with, and the next sweep retires it.
+    client.streams.sweep();
+    try testing.expect(client.streams.isRetired(0));
+}
+
+test "a reader that asks only for octets takes a lone FIN with its empty read" {
+    // zrk reads `readable` and works the FIN out from the stream's final size
+    // without asking `readableFin`. Its empty read is the one that takes the
+    // end, or the stream holds its slot for the life of the connection.
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+    _ = try client.write(0, "GET /", true);
+    _ = try deliver(&client, &server, 1000);
+    try server.consume(0, server.readable(0).len);
+    _ = try server.write(0, "hello", false);
+    _ = try deliver(&server, &client, 2000);
+    try client.consume(0, client.readable(0).len);
+    _ = try server.write(0, "", true);
+    _ = try deliver(&server, &client, 3000);
+    client.streams.sweep();
+    try testing.expect(client.findStream(0) != null);
+    try testing.expectEqual(@as(usize, 0), client.readable(0).len);
+    client.streams.sweep();
+    try testing.expect(client.streams.isRetired(0));
+}
+
+test "a FIN that arrives with unread octets is announced with them, once" {
+    var client = testClient();
+    var server = testServer();
+    try established(&client, &server);
+    _ = try client.write(0, "body", false);
+    _ = try deliver(&client, &server, 1000);
+    try testing.expectEqual(@as(u32, 1), try readableEvents(&server, 0));
+    // Not read yet: the end joins octets the reader was already told of.
+    _ = try client.write(0, "", true);
+    _ = try deliver(&client, &server, 2000);
+    try testing.expect(server.readableFin(0));
+    try testing.expectEqual(@as(u32, 1), try readableEvents(&server, 0));
+    try testing.expectEqualStrings("body", server.readable(0));
+}
+
+/// Drains every event `connection` holds, and answers how many announced
+/// stream `id` readable.
+fn readableEvents(connection: *TestConnection, id: u64) !u32 {
+    var announced: u32 = 0;
+    for (0..TestConnection.events_max + 1) |_| {
+        const event = connection.poll() orelse return announced;
+        switch (event) {
+            .stream_readable => |readable| if (readable == id) {
+                announced += 1;
+            },
+            else => {},
+        }
+    }
+    // `poll` yields at most `events_max`, and an `overflowed`, before it is
+    // empty: a queue that never empties is the finding.
+    return error.TestUnexpectedResult;
 }
 
 //= https://www.rfc-editor.org/rfc/rfc9001#section-6.2
