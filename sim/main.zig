@@ -40,6 +40,15 @@
 //!  8. **`wantsSend` agrees with `send`.** Once `send` returns zero,
 //!     `wantsSend` answers false, or an event loop polling it never sleeps.
 //!
+//! And one at the end of a run, because it is about what was never said:
+//!
+//!  9. **A stream's end reaches its reader.** A reader reads when `poll` says
+//!     a stream is readable, so a FIN that arrived with nothing announcing it
+//!     is a request or an answer that never ends. The client here writes its
+//!     FIN alone, after the payload, so a reader that kept up has nothing to
+//!     read but the end — and for as long as only octets were announced, it
+//!     was never told.
+//!
 //! ## The census
 //!
 //! A run that never lost a packet proved less than it looks like it proved. The
@@ -168,6 +177,10 @@ const feature_stream: u64 = 0x9e37_79b9_7f4a_7c15;
 /// the transfer goes quiet the pair is left alone until both idle timers have
 /// closed it (RFC 9000 section 10.1).
 const idle_seed_period: u8 = 4;
+/// One seed in this many has its client end the stream late: only once the
+/// server's reader has taken every octet, so the FIN arrives in a frame of its
+/// own with nothing before it left to read (oracle nine).
+const fin_late_seed_period: u8 = 3;
 /// The idle timeout those seeds advertise: long against anything the transfer
 /// itself waits for, so that a timer firing *during* it is a defect rather
 /// than a bad path.
@@ -235,6 +248,9 @@ const Census = struct {
     /// invisible without a count.
     runs_ended_by_close: u64 = 0,
     streams_delivered: u64 = 0,
+    /// Ends announced to a reader that had already read everything before
+    /// them: the FIN that comes alone, which oracle nine exists for.
+    ends_announced_alone: u64 = 0,
     /// Datagrams whose packets account for every octet of them, and datagrams
     /// that end in padding no packet claims.
     ///
@@ -337,6 +353,11 @@ const Census = struct {
         .{ .name = "streams fully delivered", .get = struct {
             fn get(c: *const Census) u64 {
                 return c.streams_delivered;
+            }
+        }.get },
+        .{ .name = "stream ends announced alone", .get = struct {
+            fn get(c: *const Census) u64 {
+                return c.ends_announced_alone;
             }
         }.get },
         .{ .name = "PTOs fired", .get = struct {
@@ -485,6 +506,8 @@ const World = struct {
     retry: bool = false,
     /// Whether this seed's server advertises an idle timeout.
     idle: bool = false,
+    /// Whether this seed's client writes its FIN only once the payload is read.
+    fin_late: bool = false,
     /// When the server processed the first packet that took its stream's high
     /// mark to the payload's end. Its idle timer restarted then, so it cannot
     /// have started earlier — which is what bounds an idle close from below. A
@@ -517,6 +540,11 @@ const World = struct {
     written: u32 = 0,
     write_done: bool = false,
     received: u32 = 0,
+    /// Oracle nine's two facts: the reader took every octet before the end
+    /// arrived — so the end came alone — and `poll` announced the stream while
+    /// its end was in reach.
+    read_all_before_end: bool = false,
+    end_announced: bool = false,
 
     /// Highest packet number sent per space, per endpoint, so a repeat is
     /// caught. Two arrays and not one: the client and the server number their
@@ -654,6 +682,7 @@ fn buildWorld(seed: u64) World {
     var features: std.Random.DefaultPrng = .init(seed ^ feature_stream);
     world.retry = features.random().uintLessThan(u8, retry_seed_period) == 0;
     world.idle = features.random().uintLessThan(u8, idle_seed_period) == 0;
+    world.fin_late = features.random().uintLessThan(u8, fin_late_seed_period) == 0;
     // Content that a partial or reordered delivery cannot accidentally satisfy.
     for (&world.payload, 0..) |*octet, index| octet.* = @truncate(index *% 31 +% 7);
     world.prng = prng;
@@ -795,7 +824,7 @@ fn driveApplication(world: *World) void {
             world.written += @intCast(taken);
             if (taken > 0) world.busy_until_ns = world.now_ns;
         }
-        if (world.written == world.payload_len) {
+        if (world.written == world.payload_len and !finWaits(world)) {
             // Only when the FIN was actually taken. Setting `write_done`
             // regardless made a refused FIN look like a finished write, and the
             // run then counted as a completed transfer with nothing having been
@@ -826,6 +855,40 @@ fn driveApplication(world: *World) void {
     world.received += @intCast(readable.len);
     world.server.consume(stream, readable.len) catch {};
     world.busy_until_ns = world.now_ns;
+    if (world.received == world.payload_len and !world.server.readableFin(stream)) {
+        world.read_all_before_end = true;
+    }
+}
+
+/// A late closer's FIN waits for the reader to take the whole payload.
+fn finWaits(world: *const World) bool {
+    assert(world.received <= world.payload_len);
+    return world.fin_late and world.received < world.payload_len;
+}
+
+/// Oracle nine's evidence: the server was told stream `id` is readable while
+/// its end was in reach — counted as alone when the reader had already taken
+/// everything before it.
+fn noteReadable(world: *World, id: u64) void {
+    assert(quic.stream_id.kindOf(id).bidirectional());
+    if (world.end_announced) return;
+    if (!world.server.readableFin(id)) return;
+    world.end_announced = true;
+    if (world.read_all_before_end) world.census.ends_announced_alone += 1;
+    // An end in reach is an end the client wrote.
+    assert(world.write_done);
+}
+
+/// Whether the server's stream reached its end: the FIN arrived, and every
+/// octet before it was read. Not `isComplete`, which is "Data Read" — entered
+/// only once the reader is told, so a stream nobody told never reaches it and
+/// the oracle would pass on exactly the run it exists to fail.
+fn streamEnded(world: *World) bool {
+    const id = quic.stream_id.make(.client_bidirectional, 0);
+    const stream = world.server.findStream(id) orelse return false;
+    assert(stream.consumed <= world.payload_len);
+    const final_size = stream.received.final_size orelse return false;
+    return stream.consumed == final_size;
 }
 
 /// Oracle seven: a datagram is the packets in it and nothing else.
@@ -1198,6 +1261,23 @@ fn stepOnce(world: *World) bool {
 
 /// Move to the next thing that can happen, then fire everything the clock
 /// reached. Answers false when there is nothing left to move to.
+/// The application is still at work with the network quiet — a late reader
+/// with octets in hand, or a late closer's FIN owed once it has caught up —
+/// and the next timer is too far out to jump to (`advanceClock`).
+fn applicationOwesTime(world: *World, next: ?u64) bool {
+    assert(world.received <= world.payload_len);
+    const id = quic.stream_id.make(.client_bidirectional, 0);
+    const unread = world.received < world.payload_len and world.server.readable(id).len > 0;
+    const fin_owed = world.fin_late and !world.write_done and world.written == world.payload_len;
+    // Idle seeds only: they are the ones with a timer far enough out to leap
+    // a reader past, and every other seed keeps the clock it always had — the
+    // pinned seed below is a late reader, and a cap applied everywhere turned
+    // it into a run that never fills its recovery table.
+    const far = if (next) |at| world.idle and at > world.now_ns + reader_wait_max_ns else true;
+    assert(!fin_owed or world.received < world.payload_len or world.written == world.payload_len);
+    return (unread or fin_owed) and far;
+}
+
 fn advanceClock(world: *World, random: std.Random) bool {
     // Advance to the next thing that can happen: a delivery, or a timer.
     var next: ?u64 = null;
@@ -1217,14 +1297,7 @@ fn advanceClock(world: *World, random: std.Random) bool {
     // hand, which then found its connection closed for idleness. A late reader
     // is late by steps, not by a minute; past `reader_wait_max_ns` the clock
     // moves on in catch-up increments instead of to the timer.
-    const unread = world.received < world.payload_len and
-        world.server.readable(quic.stream_id.make(.client_bidirectional, 0)).len > 0;
-    // Idle seeds only: they are the ones with a timer far enough out to leap
-    // a reader past, and every other seed keeps the clock it always had — the
-    // pinned seed below is a late reader, and a cap applied everywhere turned
-    // it into a run that never fills its recovery table.
-    const far = if (next) |at| world.idle and at > world.now_ns + reader_wait_max_ns else true;
-    if (unread and far) {
+    if (applicationOwesTime(world, next)) {
         world.now_ns += reader_catch_up_ns;
         return true;
     }
@@ -1316,7 +1389,8 @@ fn drainEvents(world: *World) void {
                 .key_updated => world.census.key_updates += 1,
                 .handshake_confirmed => {},
                 .stream_delivered => world.census.streams_delivered += 1,
-                .stream_readable, .stream_reset, .stream_stopped => {},
+                .stream_readable => |id| if (which == 1) noteReadable(world, id),
+                .stream_reset, .stream_stopped => {},
                 // An idle close is not a connection error: nothing went wrong
                 // and nothing crossed the wire. It is only legitimate once the
                 // transfer is over — the advertised timeout is long against
@@ -1419,6 +1493,12 @@ fn runSeed(seed: u64, census: *Census) ?Failure {
 
     if (world.failure == null and world.step >= steps_max) {
         fail(&world, "step budget exhausted without finishing", world.step);
+    }
+    // Oracle nine. The reader here reads on a countdown rather than when told,
+    // so it read to the end regardless — which is how the end of a stream went
+    // unannounced through every seed before this was checked.
+    if (world.failure == null and streamEnded(&world) and !world.end_announced) {
+        fail(&world, "the stream ended and its reader was never told", world.received);
     }
     if (world.failure == null and world.idle and world.received == world.payload_len) runIdle(&world);
     // And the other way a run can end without finishing: the virtual clock
@@ -1584,6 +1664,7 @@ fn printCensus(census: *const Census) void {
         .{ .name = "connection errors seen", .value = census.closes_observed },
         .{ .name = "runs excused by a close", .value = census.runs_ended_by_close },
         .{ .name = "streams fully delivered", .value = census.streams_delivered },
+        .{ .name = "stream ends announced alone", .value = census.ends_announced_alone },
         .{ .name = "datagrams whole", .value = census.datagrams_whole },
         .{ .name = "datagrams with loose padding", .value = census.datagrams_with_loose_padding },
         .{ .name = "probes carrying data", .value = census.probes_carrying_data },
